@@ -11,3 +11,6 @@ format:
 
 test:
 	python3 -m pytest
+
+clean:
+	rm -rf build dist hpc.egg-info
