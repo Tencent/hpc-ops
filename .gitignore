@@ -1,4 +1,5 @@
 build/
+dist/
 *.egg-info/
 _C.*.so
 __pycache__
