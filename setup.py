@@ -25,7 +25,7 @@ setup(
     description='High Performance Computing Operator',
     ext_modules=[cuda_extension],
     cmdclass={
-        'build_ext': BuildExtension.with_options(use_ninja=True, parallel=1)
+        'build_ext': BuildExtension.with_options(use_ninja=False, parallel=4)
     },
     packages=['hpc'],
     package_data={"hpc": ["*.so"]},

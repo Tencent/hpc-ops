@@ -7,3 +7,5 @@ CU_FILES=$(shell find src -name "*.cu")
 
 format:$(PY_FILES)
 	python3 -m yapf --style=yapf -i $^ 
+	clang-format --style=google -i $^
+
