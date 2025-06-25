@@ -9,3 +9,5 @@ format:
 	python3 -m yapf --style=yapf -i $(PY_FILES)
 	clang-format --style=google -i $(CC_FILES) $(CU_FILES)
 
+test:
+	python3 -m pytest
