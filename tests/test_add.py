@@ -1,10 +1,10 @@
 import sys
-import os
+from pathlib import Path
 
-sys.path.append('../build/lib.linux-x86_64-cpython-310/')
+sys.path.append(list(Path(__file__).parent.glob('../build/lib.*/'))[0])
 
-import hpc
 import torch
+import hpc
 
 
 def test_add():
