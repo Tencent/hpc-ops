@@ -23,7 +23,7 @@ torch::Tensor entry(torch::Tensor& a, torch::Tensor& b) {
   return c;
 }
 
-TORCH_LIBRARY_FRAGMENT(hpc, m) { m.def("add", &entry); }
-
 }  // namespace add
 }  // namespace hpc
+
+TORCH_LIBRARY_FRAGMENT(hpc, m) { m.def("add", &hpc::add::entry); }

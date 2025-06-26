@@ -2,12 +2,20 @@ from setuptools import setup
 from torch.utils.cpp_extension import CppExtension, BuildExtension, CUDAExtension
 import os
 
+include_flags = '-I' + os.path.dirname(__file__)
+
 extra_compile_args = {
-    'cxx': ['-O2', '-std=c++17', '-I./'],
+    'cxx': ['-O2', '-std=c++17', include_flags],
     'nvcc': [
-        '-arch=sm_90', '-O2', '-std=c++17', '--expt-relaxed-constexpr', '-I./'
+        '-arch=sm_90',
+        '-O2',
+        '-std=c++17',
+        '--expt-relaxed-constexpr',
+        include_flags,
     ]
 }
+
+extra_link_args = []
 
 cuda_extension = CUDAExtension(
     name='hpc._C',
@@ -15,18 +23,20 @@ cuda_extension = CUDAExtension(
         'src/_C.cc',
         'src/add/add.cu',
         'src/add/entry.cc',
-        'src/cast/entry.cu',
     ],
-    extra_compile_args=extra_compile_args)
+    extra_compile_args=extra_compile_args,
+    extra_link_args=extra_link_args,
+)
 
 setup(
     name='hpc',
-    version='0.1.0',
+    version='0.0.1',
     description='High Performance Computing Operator',
-    ext_modules=[cuda_extension],
-    cmdclass={
-        'build_ext': BuildExtension.with_options(use_ninja=False, parallel=4)
-    },
     packages=['hpc'],
+    ext_modules=[cuda_extension],
+    install_requires=['torch'],
+    cmdclass={'build_ext': BuildExtension},
     package_data={"hpc": ["*.so"]},
-    install_requires=['torch>=2.7.0'])
+    options={"bdist_wheel": {
+        "py_limited_api": "cp39"
+    }})
