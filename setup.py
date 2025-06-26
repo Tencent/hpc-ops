@@ -1,6 +1,7 @@
 from setuptools import setup
 from torch.utils.cpp_extension import CppExtension, BuildExtension, CUDAExtension
 import os
+from glob import glob
 
 include_flags = '-I' + os.path.dirname(__file__)
 
@@ -17,14 +18,16 @@ extra_compile_args = {
 
 extra_link_args = []
 
+mm_files = ['src/_C.cc']
+cc_files = glob('src/*/*.cc')
+cu_files = glob('src/*/*.cu')
+
+sources = mm_files + cc_files + cu_files
+sources = [f for f in sources if not f.endswith('test.cc')]
+
 cuda_extension = CUDAExtension(
     name='hpc._C',
-    sources=[
-        'src/_C.cc',
-        'src/add/add.cu',
-        'src/add/entry.cc',
-        'src/cast/entry.cu',
-    ],
+    sources=sources,
     extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,
     py_limited_api=True,

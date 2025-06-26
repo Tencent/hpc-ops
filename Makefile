@@ -5,6 +5,9 @@ CU_FILES=$(shell find src -name "*.cu")
 all:
 	python3 setup.py build
 
+wheel:
+	python3 setup.py bdist_wheel
+
 format:
 	python3 -m yapf --style=yapf -i $(PY_FILES)
 	clang-format --style=google -i $(CC_FILES) $(CU_FILES)
