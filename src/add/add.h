@@ -2,7 +2,7 @@
 #define SRC_ADD_ADD_H_
 
 #include <stdint.h> 
-#include <cuda.h> 
+#include <cuda_runtime_api.h>
 
 namespace hpc {
 namespace add {

@@ -1,6 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime_api.h>
+#include <torch/all.h>
 #include <torch/library.h>
-#include <torch/torch.h>
 
 #include "src/add/add.h"
 

@@ -26,6 +26,7 @@ cuda_extension = CUDAExtension(
     ],
     extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,
+    py_limited_api=True,
 )
 
 setup(
