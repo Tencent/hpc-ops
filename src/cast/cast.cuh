@@ -1,4 +1,7 @@
 #include <cuda.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 namespace hpc {
 namespace cast {
@@ -18,6 +21,22 @@ struct Convertor<half, float> {
       return __float2half(in);
     }
 };
+
+template <>
+struct Convertor<__nv_bfloat16, float> {
+    __device__ __host__ static __nv_bfloat16 convert(const float& in) {
+      return __float2bfloat16(in);
+    }
+};
+
+template <>
+struct Convertor<__nv_fp8_e4m3, float> {
+    __device__ __host__ static __nv_fp8_e4m3 convert(const float& in) {
+      __nv_fp8_e4m3 vout {in};
+      return vout;
+    }
+};
+
 
 template <typename Tout, typename Tin>
 __global__ void cast(void *cptr, const void *aptr, int num) {

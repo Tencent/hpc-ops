@@ -1,6 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
 #include <torch/all.h>
 #include <torch/library.h>
@@ -37,8 +38,16 @@ torch::Tensor entry(torch::Tensor& a, torch::Dtype dtype) {
         cast_async<half, float>(cptr, aptr, num, stream);
         break;
       }
+      case torch::kBFloat16: {
+        cast_async<__nv_bfloat16, float>(cptr, aptr, num, stream);
+        break;
+      }
+      case torch::kFloat8_e4m3fn: {
+        cast_async<__nv_fp8_e4m3, float>(cptr, aptr, num, stream);
+        break;
+      }
       default: {
-        printf("not support yet!");
+        throw std::invalid_argument("not support yet!");
         break;
       }
     }  // switch
