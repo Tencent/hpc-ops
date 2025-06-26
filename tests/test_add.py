@@ -13,7 +13,6 @@ def test_add():
 
   gt = a + b
   c = hpc.ops.add(a, b)
-  torch.allclose(c, gt)
 
   assert torch.allclose(c, gt)
   assert c.device == a.device
