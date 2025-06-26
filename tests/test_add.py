@@ -1,10 +1,12 @@
 import sys
+import os
 from pathlib import Path
 
-sys.path.append(list(Path(__file__).parent.glob('../build/lib.*/'))[0])
+sys.path.append(
+    os.path.realpath(list(Path(__file__).parent.glob('../build/lib.*/'))[0]))
 
-import torch
 import hpc
+import torch
 
 
 def test_add():

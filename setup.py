@@ -23,6 +23,7 @@ cuda_extension = CUDAExtension(
         'src/_C.cc',
         'src/add/add.cu',
         'src/add/entry.cc',
+        'src/cast/entry.cu',
     ],
     extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,

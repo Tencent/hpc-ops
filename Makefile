@@ -10,7 +10,7 @@ format:
 	clang-format --style=google -i $(CC_FILES) $(CU_FILES)
 
 test:
-	python3 -m pytest
+	python3 -m pytest tests
 
 clean:
 	rm -rf build dist hpc.egg-info

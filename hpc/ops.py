@@ -9,6 +9,6 @@ def add(a: Tensor, b: Tensor) -> Tensor:
   return torch.ops.hpc.add(a, b)
 
 
-def cast(a: Tensor) -> Tensor:
+def cast(a: Tensor, dtype) -> Tensor:
   """Performs type cast in gpu kernel"""
-  return torch.ops.hpc.cast(a,)
+  return torch.ops.hpc.cast(a, dtype)
