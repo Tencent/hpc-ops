@@ -21,4 +21,4 @@ test:
 	python3 -m pytest tests
 
 clean:
-	rm -rf build dist hpc.egg-info
+	rm -rf build dist hpc.egg-info site
