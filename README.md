@@ -1,17 +1,18 @@
-### High Performance Computing Operators
+# High Performance Computing Operator
 
-##### Build
-- with Makefile
+## Build
+### local build
 ```sh
 make
 ```
-- with setup.py
+
+### build wheel package
 ```sh
-python3 setup.py develop --user
+make wheel
 ```
 
-##### Usage Demo
-```
+## Usage
+```py
 import hpc
 import torch
 
@@ -24,6 +25,7 @@ c = hpc.ops.add(a, b)
 assert torch.allclose(c, gt)
 ```
 
-##### Test
-- py test
-- cpp test
+## Test
+```sh
+make test
+```
