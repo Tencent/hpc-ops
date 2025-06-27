@@ -46,6 +46,14 @@ torch::Tensor entry(torch::Tensor& a, torch::Dtype dtype) {
         cast_async<__nv_fp8_e4m3, float>(cptr, aptr, num, stream);
         break;
       }
+      case torch::kFloat8_e5m2: {
+        cast_async<__nv_fp8_e5m2, float>(cptr, aptr, num, stream);
+        break;
+      }
+      case torch::kFloat8_e8m0fnu: {
+        cast_async<__nv_fp8_e8m0, float>(cptr, aptr, num, stream);
+        break;
+      }
       default: {
         throw std::invalid_argument("not support yet!");
         break;

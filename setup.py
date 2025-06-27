@@ -8,7 +8,7 @@ include_flags = '-I' + os.path.dirname(__file__)
 extra_compile_args = {
     'cxx': ['-O2', '-std=c++17', include_flags],
     'nvcc': [
-        '-arch=sm_90',
+        '-arch=sm_90a',
         '-O2',
         '-std=c++17',
         '--expt-relaxed-constexpr',

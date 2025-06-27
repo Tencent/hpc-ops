@@ -1,6 +1,6 @@
 #include <cuda.h>
-#include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
 namespace hpc {
@@ -10,44 +10,59 @@ namespace kernels {
 
 template <typename Tout, typename Tin>
 struct Convertor {
-    __device__ __host__ static Tout convert(const Tin& in) {
-        return static_cast<Tout>(in);
-    }
+  __device__ __host__ static Tout convert(const Tin& in) {
+    return static_cast<Tout>(in);
+  }
 };
 
 template <>
 struct Convertor<half, float> {
-    __device__ __host__ static half convert(const float& in) {
-      return __float2half(in);
-    }
+  __device__ __host__ static half convert(const float& in) {
+    return __float2half(in);
+  }
 };
 
 template <>
 struct Convertor<__nv_bfloat16, float> {
-    __device__ __host__ static __nv_bfloat16 convert(const float& in) {
-      return __float2bfloat16(in);
-    }
+  __device__ __host__ static __nv_bfloat16 convert(const float& in) {
+    return __float2bfloat16(in);
+  }
 };
 
 template <>
 struct Convertor<__nv_fp8_e4m3, float> {
-    __device__ __host__ static __nv_fp8_e4m3 convert(const float& in) {
-      __nv_fp8_e4m3 vout {in};
-      return vout;
-    }
+  __device__ __host__ static __nv_fp8_e4m3 convert(const float& in) {
+    __nv_fp8_e4m3 vout{in};
+    return vout;
+  }
 };
 
+template <>
+struct Convertor<__nv_fp8_e5m2, float> {
+  __device__ __host__ static __nv_fp8_e5m2 convert(const float& in) {
+    __nv_fp8_e5m2 vout{in};
+    return vout;
+  }
+};
+
+template <>
+struct Convertor<__nv_fp8_e8m0, float> {
+  __device__ __host__ static __nv_fp8_e8m0 convert(const float& in) {
+    __nv_fp8_e8m0 vout{in};
+    return vout;
+  }
+};
 
 template <typename Tout, typename Tin>
-__global__ void cast(void *cptr, const void *aptr, int num) {
+__global__ void cast(void* cptr, const void* aptr, int num) {
   int idx = blockDim.x * blockIdx.x + threadIdx.x;
 
   if (idx >= num) {
     return;
   }
 
-  Tin *iptr = (Tin*)aptr;
-  Tout *optr = (Tout*)cptr;
+  Tin* iptr = (Tin*)aptr;
+  Tout* optr = (Tout*)cptr;
 
   Tin vin = iptr[idx];
   Tout vout = Convertor<Tout, Tin>::convert(vin);
@@ -57,11 +72,11 @@ __global__ void cast(void *cptr, const void *aptr, int num) {
 }  // namespace kernels
 
 template <typename Tout, typename Tin>
-void cast_async(void *cptr, const void *aptr, int num, cudaStream_t stream) {
-    dim3 block(128);
-    dim3 grid((num + block.x - 1) / block.x);
-    kernels::cast<Tout, Tin><<<grid, block, 0, stream>>>(cptr, aptr, num);
+void cast_async(void* cptr, const void* aptr, int num, cudaStream_t stream) {
+  dim3 block(128);
+  dim3 grid((num + block.x - 1) / block.x);
+  kernels::cast<Tout, Tin><<<grid, block, 0, stream>>>(cptr, aptr, num);
 }
 
-}  // namespace cast 
-}  // namespace hpc 
+}  // namespace cast
+}  // namespace hpc
