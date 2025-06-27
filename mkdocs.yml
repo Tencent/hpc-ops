@@ -1,0 +1,8 @@
+site_name: High Performance Operator 
+site_url: https://mydomain.org/mysite
+theme:
+  name: material
+
+plugins:
+- search
+- mkdocstrings

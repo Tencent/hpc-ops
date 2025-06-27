@@ -1,5 +1,7 @@
 build/
 dist/
+site/
+docs/
 *.egg-info/
 _C.*.so
 __pycache__
