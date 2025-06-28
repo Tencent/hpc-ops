@@ -3,15 +3,28 @@ from torch import Tensor
 
 
 def act_mul_and_quant(gate_up: Tensor, scale: Tensor) -> Tensor:
-  """Performs act(left) * right * scale for gate_up output.
+  """Applies activation, multiplication, and quantization to the gate projection.
 
-    Executes the operation in a custom GPU kernel for optimized performance.
+  Specifically:
+  1. Splits the `gate_up` tensor into gate (first half) and up (second half)
+  2. Applies activation (typically SiLU) to the gate portion
+  3. Computes element-wise multiplication: activated_gate × up
+  4. Scales the result using the first element of `scale`
+  5. Quantizes the output to fp8_e4m3 format
 
-    Args:
-        gate_up: gate_up projection result with size[N, C * 2], dtype = bfloat16 
-        scale: per tensor quantization scale, only using the first element, dtype = float
+  Executes via a custom high-performance GPU kernel.
 
-    Returns:
-        Output tensor with output dtype = fp8_e4m3 
-    """
+  Args:
+    gate_up: Concatenated gate and up projections.
+        Shape: [N, 2*C] (N = batch size, C = hidden dimension)
+        Dtype: bfloat16
+    scale: Quantization scale factor.
+        Only the first tensor element is used.
+        Dtype: float32
+
+  Returns:
+    Quantized output tensor.
+        Shape: [N, C]
+        Dtype: fp8_e4m3
+  """
   return torch.ops.hpc.act_mul_and_quant(gate_up, scale)
