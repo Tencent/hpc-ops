@@ -5,3 +5,5 @@ docs/
 *.egg-info/
 _C.*.so
 __pycache__
+*.ncu-rep
+*.nsys-rep

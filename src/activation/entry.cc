@@ -28,7 +28,7 @@ torch::Tensor entry(torch::Tensor &input, torch::Tensor &scale) {
   auto input_shape = input.sizes();
   int num_col = input_shape[input_shape.size() - 1];
   int num_row = 1;
-  for (int i = 0; i < input_shape.size() - 1; ++i) {
+  for (uint32_t i = 0; i < input_shape.size() - 1; ++i) {
     num_row *= input_shape[i];
   }
 
