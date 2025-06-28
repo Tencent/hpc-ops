@@ -20,7 +20,7 @@ a = torch.randn(3, 5, device='cuda')
 b = torch.randn(3, 5, device='cuda')
 
 gt = a + b
-c = hpc.ops.add(a, b)
+c = hpc.add(a, b)
 
 assert torch.allclose(c, gt)
 ```

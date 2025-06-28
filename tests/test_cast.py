@@ -11,7 +11,7 @@ import torch
 
 def test_cast_fp16():
   a = torch.randn(3, 5, device='cuda')
-  b = hpc.ops.cast(a, torch.float16)
+  b = hpc.cast(a, torch.float16)
 
   assert b.device == a.device
   assert b.dtype == torch.float16
@@ -19,7 +19,7 @@ def test_cast_fp16():
 
 def test_cast_fp8_e4m3():
   a = torch.randn(3, 5, device='cuda')
-  b = hpc.ops.cast(a, torch.float8_e4m3fn)
+  b = hpc.cast(a, torch.float8_e4m3fn)
 
   print(a)
   print(b)
@@ -30,7 +30,7 @@ def test_cast_fp8_e4m3():
 
 def test_cast_fp8_e5m2():
   a = torch.randn(3, 5, device='cuda')
-  b = hpc.ops.cast(a, torch.float8_e5m2)
+  b = hpc.cast(a, torch.float8_e5m2)
 
   print(a)
   print(b)
@@ -41,7 +41,7 @@ def test_cast_fp8_e5m2():
 
 def test_cast_fp8_e8m0():
   a = torch.randn(3, 5, device='cuda')
-  b = hpc.ops.cast(a, torch.float8_e8m0fnu)
+  b = hpc.cast(a, torch.float8_e8m0fnu)
 
   print(a)
   print(b)

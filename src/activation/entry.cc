@@ -21,9 +21,8 @@ torch::Tensor entry(torch::Tensor &input, torch::Tensor &scale) {
   using Tin = __nv_bfloat16;
   using Tout = __nv_fp8_e4m3;
 
-
-  Tin *input_ptr = reinterpret_cast<Tin*>(input.data_ptr());
-  Tout *output_ptr = reinterpret_cast<Tout*>(output.data_ptr());
+  Tin *input_ptr = reinterpret_cast<Tin *>(input.data_ptr());
+  Tout *output_ptr = reinterpret_cast<Tout *>(output.data_ptr());
   float *scale_ptr = scale.data_ptr<float>();
 
   auto input_shape = input.sizes();

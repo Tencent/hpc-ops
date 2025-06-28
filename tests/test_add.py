@@ -14,7 +14,7 @@ def test_add():
   b = torch.randn(3, 5, device='cuda')
 
   gt = a + b
-  c = hpc.ops.add(a, b)
+  c = hpc.add(a, b)
 
   assert torch.allclose(c, gt)
   assert c.device == a.device
