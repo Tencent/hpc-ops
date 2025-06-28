@@ -3,7 +3,7 @@ from torch import Tensor
 
 
 def act_mul_and_quant(gate_up: Tensor, scale: Tensor) -> Tensor:
-  """Applies activation, multiplication, and quantization to the gate projection.
+  """Applies activation, multiplication, and quantization to the gate_up projection.
 
   Specifically:
   1. Splits the `gate_up` tensor into gate (first half) and up (second half)
