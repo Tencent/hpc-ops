@@ -18,11 +18,10 @@ extra_compile_args = {
 
 extra_link_args = []
 
-mm_files = ['src/_C.cc']
-cc_files = glob('src/*/*.cc')
-cu_files = glob('src/*/*.cu')
+cc_files = glob('src/**/*.cc', recursive=True)
+cu_files = glob('src/**/*.cu', recursive=True)
 
-sources = mm_files + cc_files + cu_files
+sources = cc_files + cu_files
 sources = [f for f in sources if not f.endswith('test.cc')]
 
 cuda_extension = CUDAExtension(
