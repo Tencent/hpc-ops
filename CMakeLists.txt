@@ -15,6 +15,7 @@ find_package(Torch REQUIRED)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
+# -DPy_LIMITED_API=0x03090000
 file(GLOB mm_files "src/_C.cc")
 file(GLOB_RECURSE cc_files "src/*/*.cc")
 file(GLOB_RECURSE cu_files "src/*/*.cu")
