@@ -1,6 +1,6 @@
 
 #define kWarpSize 32
-#define UP_DIV(X, Y) (((X) + (Y) - 1) / (Y))
+#define UP_DIV(X, Y) (((X) + (Y)-1) / (Y))
 
 namespace hpc {
 namespace utils {
