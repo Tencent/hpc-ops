@@ -8,14 +8,16 @@
 namespace hpc {
 namespace add {
 
-torch::Tensor entry(torch::Tensor& a, torch::Tensor& b) {
+torch::Tensor entry(const torch::Tensor& a, const torch::Tensor& b) {
   auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+  TORCH_CHECK(a.is_contiguous(), "input tensor must be contiguous");
+  TORCH_CHECK(b.is_contiguous(), "input tensor must be contiguous");
 
   torch::Tensor c = torch::empty_like(a);
 
-  float* aptr = reinterpret_cast<float*>(a.data_ptr());
-  float* bptr = reinterpret_cast<float*>(b.data_ptr());
-  float* cptr = reinterpret_cast<float*>(c.data_ptr());
+  const auto* aptr = a.const_data_ptr<float>();
+  const auto* bptr = b.const_data_ptr<float>();
+  auto* cptr = c.mutable_data_ptr<float>();
 
   auto num = a.numel();
 
