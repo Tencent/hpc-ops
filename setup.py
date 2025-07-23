@@ -4,15 +4,13 @@ import os
 from glob import glob
 
 include_flags = '-I' + os.path.dirname(__file__)
+cute_include = '-I' + os.path.dirname(__file__) + '/3rd/cutlass/include'
 
 extra_compile_args = {
-    'cxx': ['-O2', '-std=c++17', include_flags],
+    'cxx': ['-O2', '-std=c++17', include_flags, cute_include],
     'nvcc': [
-        '-arch=sm_90a',
-        '-O2',
-        '-std=c++17',
-        '--expt-relaxed-constexpr',
-        include_flags,
+        '-arch=sm_90a', '-O2', '-lineinfo', '-Xptxas', '-v', '-std=c++17',
+        '--expt-relaxed-constexpr', include_flags, cute_include
     ]
 }
 

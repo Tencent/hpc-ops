@@ -21,7 +21,7 @@ def reference_torch_rms_norm_with_scale(x, weight, scale, eps):
   inv_scale = 1.0 / scale
   return (x_normalized * inv_scale).to(torch.float8_e4m3fn).to(torch.bfloat16)
 
-
+# torch impl for rms_norm
 def reference_torch_rms_norm(x, weight, eps):
   rms = torch.rsqrt(torch.mean(x.float().pow(2), dim=-1, keepdim=True) + eps)
   x_normalized = x * rms

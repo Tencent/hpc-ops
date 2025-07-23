@@ -1,8 +1,11 @@
 #include <cuda.h>
 
 #include "src/normalization/fused_rms_norm_with_scale/fused_rms_norm_with_scale.h"
-#include "src/ptx_wrapper.cuh"
-#include "src/utils.cuh"
+#include "src/utils/utils.cuh"
+
+#define UP_DIV(X, Y) (((X) + (Y) - 1) / (Y))
+
+constexpr static int kWarpSize = 32;
 
 namespace hpc {
 namespace normalization {
@@ -19,10 +22,10 @@ __global__ void fused_rms_norm_with_scale(
   constexpr float kInvHiddenStates = 1.0f / kHiddenStates;
   constexpr int kIterPerBatch =
       UP_DIV(kHiddenStates, kWarpPerBatch * kWarpSize * kItemPer16B);
-  float inv_scale = ptx::rcp_ftz(scale[0]);
+  float inv_scale = rcpf_ftz(scale[0]);
   float inv_scale2 = 1;
   if constexpr (kIsMoe) {
-    inv_scale2 = ptx::rcp_ftz(scale[1]);
+    inv_scale2 = rcpf_ftz(scale[1]);
     inv_scale *= scale[1];
   }
 
@@ -35,13 +38,16 @@ __global__ void fused_rms_norm_with_scale(
 
   __shared__ float smem_sum[kWarpPerBatch];
 
-  float reg_input[kIterPerBatch * kItemPer16B];
-  float reg_weight[kIterPerBatch * kItemPer16B];
+  vec_t<float, kItemPer16B> reg_input[kIterPerBatch];
+  vec_t<float, kItemPer16B> reg_weight[kIterPerBatch];
 
 #pragma unroll
-  for (int i = 0; i < kIterPerBatch * kItemPer16B; i++) {
-    reg_input[i] = 0;
-    reg_weight[i] = 0;
+  for (int i = 0; i < kIterPerBatch; i++) {
+#pragma unroll
+    for (int j = 0; j < kItemPer16B; j++) {
+      reg_input[i][j] = 0;
+      reg_weight[i][j] = 0;
+    }
   }
 
 #pragma unroll
@@ -50,8 +56,8 @@ __global__ void fused_rms_norm_with_scale(
         icol_thr_offset + iter * kWarpPerBatch * kWarpSize * kItemPer16B;
 
     if (icol < kHiddenStates) {
-      utils::load_16B_from_bf16_to_float(&reg_weight[iter * kItemPer16B],
-                                         &weight_ptr[icol]);
+      reg_weight[iter] =
+          to<float>(load<__nv_bfloat162, kItemPer16B / 2>(&weight_ptr[icol]));
     }
   }
 
@@ -64,23 +70,18 @@ __global__ void fused_rms_norm_with_scale(
           icol_thr_offset + iter * kWarpPerBatch * kWarpSize * kItemPer16B;
 
       if (icol < kHiddenStates) {
-        utils::load_16B_from_bf16_to_float(
-            &reg_input[iter * kItemPer16B],
-            &input_ptr[ibatch * kHiddenStates + icol]);
+        reg_input[iter] = to<float>(load<__nv_bfloat162, kItemPer16B / 2>(
+            &input_ptr[ibatch * kHiddenStates + icol]));
 #pragma unroll
         for (int i = 0; i < kItemPer16B; i++) {
-          local_mean += reg_input[iter * kItemPer16B + i] *
-                        reg_input[iter * kItemPer16B + i];
+          local_mean += reg_input[iter][i] * reg_input[iter][i];
         }
       }
     }
   }
 
   // warp reduce
-#pragma unroll
-  for (int mask = 16; mask >= 1; mask /= 2) {
-    local_mean += __shfl_xor_sync((uint32_t)-1, local_mean, mask);
-  }
+  local_mean = warp_reduce_sum_xor(local_mean);
 
   if (ilane == 0) {
     smem_sum[iwarp] = local_mean;
@@ -97,7 +98,7 @@ __global__ void fused_rms_norm_with_scale(
     }
   }
 
-  local_mean = ptx::rsqrt_ftz(local_mean * kInvHiddenStates + eps);
+  local_mean = rsqrtf_ftz(local_mean * kInvHiddenStates + eps);
 
   if constexpr (!kIsMoe) {
     local_mean *= inv_scale;
@@ -113,31 +114,32 @@ __global__ void fused_rms_norm_with_scale(
       if (icol < kHiddenStates) {
 #pragma unroll
         for (int i = 0; i < kItemPer16B; i++) {
-          reg_input[iter * kItemPer16B + i] =
-              reg_input[iter * kItemPer16B + i] *
-              reg_weight[iter * kItemPer16B + i] * local_mean;
+          reg_input[iter][i] =
+              reg_input[iter][i] * reg_weight[iter][i] * local_mean;
         }
 
+        auto &split_input = view<2>(reg_input[iter]);
         if constexpr (kIsMoe) {
-          utils::store_16B_to_float_from_float(&output_ptr_fp32[istore],
-                                               &reg_input[iter * kItemPer16B]);
-          utils::store_16B_to_float_from_float(
-              &output_ptr_fp32[istore + kItemPer16B / 2],
-              &reg_input[iter * kItemPer16B + kItemPer16B / 2]);
+          store(&output_ptr_fp32[istore], split_input[0]);
+          store(&output_ptr_fp32[istore + kItemPer16B / 2], split_input[1]);
 #pragma unroll
           for (int i = 0; i < kItemPer16B; i++) {
-            reg_input[iter * kItemPer16B + i] *= inv_scale2;
+            reg_input[iter][i] *= inv_scale2;
           }
-          utils::store_8B_to_fp8e4m3_from_float(&output_ptr_fp8_scale2[istore],
-                                                &reg_input[iter * kItemPer16B]);
+
+          store(&output_ptr_fp8_scale2[istore],
+                to<__nv_fp8x4_e4m3>(split_input[0]));
+          store(&output_ptr_fp8_scale2[istore + kItemPer16B / 2],
+                to<__nv_fp8x4_e4m3>(split_input[1]));
 #pragma unroll
           for (int i = 0; i < kItemPer16B; i++) {
-            reg_input[iter * kItemPer16B + i] *= inv_scale;
+            reg_input[iter][i] *= inv_scale;
           }
         }
 
-        utils::store_8B_to_fp8e4m3_from_float(&output_ptr_fp8[istore],
-                                              &reg_input[iter * kItemPer16B]);
+        store(&output_ptr_fp8[istore], to<__nv_fp8x4_e4m3>(split_input[0]));
+        store(&output_ptr_fp8[istore + kItemPer16B / 2],
+              to<__nv_fp8x4_e4m3>(split_input[1]));
       }
     }
   }

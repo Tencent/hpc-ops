@@ -118,7 +118,7 @@ void cast_async(void* cptr, const void* aptr, int num, torch::ScalarType tout,
         break;
       }
     }  // switch
-  }    // if
+  }  // if
 }
 
 }  // namespace cast
