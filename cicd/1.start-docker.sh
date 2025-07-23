@@ -4,5 +4,3 @@ set -xeo pipefail
 pwd
 
 ls -lthr
-
-env
