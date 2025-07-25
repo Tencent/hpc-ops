@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-set -xeo pipefail
+set -x
 
 make test
