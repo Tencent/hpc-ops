@@ -20,7 +20,7 @@ cc_files = glob('src/**/*.cc', recursive=True)
 cu_files = glob('src/**/*.cu', recursive=True)
 
 sources = cc_files + cu_files
-sources = [f for f in sources if not f.endswith('test.cc')]
+sources = [f for f in sources if not ('test' in f)]
 
 cuda_extension = CUDAExtension(
     name='hpc._C',
