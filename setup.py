@@ -31,7 +31,7 @@ cuda_extension = CUDAExtension(
 )
 
 setup(
-    name='hpc',
+    name='hpc-ops',
     version='0.0.1',
     description='High Performance Computing Operator',
     packages=['hpc'],
