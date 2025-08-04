@@ -61,11 +61,12 @@ __device__ __forceinline__ auto to(const vec_t<T, N> &v) {
     }
     return o;
   } else if constexpr (std::is_same_v<T, float> && std::is_same_v<U, __nv_fp8x4_e4m3>) {
+    static_assert(N % 4 == 0, "N % 4 must be 0");
     using V = vec_t<__nv_fp8x4_e4m3, N / 4>;
     V o;
 #pragma unroll
     for (int i = 0; i < N / 4; ++i) {
-      o[i] = __nv_fp8x4_e4m3(*((float4 *)(&v)));
+      o[i] = __nv_fp8x4_e4m3(*((float4 *)(&v[4 * i])));
     }
     return o;
   }
@@ -194,6 +195,15 @@ __device__ __forceinline__ float warp_reduce_sum_down(float x) {
 #pragma unroll
   for (int ioffset = 16; ioffset >= 1; ioffset /= 2) {
     x += __shfl_down_sync(0xFFFFFFFF, x, ioffset);
+  }
+
+  return x;
+}
+
+__device__ __forceinline__ float warp_reduce_max_down(float x) {
+#pragma unroll
+  for (int ioffset = 16; ioffset >= 1; ioffset /= 2) {
+    x = fmaxf(x, __shfl_down_sync(0xFFFFFFFF, x, ioffset));
   }
 
   return x;

@@ -3,8 +3,6 @@
 #include "src/normalization/fused_rms_norm_with_scale/fused_rms_norm_with_scale.h"
 #include "src/utils/utils.cuh"
 
-#define UP_DIV(X, Y) (((X) + (Y)-1) / (Y))
-
 constexpr static int kWarpSize = 32;
 
 namespace hpc {
@@ -20,7 +18,8 @@ __global__ void fused_rms_norm_with_scale(__nv_bfloat16 *input_ptr, __nv_bfloat1
                                           float eps, int batch_size) {
   constexpr int kItemPer16B = 8;
   constexpr float kInvHiddenStates = 1.0f / kHiddenStates;
-  constexpr int kIterPerBatch = UP_DIV(kHiddenStates, kWarpPerBatch * kWarpSize * kItemPer16B);
+  constexpr int kIterPerBatch = (kHiddenStates + kWarpPerBatch * kWarpSize * kItemPer16B - 1) /
+                                (kWarpPerBatch * kWarpSize * kItemPer16B);
   float inv_scale = rcpf_ftz(scale[0]);
   float inv_scale2 = 1;
   if constexpr (kIsMoe) {
@@ -141,7 +140,7 @@ __global__ void fused_rms_norm_with_scale(__nv_bfloat16 *input_ptr, __nv_bfloat1
   {                                                                                                \
     auto kernel =                                                                                  \
         &kernels::fused_rms_norm_with_scale<kHiddenStates, kWarpPerBatch, kBatchPerBlock, kIsMoe>; \
-    dim3 grid(UP_DIV(batch_size, kBatchPerBlock));                                                 \
+    dim3 grid((batch_size + kBatchPerBlock - 1) / kBatchPerBlock);                                 \
     kernel<<<grid, block, 0, stream>>>(                                                            \
         reinterpret_cast<Tin *>(input_ptr), reinterpret_cast<Tin *>(weight_ptr),                   \
         reinterpret_cast<float *>(output_fp32_ptr), reinterpret_cast<Tout *>(output_ptr),          \

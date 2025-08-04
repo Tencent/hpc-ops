@@ -6,7 +6,6 @@ from einops import rearrange, repeat
 import torch.nn.functional as F
 import torch
 import math
-import numpy as np
 
 sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
 

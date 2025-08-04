@@ -9,8 +9,6 @@ import hpc
 import torch
 import math
 
-import numpy as np
-
 
 def reference_torch_rms_norm_with_scale(x, weight, scale, eps):
     rms = torch.rsqrt(torch.mean(x.float() ** 2, dim=-1, keepdim=True) + eps)

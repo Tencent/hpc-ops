@@ -105,8 +105,8 @@ void cast_async(void *cptr, const void *aptr, int num, torch::ScalarType tout,
         throw std::invalid_argument("not support yet!");
         break;
       }
-    }  // switch
-  }    // if
+    }
+  }
 }
 
 }  // namespace cast
