@@ -3,7 +3,7 @@ from torch import Tensor
 
 
 def add(a: Tensor, b: Tensor) -> Tensor:
-  """Performs element-wise addition on GPU.
+    """Performs element-wise addition on GPU.
 
     Executes the operation in a custom GPU kernel for optimized performance.
 
@@ -14,4 +14,4 @@ def add(a: Tensor, b: Tensor) -> Tensor:
     Returns:
         Output tensor containing element-wise sum of inputs
     """
-  return torch.ops.hpc.add(a, b)
+    return torch.ops.hpc.add(a, b)

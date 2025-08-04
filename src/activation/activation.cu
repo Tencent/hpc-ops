@@ -9,10 +9,9 @@ namespace activation {
 
 namespace kernels {
 
-__global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr,
-                                         const __nv_bfloat16 *gate_up_ptr,
-                                         const float *scale_ptr,
-                                         const int num_row, const int num_col) {
+__global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_up_ptr,
+                                         const float *scale_ptr, const int num_row,
+                                         const int num_col) {
   int it = threadIdx.x + blockIdx.x * blockDim.x;
   int irow = blockIdx.y;
 
@@ -41,10 +40,8 @@ __global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr,
       out[i].y = silu(g2.y) * u2.y;
     }
 
-    float4 f1 = make_float4(out[0].x * scale, out[0].y * scale,
-                            out[1].x * scale, out[1].y * scale);
-    float4 f2 = make_float4(out[2].x * scale, out[2].y * scale,
-                            out[3].x * scale, out[3].y * scale);
+    float4 f1 = make_float4(out[0].x * scale, out[0].y * scale, out[1].x * scale, out[1].y * scale);
+    float4 f2 = make_float4(out[2].x * scale, out[2].y * scale, out[3].x * scale, out[3].y * scale);
 
     __nv_fp8x4_e4m3 o1{f1};
     __nv_fp8x4_e4m3 o2{f2};
@@ -60,10 +57,9 @@ __global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr,
 
 }  // namespace kernels
 
-void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr,
-                             const __nv_bfloat16 *gate_up_ptr,
-                             const float *scale_ptr, const int num_row,
-                             const int num_col, cudaStream_t stream) {
+void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_up_ptr,
+                             const float *scale_ptr, const int num_row, const int num_col,
+                             cudaStream_t stream) {
   // num_col == 2128 x 2
   // gate + up
 
@@ -72,8 +68,8 @@ void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr,
   dim3 block(128);
   dim3 grid((intermediate_size / 8 + block.x - 1) / block.x, num_row);
 
-  kernels::act_mul_and_quant_kernel<<<grid, block, 0, stream>>>(
-      out_ptr, gate_up_ptr, scale_ptr, num_row, intermediate_size);
+  kernels::act_mul_and_quant_kernel<<<grid, block, 0, stream>>>(out_ptr, gate_up_ptr, scale_ptr,
+                                                                num_row, intermediate_size);
 }
 
 }  // namespace activation

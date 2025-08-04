@@ -21,9 +21,7 @@ struct vec_t {
 
   __device__ __forceinline__ T &operator[](int idx) { return data[idx]; }
 
-  __device__ __forceinline__ const T &operator[](int idx) const {
-    return data[idx];
-  }
+  __device__ __forceinline__ const T &operator[](int idx) const { return data[idx]; }
 };
 
 template <int K, typename T, int N>
@@ -42,8 +40,7 @@ __device__ __forceinline__ auto to(const vec_t<T, N> &v) {
       o[i] = __float2bfloat16(v[i]);
     }
     return o;
-  } else if constexpr (std::is_same_v<T, __nv_bfloat162> &&
-                       std::is_same_v<U, float>) {
+  } else if constexpr (std::is_same_v<T, __nv_bfloat162> && std::is_same_v<U, float>) {
     using V = vec_t<float, N * 2>;
     V o;
 #pragma unroll
@@ -63,8 +60,7 @@ __device__ __forceinline__ auto to(const vec_t<T, N> &v) {
       o[i * 2 + 1] = y.y;
     }
     return o;
-  } else if constexpr (std::is_same_v<T, float> &&
-                       std::is_same_v<U, __nv_fp8x4_e4m3>) {
+  } else if constexpr (std::is_same_v<T, float> && std::is_same_v<U, __nv_fp8x4_e4m3>) {
     using V = vec_t<__nv_fp8x4_e4m3, N / 4>;
     V o;
 #pragma unroll
@@ -82,9 +78,8 @@ __device__ __forceinline__ auto load(const void *ptr) {
 
   constexpr int kBytes = sizeof(T) * N;
 
-  static_assert(
-      kBytes == 1 || kBytes == 2 || kBytes == 4 || kBytes == 8 || kBytes == 16,
-      "not support for T x N");
+  static_assert(kBytes == 1 || kBytes == 2 || kBytes == 4 || kBytes == 8 || kBytes == 16,
+                "not support for T x N");
 
   if constexpr (kBytes == 1) {
     using L = uint8_t;
@@ -112,9 +107,9 @@ __device__ __forceinline__ void store(void *ptr, const vec_t<T, N> &v) {
 
   constexpr int kBytes = sizeof(T) * N;
 
-  static_assert(kBytes == 1 || kBytes == 2 || kBytes == 4 || kBytes == 8 ||
-                    kBytes == 16 || kBytes == 32,
-                "not support for T x N");
+  static_assert(
+      kBytes == 1 || kBytes == 2 || kBytes == 4 || kBytes == 8 || kBytes == 16 || kBytes == 32,
+      "not support for T x N");
 
   if constexpr (kBytes == 1) {
     using S = uint8_t;
@@ -184,14 +179,10 @@ __device__ __forceinline__ float rcpf_ftz(float x) {
 }
 
 // y = x / (1 + e^(-x))
-__device__ __forceinline__ float silu(float x) {
-  return x * rcpf_ftz(1.f + expf_ftz(-x));
-}
+__device__ __forceinline__ float silu(float x) { return x * rcpf_ftz(1.f + expf_ftz(-x)); }
 
 // y = log(1 + exp(x))
-__device__ __forceinline__ float softplus(float x) {
-  return logf_ftz(1.f + expf_ftz(x));
-}
+__device__ __forceinline__ float softplus(float x) { return logf_ftz(1.f + expf_ftz(x)); }
 
 __device__ __forceinline__ float rsqrtf_ftz(float in) {
   float out;

@@ -9,6 +9,5 @@
 #include "src/normalization/fused_rms_norm_with_scale/fused_rms_norm_with_scale.h"
 
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
-  m.def("fused_rms_norm_with_scale",
-        &hpc::normalization::fused_rms_norm_with_scale::entry);
+  m.def("fused_rms_norm_with_scale", &hpc::normalization::fused_rms_norm_with_scale::entry);
 }

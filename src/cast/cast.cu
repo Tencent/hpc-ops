@@ -11,28 +11,22 @@ namespace kernels {
 
 template <typename Tout, typename Tin>
 struct Convertor {
-  __device__ __host__ static Tout convert(const Tin& in) {
-    return static_cast<Tout>(in);
-  }
+  __device__ __host__ static Tout convert(const Tin &in) { return static_cast<Tout>(in); }
 };
 
 template <>
 struct Convertor<half, float> {
-  __device__ __host__ static half convert(const float& in) {
-    return __float2half(in);
-  }
+  __device__ __host__ static half convert(const float &in) { return __float2half(in); }
 };
 
 template <>
 struct Convertor<__nv_bfloat16, float> {
-  __device__ __host__ static __nv_bfloat16 convert(const float& in) {
-    return __float2bfloat16(in);
-  }
+  __device__ __host__ static __nv_bfloat16 convert(const float &in) { return __float2bfloat16(in); }
 };
 
 template <>
 struct Convertor<__nv_fp8_e4m3, float> {
-  __device__ __host__ static __nv_fp8_e4m3 convert(const float& in) {
+  __device__ __host__ static __nv_fp8_e4m3 convert(const float &in) {
     __nv_fp8_e4m3 vout{in};
     return vout;
   }
@@ -40,7 +34,7 @@ struct Convertor<__nv_fp8_e4m3, float> {
 
 template <>
 struct Convertor<__nv_fp8_e5m2, float> {
-  __device__ __host__ static __nv_fp8_e5m2 convert(const float& in) {
+  __device__ __host__ static __nv_fp8_e5m2 convert(const float &in) {
     __nv_fp8_e5m2 vout{in};
     return vout;
   }
@@ -48,22 +42,22 @@ struct Convertor<__nv_fp8_e5m2, float> {
 
 template <>
 struct Convertor<__nv_fp8_e8m0, float> {
-  __device__ __host__ static __nv_fp8_e8m0 convert(const float& in) {
+  __device__ __host__ static __nv_fp8_e8m0 convert(const float &in) {
     __nv_fp8_e8m0 vout{in};
     return vout;
   }
 };
 
 template <typename Tout, typename Tin>
-__global__ void cast(void* cptr, const void* aptr, int num) {
+__global__ void cast(void *cptr, const void *aptr, int num) {
   int idx = blockDim.x * blockIdx.x + threadIdx.x;
 
   if (idx >= num) {
     return;
   }
 
-  Tin* iptr = (Tin*)aptr;
-  Tout* optr = (Tout*)cptr;
+  Tin *iptr = (Tin *)aptr;
+  Tout *optr = (Tout *)cptr;
 
   Tin vin = iptr[idx];
   Tout vout = Convertor<Tout, Tin>::convert(vin);
@@ -72,7 +66,7 @@ __global__ void cast(void* cptr, const void* aptr, int num) {
 }
 }  // namespace kernels
 
-void cast_async(void* cptr, const void* aptr, int num, torch::ScalarType tout,
+void cast_async(void *cptr, const void *aptr, int num, torch::ScalarType tout,
                 torch::ScalarType tin, cudaStream_t stream) {
   dim3 block(128);
   dim3 grid((num + block.x - 1) / block.x);
@@ -80,13 +74,11 @@ void cast_async(void* cptr, const void* aptr, int num, torch::ScalarType tout,
   if (tin == torch::kFloat32) {
     switch (tout) {
       case torch::kFloat32: {
-        kernels::cast<float, float>
-            <<<grid, block, 0, stream>>>(cptr, aptr, num);
+        kernels::cast<float, float><<<grid, block, 0, stream>>>(cptr, aptr, num);
         break;
       }
       case torch::kFloat64: {
-        kernels::cast<double, float>
-            <<<grid, block, 0, stream>>>(cptr, aptr, num);
+        kernels::cast<double, float><<<grid, block, 0, stream>>>(cptr, aptr, num);
         break;
       }
       case torch::kFloat16: {
@@ -94,23 +86,19 @@ void cast_async(void* cptr, const void* aptr, int num, torch::ScalarType tout,
         break;
       }
       case torch::kBFloat16: {
-        kernels::cast<__nv_bfloat16, float>
-            <<<grid, block, 0, stream>>>(cptr, aptr, num);
+        kernels::cast<__nv_bfloat16, float><<<grid, block, 0, stream>>>(cptr, aptr, num);
         break;
       }
       case torch::kFloat8_e4m3fn: {
-        kernels::cast<__nv_fp8_e4m3, float>
-            <<<grid, block, 0, stream>>>(cptr, aptr, num);
+        kernels::cast<__nv_fp8_e4m3, float><<<grid, block, 0, stream>>>(cptr, aptr, num);
         break;
       }
       case torch::kFloat8_e5m2: {
-        kernels::cast<__nv_fp8_e5m2, float>
-            <<<grid, block, 0, stream>>>(cptr, aptr, num);
+        kernels::cast<__nv_fp8_e5m2, float><<<grid, block, 0, stream>>>(cptr, aptr, num);
         break;
       }
       case torch::kFloat8_e8m0fnu: {
-        kernels::cast<__nv_fp8_e8m0, float>
-            <<<grid, block, 0, stream>>>(cptr, aptr, num);
+        kernels::cast<__nv_fp8_e8m0, float><<<grid, block, 0, stream>>>(cptr, aptr, num);
         break;
       }
       default: {
@@ -118,7 +106,7 @@ void cast_async(void* cptr, const void* aptr, int num, torch::ScalarType tout,
         break;
       }
     }  // switch
-  }  // if
+  }    // if
 }
 
 }  // namespace cast

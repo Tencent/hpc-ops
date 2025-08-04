@@ -20,8 +20,12 @@ doc:
 	python3 -m mkdocs build
 
 format:
-	python3 -m yapf --style=yapf -i $(PY_FILES)
-	clang-format --style=google -i $(CC_FILES) $(CU_FILES) $(CUH_FILES)
+	python3 -m black --line-length 100 $(PY_FILES)
+	clang-format --style=file -i $(CC_FILES) $(CU_FILES) $(CUH_FILES)
+
+format-check:
+	python3 -m black --check --line-length 100 $(PY_FILES)
+	clang-format --style=file --dry-run -Werror $(CC_FILES) $(CU_FILES) $(CUH_FILES)
 
 test:
 	python3 -m pytest tests

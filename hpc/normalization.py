@@ -8,8 +8,9 @@ def fused_rms_norm_with_scale(
     weight: Tensor,
     eps: float = torch.finfo(torch.float32).eps,
     scale: Tensor = torch.tensor([1], dtype=torch.float32),
-    is_moe: bool = False) -> Union[Tensor, Tuple[Tensor]]:
-  """Perform RMSNorm for input and divide scales, output the fp8_e4m3 results.
+    is_moe: bool = False,
+) -> Union[Tensor, Tuple[Tensor]]:
+    """Perform RMSNorm for input and divide scales, output the fp8_e4m3 results.
 
     Executes type conversion in a custom GPU kernel for optimized performance.
 
@@ -22,9 +23,10 @@ def fused_rms_norm_with_scale(
     Returns:
         New tensor with result RMSNorm(a) / scales in fp8_e4m3 or
         (RMSNorm(a) / scales , RMSNorm(a)) if output_high_precise is True
-  """
-  if scale.device != a.device:
-    scale = scale.to(a.device)
-  output_fp8, output_fp32, output_fp8_scale2 = torch.ops.hpc.fused_rms_norm_with_scale(
-      a, weight, scale, eps, is_moe)
-  return (output_fp32, output_fp8, output_fp8_scale2) if is_moe else output_fp8
+    """
+    if scale.device != a.device:
+        scale = scale.to(a.device)
+    output_fp8, output_fp32, output_fp8_scale2 = torch.ops.hpc.fused_rms_norm_with_scale(
+        a, weight, scale, eps, is_moe
+    )
+    return (output_fp32, output_fp8, output_fp8_scale2) if is_moe else output_fp8
