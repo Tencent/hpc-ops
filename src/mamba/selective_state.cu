@@ -17,12 +17,11 @@ namespace kernels {
 
 __global__ void selective_state_update_kernel(
     __nv_bfloat16 *out_ptr, float *ssm_states_ptr, const int *indices_ptr,
-    const __nv_bfloat16 *z_ptr, const __nv_bfloat16 *x_ptr,
-    const __nv_bfloat16 *b_ptr, const __nv_bfloat16 *c_ptr,
-    const __nv_bfloat16 *dt_ptr, const float *AD_ptr, const float *bias_ptr,
-    int batch_stride_zxbcdt, int num_head, int head_dim, int state_dim,
-    int num_headxhead_dimxstate_dim, int head_dimxstate_dim,
-    int num_headxhead_dim, int num_groupxstate_dim) {
+    const __nv_bfloat16 *z_ptr, const __nv_bfloat16 *x_ptr, const __nv_bfloat16 *b_ptr,
+    const __nv_bfloat16 *c_ptr, const __nv_bfloat16 *dt_ptr, const float *AD_ptr,
+    const float *bias_ptr, int batch_stride_zxbcdt, int num_head, int head_dim, int state_dim,
+    int num_headxhead_dimxstate_dim, int head_dimxstate_dim, int num_headxhead_dim,
+    int num_groupxstate_dim) {
   int idx = threadIdx.x;
 
   int ilane = idx % 32;
@@ -40,20 +39,14 @@ __global__ void selective_state_update_kernel(
 
   int islot = indices_ptr[ibatch];
 
-  auto *ssm_row = ssm_states_ptr +
-                  (islot * (num_headxhead_dimxstate_dim) +
-                   ihead * (head_dimxstate_dim) + irow * state_dim + icol * 4);
-  auto *out_row =
-      out_ptr + (ibatch * num_headxhead_dim + ihead * head_dim + irow);
+  auto *ssm_row = ssm_states_ptr + (islot * (num_headxhead_dimxstate_dim) +
+                                    ihead * (head_dimxstate_dim) + irow * state_dim + icol * 4);
+  auto *out_row = out_ptr + (ibatch * num_headxhead_dim + ihead * head_dim + irow);
 
-  const auto *z_row =
-      z_ptr + (ibatch * batch_stride_zxbcdt + ihead * head_dim + irow);
-  const auto *x_row =
-      x_ptr + (ibatch * batch_stride_zxbcdt + ihead * head_dim + irow);
-  const auto *b_row =
-      b_ptr + (ibatch * batch_stride_zxbcdt + igroup * state_dim + icol * 4);
-  const auto *c_row =
-      c_ptr + (ibatch * batch_stride_zxbcdt + igroup * state_dim + icol * 4);
+  const auto *z_row = z_ptr + (ibatch * batch_stride_zxbcdt + ihead * head_dim + irow);
+  const auto *x_row = x_ptr + (ibatch * batch_stride_zxbcdt + ihead * head_dim + irow);
+  const auto *b_row = b_ptr + (ibatch * batch_stride_zxbcdt + igroup * state_dim + icol * 4);
+  const auto *c_row = c_ptr + (ibatch * batch_stride_zxbcdt + igroup * state_dim + icol * 4);
   const auto *dt_row = dt_ptr + (ibatch * batch_stride_zxbcdt + ihead);
 
   auto AD = load<float, 2>(AD_ptr + ihead * 2);
@@ -115,11 +108,9 @@ __global__ void selective_state_update_kernel(
 }  // namespace kernels
 
 void selective_state_update_async(__nv_bfloat16 *out_ptr, float *ssm_states_ptr,
-                                  const int *indices_ptr,
-                                  const __nv_bfloat16 *zxbcdt_ptr,
-                                  const float *AD_ptr, const float *bias_ptr,
-                                  int num_batch, int num_head, int head_dim,
-                                  int num_group, int state_dim,
+                                  const int *indices_ptr, const __nv_bfloat16 *zxbcdt_ptr,
+                                  const float *AD_ptr, const float *bias_ptr, int num_batch,
+                                  int num_head, int head_dim, int num_group, int state_dim,
                                   cudaStream_t stream) {
   dim3 block(128);
   int num_row = (head_dim + 3) / 4;
@@ -141,14 +132,12 @@ void selective_state_update_async(__nv_bfloat16 *out_ptr, float *ssm_states_ptr,
   auto *c_ptr = b_ptr + num_groupxstate_dim;
   auto *dt_ptr = c_ptr + num_groupxstate_dim;
 
-  int batch_stride_zxbcdt =
-      num_headxhead_dim * 2 + num_groupxstate_dim * 2 + num_head;
+  int batch_stride_zxbcdt = num_headxhead_dim * 2 + num_groupxstate_dim * 2 + num_head;
 
   kernels::selective_state_update_kernel<<<grid, block, 0, stream>>>(
-      out_ptr, ssm_states_ptr, indices_ptr, z_ptr, x_ptr, b_ptr, c_ptr, dt_ptr,
-      AD_ptr, bias_ptr, batch_stride_zxbcdt, num_head, head_dim, state_dim,
-      num_headxhead_dimxstate_dim, head_dimxstate_dim, num_headxhead_dim,
-      num_groupxstate_dim);
+      out_ptr, ssm_states_ptr, indices_ptr, z_ptr, x_ptr, b_ptr, c_ptr, dt_ptr, AD_ptr, bias_ptr,
+      batch_stride_zxbcdt, num_head, head_dim, state_dim, num_headxhead_dimxstate_dim,
+      head_dimxstate_dim, num_headxhead_dim, num_groupxstate_dim);
 }
 
 }  // namespace mamba

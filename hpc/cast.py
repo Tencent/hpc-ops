@@ -3,7 +3,7 @@ from torch import Tensor
 
 
 def cast(a: Tensor, dtype) -> Tensor:
-  """Converts tensor data type using GPU kernel.
+    """Converts tensor data type using GPU kernel.
 
     Executes type conversion in a custom GPU kernel for optimized performance.
 
@@ -14,4 +14,4 @@ def cast(a: Tensor, dtype) -> Tensor:
     Returns:
         New tensor with same values as input but converted to specified dtype
     """
-  return torch.ops.hpc.cast(a, dtype)
+    return torch.ops.hpc.cast(a, dtype)

@@ -32,8 +32,7 @@ torch::Tensor entry(torch::Tensor &input, torch::Tensor &scale) {
     num_row *= input_shape[i];
   }
 
-  act_mul_and_quant_async(output_ptr, input_ptr, scale_ptr, num_row, num_col,
-                          stream);
+  act_mul_and_quant_async(output_ptr, input_ptr, scale_ptr, num_row, num_col, stream);
 
   return output;
 }
@@ -41,6 +40,4 @@ torch::Tensor entry(torch::Tensor &input, torch::Tensor &scale) {
 }  // namespace activation
 }  // namespace hpc
 
-TORCH_LIBRARY_FRAGMENT(hpc, m) {
-  m.def("act_mul_and_quant", &hpc::activation::entry);
-}
+TORCH_LIBRARY_FRAGMENT(hpc, m) { m.def("act_mul_and_quant", &hpc::activation::entry); }
