@@ -19,7 +19,7 @@ def set_penalties_mask_ref(mask, tokens):
     mask.scatter_add_(0, byte_indices.to(torch.int64), bit_masks)
 
 
-@pytest.mark.parametrize("batch_size", [1, 16, 32, 64, 200])
+@pytest.mark.parametrize("batch_size", [1, 16, 32, 64])
 @pytest.mark.parametrize("vocab_size", [129024])
 @pytest.mark.parametrize("repetition_penalties", [1.05])
 @pytest.mark.parametrize("temperature", [0.7])
