@@ -2,6 +2,7 @@ from setuptools import setup
 from torch.utils.cpp_extension import CppExtension, BuildExtension, CUDAExtension
 import os
 from glob import glob
+import subprocess
 
 include_flags = "-I" + os.path.dirname(__file__)
 cute_include = "-I" + os.path.dirname(__file__) + "/3rd/cutlass/include"
@@ -37,9 +38,31 @@ cuda_extension = CUDAExtension(
     py_limited_api=True,
 )
 
+
+def get_version():
+    git_hash = subprocess.check_output(
+        ["git", "rev-parse", "--short=7", "HEAD"], stderr=subprocess.DEVNULL, text=True
+    ).strip()
+    newest_tag = (
+        subprocess.check_output(
+            ["git", "tag", "--sort=-v:refname"], stderr=subprocess.DEVNULL, text=True
+        )
+        .split("\n")[0]
+        .strip()
+    )
+    newest_tag_hash = subprocess.check_output(
+        ["git", "rev-list", "--tags", "--max-count=1"], stderr=subprocess.DEVNULL, text=True
+    ).strip()[:7]
+
+    if newest_tag_hash == git_hash:
+        return newest_tag
+    else:
+        return newest_tag + "+g" + git_hash
+
+
 setup(
-    name="hpc",
-    version="0.1.0",
+    name="hpc-ops",
+    version=get_version(),
     description="High Performance Computing Operator",
     packages=["hpc"],
     ext_modules=[cuda_extension],
