@@ -20,7 +20,7 @@ def set_penalties_mask_ref(mask, tokens):
 
 
 @pytest.mark.parametrize("batch_size", [1, 16, 32, 64])
-@pytest.mark.parametrize("vocab_size", [129024])
+@pytest.mark.parametrize("vocab_size", [129024, 128512])
 @pytest.mark.parametrize("repetition_penalties", [1.05])
 @pytest.mark.parametrize("temperature", [0.7])
 def test_fused_repetition_penalties_softmax(

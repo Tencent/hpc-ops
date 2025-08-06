@@ -20,7 +20,7 @@ torch::Tensor entry(const torch::Tensor& logits, const torch::Tensor& penalties_
   int num_batch = logits.size(0);
   int vocab_size = logits.size(1);
 
-  TORCH_CHECK(vocab_size == 129024, "we only support vocab_size == 129024");
+  TORCH_CHECK((vocab_size == 129024 || vocab_size == 128512), "we only support vocab_size == 129024 and 128512");
 
   torch::Tensor out = torch::empty({num_batch, vocab_size}, logits.options());
 
