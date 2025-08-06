@@ -79,11 +79,11 @@ def generate_shuffled_batch_indices(num_batch, num_max_batch):
 
 
 @pytest.mark.parametrize("batch_size", [8, 16, 32])
-@pytest.mark.parametrize("nheads", [8])
+@pytest.mark.parametrize("nheads", [8, 4])
 @pytest.mark.parametrize("state_len", [3])
 @pytest.mark.parametrize("d_conv", [4])
-@pytest.mark.parametrize("d_inner", [640])
-@pytest.mark.parametrize("conv_dim", [1152])
+@pytest.mark.parametrize("d_inner", [640, 320])
+@pytest.mark.parametrize("conv_dim", [1152, 576])
 def test_mamba_causal_conv1d_update(batch_size, nheads, state_len, d_conv, d_inner, conv_dim):
     num_max_batch = 256
 
@@ -193,11 +193,11 @@ def causal_conv1d_update_with_spec_ref(
 
 
 @pytest.mark.parametrize("batch_size", [8, 16, 32])
-@pytest.mark.parametrize("nheads", [8])
+@pytest.mark.parametrize("nheads", [8, 4])
 @pytest.mark.parametrize("state_len", [4])
 @pytest.mark.parametrize("d_conv", [4])
-@pytest.mark.parametrize("d_inner", [640])
-@pytest.mark.parametrize("conv_dim", [1152])
+@pytest.mark.parametrize("d_inner", [640, 320])
+@pytest.mark.parametrize("conv_dim", [1152, 576])
 def test_mamba_causal_conv1d_update_with_spec(
     batch_size, nheads, state_len, d_conv, d_inner, conv_dim
 ):

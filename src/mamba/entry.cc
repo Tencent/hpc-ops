@@ -99,6 +99,7 @@ void causal_conv1d_update_entry(torch::Tensor &zxbcdt, torch::Tensor &conv_state
   int state_len = conv_states.size(1);
 
   TORCH_CHECK(conv_dim == weight.size(1), "weight.size(1) should be equal to conv_dim");
+  TORCH_CHECK(num_head == 8 || num_head == 4, "num_head must be 8 or 4");
 
   int d_conv = weight.size(0);
 
