@@ -1,0 +1,85 @@
+version: v3.0
+name: HPC-OPS-CICD-TAG
+on:
+  repo-name: HCF-Private/hpc-ops
+  type: git
+  tag:
+    name: Git事件触发
+    from-branches:
+    - master
+  manual: enabled
+variables:
+  BK_CI_HOOK_SOURCE_BRANCH:
+    value: master
+    props:
+      label: branch
+      type: vuex-input
+stages:
+- name: stage-1
+  label:
+  - Build
+  jobs:
+    job_Cty:
+      name: Compile
+      mutex:
+        label: singleton
+        queue-length: 5
+      runs-on:
+        self-hosted: true
+        node-name: BUILD_pwgzvezp_9.135.5.38
+        container:
+          image: mirrors.tencent.com/hunyuan_infer/text2text_infer:H-5.0.1-v7-hpc-ops
+        agent-selector:
+        - linux
+      steps:
+      - checkout:
+          repo-id: rxOYK
+        name: git clone and checkout
+        with:
+          refName: "${BK_CI_HOOK_SOURCE_BRANCH}"
+      - name: code style check
+        id: ""
+        uses: linuxScript@1.*
+        with:
+          script: |-
+            set -xe
+
+            cd ${{ci.workspace}}
+
+            python3 -m pip -q install black
+
+            make format-check
+      - name: character check
+        id: N_0
+        uses: linuxScript@1.*
+        with:
+          script: |-
+            set -xe
+
+            cd ${{ci.workspace}}
+
+            python3 cicd/check-no-chinese.py
+      - name: complile whl
+        uses: linuxScript@1.*
+        with:
+          script: |-
+            set -xe
+
+            cd ${{ci.workspace}}
+
+            make wheel
+
+            python3 -m pip install twine
+      - name: upload to pypi
+        uses: DistributionToGeneric@1.*
+        with:
+          username: reedlauliu
+          token: e0b4892c66d411f086b85254009bad14
+          repo_category: pypi
+          pypi_upload_arguments:
+          - skip_existing
+          - verbose
+          distribution: dist/hpc*.whl
+        retry-times: 2
+concurrency: {}
+syntax-dialect: INHERIT
