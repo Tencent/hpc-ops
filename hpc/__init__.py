@@ -48,6 +48,9 @@ __all__ = []
 
 _export_functions(_discover_modules())
 
+__version__ = torch.ops.hpc.version()
+__built_json__ = torch.ops.hpc.built_json()
+
 __doc__ = """
 High Performance Computing Operators Library
 
