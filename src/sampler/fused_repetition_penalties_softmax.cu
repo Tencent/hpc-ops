@@ -338,18 +338,18 @@ void fused_repetition_penalties_softmax_async(float* out_ptr, const float* logit
 
     if (vocab_size == 129024) {
       cudaLaunchKernelEx(
-        &config,
-        fused_repetition_penalties_softmax::kernels::
-            cluster_fused_repetition_penalties_softmax_kernel<129024, kThreadsPerBlock,
-                                                              kClusterSize>,
-        out_ptr, logits_ptr, penalties_masks_ptrs, repetition_penalties, 1.0f / temperature);
+          &config,
+          fused_repetition_penalties_softmax::kernels::
+              cluster_fused_repetition_penalties_softmax_kernel<129024, kThreadsPerBlock,
+                                                                kClusterSize>,
+          out_ptr, logits_ptr, penalties_masks_ptrs, repetition_penalties, 1.0f / temperature);
     } else if (vocab_size == 128512) {
       cudaLaunchKernelEx(
-        &config,
-        fused_repetition_penalties_softmax::kernels::
-            cluster_fused_repetition_penalties_softmax_kernel<128512, kThreadsPerBlock,
-                                                              kClusterSize>,
-        out_ptr, logits_ptr, penalties_masks_ptrs, repetition_penalties, 1.0f / temperature);
+          &config,
+          fused_repetition_penalties_softmax::kernels::
+              cluster_fused_repetition_penalties_softmax_kernel<128512, kThreadsPerBlock,
+                                                                kClusterSize>,
+          out_ptr, logits_ptr, penalties_masks_ptrs, repetition_penalties, 1.0f / temperature);
     }
   } else {
     dim3 grid(num_batch);
