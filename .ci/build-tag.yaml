@@ -45,10 +45,9 @@ stages:
             set -xe
 
             cd ${{ci.workspace}}
-
             python3 -m pip -q install black
-
             make format-check
+
       - name: character check
         id: N_0
         uses: linuxScript@1.*
@@ -57,8 +56,8 @@ stages:
             set -xe
 
             cd ${{ci.workspace}}
+            python3 tools/check-no-chinese.py
 
-            python3 cicd/check-no-chinese.py
       - name: complile whl
         uses: linuxScript@1.*
         with:
@@ -66,10 +65,9 @@ stages:
             set -xe
 
             cd ${{ci.workspace}}
-
             make wheel
-
             python3 -m pip install twine
+
       - name: upload to pypi
         uses: DistributionToGeneric@1.*
         with:

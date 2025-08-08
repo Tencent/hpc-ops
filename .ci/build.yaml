@@ -49,11 +49,8 @@ stages:
         with:
           script: |-
             set -xe
-
             cd ${{ci.workspace}}
-
             python3 -m pip -q install black
-
             make format-check
       - name: character check
         id: N_0
@@ -61,18 +58,14 @@ stages:
         with:
           script: |-
             set -xe
-
             cd ${{ci.workspace}}
-
-            python3 cicd/check-no-chinese.py
+            python3 tools/check-no-chinese.py
       - name: code.tar.gz
         uses: linuxScript@1.*
         with:
           script: |-
             set -xe
-
             cd ${{ci.workspace}}
-
             tar -cvf code.tar.gz ./
       - name: upload-code.tar.gz
         id: ""
@@ -86,11 +79,8 @@ stages:
         with:
           script: |-
             set -xe
-
             cd ${{ci.workspace}}
-
             make wheel
-
             python3 -m pip install twine
       - name: upload to pypi
         uses: DistributionToGeneric@1.*
@@ -125,40 +115,7 @@ stages:
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
-
-            anynowtime="date +'%Y-%m-%d %H:%M:%S'"
-            NOW="echo [\`$anynowtime\`][PID:$$]"
-
-            ##### 可在脚本开始运行时调用，打印当时的时间戳及PID。
-            function job_start
-            {
-                echo "`eval $NOW` job_start"
-            }
-
-            ##### 可在脚本执行成功的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_success
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_success:[$MSG]"
-                exit 0
-            }
-
-            ##### 可在脚本执行失败的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_fail
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_fail:[$MSG]"
-                exit 1
-            }
-
-            job_start
-
-            ###### 可在此处开始编写您的脚本逻辑代码
-            ###### 作业平台中执行脚本成功和失败的标准只取决于脚本最后一条执行语句的返回值
-            ###### 如果返回值为0，则认为此脚本执行成功，如果非0，则认为脚本执行失败
-
             set -xe
-
             echo ${{BK_CI_PROJECT_NAME}}
             echo ${{BK_CI_PIPELINE_ID}}
             echo ${{BK_CI_BUILD_ID}}
@@ -166,14 +123,10 @@ stages:
             echo ${{BK_CI_BUILD_TASK_ID}}
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-
             sudo mkdir -p ${workpath}
             cd ${workpath}
-            pwd
 
             sudo curl -L -O --user reedlauliu:063d7d21ae494ce73636f0f767a15ec5 "https://bkrepo.woa.com/generic/ds-opt/pipeline/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}/code.tar.gz"
-
-            ls -lthr
       - name: untar-code
         uses: JobScriptExecutionA@1.*
         with:
@@ -183,39 +136,6 @@ stages:
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
-
-            anynowtime="date +'%Y-%m-%d %H:%M:%S'"
-            NOW="echo [\`$anynowtime\`][PID:$$]"
-
-            ##### 可在脚本开始运行时调用，打印当时的时间戳及PID。
-            function job_start
-            {
-                echo "`eval $NOW` job_start"
-            }
-
-            ##### 可在脚本执行成功的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_success
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_success:[$MSG]"
-                exit 0
-            }
-
-            ##### 可在脚本执行失败的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_fail
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_fail:[$MSG]"
-                exit 1
-            }
-
-            job_start
-
-            ###### 可在此处开始编写您的脚本逻辑代码
-            ###### 作业平台中执行脚本成功和失败的标准只取决于脚本最后一条执行语句的返回值
-            ###### 如果返回值为0，则认为此脚本执行成功，如果非0，则认为脚本执行失败
-
-
             set -xe
 
             echo ${{BK_CI_PROJECT_NAME}}
@@ -225,8 +145,8 @@ stages:
             echo ${{BK_CI_BUILD_TASK_ID}}
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-
             sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && tar -xvf ./code.tar.gz"
+
       - name: make
         uses: JobScriptExecutionA@1.*
         with:
@@ -237,37 +157,6 @@ stages:
           shellScriptContent: |-
             #!/bin/bash
 
-            anynowtime="date +'%Y-%m-%d %H:%M:%S'"
-            NOW="echo [\`$anynowtime\`][PID:$$]"
-
-            ##### 可在脚本开始运行时调用，打印当时的时间戳及PID。
-            function job_start
-            {
-                echo "`eval $NOW` job_start"
-            }
-
-            ##### 可在脚本执行成功的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_success
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_success:[$MSG]"
-                exit 0
-            }
-
-            ##### 可在脚本执行失败的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_fail
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_fail:[$MSG]"
-                exit 1
-            }
-
-            job_start
-
-            ###### 可在此处开始编写您的脚本逻辑代码
-            ###### 作业平台中执行脚本成功和失败的标准只取决于脚本最后一条执行语句的返回值
-            ###### 如果返回值为0，则认为此脚本执行成功，如果非0，则认为脚本执行失败
-
             set -xe
 
             echo ${{BK_CI_PROJECT_NAME}}
@@ -277,8 +166,8 @@ stages:
             echo ${{BK_CI_BUILD_TASK_ID}}
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-
             sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make"
+
       - name: pytest
         id: yST
         uses: JobScriptExecutionA@1.*
@@ -290,37 +179,6 @@ stages:
           shellScriptContent: |-
             #!/bin/bash
 
-            anynowtime="date +'%Y-%m-%d %H:%M:%S'"
-            NOW="echo [\`$anynowtime\`][PID:$$]"
-
-            ##### 可在脚本开始运行时调用，打印当时的时间戳及PID。
-            function job_start
-            {
-                echo "`eval $NOW` job_start"
-            }
-
-            ##### 可在脚本执行成功的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_success
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_success:[$MSG]"
-                exit 0
-            }
-
-            ##### 可在脚本执行失败的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_fail
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_fail:[$MSG]"
-                exit 1
-            }
-
-            job_start
-
-            ###### 可在此处开始编写您的脚本逻辑代码
-            ###### 作业平台中执行脚本成功和失败的标准只取决于脚本最后一条执行语句的返回值
-            ###### 如果返回值为0，则认为此脚本执行成功，如果非0，则认为脚本执行失败
-
             set -xe
 
             echo ${{BK_CI_PROJECT_NAME}}
@@ -330,9 +188,8 @@ stages:
             echo ${{BK_CI_BUILD_TASK_ID}}
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-
-
             sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make test"
+
       - name: computer-sanitizer::memcheck
         id: rL0
         uses: JobScriptExecutionA@1.*
@@ -344,37 +201,6 @@ stages:
           shellScriptContent: |-
             #!/bin/bash
 
-            anynowtime="date +'%Y-%m-%d %H:%M:%S'"
-            NOW="echo [\`$anynowtime\`][PID:$$]"
-
-            ##### 可在脚本开始运行时调用，打印当时的时间戳及PID。
-            function job_start
-            {
-                echo "`eval $NOW` job_start"
-            }
-
-            ##### 可在脚本执行成功的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_success
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_success:[$MSG]"
-                exit 0
-            }
-
-            ##### 可在脚本执行失败的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_fail
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_fail:[$MSG]"
-                exit 1
-            }
-
-            job_start
-
-            ###### 可在此处开始编写您的脚本逻辑代码
-            ###### 作业平台中执行脚本成功和失败的标准只取决于脚本最后一条执行语句的返回值
-            ###### 如果返回值为0，则认为此脚本执行成功，如果非0，则认为脚本执行失败
-
             set -xe
 
             echo ${{BK_CI_PROJECT_NAME}}
@@ -385,8 +211,8 @@ stages:
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
 
-
             sudo docker exec -e PYTORCH_NO_CUDA_MEMORY_CACHING=1 -t hpc-ops-cicd bash -c "cd ${workpath}/ && compute-sanitizer --tool=memcheck pytest tests"
+
       - name: computer-sanitizer::initcheck
         id: F2Q
         uses: JobScriptExecutionA@1.*
@@ -397,38 +223,6 @@ stages:
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
-
-            anynowtime="date +'%Y-%m-%d %H:%M:%S'"
-            NOW="echo [\`$anynowtime\`][PID:$$]"
-
-            ##### 可在脚本开始运行时调用，打印当时的时间戳及PID。
-            function job_start
-            {
-                echo "`eval $NOW` job_start"
-            }
-
-            ##### 可在脚本执行成功的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_success
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_success:[$MSG]"
-                exit 0
-            }
-
-            ##### 可在脚本执行失败的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_fail
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_fail:[$MSG]"
-                exit 1
-            }
-
-            job_start
-
-            ###### 可在此处开始编写您的脚本逻辑代码
-            ###### 作业平台中执行脚本成功和失败的标准只取决于脚本最后一条执行语句的返回值
-            ###### 如果返回值为0，则认为此脚本执行成功，如果非0，则认为脚本执行失败
-
             set -xe
 
             echo ${{BK_CI_PROJECT_NAME}}
@@ -438,9 +232,8 @@ stages:
             echo ${{BK_CI_BUILD_TASK_ID}}
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-
-
             sudo docker exec -e PYTORCH_NO_CUDA_MEMORY_CACHING=1 -t hpc-ops-cicd bash -c "cd ${workpath}/ && compute-sanitizer --tool=initcheck pytest tests"
+
       - name: computer-sanitizer::synccheck
         id: BTt
         uses: JobScriptExecutionA@1.*
@@ -451,38 +244,6 @@ stages:
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
-
-            anynowtime="date +'%Y-%m-%d %H:%M:%S'"
-            NOW="echo [\`$anynowtime\`][PID:$$]"
-
-            ##### 可在脚本开始运行时调用，打印当时的时间戳及PID。
-            function job_start
-            {
-                echo "`eval $NOW` job_start"
-            }
-
-            ##### 可在脚本执行成功的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_success
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_success:[$MSG]"
-                exit 0
-            }
-
-            ##### 可在脚本执行失败的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_fail
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_fail:[$MSG]"
-                exit 1
-            }
-
-            job_start
-
-            ###### 可在此处开始编写您的脚本逻辑代码
-            ###### 作业平台中执行脚本成功和失败的标准只取决于脚本最后一条执行语句的返回值
-            ###### 如果返回值为0，则认为此脚本执行成功，如果非0，则认为脚本执行失败
-
             set -xe
 
             echo ${{BK_CI_PROJECT_NAME}}
@@ -492,9 +253,8 @@ stages:
             echo ${{BK_CI_BUILD_TASK_ID}}
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-
-
             sudo docker exec -e PYTORCH_NO_CUDA_MEMORY_CACHING=1 -t hpc-ops-cicd bash -c "cd ${workpath}/ && compute-sanitizer --tool=synccheck pytest tests"
+
       - name: computer-sanitizer::racecheck
         id: ywt
         uses: JobScriptExecutionA@1.*
@@ -505,38 +265,6 @@ stages:
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
-
-            anynowtime="date +'%Y-%m-%d %H:%M:%S'"
-            NOW="echo [\`$anynowtime\`][PID:$$]"
-
-            ##### 可在脚本开始运行时调用，打印当时的时间戳及PID。
-            function job_start
-            {
-                echo "`eval $NOW` job_start"
-            }
-
-            ##### 可在脚本执行成功的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_success
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_success:[$MSG]"
-                exit 0
-            }
-
-            ##### 可在脚本执行失败的逻辑分支处调用，打印当时的时间戳及PID。
-            function job_fail
-            {
-                MSG="$*"
-                echo "`eval $NOW` job_fail:[$MSG]"
-                exit 1
-            }
-
-            job_start
-
-            ###### 可在此处开始编写您的脚本逻辑代码
-            ###### 作业平台中执行脚本成功和失败的标准只取决于脚本最后一条执行语句的返回值
-            ###### 如果返回值为0，则认为此脚本执行成功，如果非0，则认为脚本执行失败
-
             set -xe
 
             echo ${{BK_CI_PROJECT_NAME}}
@@ -546,9 +274,8 @@ stages:
             echo ${{BK_CI_BUILD_TASK_ID}}
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-
-
             sudo docker exec -e PYTORCH_NO_CUDA_MEMORY_CACHING=1 -t hpc-ops-cicd bash -c "cd ${workpath}/ && compute-sanitizer --tool=racecheck pytest tests"
+
 finally:
   job_SCd:
     name: clean temp file
@@ -567,41 +294,11 @@ finally:
         account: reedlauliu
         shellScriptContent: |-
           #!/bin/bash
-
-          anynowtime="date +'%Y-%m-%d %H:%M:%S'"
-          NOW="echo [\`$anynowtime\`][PID:$$]"
-
-          ##### 可在脚本开始运行时调用，打印当时的时间戳及PID。
-          function job_start
-          {
-              echo "`eval $NOW` job_start"
-          }
-
-          ##### 可在脚本执行成功的逻辑分支处调用，打印当时的时间戳及PID。
-          function job_success
-          {
-              MSG="$*"
-              echo "`eval $NOW` job_success:[$MSG]"
-              exit 0
-          }
-
-          ##### 可在脚本执行失败的逻辑分支处调用，打印当时的时间戳及PID。
-          function job_fail
-          {
-              MSG="$*"
-              echo "`eval $NOW` job_fail:[$MSG]"
-              exit 1
-          }
-
-          job_start
-
-          ###### 可在此处开始编写您的脚本逻辑代码
-          ###### 作业平台中执行脚本成功和失败的标准只取决于脚本最后一条执行语句的返回值
-          ###### 如果返回值为0，则认为此脚本执行成功，如果非0，则认为脚本执行失败
+          set -xe
 
           workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}
-
           sudo rm -rf $workpath
+
 notices:
 - if: FAILURE
   type:
