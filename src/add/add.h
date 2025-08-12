@@ -1,8 +1,10 @@
+// Copyright 2025 hpc-ops authors
+
 #ifndef SRC_ADD_ADD_H_
 #define SRC_ADD_ADD_H_
 
-#include <stdint.h> 
 #include <cuda_runtime_api.h>
+#include <stdint.h>
 
 namespace hpc {
 namespace add {

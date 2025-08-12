@@ -1,8 +1,10 @@
+// Copyright 2025 hpc-ops authors
+
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <stdio.h>
 
-#include "utils.cuh"
+#include "src/utils/utils.cuh"
 
 namespace hpc {
 

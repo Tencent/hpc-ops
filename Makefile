@@ -2,6 +2,9 @@ PY_FILES=$(shell find hpc -name "*.py") $(shell find tests -name "*.py") setup.p
 CC_FILES=$(shell find src -name "*.cc")
 CU_FILES=$(shell find src -name "*.cu")
 CUH_FILES=$(shell find src -name "*.cuh")
+CUH_FILES=$(shell find src -name "*.h")
+
+CSRC_FILES=$(CC_FILES) $(CU_FILES) $(CUH_FILES) $(H_FILES)
 
 TORCH_PATH=$(shell python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')
 
@@ -21,11 +24,13 @@ doc:
 
 format:
 	python3 -m black --line-length 100 $(PY_FILES)
-	clang-format --style=file -i $(CC_FILES) $(CU_FILES) $(CUH_FILES)
+	clang-format --style=file -i $(CSRC_FILES)
+	python3 -m cpplint --quiet $(CSRC_FILES)
 
 format-check:
 	python3 -m black --check --line-length 100 $(PY_FILES)
-	clang-format --style=file --dry-run -Werror $(CC_FILES) $(CU_FILES) $(CUH_FILES)
+	clang-format --style=file --dry-run -Werror $(CSRC_FILES)
+	python3 -m cpplint $(CSRC_FILES)
 
 test:
 	python3 -m pytest tests

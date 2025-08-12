@@ -1,8 +1,12 @@
+// Copyright 2025 hpc-ops authors
+
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <torch/all.h>
+
+#include "src/cast/cast.h"
 
 namespace hpc {
 namespace cast {

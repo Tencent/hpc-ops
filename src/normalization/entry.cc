@@ -1,3 +1,5 @@
+// Copyright 2025 hpc-ops authors
+
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

@@ -1,7 +1,11 @@
+// Copyright 2025 hpc-ops authors
+
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime_api.h>
 #include <torch/all.h>
 #include <torch/library.h>
+
+#include <vector>
 
 #include "src/activation/activation.h"
 

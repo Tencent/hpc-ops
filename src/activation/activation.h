@@ -1,17 +1,21 @@
+// Copyright 2025 hpc-ops authors
+
 #ifndef SRC_ACTIVATION_ACTIVATION_H_
 #define SRC_ACTIVATION_ACTIVATION_H_
 
-#include <stdint.h> 
-#include <cuda_runtime_api.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cuda_runtime_api.h>
+#include <stdint.h>
 
 namespace hpc {
 namespace activation {
 
-void act_mul_and_quant_async(__nv_fp8_e4m3 *y_ptr, const __nv_bfloat16 *x_ptr, const float *scale_ptr, const int num_row, const int num_col, cudaStream_t stream);
+void act_mul_and_quant_async(__nv_fp8_e4m3 *y_ptr, const __nv_bfloat16 *x_ptr,
+                             const float *scale_ptr, const int num_row, const int num_col,
+                             cudaStream_t stream);
 
-}  // namespace activation 
+}  // namespace activation
 }  // namespace hpc
 
 #endif  // SRC_ACTIVATION_ACTIVATION_H_

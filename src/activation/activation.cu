@@ -1,3 +1,5 @@
+// Copyright 2025 hpc-ops authors
+
 #include <cuda.h>
 #include <stdio.h>
 

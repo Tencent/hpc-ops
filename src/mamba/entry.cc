@@ -1,3 +1,5 @@
+// Copyright 2025 hpc-ops authors
+
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
@@ -53,9 +55,9 @@ torch::Tensor selective_state_update(torch::Tensor &ssm_states, const torch::Ten
       torch::empty({num_batch * num_sp_tokens, num_head * head_dim}, zxbcdt.options());
 
   auto *ssm_states_ptr = ssm_states.mutable_data_ptr<float>();
-  auto *out_ptr = (T *)out.mutable_data_ptr();
+  auto *out_ptr = reinterpret_cast<T *>(out.mutable_data_ptr());
 
-  const auto *zxbcdt_ptr = (T *)zxbcdt.const_data_ptr();
+  const auto *zxbcdt_ptr = reinterpret_cast<const T *>(zxbcdt.const_data_ptr());
 
   const auto *AD_ptr = AD.const_data_ptr<float>();
   const auto *bias_ptr = bias.const_data_ptr<float>();
@@ -86,11 +88,11 @@ void causal_conv1d_update_entry(torch::Tensor &zxbcdt, torch::Tensor &conv_state
 
   using T = __nv_bfloat16;
 
-  auto *zxbcdt_ptr = (T *)zxbcdt.const_data_ptr();
-  auto *conv_states_ptr = (T *)conv_states.mutable_data_ptr();
+  auto *zxbcdt_ptr = reinterpret_cast<T *>(zxbcdt.mutable_data_ptr());
+  auto *conv_states_ptr = reinterpret_cast<T *>(conv_states.mutable_data_ptr());
 
-  const auto *weight_ptr = (T *)weight.const_data_ptr();
-  const auto *bias_ptr = (T *)bias.const_data_ptr();
+  const auto *weight_ptr = reinterpret_cast<const T *>(weight.const_data_ptr());
+  const auto *bias_ptr = reinterpret_cast<const T *>(bias.const_data_ptr());
   const auto *indices_ptr = indices.const_data_ptr<int>();
 
   int num_batch = indices.size(0);

@@ -45,7 +45,7 @@ stages:
             set -xe
 
             cd ${{ci.workspace}}
-            python3 -m pip -q install black
+            python3 -m pip -q install black cpplint
             make format-check
 
       - name: character check

@@ -1,3 +1,5 @@
+// Copyright 2025 hpc-ops authors
+
 #include <cuda.h>
 
 #include "src/normalization/fused_rms_norm_with_scale/fused_rms_norm_with_scale.h"

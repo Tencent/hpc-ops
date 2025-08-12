@@ -1,6 +1,9 @@
+// Copyright 2025 hpc-ops authors
+
 #include <torch/library.h>
 
 #include <sstream>
+#include <string>
 
 #ifndef HPC_VERSION_STR
 #define HPC_VERSION_STR "unknown"
