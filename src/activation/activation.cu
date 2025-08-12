@@ -1,6 +1,7 @@
 #include <cuda.h>
 #include <stdio.h>
 
+#include "cutlass/fast_math.h"
 #include "src/activation/activation.h"
 #include "src/utils/utils.cuh"
 
@@ -11,9 +12,14 @@ namespace kernels {
 
 __global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_up_ptr,
                                          const float *scale_ptr, const int num_row,
-                                         const int num_col) {
-  int it = threadIdx.x + blockIdx.x * blockDim.x;
-  int irow = blockIdx.y;
+                                         const int num_col, cutlass::FastDivmod block1D22D) {
+  int iblockx;
+  int iblocky;
+
+  block1D22D(iblocky, iblockx, blockIdx.x);
+  int it = threadIdx.x + iblockx * blockDim.x;
+
+  int irow = iblocky;
 
   __nv_bfloat162 gate[4];
   __nv_bfloat162 up[4];
@@ -51,7 +57,7 @@ __global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr, const __nv_bflo
     out_2i.x = *(int *)(&o1);
     out_2i.y = *(int *)(&o2);
 
-    *((int2 *)(out_row_ptr + icol)) = out_2i;  // *((int2*)(&out_2i));
+    *((int2 *)(out_row_ptr + icol)) = out_2i;
   }
 }
 
@@ -66,10 +72,12 @@ void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_u
   int intermediate_size = num_col / 2;
 
   dim3 block(128);
-  dim3 grid((intermediate_size / 8 + block.x - 1) / block.x, num_row);
+  int num_col_block = (intermediate_size / 8 + block.x - 1) / block.x;
+  cutlass::FastDivmod block1D22D(num_col_block);
+  dim3 grid(num_row * num_col_block);
 
-  kernels::act_mul_and_quant_kernel<<<grid, block, 0, stream>>>(out_ptr, gate_up_ptr, scale_ptr,
-                                                                num_row, intermediate_size);
+  kernels::act_mul_and_quant_kernel<<<grid, block, 0, stream>>>(
+      out_ptr, gate_up_ptr, scale_ptr, num_row, intermediate_size, block1D22D);
 }
 
 }  // namespace activation
