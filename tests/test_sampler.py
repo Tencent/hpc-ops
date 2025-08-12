@@ -19,8 +19,15 @@ def set_penalties_mask_ref(mask, tokens):
     mask.scatter_add_(0, byte_indices.to(torch.int64), bit_masks)
 
 
-@pytest.mark.parametrize("batch_size", [1, 16, 32, 64])
-@pytest.mark.parametrize("vocab_size", [129024, 128512])
+@pytest.mark.parametrize("batch_size", [1, 18, 35])
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        129024,  # turbos text to text
+        128512,  # turbos image to text
+        129280,  # deepseek r1 text to text
+    ],
+)
 @pytest.mark.parametrize("repetition_penalties", [1.05])
 @pytest.mark.parametrize("temperature", [0.7])
 def test_fused_repetition_penalties_softmax(
@@ -46,11 +53,12 @@ def test_fused_repetition_penalties_softmax(
         set_penalties_mask_ref(penalties_masks[i], torch.unique(tokens[i]))
 
     for bi in range(batch_size):
-        for si in torch.unique(tokens[bi]):
-            if logits[bi][si] > 0:
-                logits[bi][si] /= repetition_penalties
-            else:
-                logits[bi][si] *= repetition_penalties
+        if repetition_penalties > 0:
+            for si in torch.unique(tokens[bi]):
+                if logits[bi][si] > 0:
+                    logits[bi][si] /= repetition_penalties
+                else:
+                    logits[bi][si] *= repetition_penalties
     if temperature > 0:
         logits /= temperature
 

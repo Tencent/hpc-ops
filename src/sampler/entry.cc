@@ -10,33 +10,75 @@ namespace hpc {
 namespace sampler {
 namespace fused_repetition_penalties_softmax {
 
-torch::Tensor entry(const torch::Tensor& logits, const torch::Tensor& penalties_masks_ptrs,
-                    double repetition_penalties, double temperature) {
-  auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
-
-  TORCH_CHECK(logits.is_contiguous(), "input tensor must be contiguous");
-  TORCH_CHECK(penalties_masks_ptrs.is_contiguous(), "input tensor must be contiguous");
-
+torch::Tensor entry(const torch::Tensor& logits, std::optional<torch::Tensor> penalties_masks_ptrs,
+                    std::optional<torch::Tensor> repetition_penalties,
+                    double repetition_penalties_val, std::optional<torch::Tensor> temperature,
+                    double temperature_val) {
+  TORCH_CHECK(logits.is_contiguous(), "logits tensor must be contiguous");
+  TORCH_CHECK(logits.dim() == 2, "logits tensor must be dim == 2");
   int num_batch = logits.size(0);
   int vocab_size = logits.size(1);
 
-  TORCH_CHECK((vocab_size == 129024 || vocab_size == 128512),
-              "we only support vocab_size == 129024 and 128512");
+  // 129024, turbos text to text
+  // 128512, turbos image to text
+  // 129280, deepseek r1 text to text
+  TORCH_CHECK(vocab_size == 129024 || vocab_size == 128512 || vocab_size == 129280,
+              "hpc sample only support vocab_size == 129024, 128512 or 129280");
+
+  if (penalties_masks_ptrs.has_value()) {
+    TORCH_CHECK(penalties_masks_ptrs->is_contiguous(),
+                "penalties_masks_ptrs tensor must be contiguous");
+    TORCH_CHECK(penalties_masks_ptrs->dim() == 1,
+                "penalties_masks_ptrs tensor must be dim == 1, but get ",
+                penalties_masks_ptrs->dim());
+    TORCH_CHECK(penalties_masks_ptrs->size(0) == num_batch,
+                "penalties_masks_ptrs tensor must be shape [num_batch(", num_batch,
+                "),], but get [", penalties_masks_ptrs->size(0), ",]");
+  }
+
+  if (repetition_penalties.has_value()) {
+    TORCH_CHECK(repetition_penalties->is_contiguous(),
+                "penalties_masks_ptrs tensor must be contiguous");
+    TORCH_CHECK(repetition_penalties->dim() == 1,
+                "penalties_masks_ptrs tensor must be dim == 1, but get ",
+                repetition_penalties->dim());
+    TORCH_CHECK(repetition_penalties->size(0) == num_batch,
+                "penalties_masks_ptrs tensor must be shape [num_batch(", num_batch,
+                "),], but get [", repetition_penalties->size(0), ",]");
+  }
+
+  if (temperature.has_value()) {
+    TORCH_CHECK(temperature->is_contiguous(), "penalties_masks_ptrs tensor must be contiguous");
+    TORCH_CHECK(temperature->dim() == 1, "penalties_masks_ptrs tensor must be dim == 1, but get ",
+                temperature->dim());
+    TORCH_CHECK(temperature->size(0) == num_batch,
+                "penalties_masks_ptrs tensor must be shape [num_batch(", num_batch,
+                "),], but get [", temperature->size(0), ",]");
+  }
 
   torch::Tensor out = torch::empty({num_batch, vocab_size}, logits.options());
 
-  const auto* logits_ptr = logits.data_ptr<float>();
   auto* out_ptr = out.mutable_data_ptr<float>();
-  const uint8_t** repetition_penalties_ptr =
-      reinterpret_cast<const uint8_t**>(penalties_masks_ptrs.data_ptr<uint64_t>());
-
-  if (temperature <= 0) {
-    temperature = 1;
+  auto* logits_ptr = logits.data_ptr<float>();
+  const uint8_t** penalties_masks_ptrs_ptr = nullptr;
+  if (penalties_masks_ptrs.has_value()) {
+    penalties_masks_ptrs_ptr =
+        reinterpret_cast<const uint8_t**>(penalties_masks_ptrs->data_ptr<uint64_t>());
+  }
+  float* repetition_penalties_ptr = nullptr;
+  if (repetition_penalties.has_value()) {
+    repetition_penalties_ptr = repetition_penalties->data_ptr<float>();
+  }
+  float* temperature_ptr = nullptr;
+  if (temperature.has_value()) {
+    temperature_ptr = temperature->data_ptr<float>();
   }
 
-  fused_repetition_penalties_softmax_async(out_ptr, logits_ptr, repetition_penalties_ptr,
-                                           repetition_penalties, temperature, num_batch, vocab_size,
-                                           stream);
+  auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
+
+  fused_repetition_penalties_softmax_async(
+      out_ptr, logits_ptr, penalties_masks_ptrs_ptr, repetition_penalties_ptr,
+      repetition_penalties_val, temperature_ptr, temperature_val, num_batch, vocab_size, stream);
 
   return out;
 }
