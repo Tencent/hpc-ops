@@ -6,6 +6,7 @@
 #include <algorithm>
 
 #include "cute/tensor.hpp"
+#include "cutlass/arch/barrier.h"
 #include "src/gem3/gem3.h"
 
 namespace hpc {
@@ -13,9 +14,9 @@ namespace gem3 {
 
 namespace kernels {
 
-template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, typename TiledMmaQK,
-          typename TiledMmaAV, typename TmaQ, typename TmaK, typename TmaV, typename TmaY,
-          typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutY>
+template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int kTileV,
+          typename TiledMmaQK, typename TiledMmaAV, typename TmaQ, typename TmaK, typename TmaV,
+          typename TmaY, typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutY>
 __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant__ const TmaK tma_k,
                             __grid_constant__ const TmaV tma_v, __grid_constant__ const TmaY tma_y,
                             int num_batch, int num_seq, int num_qk_dim, int num_v_dim,
@@ -29,12 +30,12 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
   __shared__ uint64_t bar_q;
   __shared__ uint64_t bar_k;
   __shared__ uint64_t bar_v;
-  extern __shared__ float4 shm_data[] alignas(128);
+  extern __shared__ uint8_t shm_data[] alignas(128);
 
   auto *shm_q = (Tin *)shm_data;
   auto *shm_k = ((Tin *)shm_q) + cosize(SLayoutQ{});
   auto *shm_v = ((Tin *)shm_k) + cosize(SLayoutK{});
-  auto *shm_y = ((Tout *)shm_v) + cosize(SLayoutV{});
+  auto *shm_y = ((Tout *)shm_q);  // Reuse All
 
   // Tensor Q/K/V/Y
   auto gQ = tma_q.get_tma_tensor(make_shape(num_seq, num_qk_dim, num_batch));
@@ -42,11 +43,9 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
   auto gV = tma_v.get_tma_tensor(make_shape(num_v_dim, num_seq, num_batch));
   auto gY = tma_y.get_tma_tensor(make_shape(num_seq, num_v_dim, num_batch));
 
-  constexpr int kTileV = 80;
-  auto gAtt =
-      make_tensor(make_gmem_ptr((float *)shm_data), make_shape(Int<kTileM>{}, Int<kTileN>{}),
-                  make_stride(Int<kTileN>{}, Int<1>{}));
-  auto gYY = make_tensor(make_gmem_ptr((Tout *)shm_data), make_shape(Int<kTileM>{}, Int<kTileV>{}),
+  auto gAtt = make_tensor(make_gmem_ptr((float *)nullptr), make_shape(Int<kTileM>{}, Int<kTileN>{}),
+                          make_stride(Int<kTileN>{}, Int<1>{}));
+  auto gYY = make_tensor(make_gmem_ptr((Tout *)nullptr), make_shape(Int<kTileM>{}, Int<kTileV>{}),
                          make_stride(Int<kTileV>{}, Int<1>{}));
 
   // Tensor sQ/sK/sV
@@ -107,12 +106,13 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
   auto layout_asA = thr_mma_av.partition_A(gAtt).layout();
   auto tAttA = make_tensor(tAttr.data(), left_inverse(layout_asC).compose(layout_asA));
 
+  __syncthreads();
   clear(tYr);
+
   tiled_mma_av.accumulate_ = GMMA::ScaleOut::One;
 
 #pragma unroll 1
   for (int itile_seq_kv = 0; itile_seq_kv < size<1>(tKg); ++itile_seq_kv) {
-    __syncthreads();
     // load k/v
     if (idx == 0) {
       set_barrier_transaction_bytes(bar_k, sizeof(Tin) * cosize(SLayoutK{}));
@@ -128,6 +128,7 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
     tiled_mma_qk.accumulate_ = GMMA::ScaleOut::One;
     clear(tAttr);
 
+    warpgroup_fence_operand(tAttr);
     warpgroup_arrive();
     cute::gemm(tiled_mma_qk, tQr, tKr, tAttr);
 
@@ -145,15 +146,15 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
     __syncthreads();
     wait_barrier(bar_v, itile_seq_kv % 2);
 
+    warpgroup_fence_operand(tYr);
     warpgroup_arrive();
     cute::gemm(tiled_mma_av, tAttAbf16, tVr, tYr);
     warpgroup_commit_batch();
     warpgroup_wait<0>();
 
     warpgroup_fence_operand(tYr);
+    __syncthreads();
   }
-
-  warpgroup_fence_operand(tYr);
 
   // to bfloat16
   auto tYr_bf16 = make_tensor_like<Tout>(tYr);
@@ -163,8 +164,6 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
     Tout v{tYr(i)};
     tYr_bf16(i) = v;
   }
-
-  warpgroup_fence_operand(tYr_bf16);
 
   // Epilogue: write register-C to global memory
   // simple mode
@@ -190,6 +189,7 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
   cute::copy(r2s_tiled_copy, tYr4s, tYs4r);
   __syncthreads();
 
+  tma_store_fence();
   // using TMA to store
   if (idx == 0) {
     auto cY = tma_y.get_tma_tensor(make_shape(num_seq, num_v_dim, num_batch));
@@ -212,8 +212,8 @@ void gem3_async(void *y_ptr, const void *q_ptr, const void *k_ptr, const void *v
   using Tin = cute::bfloat16_t;
   using Tout = cute::bfloat16_t;
 
-  constexpr int kTileM = 128;
-  constexpr int kTileN = 128;
+  constexpr int kTileM = 64;
+  constexpr int kTileN = 64;
   constexpr int kTileK = 128;
   constexpr int kTileV = 80;
 
@@ -230,10 +230,11 @@ void gem3_async(void *y_ptr, const void *q_ptr, const void *k_ptr, const void *v
                        make_shape(num_seq, num_v_dim, num_batch),
                        make_stride(num_v_dim, Int<1>{}, num_seq * num_v_dim));
 
+  // TODO(reed): optimize it
   auto slayout_q =
-      tile_to_shape(GMMA::Layout_K_SW128_Atom<Tin>{}, make_shape(Int<kTileM>{}, Int<kTileK>{}));
+      tile_to_shape(GMMA::Layout_K_SW32_Atom<Tin>{}, make_shape(Int<kTileM>{}, Int<kTileK>{}));
   auto slayout_k =
-      tile_to_shape(GMMA::Layout_K_SW128_Atom<Tin>{}, make_shape(Int<kTileN>{}, Int<kTileK>{}));
+      tile_to_shape(GMMA::Layout_K_SW32_Atom<Tin>{}, make_shape(Int<kTileN>{}, Int<kTileK>{}));
   auto slayout_v =
       tile_to_shape(GMMA::Layout_MN_SW32_Atom<Tin>{}, make_shape(Int<kTileV>{}, Int<kTileN>{}));
   auto slayout_y =
@@ -249,13 +250,28 @@ void gem3_async(void *y_ptr, const void *q_ptr, const void *k_ptr, const void *v
   using TiledMmaAV =
       decltype(make_tiled_mma(SM90_64x80x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::MN>{}));
 
+  static_assert(kTileM >= get<0>(TiledMmaQK::Shape_MNK{}));
+  static_assert(kTileM % get<0>(TiledMmaQK::Shape_MNK{}) == 0);
+  static_assert(kTileM >= get<0>(TiledMmaAV::Shape_MNK{}));
+  static_assert(kTileM % get<0>(TiledMmaAV::Shape_MNK{}) == 0);
+
+  static_assert(kTileN >= get<1>(TiledMmaQK::Shape_MNK{}));
+  static_assert(kTileN % get<1>(TiledMmaQK::Shape_MNK{}) == 0);
+  static_assert(kTileN >= get<2>(TiledMmaAV::Shape_MNK{}));
+  static_assert(kTileN % get<2>(TiledMmaAV::Shape_MNK{}) == 0);
+
+  static_assert(kTileK >= get<2>(TiledMmaQK::Shape_MNK{}));
+  static_assert(kTileK % get<2>(TiledMmaQK::Shape_MNK{}) == 0);
+
+  static_assert(kTileV >= get<1>(TiledMmaAV::Shape_MNK{}));
+  static_assert(kTileV % get<1>(TiledMmaAV::Shape_MNK{}) == 0);
+
   dim3 block(size(TiledMmaQK{}));
   dim3 grid((num_seq + kTileM - 1) / kTileM, num_batch);
 
   int shm_qkv = (cosize(slayout_q) + cosize(slayout_k) + cosize(slayout_v)) * sizeof(Tin);
   int shm_y = cosize(slayout_y) * sizeof(Tout);
-  // int shm_size = std::max(shm_qkv, shm_y);
-  int shm_size = shm_qkv + shm_y;
+  int shm_size = std::max(shm_qkv, shm_y);
 
   printf("num_batch = %d, num_seq = %d, num_qk_dim = %d, num_v_dim = %d\n", num_batch, num_seq,
          num_qk_dim, num_v_dim);
@@ -265,8 +281,8 @@ void gem3_async(void *y_ptr, const void *q_ptr, const void *k_ptr, const void *v
   printf("grid = (%d, %d, %d) block = (%d, %d, %d)\n", grid.x, grid.y, grid.z, block.x, block.y,
          block.z);
 
-  auto kernel = kernels::gem3_kernel<Tout, Tin, kTileM, kTileN, kTileK, TiledMmaQK, TiledMmaAV,
-                                     decltype(tma_q), decltype(tma_k), decltype(tma_v),
+  auto kernel = kernels::gem3_kernel<Tout, Tin, kTileM, kTileN, kTileK, kTileV, TiledMmaQK,
+                                     TiledMmaAV, decltype(tma_q), decltype(tma_k), decltype(tma_v),
                                      decltype(tma_y), decltype(slayout_q), decltype(slayout_k),
                                      decltype(slayout_v), decltype(slayout_y)>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);

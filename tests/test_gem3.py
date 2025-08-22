@@ -9,10 +9,11 @@ import torch
 
 
 def test_gem3():
+
+    # torch.cuda.manual_seed(10086)
+
     num_batch = 70 * 8
     num_batch = 37 * 8  # (9288 + 255) / 256  * 8
-    num_batch = 1
-    num_batch = 560
 
     num_seq = 256
     num_qk_dim = 128
@@ -23,18 +24,22 @@ def test_gem3():
     )  # * 0 + 1.
     K = torch.randn(
         (num_batch, num_seq, num_qk_dim), dtype=torch.bfloat16, device="cuda"
-    )  # * 0 + 1.
+    )  # * 0 + 5.
     V = torch.randn(
         (num_batch, num_seq, num_v_dim), dtype=torch.bfloat16, device="cuda"
     )  # * 0 + 0.01
 
+    # gt = torch.tril(Q @ K.permute(0, 2, 1)) @ V
     gt = Q @ K.permute(0, 2, 1) @ V
     my = hpc.gem3(Q, K, V)
 
+    print("\nK\n")
+    print(K[0, :, :])
+
     print("\ngt\n")
-    print(gt)
+    print(gt[0, :, :])
     print("\nmy\n")
-    print(my)
+    print(my[0, :, :])
 
     """
     my = my.flatten()
@@ -42,7 +47,7 @@ def test_gem3():
     """
 
     idx = torch.nonzero(torch.abs(gt - my) > 1.0)
-    print(idx)
+    print(idx[:20])
 
     """
     for i in idx:
