@@ -29,8 +29,7 @@ def test_gem3():
         (num_batch, num_seq, num_v_dim), dtype=torch.bfloat16, device="cuda"
     )  # * 0 + 0.01
 
-    # gt = torch.tril(Q @ K.permute(0, 2, 1)) @ V
-    gt = Q @ K.permute(0, 2, 1) @ V
+    gt = torch.tril(Q @ K.permute(0, 2, 1)) @ V
     my = hpc.gem3(Q, K, V)
 
     print("\nK\n")

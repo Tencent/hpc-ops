@@ -86,6 +86,9 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
   auto tAttr = thr_mma_qk.partition_fragment_C(gAtt);
   auto tYr = thr_mma_av.partition_fragment_C(gYY);
 
+  auto gI = make_identity_tensor(gAtt.shape());
+  auto tI = thr_mma_qk.partition_C(gI);
+
   // Load Q
   if (idx == 0) {
     initialize_barrier(bar_q, 1);
@@ -113,6 +116,13 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
 
 #pragma unroll 1
   for (int itile_seq_kv = 0; itile_seq_kv < size<1>(tKg); ++itile_seq_kv) {
+    // casual mask, skip unused block
+    int icol = itile_seq_kv * kTileN;
+    int idiag = (itile_m + 1) * kTileM;
+    if (icol > idiag) {
+      break;
+    }
+
     // load k/v
     if (idx == 0) {
       set_barrier_transaction_bytes(bar_k, sizeof(Tin) * cosize(SLayoutK{}));
@@ -135,6 +145,17 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
     warpgroup_commit_batch();
     warpgroup_wait<0>();
     warpgroup_fence_operand(tAttr);
+
+    // do causal mask
+#pragma unroll
+    for (int i = 0; i < size(tAttr); ++i) {
+      int irow = get<0>(tI(i)) + itile_m * kTileM;
+      int icol = get<1>(tI(i)) + itile_seq_kv * kTileN;
+
+      if (icol > irow) {
+        tAttr(i) = 0.f;
+      }
+    }
 
     // Y = PV
     auto tAttAbf16 = make_tensor_like<Tin>(tAttA);
@@ -217,6 +238,8 @@ void gem3_async(void *y_ptr, const void *q_ptr, const void *k_ptr, const void *v
   constexpr int kTileK = 128;
   constexpr int kTileV = 80;
 
+  assert(kTileK == num_qk_dim);
+
   auto Q = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(q_ptr)),
                        make_shape(num_seq, num_qk_dim, num_batch),
                        make_stride(num_qk_dim, Int<1>{}, num_seq * num_qk_dim));
@@ -232,9 +255,9 @@ void gem3_async(void *y_ptr, const void *q_ptr, const void *k_ptr, const void *v
 
   // TODO(reed): optimize it
   auto slayout_q =
-      tile_to_shape(GMMA::Layout_K_SW32_Atom<Tin>{}, make_shape(Int<kTileM>{}, Int<kTileK>{}));
+      tile_to_shape(GMMA::Layout_K_SW128_Atom<Tin>{}, make_shape(Int<kTileM>{}, Int<kTileK>{}));
   auto slayout_k =
-      tile_to_shape(GMMA::Layout_K_SW32_Atom<Tin>{}, make_shape(Int<kTileN>{}, Int<kTileK>{}));
+      tile_to_shape(GMMA::Layout_K_SW128_Atom<Tin>{}, make_shape(Int<kTileN>{}, Int<kTileK>{}));
   auto slayout_v =
       tile_to_shape(GMMA::Layout_MN_SW32_Atom<Tin>{}, make_shape(Int<kTileV>{}, Int<kTileN>{}));
   auto slayout_y =
