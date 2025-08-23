@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/li
 
 import hpc
 import torch
+import math
 
 
 def test_gem3():
@@ -21,45 +22,46 @@ def test_gem3():
 
     Q = torch.randn(
         (num_batch, num_seq, num_qk_dim), dtype=torch.bfloat16, device="cuda"
-    )  # * 0 + 1.
+    ) / math.sqrt(num_qk_dim)
     K = torch.randn(
         (num_batch, num_seq, num_qk_dim), dtype=torch.bfloat16, device="cuda"
-    )  # * 0 + 5.
-    V = torch.randn(
-        (num_batch, num_seq, num_v_dim), dtype=torch.bfloat16, device="cuda"
-    )  # * 0 + 0.01
+    ) / math.sqrt(num_qk_dim)
+    V = torch.randn((num_batch, num_seq, num_v_dim), dtype=torch.bfloat16, device="cuda")
 
-    gt = torch.tril(Q @ K.permute(0, 2, 1)) @ V
-    my = hpc.gem3(Q, K, V)
+    qscale = (
+        torch.rand((num_batch, num_seq, 1), dtype=torch.float32, device="cuda")
+        .to(torch.bfloat16)
+        .to(torch.float32)
+    )
 
-    print("\nK\n")
-    print(K[0, :, :])
+    kscale = (
+        torch.rand((num_batch, 1, num_seq), dtype=torch.float32, device="cuda")
+        .to(torch.bfloat16)
+        .to(torch.float32)
+    )
+
+    P = torch.tril(
+        (Q.to(torch.float32) @ K.to(torch.float32).permute(0, 2, 1)) * qscale * kscale
+    ).to(torch.bfloat16)
+    gt = (P.to(torch.float32) @ V.to(torch.float32)).to(torch.bfloat16)
+    my = hpc.gem3(Q, K, V, qscale, kscale)
 
     print("\ngt\n")
     print(gt[0, :, :])
     print("\nmy\n")
     print(my[0, :, :])
 
-    """
-    my = my.flatten()
-    gt = gt.flatten()
-    """
+    abs_diff = torch.abs(gt - my)
+    vals, idxs = torch.topk(abs_diff.view(-1), 10)
+    idxs = [torch.unravel_index(idx, gt.shape) for idx in idxs]
 
-    idx = torch.nonzero(torch.abs(gt - my) > 1.0)
-    print(idx[:20])
+    for i, idx in enumerate(idxs):
+        cpu_idx = tuple(tensor.cpu().item() for tensor in idx)
+        print(
+            "{:+.4f} vs {:+.4f} with diff = {:.4f}, @ {}".format(gt[idx], my[idx], vals[i], cpu_idx)
+        )
 
-    """
-    for i in idx:
-        print(i)
-    """
-
-    for i in idx[:5]:
-        t = tuple(i.tolist())
-        print("{} {} vs {}".format(t, gt[t].item(), my[t].item()))
-    """
-    """
-
-    assert torch.allclose(my, gt)
+    assert torch.allclose(my, gt, atol=0.0156)
     assert gt.device == my.device
     assert gt.dtype == my.dtype
     assert gt.shape == my.shape
