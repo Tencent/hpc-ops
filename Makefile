@@ -1,8 +1,8 @@
 PY_FILES=$(shell find hpc -name "*.py") $(shell find tests -name "*.py") setup.py
 CC_FILES=$(shell find src -name "*.cc")
 CU_FILES=$(shell find src -name "*.cu")
+H_FILES=$(shell find src -name "*.h")
 CUH_FILES=$(shell find src -name "*.cuh")
-CUH_FILES=$(shell find src -name "*.h")
 
 CSRC_FILES=$(CC_FILES) $(CU_FILES) $(CUH_FILES) $(H_FILES)
 

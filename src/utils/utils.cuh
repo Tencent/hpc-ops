@@ -1,5 +1,7 @@
-#ifndef SRC_UTILS_UTILS_H_
-#define SRC_UTILS_UTILS_H_
+// Copyright 2025 hpc-ops authors
+
+#ifndef SRC_UTILS_UTILS_CUH_
+#define SRC_UTILS_UTILS_CUH_
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -27,7 +29,7 @@ struct vec_t {
 template <int K, typename T, int N>
 __device__ __forceinline__ auto &view(vec_t<T, N> &v) {
   using V = vec_t<vec_t<T, N / K>, K>;
-  return *((V *)(&v));
+  return *reinterpret_cast<V *>(&v);
 }
 
 template <typename U, typename T, int N>
@@ -66,7 +68,7 @@ __device__ __forceinline__ auto to(const vec_t<T, N> &v) {
     V o;
 #pragma unroll
     for (int i = 0; i < N / 4; ++i) {
-      o[i] = __nv_fp8x4_e4m3(*((float4 *)(&v[4 * i])));
+      o[i] = __nv_fp8x4_e4m3(*reinterpret_cast<const float4 *>(&v[4 * i]));
     }
     return o;
   }
@@ -84,19 +86,19 @@ __device__ __forceinline__ auto load(const void *ptr) {
 
   if constexpr (kBytes == 1) {
     using L = uint8_t;
-    *(L *)(&v) = *((L *)ptr);
+    *reinterpret_cast<L *>(&v) = *reinterpret_cast<const L *>(ptr);
   } else if constexpr (kBytes == 2) {
     using L = uint16_t;
-    *(L *)(&v) = *((L *)ptr);
+    *reinterpret_cast<L *>(&v) = *reinterpret_cast<const L *>(ptr);
   } else if constexpr (kBytes == 4) {
     using L = uint32_t;
-    *(L *)(&v) = *((L *)ptr);
+    *reinterpret_cast<L *>(&v) = *reinterpret_cast<const L *>(ptr);
   } else if constexpr (kBytes == 8) {
     using L = uint64_t;
-    *(L *)(&v) = *((L *)ptr);
+    *reinterpret_cast<L *>(&v) = *reinterpret_cast<const L *>(ptr);
   } else if constexpr (kBytes == 16) {
     using L = uint4;
-    *(L *)(&v) = *((L *)ptr);
+    *reinterpret_cast<L *>(&v) = *reinterpret_cast<const L *>(ptr);
   }
 
   return v;
@@ -114,19 +116,19 @@ __device__ __forceinline__ void store(void *ptr, const vec_t<T, N> &v) {
 
   if constexpr (kBytes == 1) {
     using S = uint8_t;
-    *((S *)ptr) = *(S *)(&v);
+    *reinterpret_cast<S *>(ptr) = *reinterpret_cast<const S *>(&v);
   } else if constexpr (kBytes == 2) {
     using S = uint16_t;
-    *((S *)ptr) = *(S *)(&v);
+    *reinterpret_cast<S *>(ptr) = *reinterpret_cast<const S *>(&v);
   } else if constexpr (kBytes == 4) {
     using S = uint32_t;
-    *((S *)ptr) = *(S *)(&v);
+    *reinterpret_cast<S *>(ptr) = *reinterpret_cast<const S *>(&v);
   } else if constexpr (kBytes == 8) {
     using S = uint64_t;
-    *((S *)ptr) = *(S *)(&v);
+    *reinterpret_cast<S *>(ptr) = *reinterpret_cast<const S *>(&v);
   } else if constexpr (kBytes == 16) {
     using S = uint4;
-    *((S *)ptr) = *(S *)(&v);
+    *reinterpret_cast<S *>(ptr) = *reinterpret_cast<const S *>(&v);
   }
 
   return;
@@ -141,8 +143,8 @@ __device__ __forceinline__ void store(void *ptr, T val, Args... vals) {
 
   V v;
   int idx = 0;
-  ((T *)(&v))[idx++] = val;
-  ((((T *)(&v))[idx++] = vals), ...);
+  (reinterpret_cast<T *>(&v))[idx++] = val;
+  (((reinterpret_cast<T *>(&v))[idx++] = vals), ...);
 
   store(ptr, v);
 }
@@ -220,4 +222,4 @@ __device__ __forceinline__ float warp_reduce_sum_xor(float x) {
 
 }  // namespace hpc
 
-#endif  // SRC_UTILS_UTILS_H_
+#endif  // SRC_UTILS_UTILS_CUH_

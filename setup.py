@@ -9,6 +9,7 @@ def get_version():
     git_hash = subprocess.check_output(
         ["git", "rev-parse", "--short=7", "HEAD"], stderr=subprocess.DEVNULL, text=True
     ).strip()
+
     newest_tag = (
         subprocess.check_output(
             ["git", "tag", "--sort=-v:refname"], stderr=subprocess.DEVNULL, text=True
@@ -20,11 +21,19 @@ def get_version():
     newest_tag_hash = subprocess.check_output(
         ["git", "rev-list", "--tags", "--max-count=1"], stderr=subprocess.DEVNULL, text=True
     ).strip()[:7]
-
     if newest_tag_hash == git_hash:
         return newest_tag
     else:
-        return newest_tag + "+g" + git_hash
+        try:
+            commit_count = subprocess.check_output(
+                ["git", "rev-list", "--count", f"{newest_tag_hash}..HEAD"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        except subprocess.CalledProcessError:
+            commit_count = "0"
+
+        return f"{newest_tag}.dev{commit_count}+g{git_hash}"
 
 
 version = get_version()
@@ -43,6 +52,7 @@ extra_compile_args = {
         "-v",
         "-std=c++17",
         "--expt-relaxed-constexpr",
+        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
         include_flags,
         cute_include,
     ],
