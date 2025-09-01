@@ -86,7 +86,8 @@ __device__ __forceinline__ auto to(const vec_t<T, N> &v) {
     V o;
 #pragma unroll
     for (int i = 0; i < N / 2; ++i) {
-      o[i] = __nv_fp8x4_e4m3(*((__nv_bfloat162*)(&v[2 * i])), *((__nv_bfloat162*)(&v[2 * i + 1])));
+      o[i] = __nv_fp8x4_e4m3(*(reinterpret_cast<__nv_bfloat162 *>(&v[2 * i])),
+                             *(reinterpret_cast<__nv_bfloat162 *>(&v[2 * i + 1])));
     }
     return o;
   }
