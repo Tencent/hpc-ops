@@ -11,6 +11,14 @@
 namespace hpc {
 
 // ============================
+//    Debug Utility
+// ============================
+
+// print_type<T> _; // it will generate a compile time error with type T.
+template <typename T>
+struct print_type;
+
+// ============================
 //    Load/Store(vectorized)
 // ============================
 
