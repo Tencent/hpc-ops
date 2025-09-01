@@ -10,3 +10,4 @@ __pycache__
 *.nsys-rep
 *.sqlite
 test
+version.py

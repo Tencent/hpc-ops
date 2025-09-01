@@ -9,6 +9,10 @@
 #define HPC_VERSION_STR "unknown"
 #endif
 
+#ifndef HPC_GIT_HASH_STR
+#define HPC_GIT_HASH_STR "unknown"
+#endif
+
 static const std::string version() { return HPC_VERSION_STR; }
 
 static const std::string built_json() {
@@ -20,6 +24,7 @@ static const std::string built_json() {
   oss << " \"built-time\": " << "\"" << __TIME__ << "\",\n";
   oss << " \"_C\": " << "\"" << __FILE__ << "\",\n";
   oss << " \"version\": " << "\"" << HPC_VERSION_STR << "\",\n";
+  oss << " \"git-hash\": " << "\"" << HPC_GIT_HASH_STR << "\",\n";
   oss << " \"compiler\": " << "\"g++-" << __GNUC__ << "." << __GNUC_MINOR__ << "."
       << __GNUC_PATCHLEVEL__ << "\",\n";
   oss << " \"glibc\": " << "\"" << __GLIBC__ << "." << __GLIBC_MINOR__ << "\",\n";

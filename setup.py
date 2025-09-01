@@ -22,7 +22,7 @@ def get_version():
         ["git", "rev-list", "--tags", "--max-count=1"], stderr=subprocess.DEVNULL, text=True
     ).strip()[:7]
     if newest_tag_hash == git_hash:
-        return newest_tag
+        return newest_tag, git_hash
     else:
         try:
             commit_count = subprocess.check_output(
@@ -33,17 +33,17 @@ def get_version():
         except subprocess.CalledProcessError:
             commit_count = "0"
 
-        return f"{newest_tag}.dev{commit_count}+g{git_hash}"
+        return f"{newest_tag}.dev{commit_count}+g{git_hash}", git_hash
 
 
-version = get_version()
+version, git_hash = get_version()
 
 include_flags = "-I" + os.path.dirname(__file__)
 cute_include = "-I" + os.path.dirname(__file__) + "/3rd/cutlass/include"
-cxx_flags = '-DHPC_VERSION_STR="{}"'.format(version)
+cxx_flags = ['-DHPC_VERSION_STR="{}"'.format(version), '-DHPC_GIT_HASH_STR="{}"'.format(git_hash)]
 
 extra_compile_args = {
-    "cxx": ["-O2", "-std=c++17", include_flags, cute_include, cxx_flags],
+    "cxx": ["-O2", "-std=c++17", include_flags, cute_include, *cxx_flags],
     "nvcc": [
         "-arch=sm_90a",
         "-O2",
@@ -74,11 +74,18 @@ cuda_extension = CUDAExtension(
     py_limited_api=True,
 )
 
+with open("hpc/version.py", "w") as fp:
+    fp.write('version = "{}"\n'.format(version))
+    fp.write('git_hash = "{}"\n'.format(git_hash))
 
 setup(
     name="hpc-ops",
     version=version,
     description="High Performance Computing Operator",
+    author="hpc-ops team",
+    author_email="authors@hpc-ops",
+    url="https://mirrors.tencent.com/#/private/pypi/detail?repo_id=155&project_name=hpc-ops",
+    license="Copyright 2025",
     packages=["hpc"],
     ext_modules=[cuda_extension],
     install_requires=["torch"],
