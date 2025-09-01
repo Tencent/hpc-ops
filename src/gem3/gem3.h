@@ -10,8 +10,8 @@ namespace hpc {
 namespace gem3 {
 
 void gem3_async(void *y_ptr, const void *q_ptr, const void *k_ptr, const void *v_ptr,
-                const void *qscale_ptr, const void *kscale_ptr, int num_batch, int num_seq,
-                int num_qk_dim, int num_v_dim, cudaStream_t stream);
+                const void *qscale_ptr, const void *kscale_ptr, void *tmas_ptr, int num_batch,
+                int num_seq, int num_qk_dim, int num_v_dim, cudaStream_t stream);
 
 }  // namespace gem3
 }  // namespace hpc

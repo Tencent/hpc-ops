@@ -28,17 +28,22 @@ torch::Tensor entry(const torch::Tensor &q, const torch::Tensor &k, const torch:
   // torch::Tensor y = torch::empty_like(v);
   torch::Tensor y = torch::zeros_like(v);
 
+  auto options = q.options().dtype(torch::kUInt64);
+  torch::Tensor tmas = torch::empty({6, 16}, options);
+
   const auto *q_ptr = q.const_data_ptr();
   const auto *k_ptr = k.const_data_ptr();
   const auto *v_ptr = v.const_data_ptr();
   const auto *qscale_ptr = qscale.const_data_ptr();
   const auto *kscale_ptr = kscale.const_data_ptr();
 
+  void *tmas_ptr = tmas.mutable_data_ptr();
+
   using T = __nv_bfloat16;
   auto *y_ptr = reinterpret_cast<T *>(y.mutable_data_ptr());
 
-  gem3_async(y_ptr, q_ptr, k_ptr, v_ptr, qscale_ptr, kscale_ptr, num_batch, num_seq, num_qk_dim,
-             num_v_dim, stream);
+  gem3_async(y_ptr, q_ptr, k_ptr, v_ptr, qscale_ptr, kscale_ptr, tmas_ptr, num_batch, num_seq,
+             num_qk_dim, num_v_dim, stream);
 
   return y;
 }

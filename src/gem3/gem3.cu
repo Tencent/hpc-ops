@@ -6,8 +6,8 @@
 #include <algorithm>
 
 #include "cute/tensor.hpp"
-#include "cutlass/arch/barrier.h"
 #include "src/gem3/gem3.h"
+#include "src/utils/tma.cuh"
 #include "src/utils/utils.cuh"
 
 namespace hpc {
@@ -15,15 +15,78 @@ namespace gem3 {
 
 namespace kernels {
 
+template <typename T, typename TmaQ, typename TmaK, typename TmaV, typename TmaQS, typename TmaKS,
+          typename TmaY>
+__global__ void update_batched_tma(const vec_t<cute::TmaDescriptor, 6> td_qkvqsksy0,
+                                   cute::TmaDescriptor *tma_qkvqsksy, const T *q_ptr,
+                                   const T *k_ptr, const T *v_ptr, const float *qs_ptr,
+                                   const float *ks_ptr, const T *y_ptr, int num_batch, int num_seq,
+                                   int num_qk_dim, int num_v_dim) {
+  using namespace cute;  // NOLINT
+
+  int idx = threadIdx.x;
+  int ilane = idx % 32;
+  int ibatch = blockIdx.x;
+
+  __shared__ cute::TmaDescriptor smem_tma_desc[6];
+
+  __syncwarp();
+  if (ilane == 0) {
+    smem_tma_desc[ibatch] = td_qkvqsksy0[ibatch];
+    // Q
+    if (ibatch == 0) {
+      auto gQ = make_tensor(make_gmem_ptr(q_ptr), make_shape(num_seq, num_qk_dim, num_batch),
+                            make_stride(num_qk_dim, Int<1>{}, num_qk_dim * num_seq));
+      update_tma_gtensor<TmaQ>(smem_tma_desc[ibatch], gQ);
+    }
+
+    // K
+    if (ibatch == 1) {
+      auto gK = make_tensor(make_gmem_ptr(k_ptr), make_shape(num_seq, num_qk_dim, num_batch),
+                            make_stride(num_qk_dim, Int<1>{}, num_qk_dim * num_seq));
+      update_tma_gtensor<TmaK>(smem_tma_desc[ibatch], gK);
+    }
+
+    // V
+    if (ibatch == 2) {
+      auto gV = make_tensor(make_gmem_ptr(v_ptr), make_shape(num_v_dim, num_seq, num_batch),
+                            make_stride(Int<1>{}, num_v_dim, num_v_dim * num_seq));
+      update_tma_gtensor<TmaV>(smem_tma_desc[ibatch], gV);
+    }
+
+    // QS
+    if (ibatch == 3) {
+      auto gQS = make_tensor(make_gmem_ptr(qs_ptr), make_shape(num_seq, num_batch),
+                             make_stride(Int<1>{}, num_seq));
+      update_tma_gtensor<TmaQS>(smem_tma_desc[ibatch], gQS);
+    }
+
+    // KS
+    if (ibatch == 4) {
+      auto g = make_tensor(make_gmem_ptr(ks_ptr), make_shape(num_seq, num_batch),
+                           make_stride(Int<1>{}, num_seq));
+      update_tma_gtensor<TmaKS>(smem_tma_desc[ibatch], g);
+    }
+
+    // Y
+    if (ibatch == 5) {
+      auto g = make_tensor(make_gmem_ptr(y_ptr), make_shape(num_seq, num_v_dim, num_batch),
+                           make_stride(num_v_dim, Int<1>{}, num_v_dim * num_seq));
+      update_tma_gtensor<TmaY>(smem_tma_desc[ibatch], g);
+    }
+  }
+
+  __syncwarp();
+
+  tma_descriptor_cp_fence_release(tma_qkvqsksy + ibatch, smem_tma_desc[ibatch]);
+}
+
 template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int kTileV,
           typename TiledMmaQK, typename TiledMmaAV, typename TmaQ, typename TmaK, typename TmaV,
           typename TmaY, typename TmaQS, typename TmaKS, typename SLayoutQ, typename SLayoutK,
           typename SLayoutV, typename SLayoutY, typename SLayoutQS, typename SLayoutKS>
-__global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant__ const TmaK tma_k,
-                            __grid_constant__ const TmaV tma_v, __grid_constant__ const TmaY tma_y,
-                            __grid_constant__ const TmaQS tma_qs,
-                            __grid_constant__ const TmaKS tma_ks, int num_batch, int num_seq,
-                            int num_qk_dim, int num_v_dim, void *y_ptr) {
+__global__ void gem3_kernel(cute::TmaDescriptor *td_qkvqsksy, int num_batch, int num_seq,
+                            int num_qk_dim, int num_v_dim) {
   using namespace cute;  // NOLINT
 
   int idx = threadIdx.x;
@@ -46,6 +109,20 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
   auto *shm_qs = (float *)(((Tin *)shm_v) + cosize(SLayoutV{}));
   auto *shm_ks = (float *)(((float *)shm_qs) + cosize(SLayoutQS{}));
   auto *shm_y = ((Tout *)shm_data);  // Reuse All
+
+  TmaQ tma_q;
+  TmaK tma_k;
+  TmaV tma_v;
+  TmaQS tma_qs;
+  TmaKS tma_ks;
+  TmaY tma_y;
+
+  auto *td_q = td_qkvqsksy + 0;
+  auto *td_k = td_qkvqsksy + 1;
+  auto *td_v = td_qkvqsksy + 2;
+  auto *td_qs = td_qkvqsksy + 3;
+  auto *td_ks = td_qkvqsksy + 4;
+  auto *td_y = td_qkvqsksy + 5;
 
   // Tensor Q/K/V/Y
   auto gQ = tma_q.get_tma_tensor(make_shape(num_seq, num_qk_dim, num_batch));
@@ -113,7 +190,7 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
   if ((iwarp == 0) && elected) {
     initialize_barrier(bar_q, 1);
     set_barrier_transaction_bytes(bar_q, sizeof(Tin) * cosize(SLayoutQ{}));
-    cute::copy(tma_q.with(bar_q), tQg(_, itile_m, _, ibatch), tQs(_, 0, _));
+    cute::copy(tma_q.with(td_q, bar_q), tQg(_, itile_m, _, ibatch), tQs(_, 0, _));
   }
 
   // init k/v barrier
@@ -149,17 +226,17 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
     if ((iwarp == 0) && elected) {
       // k
       set_barrier_transaction_bytes(bar_k, sizeof(Tin) * cosize(SLayoutK{}));
-      cute::copy(tma_k.with(bar_k), tKg(_, itile_seq_kv, _, ibatch), tKs(_, 0, _));
+      cute::copy(tma_k.with(td_k, bar_k), tKg(_, itile_seq_kv, _, ibatch), tKs(_, 0, _));
 
       // qscale/kscale
       set_barrier_transaction_bytes(bar_qs, sizeof(float) * cosize(SLayoutQS{}));
-      cute::copy(tma_qs.with(bar_qs), tQSg(_, itile_m, ibatch), tQSs(_, 0));
+      cute::copy(tma_qs.with(td_qs, bar_qs), tQSg(_, itile_m, ibatch), tQSs(_, 0));
       set_barrier_transaction_bytes(bar_ks, sizeof(float) * cosize(SLayoutKS{}));
-      cute::copy(tma_ks.with(bar_ks), tKSg(_, itile_seq_kv, ibatch), tKSs(_, 0));
+      cute::copy(tma_ks.with(td_ks, bar_ks), tKSg(_, itile_seq_kv, ibatch), tKSs(_, 0));
 
       // v
       set_barrier_transaction_bytes(bar_v, sizeof(Tin) * cosize(SLayoutV{}));
-      cute::copy(tma_v.with(bar_v), tVg(_, _, itile_seq_kv, ibatch), tVs(_, _, 0));
+      cute::copy(tma_v.with(td_v, bar_v), tVg(_, _, itile_seq_kv, ibatch), tVs(_, _, 0));
     }
     __syncthreads();
     wait_barrier(bar_k, itile_seq_kv % 2);
@@ -228,19 +305,6 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
   }
 
   // Epilogue: write register-C to global memory
-  // simple mode
-#if 0
-  {
-    auto Y = make_tensor(make_gmem_ptr((Tout *)y_ptr), make_shape(num_seq, num_v_dim, num_batch),
-                         make_stride(num_v_dim, Int<1>{}, num_seq * num_v_dim));
-    auto gY =
-        local_tile(Y, make_tile(Int<kTileM>{}, Int<kTileV>{}), make_coord(itile_m, 0, ibatch));
-    auto tYg = thr_mma_av.partition_C(gY);
-    copy(tYr_bf16, tYg);
-  }
-
-#else
-
   using R2SCopyAtomC = Copy_Atom<cute::SM90_U32x4_STSM_N, Tout>;
   auto r2s_tiled_copy = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma_av);
   auto r2s_thr_copy = r2s_tiled_copy.get_slice(idx);
@@ -260,15 +324,14 @@ __global__ void gem3_kernel(__grid_constant__ const TmaQ tma_q, __grid_constant_
     auto tYss = btma_y.partition_S(sY);  // (TMA, TMA_M, TMA_N)
     auto tYgg = btma_y.partition_D(cY);  // (TMA, TMA_M, TMA_N, b)
 
-    cute::copy(tma_y, tYss(_, 0, 0), tYgg(_, itile_m, 0, ibatch));
+    cute::copy(tma_y.with(td_y), tYss(_, 0, 0), tYgg(_, itile_m, 0, ibatch));
   }
-#endif
 }
 
 }  // namespace kernels
 
 void gem3_async(void *y_ptr, const void *q_ptr, const void *k_ptr, const void *v_ptr,
-                const void *qscale_ptr, const void *kscale_ptr, int num_batch, int num_seq,
+                const void *qs_ptr, const void *ks_ptr, void *tmas_ptr, int num_batch, int num_seq,
                 int num_qk_dim, int num_v_dim, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
@@ -285,6 +348,7 @@ void gem3_async(void *y_ptr, const void *q_ptr, const void *k_ptr, const void *v
   auto Q = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(q_ptr)),
                        make_shape(num_seq, num_qk_dim, num_batch),
                        make_stride(num_qk_dim, Int<1>{}, num_seq * num_qk_dim));
+
   auto K = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(k_ptr)),
                        make_shape(num_seq, num_qk_dim, num_batch),
                        make_stride(num_qk_dim, Int<1>{}, num_seq * num_qk_dim));
@@ -294,9 +358,9 @@ void gem3_async(void *y_ptr, const void *q_ptr, const void *k_ptr, const void *v
   auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<const Tout *>(y_ptr)),
                        make_shape(num_seq, num_v_dim, num_batch),
                        make_stride(num_v_dim, Int<1>{}, num_seq * num_v_dim));
-  auto QS = make_tensor(make_gmem_ptr(reinterpret_cast<const float *>(qscale_ptr)),
+  auto QS = make_tensor(make_gmem_ptr(reinterpret_cast<const float *>(qs_ptr)),
                         make_shape(num_seq, num_batch), make_stride(Int<1>{}, num_seq));
-  auto KS = make_tensor(make_gmem_ptr(reinterpret_cast<const float *>(kscale_ptr)),
+  auto KS = make_tensor(make_gmem_ptr(reinterpret_cast<const float *>(ks_ptr)),
                         make_shape(num_seq, num_batch), make_stride(Int<1>{}, num_seq));
 
   // TODO(reed): optimize it
@@ -349,13 +413,17 @@ void gem3_async(void *y_ptr, const void *q_ptr, const void *k_ptr, const void *v
   int shm_y = cosize(slayout_y) * sizeof(Tout);
   int shm_size = std::max(shm_qkv + shm_qs + shm_ks, shm_y);
 
-  printf("num_batch = %d, num_seq = %d, num_qk_dim = %d, num_v_dim = %d\n", num_batch, num_seq,
-         num_qk_dim, num_v_dim);
+  vec_t<cute::TmaDescriptor, 6> td_qkvqsksy0{
+      *tma_q.get_tma_descriptor(),  *tma_k.get_tma_descriptor(),  *tma_v.get_tma_descriptor(),
+      *tma_qs.get_tma_descriptor(), *tma_ks.get_tma_descriptor(), *tma_y.get_tma_descriptor(),
+  };
 
-  print("shm_size(byte) = %d\n", shm_size);
-
-  printf("grid = (%d, %d, %d) block = (%d, %d, %d)\n", grid.x, grid.y, grid.z, block.x, block.y,
-         block.z);
+  auto *tma_qkvqsksy = static_cast<cute::TmaDescriptor *>(tmas_ptr);
+  kernels::update_batched_tma<Tin, decltype(tma_q), decltype(tma_k), decltype(tma_v),
+                              decltype(tma_qs), decltype(tma_ks), decltype(tma_y)>
+      <<<6, 32, 0, stream>>>(td_qkvqsksy0, tma_qkvqsksy, (Tin *)q_ptr, (Tin *)k_ptr, (Tin *)v_ptr,
+                             (float *)qs_ptr, (float *)ks_ptr, (Tout *)y_ptr, num_batch, num_seq,
+                             num_qk_dim, num_v_dim);
 
   auto kernel =
       kernels::gem3_kernel<Tout, Tin, kTileM, kTileN, kTileK, kTileV, TiledMmaQK, TiledMmaAV,
@@ -364,8 +432,8 @@ void gem3_async(void *y_ptr, const void *q_ptr, const void *k_ptr, const void *v
                            decltype(slayout_k), decltype(slayout_v), decltype(slayout_y),
                            decltype(slayout_qs), decltype(slayout_ks)>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-  kernel<<<grid, block, shm_size, stream>>>(tma_q, tma_k, tma_v, tma_y, tma_qs, tma_ks, num_batch,
-                                            num_seq, num_qk_dim, num_v_dim, y_ptr);
+  kernel<<<grid, block, shm_size, stream>>>(tma_qkvqsksy, num_batch, num_seq, num_qk_dim,
+                                            num_v_dim);
 }
 
 }  // namespace gem3
