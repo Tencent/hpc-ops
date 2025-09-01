@@ -28,6 +28,7 @@ struct vec_t {
 
   using type = T;
   static constexpr int num = N;
+  static constexpr int kNum = N;
 
   __device__ __forceinline__ T &operator[](int idx) { return data[idx]; }
 
@@ -77,6 +78,15 @@ __device__ __forceinline__ auto to(const vec_t<T, N> &v) {
 #pragma unroll
     for (int i = 0; i < N / 4; ++i) {
       o[i] = __nv_fp8x4_e4m3(*reinterpret_cast<const float4 *>(&v[4 * i]));
+    }
+    return o;
+  } else if constexpr (std::is_same_v<T, __nv_bfloat162> && std::is_same_v<U, __nv_fp8x4_e4m3>) {
+    static_assert(N % 2 == 0, "N % 2 must be 0");
+    using V = vec_t<__nv_fp8x4_e4m3, N / 2>;
+    V o;
+#pragma unroll
+    for (int i = 0; i < N / 2; ++i) {
+      o[i] = __nv_fp8x4_e4m3(*((__nv_bfloat162*)(&v[2 * i])), *((__nv_bfloat162*)(&v[2 * i + 1])));
     }
     return o;
   }

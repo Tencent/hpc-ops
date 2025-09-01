@@ -63,6 +63,61 @@ __global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr, const __nv_bflo
   }
 }
 
+// input : gate + up
+__global__ void masked_act_mul_and_quant_kernel(
+    __nv_fp8_e4m3 *output_ptr, const __nv_bfloat16 *input_ptr, const __nv_bfloat16 *scale_ptr,
+    const int *num_per_expert_ptr, int num_total_tokens, int num_intermediate_size,
+    int num_tokens_per_expert, cutlass::FastDivmod Block2YX, cutlass::FastDivmod Row2EandT,
+    int num_block_row) {
+  constexpr int kRows = 4;
+
+  int iblockx;
+  int iblocky;
+
+  Block2YX(iblocky, iblockx, blockIdx.x);
+
+#pragma unroll 1
+  for (int irow0 = iblocky * kRows; irow0 < num_total_tokens; irow0 += num_block_row * kRows) {
+    int it = threadIdx.x + iblockx * blockDim.x;
+
+#pragma unroll
+    for (int i = 0; i < kRows; ++i) {
+      int iexpert;
+      int itoken;
+
+      int irow = irow0 + i;
+
+      Row2EandT(iexpert, itoken, irow);
+      int num_tokens_curr_expert = num_per_expert_ptr[iexpert];
+      if (itoken >= num_tokens_curr_expert) {
+        continue;
+      }
+
+      const auto *gate_row_ptr = input_ptr + irow * (num_intermediate_size * 2);
+      const auto *up_row_ptr = gate_row_ptr + num_intermediate_size;
+      const auto *scale_row_ptr = scale_ptr;
+      auto *output_row_ptr = output_ptr + irow * num_intermediate_size;
+
+      int icol = it * 8;
+      if (icol < num_intermediate_size) {
+        auto gate = to<float>(load<__nv_bfloat162, 4>(gate_row_ptr + icol));
+        auto up = to<float>(load<__nv_bfloat162, 4>(up_row_ptr + icol));
+        auto scale = to<float>(load<__nv_bfloat162, 4>(scale_row_ptr + icol));
+        decltype(gate) out;
+
+#pragma unroll
+        for (int i = 0; i < decltype(gate)::kNum; ++i) {
+          out[i] = silu(gate[i]) * up[i] * scale[i];
+        }
+
+        auto out_fp8 = to<__nv_fp8x4_e4m3>(out);
+
+        store(output_row_ptr + icol, out_fp8);
+      }
+    }  // for
+  }  // irow0
+}
+
 }  // namespace kernels
 
 void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_up_ptr,
@@ -80,6 +135,28 @@ void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_u
 
   kernels::act_mul_and_quant_kernel<<<grid, block, 0, stream>>>(
       out_ptr, gate_up_ptr, scale_ptr, num_row, intermediate_size, block1D22D);
+}
+
+void masked_act_mul_and_quant_async(__nv_fp8_e4m3 *output_ptr, const __nv_bfloat16 *input_ptr,
+                                    const __nv_bfloat16 *scale_ptr, const int *num_per_expert_ptr,
+                                    int num_total_tokens, int num_intermediate_size,
+                                    int num_tokens_per_expert, cudaStream_t stream) {
+  dim3 block(256);
+  int num_block_col = (num_intermediate_size / 8 + block.x - 1) / block.x;
+
+  int num_sm = 78;
+  int num_block_hard = num_sm * 8;
+
+  int num_block_row = num_block_hard / num_block_col;
+  int num_block = num_block_row * num_block_col;
+  dim3 grid(num_block);
+
+  cutlass::FastDivmod Block2YX(num_block_col);
+  cutlass::FastDivmod Row2EandT(num_tokens_per_expert);
+
+  kernels::masked_act_mul_and_quant_kernel<<<grid, block, 0, stream>>>(
+      output_ptr, input_ptr, scale_ptr, num_per_expert_ptr, num_total_tokens, num_intermediate_size,
+      num_tokens_per_expert, Block2YX, Row2EandT, num_block_row);
 }
 
 }  // namespace activation

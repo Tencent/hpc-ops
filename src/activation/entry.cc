@@ -41,7 +41,51 @@ torch::Tensor entry(torch::Tensor &input, torch::Tensor &scale) {
   return output;
 }
 
+torch::Tensor entry1(const torch::Tensor &input, torch::Tensor &scale,
+                     const torch::Tensor &num_per_expert) {
+  auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+  TORCH_CHECK(input.is_contiguous(), "input tensor must be contiguous");
+  TORCH_CHECK(scale.is_contiguous(), "scale tensor must be contiguous");
+  TORCH_CHECK(num_per_expert.is_contiguous(), "num_per_expert tensor must be contiguous");
+
+  TORCH_CHECK(input.device().is_cuda(), "input tensor's device must be cuda");
+  TORCH_CHECK(scale.device().is_cuda(), "scale tensor's device must be cuda");
+  TORCH_CHECK(num_per_expert.device().is_cuda(), "num_per_expert tensor's device must be cuda");
+
+  std::vector<int64_t> output_shape(input.sizes().begin(), input.sizes().end());
+  output_shape[output_shape.size() - 1] /= 2;
+
+  auto options = input.options().dtype(torch::kFloat8_e4m3fn);
+
+  torch::Tensor output = torch::empty(output_shape, options);
+
+  using Tin = __nv_bfloat16;
+  using Tout = __nv_fp8_e4m3;
+
+  const auto *input_ptr = reinterpret_cast<const Tin *>(input.const_data_ptr());
+  const auto *scale_ptr = reinterpret_cast<const Tin *>(scale.const_data_ptr());
+  auto *output_ptr = reinterpret_cast<Tout *>(output.data_ptr());
+
+  const auto *num_per_expert_ptr = num_per_expert.const_data_ptr<int>();
+
+  int num_experts = num_per_expert.size(0);
+  int num_total_tokens = input.size(0);
+  int num_tokens_per_expert = num_total_tokens / num_experts;
+
+  int num_intermediate_size = input.size(1) / 2;
+
+  masked_act_mul_and_quant_async(output_ptr, input_ptr, scale_ptr, num_per_expert_ptr,
+                                 num_total_tokens, num_intermediate_size, num_tokens_per_expert,
+                                 stream);
+
+  return output;
+}
+
 }  // namespace activation
 }  // namespace hpc
 
-TORCH_LIBRARY_FRAGMENT(hpc, m) { m.def("act_mul_and_quant", &hpc::activation::entry); }
+TORCH_LIBRARY_FRAGMENT(hpc, m) {
+  m.def("act_mul_and_quant", &hpc::activation::entry)
+      .def("masked_act_mul_and_quant", &hpc::activation::entry1);
+}
