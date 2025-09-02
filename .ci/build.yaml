@@ -109,9 +109,9 @@ stages:
         id: ""
         uses: JobScriptExecutionA@1.*
         with:
-          envType: NODE
-          nodeId:
-          - pbwloxom
+          envType: ENV
+          envId:
+          - dpzbvgzp
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
@@ -130,9 +130,9 @@ stages:
       - name: untar-code
         uses: JobScriptExecutionA@1.*
         with:
-          envType: NODE
-          nodeId:
-          - pbwloxom
+          envType: ENV
+          envId:
+          - dpzbvgzp
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
@@ -150,9 +150,9 @@ stages:
       - name: make
         uses: JobScriptExecutionA@1.*
         with:
-          envType: NODE
-          nodeId:
-          - pbwloxom
+          envType: ENV
+          envId:
+          - dpzbvgzp
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
@@ -172,9 +172,9 @@ stages:
         id: yST
         uses: JobScriptExecutionA@1.*
         with:
-          envType: NODE
-          nodeId:
-          - pbwloxom
+          envType: ENV
+          envId:
+          - dpzbvgzp
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
@@ -194,9 +194,9 @@ stages:
         id: rL0
         uses: JobScriptExecutionA@1.*
         with:
-          envType: NODE
-          nodeId:
-          - pbwloxom
+          envType: ENV
+          envId:
+          - dpzbvgzp
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
@@ -217,9 +217,9 @@ stages:
         id: F2Q
         uses: JobScriptExecutionA@1.*
         with:
-          envType: NODE
-          nodeId:
-          - pbwloxom
+          envType: ENV
+          envId:
+          - dpzbvgzp
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
@@ -238,9 +238,9 @@ stages:
         id: BTt
         uses: JobScriptExecutionA@1.*
         with:
-          envType: NODE
-          nodeId:
-          - pbwloxom
+          envType: ENV
+          envId:
+          - dpzbvgzp
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
@@ -259,9 +259,9 @@ stages:
         id: ywt
         uses: JobScriptExecutionA@1.*
         with:
-          envType: NODE
-          nodeId:
-          - pbwloxom
+          envType: ENV
+          envId:
+          - dpzbvgzp
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
@@ -288,9 +288,9 @@ finally:
     - name: clean
       uses: JobScriptExecutionA@1.*
       with:
-        envType: NODE
-        nodeId:
-        - pbwloxom
+        envType: ENV
+        envId:
+        - dpzbvgzp
         account: reedlauliu
         shellScriptContent: |-
           #!/bin/bash
