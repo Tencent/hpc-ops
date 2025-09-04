@@ -218,7 +218,7 @@ __global__ void gem3_kernel(cute::TmaDescriptor *td_qkvqsksy, int num_batch, int
     // casual mask, skip unused block
     int icol = itile_seq_kv * kTileN;
     int idiag = (itile_m + 1) * kTileM;
-    if (icol > idiag) {
+    if (icol >= idiag) {
       break;
     }
 
