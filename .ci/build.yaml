@@ -34,7 +34,7 @@ stages:
         self-hosted: true
         node-name: BUILD_pwgzvezp_9.135.5.38
         container:
-          image: mirrors.tencent.com/hunyuan_infer/text2text_infer:H-5.0.1-v7-hpc-ops
+          image: mirrors.tencent.com/hunyuan_infer/text2text_infer:H-5.2.1-v1
         agent-selector:
         - linux
       steps:
@@ -50,7 +50,6 @@ stages:
           script: |-
             set -xe
             cd ${{ci.workspace}}
-            python3 -m pip -q install black cpplint
             make format-check
       - name: character check
         id: N_0
@@ -81,7 +80,6 @@ stages:
             set -xe
             cd ${{ci.workspace}}
             make wheel
-            python3 -m pip install twine
       - name: upload to pypi
         uses: DistributionToGeneric@1.*
         with:
