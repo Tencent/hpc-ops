@@ -26,6 +26,8 @@ def set_penalties_mask_ref(mask, tokens):
         129024,  # turbos text to text
         128512,  # turbos image to text
         129280,  # deepseek r1 text to text
+        127962,
+        127961,
     ],
 )
 @pytest.mark.parametrize("repetition_penalties", [1.05])

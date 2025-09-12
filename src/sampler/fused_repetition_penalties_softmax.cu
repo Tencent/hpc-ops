@@ -183,14 +183,16 @@ __global__ void cluster_fused_repetition_penalties_softmax_kernel(
   }
 }
 
-template <int kThreadsPerBlock = 1024>
+template <int kThreadsPerBlock = 1024, int kItemPerLoad = 4, int kStage = 1>
 __global__ void block_fused_repetition_penalties_softmax_kernel(
     float* out, const float* logits, const uint8_t** penalties_masks_ptrs,
     const float* repetition_penalties_arr, float repetition_penalties_val,
     const float* temperature_arr, float temperature_val, const int64_t vocab_size) {
-  constexpr int kItemPer16B = 4;
-  constexpr int kItemsPerIter = kItemPer16B * kThreadsPerBlock;
-  const int kIters = (vocab_size + kItemsPerIter - 1) / kItemsPerIter;
+  constexpr int kItemsPerStage = kItemPerLoad * kThreadsPerBlock;
+  constexpr int kItemsPerIter = kItemsPerStage * kStage;
+
+  const int kIters = vocab_size / kItemsPerIter;
+
   constexpr int kWarpCount = kThreadsPerBlock / 32;
 
   __shared__ float smem[kWarpCount];
@@ -214,39 +216,100 @@ __global__ void block_fused_repetition_penalties_softmax_kernel(
   float inv_repetition_penalties =
       repetition_penalties <= 0.f ? 0.f : rcpf_ftz(repetition_penalties);
 
-  vec_t<float, kItemPer16B> local_logits;
-
+  vec_t<float, kItemPerLoad> local_logits[kStage];
+  vec_t<uint8_t, kStage> masks;
   float local_max = 0;
   float local_sum = 0;
 
+  // seperate iter loops to two parts:
+  // 1. first part deal with data within [0: vocab_size / kItemsPerIter * kItemsPerIter] ,
+  //    so we don't need add bound checking.
+  // 2. second part deal with data within [vocab_size / kItemsPerIter * kItemsPerIter:],
+  //    which not all threads participat in, so we add extra 'if' instruction.
+
   // step 1. Load logits and calculate local max.
   for (int iter = 0; iter < kIters; iter++) {
-    int64_t icol = iter * kItemsPerIter + idx * kItemPer16B;
-    if (icol + kItemPer16B <= vocab_size) {
-      local_logits = load<float, kItemPer16B>(logits_batch + icol);
-      uint8_t mask = 0;
-      if (penalties_masks_batch != nullptr) {
-        mask = penalties_masks_batch[icol / 8];
-        if (icol % 8 >= 4) {
-          mask >>= 4;
-        }
-      }
-
 #pragma unroll
-      for (int i = 0; i < kItemPer16B; i++) {
-        if (repetition_penalties > 0.f) {
-          if (mask & (1 << i)) {
-            local_logits[i] *=
-                (local_logits[i] > 0.f) ? inv_repetition_penalties : repetition_penalties;
+    for (int istage = 0; istage < kStage; istage++) {
+      int64_t icol = iter * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
+      local_logits[istage] = load<float, kItemPerLoad>(logits_batch + icol);
+      masks[istage] = penalties_masks_batch[icol / 8];
+    }
+
+    if (repetition_penalties > 0.f && penalties_masks_batch != nullptr) {
+#pragma unroll
+      for (int istage = 0; istage < kStage; istage++) {
+        int64_t icol = iter * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
+        int ibit = icol % 8;
+        masks[istage] >>= ibit;
+#pragma unroll
+        for (int i = 0; i < kItemPerLoad; i++) {
+          if (masks[istage] & (1 << i)) {
+            local_logits[istage][i] *=
+                (local_logits[istage][i] > 0.f) ? inv_repetition_penalties : repetition_penalties;
           }
         }
+      }
+    }
+
+#pragma unroll
+    for (int istage = 0; istage < kStage; istage++) {
+      int64_t icol = iter * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
+#pragma unroll
+      for (int i = 0; i < kItemPerLoad; i++) {
         if (temperature > 0.f) {
-          local_logits[i] *= inv_temperature;
+          local_logits[istage][i] *= inv_temperature;
         }
-        local_max = fmaxf(local_max, local_logits[i]);
+        local_max = fmaxf(local_max, local_logits[istage][i]);
       }
       if (repetition_penalties > 0.f || temperature > 0.f) {
-        store<float, kItemPer16B>(out_batch + icol, local_logits);
+        store<float, kItemPerLoad>(out_batch + icol, local_logits[istage]);
+      }
+    }
+  }
+
+  {
+#pragma unroll
+    for (int istage = 0; istage < kStage; istage++) {
+      int64_t icol = kIters * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
+      if (icol + kItemPerLoad <= vocab_size) {
+        local_logits[istage] = load<float, kItemPerLoad>(logits_batch + icol);
+        masks[istage] = penalties_masks_batch[icol / 8];
+      } else {
+        break;
+      }
+    }
+
+    if (repetition_penalties > 0.f && penalties_masks_batch != nullptr) {
+#pragma unroll
+      for (int istage = 0; istage < kStage; istage++) {
+        int64_t icol = kIters * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
+        if (icol + kItemPerLoad > vocab_size) break;
+        int ibit = icol % 8;
+        masks[istage] >>= ibit;
+#pragma unroll
+        for (int i = 0; i < kItemPerLoad; i++) {
+          if (masks[istage] & (1 << i)) {
+            local_logits[istage][i] *=
+                (local_logits[istage][i] > 0.f) ? inv_repetition_penalties : repetition_penalties;
+          }
+        }
+      }
+    }
+
+#pragma unroll
+    for (int istage = 0; istage < kStage; istage++) {
+      int64_t icol = kIters * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
+      if (icol + kItemPerLoad > vocab_size) break;
+#pragma unroll
+      for (int i = 0; i < kItemPerLoad; i++) {
+        if (temperature > 0.f) {
+          local_logits[istage][i] *= inv_temperature;
+        }
+        local_max = fmaxf(local_max, local_logits[istage][i]);
+      }
+      if (repetition_penalties > 0.f || temperature > 0.f) {
+        store<float, kItemPerLoad>(out_batch + icol, local_logits[istage]);
       }
     }
   }
@@ -270,17 +333,53 @@ __global__ void block_fused_repetition_penalties_softmax_kernel(
 
   // step 3. calculate exp(x - max) and local_sum
   for (int iter = 0; iter < kIters; iter++) {
-    int64_t icol = iter * kItemsPerIter + idx * kItemPer16B;
-    if (icol + kItemPer16B <= vocab_size) {
-      if (repetition_penalties > 0. || temperature > 0.) {
-        local_logits = load<float, kItemPer16B>(out_batch + icol);
-      } else {
-        local_logits = load<float, kItemPer16B>(logits_batch + icol);
-      }
 #pragma unroll
-      for (int i = 0; i < kItemPer16B; i++) {
-        local_logits[i] = expf_ftz(local_logits[i] - local_max);
-        local_sum += local_logits[i];
+    for (int istage = 0; istage < kStage; istage++) {
+      int64_t icol = iter * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
+      if (repetition_penalties > 0. || temperature > 0.) {
+        local_logits[istage] = load<float, kItemPerLoad>(out_batch + icol);
+      } else {
+        local_logits[istage] = load<float, kItemPerLoad>(logits_batch + icol);
+      }
+    }
+
+#pragma unroll
+    for (int istage = 0; istage < kStage; istage++) {
+      int64_t icol = iter * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
+#pragma unroll
+      for (int i = 0; i < kItemPerLoad; i++) {
+        local_logits[istage][i] = expf_ftz(local_logits[istage][i] - local_max);
+        local_sum += local_logits[istage][i];
+      }
+    }
+  }
+
+  {
+#pragma unroll
+    for (int istage = 0; istage < kStage; istage++) {
+      int64_t icol = kIters * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
+      if (icol + kItemPerLoad <= vocab_size) {
+        if (repetition_penalties > 0. || temperature > 0.) {
+          local_logits[istage] = load<float, kItemPerLoad>(out_batch + icol);
+        } else {
+          local_logits[istage] = load<float, kItemPerLoad>(logits_batch + icol);
+        }
+      } else {
+        break;
+      }
+    }
+
+#pragma unroll
+    for (int istage = 0; istage < kStage; istage++) {
+      int64_t icol = kIters * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
+#pragma unroll
+      if (icol + kItemPerLoad <= vocab_size) {
+        for (int i = 0; i < kItemPerLoad; i++) {
+          local_logits[istage][i] = expf_ftz(local_logits[istage][i] - local_max);
+          local_sum += local_logits[istage][i];
+        }
+      } else {
+        break;
       }
     }
   }
@@ -309,18 +408,54 @@ __global__ void block_fused_repetition_penalties_softmax_kernel(
 
   // step 5. store outputs
   for (int iter = 0; iter < kIters; iter++) {
-    int64_t icol = iter * kItemsPerIter + idx * kItemPer16B;
-    if (icol + kItemPer16B <= vocab_size) {
-      if (repetition_penalties > 0.f || temperature > 0.f) {
-        local_logits = load<float, kItemPer16B>(out_batch + icol);
-      } else {
-        local_logits = load<float, kItemPer16B>(logits_batch + icol);
-      }
 #pragma unroll
-      for (int i = 0; i < kItemPer16B; i++) {
-        local_logits[i] = inv_local_sum * expf_ftz(local_logits[i] - local_max);
+    for (int istage = 0; istage < kStage; istage++) {
+      int64_t icol = iter * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
+      if (repetition_penalties > 0.f || temperature > 0.f) {
+        local_logits[istage] = load<float, kItemPerLoad>(out_batch + icol);
+      } else {
+        local_logits[istage] = load<float, kItemPerLoad>(logits_batch + icol);
       }
-      store<float, kItemPer16B>(out_batch + icol, local_logits);
+    }
+
+#pragma unroll
+    for (int istage = 0; istage < kStage; istage++) {
+      int64_t icol = iter * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
+#pragma unroll
+      for (int i = 0; i < kItemPerLoad; i++) {
+        local_logits[istage][i] = inv_local_sum * expf_ftz(local_logits[istage][i] - local_max);
+      }
+      store<float, kItemPerLoad>(out_batch + icol, local_logits[istage]);
+    }
+  }
+
+  {
+#pragma unroll
+    for (int istage = 0; istage < kStage; istage++) {
+      int64_t icol = kIters * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
+      if (icol + kItemPerLoad <= vocab_size) {
+        if (repetition_penalties > 0.f || temperature > 0.f) {
+          local_logits[istage] = load<float, kItemPerLoad>(out_batch + icol);
+        } else {
+          local_logits[istage] = load<float, kItemPerLoad>(logits_batch + icol);
+        }
+      } else {
+        break;
+      }
+    }
+
+#pragma unroll
+    for (int istage = 0; istage < kStage; istage++) {
+      int64_t icol = kIters * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
+      if (icol + kItemPerLoad <= vocab_size) {
+#pragma unroll
+        for (int i = 0; i < kItemPerLoad; i++) {
+          local_logits[istage][i] = inv_local_sum * expf_ftz(local_logits[istage][i] - local_max);
+        }
+        store<float, kItemPerLoad>(out_batch + icol, local_logits[istage]);
+      } else {
+        break;
+      }
     }
   }
 }
@@ -383,10 +518,28 @@ void fused_repetition_penalties_softmax_async(
     dim3 grid(num_batch);
     dim3 block(kThreadsPerBlock);
 
-    fused_repetition_penalties_softmax::kernels::block_fused_repetition_penalties_softmax_kernel<
-        kThreadsPerBlock><<<grid, block, 0, stream>>>(
-        out_ptr, logits_ptr, penalties_masks_ptrs, repetition_penalties, repetition_penalties_val,
-        temperature, temperature_val, vocab_size);
+    if (vocab_size % 4 == 0) {
+      constexpr int kItemsPerLoad = 4;
+      constexpr int kStage = 4;
+      fused_repetition_penalties_softmax::kernels::block_fused_repetition_penalties_softmax_kernel<
+          kThreadsPerBlock, kItemsPerLoad, kStage><<<grid, block, 0, stream>>>(
+          out_ptr, logits_ptr, penalties_masks_ptrs, repetition_penalties, repetition_penalties_val,
+          temperature, temperature_val, vocab_size);
+    } else if (vocab_size % 2 == 0) {
+      constexpr int kItemsPerLoad = 2;
+      constexpr int kStage = 7;
+      fused_repetition_penalties_softmax::kernels::block_fused_repetition_penalties_softmax_kernel<
+          kThreadsPerBlock, kItemsPerLoad, kStage><<<grid, block, 0, stream>>>(
+          out_ptr, logits_ptr, penalties_masks_ptrs, repetition_penalties, repetition_penalties_val,
+          temperature, temperature_val, vocab_size);
+    } else {
+      constexpr int kItemsPerLoad = 1;
+      constexpr int kStage = 8;
+      fused_repetition_penalties_softmax::kernels::block_fused_repetition_penalties_softmax_kernel<
+          kThreadsPerBlock, kItemsPerLoad, kStage><<<grid, block, 0, stream>>>(
+          out_ptr, logits_ptr, penalties_masks_ptrs, repetition_penalties, repetition_penalties_val,
+          temperature, temperature_val, vocab_size);
+    }
   }
 }
 

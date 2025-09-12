@@ -21,12 +21,6 @@ torch::Tensor entry(const torch::Tensor& logits, std::optional<torch::Tensor> pe
   int num_batch = logits.size(0);
   int vocab_size = logits.size(1);
 
-  // 129024, turbos text to text
-  // 128512, turbos image to text
-  // 129280, deepseek r1 text to text
-  TORCH_CHECK(vocab_size == 129024 || vocab_size == 128512 || vocab_size == 129280,
-              "hpc sample only support vocab_size == 129024, 128512 or 129280");
-
   if (penalties_masks_ptrs.has_value()) {
     TORCH_CHECK(penalties_masks_ptrs->is_contiguous(),
                 "penalties_masks_ptrs tensor must be contiguous");
