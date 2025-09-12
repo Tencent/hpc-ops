@@ -32,6 +32,8 @@ __global__ void gemm(const __grid_constant__ TmaA tma_a, const __grid_constant__
 
   __shared__ uint64_t bar_ab[kStage];
 
+  __shared__ uint64_t empty[kStage];
+
   extern __shared__ uint8_t shm_data[] alignas(128);
   auto *shm_a = (Tin *)shm_data;
   auto *shm_b = (Tin *)shm_a + cosize(SLayoutA{});
@@ -57,6 +59,7 @@ __global__ void gemm(const __grid_constant__ TmaA tma_a, const __grid_constant__
 #pragma unroll
     for (int i = 0; i < kStage; ++i) {
       initialize_barrier(bar_ab[i], 1);
+      initialize_barrier(empty[i], 256);
     }
   }
   // sync to avoid ahead thread use(wait) bar_ab when it is not initizlized yet
@@ -75,10 +78,18 @@ __global__ void gemm(const __grid_constant__ TmaA tma_a, const __grid_constant__
 
   constexpr int kTransactionBytes =
       sizeof(Tin) * cosize(SLayoutA{}(_, _, 0)) + sizeof(Tin) * cosize(SLayoutB{}(_, _, 0));
+
+  int ephase = 0;
+  for (int i = 0; i < kStage; ++i) {
+    arrive_barrier(empty[i]);
+  }
+
   int ismem_write = 0;
 #pragma unroll
   for (int istage = 0; istage < kStage - 1; ++istage) {
     if (is_leader_in_block) {
+      wait_barrier(empty[ismem_write], ephase);
+
       cute::copy(tma_a.with(bar_ab[istage]), tAg(_, itile_m, istage), tAs(_, 0, 0, istage));
       cute::copy(tma_b.with(bar_ab[istage]), tBg(_, itile_n, istage), tBs(_, 0, 0, istage));
 
@@ -107,6 +118,7 @@ __global__ void gemm(const __grid_constant__ TmaA tma_a, const __grid_constant__
     warpgroup_fence_operand(tCr);
     warpgroup_wait<0>();
 
+    arrive_barrier(empty[ismem_read]);
     ++ismem_read;
   }
 
@@ -118,6 +130,8 @@ __global__ void gemm(const __grid_constant__ TmaA tma_a, const __grid_constant__
     // load a, b
     if (itile_write_k < ntile_k) {
       if (is_leader_in_block) {
+        wait_barrier(empty[ismem_write], ephase);
+
         cute::copy(tma_a.with(bar_ab[ismem_write]), tAg(_, itile_m, itile_write_k),
                    tAs(_, 0, 0, ismem_write));
         cute::copy(tma_b.with(bar_ab[ismem_write]), tBg(_, itile_n, itile_write_k),
@@ -125,7 +139,11 @@ __global__ void gemm(const __grid_constant__ TmaA tma_a, const __grid_constant__
 
         set_barrier_transaction_bytes(bar_ab[ismem_write], kTransactionBytes);
 
-        ismem_write = (ismem_write + 1) % kStage;
+        ++ismem_write;
+        if (ismem_write == kStage) {
+          ismem_write = 0;
+          ephase ^= 1;
+        }
       }
     }
     ++itile_write_k;
@@ -139,13 +157,12 @@ __global__ void gemm(const __grid_constant__ TmaA tma_a, const __grid_constant__
     warpgroup_commit_batch();
     warpgroup_wait<0>();
 
+    arrive_barrier(empty[ismem_read]);
     ++ismem_read;
     if (ismem_read == kStage) {
       phase ^= 1;
       ismem_read = 0;
     }
-
-    __syncthreads();
   }
 
   warpgroup_fence_operand(tCr);
