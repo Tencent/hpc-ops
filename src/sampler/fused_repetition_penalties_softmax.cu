@@ -233,7 +233,6 @@ __global__ void block_fused_repetition_penalties_softmax_kernel(
     for (int istage = 0; istage < kStage; istage++) {
       int64_t icol = iter * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
       local_logits[istage] = load<float, kItemPerLoad>(logits_batch + icol);
-      masks[istage] = penalties_masks_batch[icol / 8];
     }
 
     if (repetition_penalties > 0.f && penalties_masks_batch != nullptr) {
@@ -241,6 +240,7 @@ __global__ void block_fused_repetition_penalties_softmax_kernel(
       for (int istage = 0; istage < kStage; istage++) {
         int64_t icol = iter * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
         int ibit = icol % 8;
+        masks[istage] = penalties_masks_batch[icol / 8];
         masks[istage] >>= ibit;
 #pragma unroll
         for (int i = 0; i < kItemPerLoad; i++) {
@@ -274,7 +274,6 @@ __global__ void block_fused_repetition_penalties_softmax_kernel(
       int64_t icol = kIters * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
       if (icol + kItemPerLoad <= vocab_size) {
         local_logits[istage] = load<float, kItemPerLoad>(logits_batch + icol);
-        masks[istage] = penalties_masks_batch[icol / 8];
       } else {
         break;
       }
@@ -286,6 +285,7 @@ __global__ void block_fused_repetition_penalties_softmax_kernel(
         int64_t icol = kIters * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
         if (icol + kItemPerLoad > vocab_size) break;
         int ibit = icol % 8;
+        masks[istage] = penalties_masks_batch[icol / 8];
         masks[istage] >>= ibit;
 #pragma unroll
         for (int i = 0; i < kItemPerLoad; i++) {

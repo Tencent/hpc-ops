@@ -30,7 +30,7 @@ def set_penalties_mask_ref(mask, tokens):
         127961,
     ],
 )
-@pytest.mark.parametrize("repetition_penalties", [1.05])
+@pytest.mark.parametrize("repetition_penalties", [1.05, 0])
 @pytest.mark.parametrize("temperature", [0.7])
 def test_fused_repetition_penalties_softmax(
     batch_size, vocab_size, repetition_penalties, temperature
@@ -66,6 +66,8 @@ def test_fused_repetition_penalties_softmax(
 
     gt_y = torch.softmax(logits, dim=-1)
 
+    if repetition_penalties == 0:
+        penalties_masks_ptrs = None
     y = hpc.sampler.fused_repetition_penalties_softmax(
         logits_hpc_input, penalties_masks_ptrs, repetition_penalties, temperature
     )
