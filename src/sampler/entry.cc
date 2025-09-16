@@ -34,22 +34,21 @@ torch::Tensor entry(const torch::Tensor& logits, std::optional<torch::Tensor> pe
 
   if (repetition_penalties.has_value()) {
     TORCH_CHECK(repetition_penalties->is_contiguous(),
-                "penalties_masks_ptrs tensor must be contiguous");
+                "repetition_penalties tensor must be contiguous");
     TORCH_CHECK(repetition_penalties->dim() == 1,
-                "penalties_masks_ptrs tensor must be dim == 1, but get ",
+                "repetition_penalties tensor must be dim == 1, but get ",
                 repetition_penalties->dim());
     TORCH_CHECK(repetition_penalties->size(0) == num_batch,
-                "penalties_masks_ptrs tensor must be shape [num_batch(", num_batch,
+                "repetition_penalties tensor must be shape [num_batch(", num_batch,
                 "),], but get [", repetition_penalties->size(0), ",]");
   }
 
   if (temperature.has_value()) {
-    TORCH_CHECK(temperature->is_contiguous(), "penalties_masks_ptrs tensor must be contiguous");
-    TORCH_CHECK(temperature->dim() == 1, "penalties_masks_ptrs tensor must be dim == 1, but get ",
+    TORCH_CHECK(temperature->is_contiguous(), "temperature tensor must be contiguous");
+    TORCH_CHECK(temperature->dim() == 1, "temperature tensor must be dim == 1, but get ",
                 temperature->dim());
-    TORCH_CHECK(temperature->size(0) == num_batch,
-                "penalties_masks_ptrs tensor must be shape [num_batch(", num_batch,
-                "),], but get [", temperature->size(0), ",]");
+    TORCH_CHECK(temperature->size(0) == num_batch, "temperature tensor must be shape [num_batch(",
+                num_batch, "),], but get [", temperature->size(0), ",]");
   }
 
   torch::Tensor out = torch::empty({num_batch, vocab_size}, logits.options());
