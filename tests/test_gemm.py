@@ -9,24 +9,6 @@ import torch
 import math
 
 
-def allclose_report(a, b, rtol=1e-5, atol=1e-8):
-    diff = (a - b).abs()
-    mask = diff > (atol + rtol * b.abs())
-    if not mask.any():
-        return True
-
-    bad = mask.nonzero(as_tuple=False)
-    print(f"allclose failed: {bad.shape[0]} elements")
-    for i in range(min(10, bad.shape[0])):
-        idx = tuple(bad[i].tolist())
-        print(
-            f"  idx={idx}  |  pred={a[idx].item():.6f}  "
-            f"  gt={b[idx].item():.6f}  |  diff={diff[idx].item():.6f}"
-        )
-    if bad.shape[0] > 10:
-        print("  ... ")
-
-
 def test_gemm():
 
     m = 512
@@ -38,7 +20,7 @@ def test_gemm():
     w = torch.randn((n, k), dtype=torch.float, device="cuda").to(dtype)
     scale = torch.tensor(1.0, dtype=torch.float, device="cuda")
 
-    for _ in range(5):
+    for _ in range(27):
         gt = torch._scaled_mm(
             x, w.t(), scale_a=scale, scale_b=scale, bias=None, out_dtype=torch.bfloat16
         )
@@ -63,5 +45,4 @@ def test_gemm():
     assert gt.device == my.device
     assert gt.dtype == my.dtype
     assert gt.shape == my.shape
-    # assert torch.allclose(my.to(torch.float), gt.to(torch.float), rtol=0.08, atol=0.01)
-    allclose_report(my.to(torch.float), gt.to(torch.float), rtol=0.08, atol=0.01)
+    assert torch.allclose(my.to(torch.float), gt.to(torch.float), rtol=0.08, atol=0.01)
