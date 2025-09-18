@@ -16,32 +16,27 @@ namespace gem3 {
 
 namespace kernels {
 
-__device__ __forceinline__ auto get_next_tile(int iblock) {
-  /*
-   */
-  int irow0 = iblock / 2;
-  int icol0 = iblock % 2;
-
-  int irow = irow0 % 4;
-  int icol = irow0 / 4;
-
-  int itile_m = irow;
-  int itile_n = icol0 + icol * 2;
-
-  /*
-  int irow = iblock % 4;
-  int icol = iblock / 4;
-
-  int itile_m = irow;
-  int itile_n = icol;
-  */
+template <int kBlockSwizzle>
+__device__ __forceinline__ auto get_next_tile(int iblock, int num_tile_m, int num_tile_n) {
+  int itile_m, itile_n;
+  int num_tile_bxn = kBlockSwizzle * num_tile_n;
+  int total_sizzle_blocks = num_tile_m / kBlockSwizzle * num_tile_bxn;
+  if (iblock >= total_sizzle_blocks) {
+    itile_m = iblock / num_tile_n;
+    itile_n = iblock % num_tile_n;
+  } else {
+    int i_bxn = iblock / num_tile_bxn;
+    int i_bxn_res = iblock % num_tile_bxn;
+    itile_m = i_bxn * kBlockSwizzle + i_bxn_res % kBlockSwizzle;
+    itile_n = i_bxn_res / kBlockSwizzle;
+  }
 
   return cute::make_tuple(itile_m, itile_n);
 }
 
 template <typename TiledMma, typename TmaA, typename TmaB, typename TmaD, int kTileM, int kTileN,
           int kStage, typename Tin, typename Tout, typename SLayoutA, typename SLayoutB,
-          typename SLayoutC>
+          typename SLayoutC, int kBlockSwizzle>
 __global__ void __launch_bounds__(384, 1)
     gemm(const __grid_constant__ TmaA tma_a, const __grid_constant__ TmaB tma_b,
          const __grid_constant__ TmaD tma_d, int m, int n, int k) {
@@ -117,11 +112,11 @@ __global__ void __launch_bounds__(384, 1)
     int iblock = blockIdx.x;
     if (is_leader_in_load) {
       while (true) {
-        auto [itile_m, itile_n] = get_next_tile(iblock);
-        if ((itile_m >= num_tile_m) || (itile_n >= num_tile_n)) {
+        auto [itile_m, itile_n] = get_next_tile<kBlockSwizzle>(iblock, num_tile_m, num_tile_n);
+
+        if (itile_m >= num_tile_m) {
           break;
         }
-
         iblock += gridDim.x;
 
 #pragma unroll 1
@@ -170,9 +165,9 @@ __global__ void __launch_bounds__(384, 1)
 
     int iblock = blockIdx.x;
     while (true) {
-      auto [itile_m, itile_n] = get_next_tile(iblock);
+      auto [itile_m, itile_n] = get_next_tile<kBlockSwizzle>(iblock, num_tile_m, num_tile_n);
 
-      if ((itile_m >= num_tile_m) || (itile_n >= num_tile_n)) {
+      if (itile_m >= num_tile_m) {
         break;
       }
       iblock += gridDim.x;
@@ -265,6 +260,7 @@ void gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr, int m, int n,
   constexpr int kTileN = 128;
   constexpr int kTileK = 128;
   constexpr int kStage = 6;
+  constexpr int kBlockSwizzle = 4;
 
   auto X = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x_ptr)), make_shape(m, k),
                        make_stride(k, Int<1>{}));
@@ -291,9 +287,10 @@ void gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr, int m, int n,
   auto warpgroup_layout = make_layout(make_shape(Int<2>{}, Int<1>{}, Int<1>{}));
   auto tiled_mma = make_tiled_mma(SM90_64x128x32_F32E4M3E4M3_SS_TN<>{}, warpgroup_layout);
 
-  auto kernel = kernels::gemm<decltype(tiled_mma), decltype(tma_x), decltype(tma_w),
-                              decltype(tma_y), kTileM, kTileN, kStage, Tin, Tout,
-                              decltype(slayout_x), decltype(slayout_w), decltype(slayout_y)>;
+  auto kernel =
+      kernels::gemm<decltype(tiled_mma), decltype(tma_x), decltype(tma_w), decltype(tma_y), kTileM,
+                    kTileN, kStage, Tin, Tout, decltype(slayout_x), decltype(slayout_w),
+                    decltype(slayout_y), kBlockSwizzle>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
   dim3 block(size(tiled_mma) + 128);
