@@ -51,6 +51,14 @@ __device__ __forceinline__ auto to(const vec_t<T, N> &v) {
       o[i] = __float2bfloat16(v[i]);
     }
     return o;
+  } else if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<U, float>) {
+    using V = vec_t<float, N>;
+    V o;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+      o[i] = __bfloat162float(v[i]);
+    }
+    return o;
   } else if constexpr (std::is_same_v<T, __nv_bfloat162> && std::is_same_v<U, float>) {
     using V = vec_t<float, N * 2>;
     V o;
@@ -88,6 +96,15 @@ __device__ __forceinline__ auto to(const vec_t<T, N> &v) {
     for (int i = 0; i < N / 2; ++i) {
       o[i] = __nv_fp8x4_e4m3(*(reinterpret_cast<__nv_bfloat162 *>(&v[2 * i])),
                              *(reinterpret_cast<__nv_bfloat162 *>(&v[2 * i + 1])));
+    }
+    return o;
+  } else if constexpr (std::is_same_v<T, float> && std::is_same_v<U, __nv_bfloat162>) {
+    static_assert(N % 2 == 0, "N % 2 must be 0");
+    using V = vec_t<__nv_bfloat162, N / 2>;
+    V o;
+#pragma unroll
+    for (int i = 0; i < N / 2; ++i) {
+      o[i] = __float22bfloat162_rn(*reinterpret_cast<const float2 *>(&v[2 * i]));
     }
     return o;
   }

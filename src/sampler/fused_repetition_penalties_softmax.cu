@@ -345,7 +345,6 @@ __global__ void block_fused_repetition_penalties_softmax_kernel(
 
 #pragma unroll
     for (int istage = 0; istage < kStage; istage++) {
-      int64_t icol = iter * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
 #pragma unroll
       for (int i = 0; i < kItemPerLoad; i++) {
         local_logits[istage][i] = expf_ftz(local_logits[istage][i] - local_max);
@@ -372,7 +371,6 @@ __global__ void block_fused_repetition_penalties_softmax_kernel(
 #pragma unroll
     for (int istage = 0; istage < kStage; istage++) {
       int64_t icol = kIters * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
-#pragma unroll
       if (icol + kItemPerLoad <= vocab_size) {
         for (int i = 0; i < kItemPerLoad; i++) {
           local_logits[istage][i] = expf_ftz(local_logits[istage][i] - local_max);

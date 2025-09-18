@@ -1,5 +1,6 @@
 import torch
 from torch import Tensor
+from typing import Tuple
 
 
 def selective_state_update(
@@ -190,4 +191,172 @@ def causal_conv1d_update_with_spec(
         num_head,
         spec_total_tokens,
         num_accept_tokens,
+    )
+
+
+def mamba_exp_dA_chunked_cumsum(
+    zxbcdt: torch.Tensor,
+    A: torch.Tensor,
+    dt_bias: torch.Tensor,
+    seqlens: torch.Tensor,
+    host_split_metadata: torch.Tensor,
+    chunk_size: int,
+    head_dim: int,
+    ngroups: int,
+    dstate: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.hpc.exp_dA_chunked_cumsum(
+        zxbcdt, A, dt_bias, seqlens, host_split_metadata, chunk_size, head_dim, ngroups, dstate
+    )
+
+
+def causal_conv1d_prefill(
+    y: torch.Tensor,
+    zxbcdt: torch.Tensor,
+    conv_states: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    indices: torch.Tensor,
+    split_metadata: torch.Tensor,
+    x_scale: torch.Tensor,
+    y_scale: torch.Tensor,
+    chunk_size: int,
+    total_chunks: int,
+    d_inner: int,
+    num_head: int,
+):
+    return torch.ops.hpc.causal_conv1d_prefill(
+        y,
+        zxbcdt,
+        conv_states,
+        weight,
+        bias,
+        indices,
+        split_metadata,
+        x_scale,
+        y_scale,
+        chunk_size,
+        total_chunks,
+        d_inner,
+        num_head,
+    )
+
+
+def mamba_chunk_states_bmm(
+    zxbcdt: torch.Tensor,
+    scaled_x: torch.Tensor,
+    split_metadata: torch.Tensor,
+    tma_desc: torch.Tensor,
+    total_chunks: int,
+    nheads: int,
+    ngroups: int,
+    head_dim: int,
+    dstate: int,
+) -> torch.Tensor:
+    return torch.ops.hpc.chunk_states_bmm(
+        zxbcdt,
+        scaled_x,
+        split_metadata,
+        tma_desc,
+        total_chunks,
+        nheads,
+        ngroups,
+        head_dim,
+        dstate,
+    )
+
+
+def mamba_chunk_states_passing(
+    chunk_states: torch.Tensor,
+    yscale: torch.Tensor,
+    split_metadata: torch.Tensor,
+    ssm_states: torch.Tensor,
+    indices: torch.Tensor,
+    chunk_size,
+) -> torch.Tensor:
+    return torch.ops.hpc.chunk_states_passing(
+        chunk_states,
+        yscale,
+        split_metadata,
+        ssm_states,
+        indices,
+        chunk_size,
+    )
+
+
+def mamba_pre_y_bmm(
+    chunked_states_cumsum: torch.Tensor,
+    zxbcdt: torch.Tensor,
+    split_metadata: torch.Tensor,
+    tma_desc: torch.Tensor,
+    ngroups: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    return torch.ops.hpc.pre_y_bmm(
+        chunked_states_cumsum,
+        zxbcdt,
+        split_metadata,
+        tma_desc,
+        ngroups,
+        chunk_size,
+    )
+
+
+def mamba_chunk_scan_gem3(
+    y: torch.Tensor,
+    zxbcdt: torch.Tensor,
+    pre_y: torch.Tensor,
+    xscale: torch.Tensor,
+    yscale: torch.Tensor,
+    D: torch.Tensor,
+    split_metadata: torch.Tensor,
+    tma_desc: torch.Tensor,
+    ngroups: int,
+    dstate: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    return torch.ops.hpc.chunk_scan_gem3(
+        y,
+        zxbcdt,
+        pre_y,
+        xscale,
+        yscale,
+        D,
+        split_metadata,
+        tma_desc,
+        ngroups,
+        dstate,
+        chunk_size,
+    )
+
+
+def mamba_prefill(
+    zxbcdt: torch.Tensor,
+    conv_states: torch.Tensor,
+    ssm_states: torch.Tensor,
+    indices: torch.Tensor,
+    host_seqlens: torch.Tensor,
+    split_metadata: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor,
+    A: torch.Tensor,
+    D: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ngroups: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    return torch.ops.hpc.mamba_prefill(
+        zxbcdt,
+        conv_states,
+        ssm_states,
+        indices,
+        host_seqlens,
+        split_metadata,
+        conv_weight,
+        conv_bias,
+        A,
+        D,
+        dt_bias,
+        ngroups,
+        chunk_size,
     )

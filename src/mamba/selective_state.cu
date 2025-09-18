@@ -9,7 +9,6 @@
 
 namespace hpc {
 namespace mamba {
-
 namespace kernels {
 
 /*
