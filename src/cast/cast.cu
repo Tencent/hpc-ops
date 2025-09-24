@@ -81,10 +81,6 @@ void cast_async(void *cptr, const void *aptr, int num, torch::ScalarType tout,
         kernels::cast<float, float><<<grid, block, 0, stream>>>(cptr, aptr, num);
         break;
       }
-      case torch::kFloat64: {
-        kernels::cast<double, float><<<grid, block, 0, stream>>>(cptr, aptr, num);
-        break;
-      }
       case torch::kFloat16: {
         kernels::cast<half, float><<<grid, block, 0, stream>>>(cptr, aptr, num);
         break;
