@@ -8,6 +8,8 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+#include "src/utils/utils.h"
+
 namespace hpc {
 
 // ============================
@@ -17,6 +19,8 @@ namespace hpc {
 // print_type<T> _; // it will generate a compile time error with type T.
 template <typename T>
 struct print_type;
+
+__device__ __forceinline__ void brkpt() { asm volatile("brkpt;" ::); }
 
 // ============================
 //    Load/Store(vectorized)

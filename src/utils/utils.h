@@ -1,0 +1,16 @@
+// Copyright 2025 hpc-ops authors
+
+#ifndef SRC_UTILS_UTILS_H_
+#define SRC_UTILS_UTILS_H_
+
+namespace hpc {
+
+// ============================
+//    Device Information
+// ============================
+
+int get_sm_count();
+
+}  // namespace hpc
+
+#endif  // SRC_UTILS_UTILS_H_
