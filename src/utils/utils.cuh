@@ -8,6 +8,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+#include "cute/tensor.hpp"
 #include "src/utils/utils.h"
 
 namespace hpc {
@@ -258,6 +259,30 @@ __device__ __forceinline__ float warp_reduce_sum_xor(float x) {
   }
 
   return x;
+}
+
+// ============================
+//    Fragment Retile
+// ============================
+
+template <typename Tensor>
+__device__ __forceinline__ auto retile_fragment(Tensor &&tensor) {
+  using namespace cute;  // NOLINT
+
+  constexpr int R = decltype(tensor.layout())::rank;
+  static_assert(R == 3, "we only support rank 3 fragment");
+
+  auto thr_vmk = flatten(select<0>(tensor.layout()));
+  auto tile_mk = select<1, 2>(tensor.layout());
+
+  auto m_layout =
+      coalesce(make_layout(make_shape(get<1>(thr_vmk.shape()), get<0>(tile_mk.shape())),
+                           make_stride(get<1>(thr_vmk.stride()), get<0>(tile_mk.stride()))));
+  auto k_layout = coalesce(make_layout(
+      make_shape(get<0>(thr_vmk.shape()), get<2>(thr_vmk.shape()), get<1>(tile_mk.shape())),
+      make_stride(get<0>(thr_vmk.stride()), get<2>(thr_vmk.stride()), get<1>(tile_mk.stride()))));
+
+  return make_tensor(static_cast<Tensor &&>(tensor).data(), make_layout(m_layout, k_layout));
 }
 
 }  // namespace hpc
