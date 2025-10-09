@@ -45,9 +45,9 @@ __global__ void __launch_bounds__(384, 1)
   int idx = threadIdx.x;
 
   int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
-  int iwarpgroup = __shfl_sync(0xFFFFFFFF, idx / 128, 0);
   int elected = cute::elect_one_sync();
   bool is_leader_in_block = (iwarp == 0) && elected;
+  bool is_leader_in_warpgroup = ((iwarp % 4) == 0) && elected;
 
   __shared__ uint64_t writable[kStage];
   __shared__ uint64_t readable[kStage];
@@ -106,11 +106,12 @@ __global__ void __launch_bounds__(384, 1)
     int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
     int is_leader_in_load = ((iwarp == 0) && elected);
 
-    int phase = 1;  // start with ok
-    int ismem_write = 0;
-    int ntile_k = size<2>(tAg);
-    int iblock = blockIdx.x;
     if (is_leader_in_load) {
+      int phase = 1;  // start with ok
+      int ismem_write = __shfl_sync(0xFFFFFFFF, 0, 0);
+      int iblock = blockIdx.x;
+      int ntile_k = size<2>(tAg);
+
       while (true) {
         auto [itile_m, itile_n] = get_next_tile<kBlockSwizzle>(iblock, num_tile_m, num_tile_n);
 
@@ -146,6 +147,7 @@ __global__ void __launch_bounds__(384, 1)
     cutlass::arch::warpgroup_reg_alloc<168>();
 
     int idx_in_warpgroup = idx % 128;
+    int iwarpgroup = idx / 128;
     int iwarp_in_warpgroup = idx_in_warpgroup / 32;
     int elected_idx_in_warpgroup = ((iwarp_in_warpgroup == 0) && elected);
 
@@ -222,7 +224,7 @@ __global__ void __launch_bounds__(384, 1)
       }
 
       // Epilogue
-      auto sC = make_tensor(make_smem_ptr((Tout *)shm_c), SLayoutC{});
+      auto sC = make_tensor(make_smem_ptr((Tout *)shm_c), SLayoutC{});  // (M, N)
       using R2SCopyAtomC = Copy_Atom<cute::SM90_U32x4_STSM_N, Tout>;
       auto tiled_copy_c = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);
       auto thr_copy_c = tiled_copy_c.get_slice(idx);
@@ -231,17 +233,18 @@ __global__ void __launch_bounds__(384, 1)
       auto tCs4r = thr_copy_c.partition_D(sC);
 
       cute::copy(tiled_copy_c, tCr4s, tCs4r);
-      asm volatile("bar.sync %0, 256;\n" ::"r"(2) : "memory");
+      asm volatile("barrier.sync %0, 128;\n" ::"r"(iwarpgroup) : "memory");
       cute::tma_store_fence();
 
-      if (is_leader_in_block) {
+      if (is_leader_in_warpgroup) {
         auto gD = tma_d.get_tma_tensor(make_shape(m, n));
         auto btma_d = tma_d.get_slice(0);
 
-        auto tDs = btma_d.partition_S(sC);  // (TMA, _1, _1)
+        auto tDs = btma_d.partition_S(sC);  // (TMA, _2, _1)
         auto tDg = btma_d.partition_D(gD);  // (TMA, TMA_M, TMA_N)
 
-        cute::copy(tma_d, tDs(_, 0, 0), tDg(_, itile_m, itile_n));
+        cute::copy(tma_d, tDs(_, iwarpgroup, Int<0>{}), tDg(_, itile_m * 2 + iwarpgroup, itile_n));
+        tma_store_arrive();
       }
     }
   }
@@ -273,6 +276,10 @@ void gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr, int m, int n,
                                  make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{}));
   auto slayout_w = tile_to_shape(GMMA::Layout_K_SW128_Atom<Tin>{},
                                  make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{}));
+
+  auto cpbox_y = tile_to_shape(GMMA::Layout_K_SW128_Atom<Tout>{},
+                               make_shape(Int<kTileM / 2>{}, Int<kTileN>{}));
+
   auto slayout_y =
       tile_to_shape(GMMA::Layout_K_SW128_Atom<Tout>{}, make_shape(Int<kTileM>{}, Int<kTileN>{}));
 
@@ -282,7 +289,7 @@ void gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr, int m, int n,
 
   auto tma_x = make_tma_copy(SM90_TMA_LOAD{}, X, slayout_x(_, _, 0));
   auto tma_w = make_tma_copy(SM90_TMA_LOAD{}, W, slayout_w(_, _, 0));
-  auto tma_y = make_tma_copy(SM90_TMA_STORE{}, Y, slayout_y);
+  auto tma_y = make_tma_copy(SM90_TMA_STORE{}, Y, cpbox_y);
 
   auto warpgroup_layout = make_layout(make_shape(Int<2>{}, Int<1>{}, Int<1>{}));
   auto tiled_mma = make_tiled_mma(SM90_64x128x32_F32E4M3E4M3_SS_TN<>{}, warpgroup_layout);
@@ -293,8 +300,12 @@ void gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr, int m, int n,
                     decltype(slayout_y), kBlockSwizzle>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
+  int num_tile_m = (m + kTileM - 1) / kTileM;
+  int num_tile_n = (n + kTileN - 1) / kTileN;
+  int num_tile = num_tile_m * num_tile_n;
+
   dim3 block(size(tiled_mma) + 128);
-  dim3 grid(78);
+  dim3 grid(std::min(get_sm_count(), num_tile));
 
   kernel<<<grid, block, shm_size, stream>>>(tma_x, tma_w, tma_y, m, n, k);
 }

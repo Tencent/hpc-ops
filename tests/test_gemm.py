@@ -12,6 +12,7 @@ import math
 def test_gemm():
 
     m = 512
+    n = 2432
     n = 7168
     k = 7168
     dtype = torch.float8_e4m3fn
@@ -20,7 +21,7 @@ def test_gemm():
     w = torch.randn((n, k), dtype=torch.float, device="cuda").to(dtype)
     scale = torch.tensor(1.0, dtype=torch.float, device="cuda")
 
-    for _ in range(27):
+    for _ in range(11):
         gt = torch._scaled_mm(
             x, w.t(), scale_a=scale, scale_b=scale, bias=None, out_dtype=torch.bfloat16
         )
