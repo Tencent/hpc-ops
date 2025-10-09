@@ -54,6 +54,7 @@ extra_compile_args = {
         "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
         include_flags,
         cute_include,
+        *cxx_flags,
     ],
 }
 

@@ -36,4 +36,4 @@ test:
 	python3 -m pytest tests
 
 clean:
-	rm -rf build dist hpc_ops.egg-info hpc.egg-info site
+	rm -rf build dist hpc_ops.egg-info hpc.egg-info .pytest_cache tests/__pycache__ site
