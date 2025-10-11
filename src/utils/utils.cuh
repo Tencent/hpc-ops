@@ -261,6 +261,20 @@ __device__ __forceinline__ float warp_reduce_sum_xor(float x) {
   return x;
 }
 
+__device__ __forceinline__ float warp_4lane_reduce_max_xor(float x) {
+  x = fmaxf(__shfl_xor_sync(0xFFFFFFFF, x, 1), x);
+  x = fmaxf(__shfl_xor_sync(0xFFFFFFFF, x, 2), x);
+
+  return x;
+}
+
+__device__ __forceinline__ float warp_4lane_reduce_sum_xor(float x) {
+  x += __shfl_xor_sync(0xFFFFFFFF, x, 1);
+  x += __shfl_xor_sync(0xFFFFFFFF, x, 2);
+
+  return x;
+}
+
 // ============================
 //    Fragment Retile
 // ============================
