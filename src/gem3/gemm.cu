@@ -17,16 +17,19 @@ namespace gem3 {
 namespace kernels {
 
 template <int kBlockSwizzle>
-__device__ __forceinline__ auto get_next_tile(int iblock, int num_tile_m, int num_tile_n) {
+__device__ __forceinline__ auto get_next_tile(int iblock, int num_tile_m, int num_tile_n,
+                                              cutlass::FastDivmod swizzle_divider,
+                                              cutlass::FastDivmod flat_divider) {
   int itile_m, itile_n;
   int num_tile_bxn = kBlockSwizzle * num_tile_n;
   int total_sizzle_blocks = num_tile_m / kBlockSwizzle * num_tile_bxn;
+
   if (iblock >= total_sizzle_blocks) {
-    itile_m = iblock / num_tile_n;
-    itile_n = iblock % num_tile_n;
+    flat_divider(itile_m, itile_n, iblock);
   } else {
-    int i_bxn = iblock / num_tile_bxn;
-    int i_bxn_res = iblock % num_tile_bxn;
+    int i_bxn, i_bxn_res;
+    swizzle_divider(i_bxn, i_bxn_res, iblock);
+
     itile_m = i_bxn * kBlockSwizzle + i_bxn_res % kBlockSwizzle;
     itile_n = i_bxn_res / kBlockSwizzle;
   }
@@ -39,7 +42,8 @@ template <typename TiledMma, typename TmaA, typename TmaB, typename TmaD, int kT
           typename SLayoutC, int kBlockSwizzle>
 __global__ void __launch_bounds__(384, 1)
     gemm(const __grid_constant__ TmaA tma_a, const __grid_constant__ TmaB tma_b,
-         const __grid_constant__ TmaD tma_d, int m, int n, int k) {
+         const __grid_constant__ TmaD tma_d, int m, int n, int k,
+         cutlass::FastDivmod swizzle_divider, cutlass::FastDivmod flat_divider) {
   using namespace cute;  // NOLINT
 
   int idx = threadIdx.x;
@@ -113,7 +117,8 @@ __global__ void __launch_bounds__(384, 1)
       int ntile_k = size<2>(tAg);
 
       while (true) {
-        auto [itile_m, itile_n] = get_next_tile<kBlockSwizzle>(iblock, num_tile_m, num_tile_n);
+        auto [itile_m, itile_n] = get_next_tile<kBlockSwizzle>(iblock, num_tile_m, num_tile_n,
+                                                               swizzle_divider, flat_divider);
 
         if (itile_m >= num_tile_m) {
           break;
@@ -167,7 +172,8 @@ __global__ void __launch_bounds__(384, 1)
 
     int iblock = blockIdx.x;
     while (true) {
-      auto [itile_m, itile_n] = get_next_tile<kBlockSwizzle>(iblock, num_tile_m, num_tile_n);
+      auto [itile_m, itile_n] = get_next_tile<kBlockSwizzle>(iblock, num_tile_m, num_tile_n,
+                                                             swizzle_divider, flat_divider);
 
       if (itile_m >= num_tile_m) {
         break;
@@ -303,11 +309,15 @@ void gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr, int m, int n,
   int num_tile_m = (m + kTileM - 1) / kTileM;
   int num_tile_n = (n + kTileN - 1) / kTileN;
   int num_tile = num_tile_m * num_tile_n;
+  int num_tile_bxn = kBlockSwizzle * num_tile_n;
+  cutlass::FastDivmod swizzle_divider(num_tile_bxn);
+  cutlass::FastDivmod flat_divider(num_tile_n);
 
   dim3 block(size(tiled_mma) + 128);
   dim3 grid(std::min(get_sm_count(), num_tile));
 
-  kernel<<<grid, block, shm_size, stream>>>(tma_x, tma_w, tma_y, m, n, k);
+  kernel<<<grid, block, shm_size, stream>>>(tma_x, tma_w, tma_y, m, n, k, swizzle_divider,
+                                            flat_divider);
 }
 
 }  // namespace gem3
