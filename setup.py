@@ -58,7 +58,7 @@ extra_compile_args = {
     ],
 }
 
-extra_link_args = []
+extra_link_args = ["-L/usr/local/cuda/targets/x86_64-linux/lib/stubs", "-lcuda"]
 
 cc_files = glob("src/**/*.cc", recursive=True)
 cu_files = glob("src/**/*.cu", recursive=True)
