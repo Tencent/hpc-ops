@@ -111,7 +111,25 @@ bool Communicator::BroadcastFd(const int send_fd, int *recv_fd, const std::strin
 }
 
 void Communicator::Barrier() {
-  // TODO(reed): add the barrier
+  if (rank_ == 0) {
+    std::string data;
+    for (auto &[rank, chan] : channels_) {
+      chan->Recv(&data);
+    }
+  } else {
+    std::string data = "C->S";
+    channel_->Send(data);
+  }
+
+  if (rank_ == 0) {
+    std::string data = "S->C";
+    for (auto &[rank, chan] : channels_) {
+      chan->Send(data);
+    }
+  } else {
+    std::string data;
+    channel_->Recv(&data);
+  }
 }
 
 }  // namespace communicator

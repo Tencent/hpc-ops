@@ -1,21 +1,21 @@
 // Copyright 2025 hpc-ops authors
 
-#include "src/communicator/multicast_comm.h"
-
-#include <torch/custom_class.h>
+#include "src/communicator/multicast_communicator.h"
 
 #include <cstdio>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
 
 #include "src/communicator/communicator.h"
+#include "src/communicator/type.h"
 
 namespace hpc {
 namespace communicator {
 
-MulticastComm::MulticastComm(int64_t rank, int64_t world_size, int64_t device_id, int64_t root) {
+MulticastCommunicator::MulticastCommunicator(int64_t rank, int64_t world_size, int64_t device_id) {
   rank_ = rank;
   world_size_ = world_size;
 
@@ -29,14 +29,14 @@ MulticastComm::MulticastComm(int64_t rank, int64_t world_size, int64_t device_id
   multiobj_ = std::make_unique<MulticastObjectManager>(device_id_, world_size_);
 }
 
-MulticastComm::~MulticastComm() {
+MulticastCommunicator::~MulticastCommunicator() {
   multiobj_.reset();
   comm_.reset();
 }
 
-void MulticastComm::Barrier() { comm_->Barrier(); }
+void MulticastCommunicator::Barrier() { comm_->Barrier(); }
 
-std::tuple<torch::Tensor, torch::Tensor> MulticastComm::CreateTensorSync(int64_t bytes) {
+MulticastTensors MulticastCommunicator::CreateTensorSync(int64_t bytes) {
   if (rank_ == 0) {
     // get multimem fd and broadcast it
     int fd = -1;
@@ -57,35 +57,23 @@ std::tuple<torch::Tensor, torch::Tensor> MulticastComm::CreateTensorSync(int64_t
     if (!comm_->BroadcastFd(fd, &rfd, data, &data, 0)) {
       throw std::runtime_error("hpc comm broadcast fail");
     }
-    if (!multiobj_->CreateMulticastObjByImportFd(rfd)) {
+
+    int64_t bytes_from_root = std::stoll(data);
+    if (bytes_from_root != bytes) {
+      throw std::runtime_error("hpc comm broadcast bytes not consistent");
+    }
+
+    if (!multiobj_->CreateMulticastObjByImportFd(rfd, bytes)) {
       throw std::runtime_error("hpc multimem obj create multicast obj by import fd fail");
     }
   }
 
-  void *multi_ptr = nullptr;
-  void *local_ptr = nullptr;
-  if (!multiobj_->AllocateMemoryAndBindToMulticastObj(&multi_ptr, &local_ptr)) {
+  auto tensors = multiobj_->AllocateMemoryAndBindToMulticastObj();
+  if (!tensors.ok) {
     throw std::runtime_error("hpc multimem obj allocate memory and bind to multicast obj fail");
   }
 
-  cudaPointerAttributes multi_attr;
-  cudaPointerGetAttributes(&multi_attr, multi_ptr);
-
-  cudaPointerAttributes local_attr;
-  cudaPointerGetAttributes(&local_attr, local_ptr);
-
-  if (local_attr.device != device_id_) {
-    throw std::runtime_error("hpc multimem obj local_ptr.device != device_id");
-  }
-
-  torch::TensorOptions options;
-  auto multi_opt = options.dtype(torch::kUInt8).device(torch::kCUDA, multi_attr.device);
-  auto local_opt = options.dtype(torch::kUInt8).device(torch::kCUDA, local_attr.device);
-
-  torch::Tensor multi = torch::from_blob(multi_ptr, {bytes}, multi_opt);
-  torch::Tensor local = torch::from_blob(local_ptr, {bytes}, local_opt);
-
-  return std::make_tuple(multi, local);
+  return tensors;
 }
 
 }  // namespace communicator

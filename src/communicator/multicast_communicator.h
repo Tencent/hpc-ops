@@ -1,10 +1,7 @@
 // Copyright 2025 hpc-ops authors
 
-#ifndef SRC_COMMUNICATOR_MULTICAST_COMM_H_
-#define SRC_COMMUNICATOR_MULTICAST_COMM_H_
-
-#include <torch/all.h>
-#include <torch/custom_class.h>
+#ifndef SRC_COMMUNICATOR_MULTICAST_COMMUNICATOR_H_
+#define SRC_COMMUNICATOR_MULTICAST_COMMUNICATOR_H_
 
 #include <map>
 #include <memory>
@@ -13,16 +10,17 @@
 
 #include "src/communicator/communicator.h"
 #include "src/communicator/multicast_object_manager.h"
+#include "src/communicator/type.h"
 
 namespace hpc {
 namespace communicator {
 
-class MulticastComm : public torch::CustomClassHolder {
+class MulticastCommunicator {
  public:
-  MulticastComm(int64_t rank, int64_t world_size, int64_t device_id = -1, int64_t root = 0);
-  ~MulticastComm();
+  MulticastCommunicator(int64_t rank, int64_t world_size, int64_t device_id = -1);
+  ~MulticastCommunicator();
 
-  std::tuple<torch::Tensor, torch::Tensor> CreateTensorSync(int64_t size);
+  MulticastTensors CreateTensorSync(int64_t bytes);
   void Barrier();
 
  private:
@@ -37,4 +35,4 @@ class MulticastComm : public torch::CustomClassHolder {
 }  // namespace communicator
 }  // namespace hpc
 
-#endif  // SRC_COMMUNICATOR_MULTICAST_COMM_H_
+#endif  // SRC_COMMUNICATOR_MULTICAST_COMMUNICATOR_H_

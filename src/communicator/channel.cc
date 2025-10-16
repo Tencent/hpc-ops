@@ -41,9 +41,9 @@ bool Channel::Send(const std::string &data) {
   msg.msg_iov = iov;
   msg.msg_iovlen = 2;
 
-  ssize_t ssize = sendmsg(socket_, &msg, 0);
+  ssize_t size = sendmsg(socket_, &msg, 0);
 
-  return ssize == sizeof(header) + data.size();
+  return size == static_cast<ssize_t>(sizeof(header) + data.size());
 }
 
 bool Channel::Recv(std::string *data) {
@@ -58,7 +58,7 @@ bool Channel::Recv(std::string *data) {
   uint8_t *ptr = reinterpret_cast<uint8_t *>((data->data()));
   ssize_t size = recv(socket_, ptr, header.size, MSG_WAITALL);
 
-  return size == data->size();
+  return size == static_cast<ssize_t>(data->size());
 }
 
 bool Channel::SendFd(int fd, const std::string &data) {
@@ -94,7 +94,7 @@ bool Channel::SendFd(int fd, const std::string &data) {
 
   ssize_t size = sendmsg(socket_, &msg, 0);
 
-  return size == data.size();
+  return size == static_cast<ssize_t>(data.size());
 }
 
 bool Channel::RecvFd(int *fd, std::string *data) {

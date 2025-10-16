@@ -7,6 +7,11 @@
 #include <cuda_runtime_api.h>
 #include <stdint.h>
 
+#include <memory>
+#include <tuple>
+
+#include "src/communicator/type.h"
+
 namespace hpc {
 namespace communicator {
 
@@ -16,11 +21,13 @@ class MulticastObjectManager {
   ~MulticastObjectManager();
 
   bool CreateMulticastObjAndExportFd(int *fd, int64_t bytes);
-  bool CreateMulticastObjByImportFd(int fd);
+  bool CreateMulticastObjByImportFd(int fd, int64_t bytes);
 
-  bool AllocateMemoryAndBindToMulticastObj(void **multi_ptr, void **local_ptr);
+  MulticastTensors AllocateMemoryAndBindToMulticastObj();
 
  private:
+  static constexpr int64_t kAlignment = 2 * 1024 * 1024;  // 2MB
+
   int device_id_;
   int num_devices_;
   int64_t bytes_;

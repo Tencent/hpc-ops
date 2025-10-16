@@ -82,4 +82,4 @@ class MulticastComm:
         pass
 
 
-MulticastComm = torch.classes.hpc.MulticastComm
+MulticastCommunicator = torch.classes.hpc.MulticastCommunicator

@@ -6,8 +6,11 @@
 #include <cuda_runtime_api.h>
 #include <stdio.h>
 
+#include <memory>
 #include <stdexcept>
 #include <string>
+
+#include "src/communicator/type.h"
 
 #define CUCHECK(cmd)                                                \
   do {                                                              \
@@ -28,6 +31,9 @@ static int64_t align_to(int64_t bytes, int64_t alignment) {
 }
 
 MulticastObjectManager::MulticastObjectManager(int device_id, int num_devices) {
+  multi_handle_ = 0;
+  local_handle_ = 0;
+
   device_id_ = device_id;
   num_devices_ = num_devices;
 }
@@ -40,7 +46,6 @@ MulticastObjectManager::~MulticastObjectManager() {
 bool MulticastObjectManager::CreateMulticastObjAndExportFd(int *fd, int64_t bytes) {
   cudaSetDevice(device_id_);
 
-  constexpr int64_t kAlignment = 2 * 1024 * 1024;
   int64_t aligned_bytes = align_to(bytes, kAlignment);
 
   bytes_ = bytes;
@@ -65,8 +70,12 @@ bool MulticastObjectManager::CreateMulticastObjAndExportFd(int *fd, int64_t byte
   return true;
 }
 
-bool MulticastObjectManager::CreateMulticastObjByImportFd(int fd) {
+bool MulticastObjectManager::CreateMulticastObjByImportFd(int fd, int64_t bytes) {
   cudaSetDevice(device_id_);
+
+  int64_t aligned_bytes = align_to(bytes, kAlignment);
+  bytes_ = bytes;
+  aligned_bytes_ = aligned_bytes;
 
   int64_t fd64 = fd;
   // work rank, import multicast
@@ -80,13 +89,11 @@ bool MulticastObjectManager::CreateMulticastObjByImportFd(int fd) {
   return true;
 }
 
-bool MulticastObjectManager::AllocateMemoryAndBindToMulticastObj(void **multi_ptrs,
-                                                                 void **local_ptrs) {
+MulticastTensors MulticastObjectManager::AllocateMemoryAndBindToMulticastObj() {
   int curr_device_id;
   cudaGetDevice(&curr_device_id);
   cudaSetDevice(device_id_);
 
-  aligned_bytes_ = 2 * 1024 * 1024;
   CUdeviceptr local_ptr;
   {
     CUmemAllocationProp prop = {};
@@ -120,12 +127,39 @@ bool MulticastObjectManager::AllocateMemoryAndBindToMulticastObj(void **multi_pt
 
   CUCHECK(cuMulticastBindMem(multi_handle_, 0, local_handle_, 0, aligned_bytes_, 0));
 
-  *multi_ptrs = reinterpret_cast<void *>(multi_ptr);
-  *local_ptrs = reinterpret_cast<void *>(local_ptr);
+  int multi_device = -1;
+  {
+    CUmemAllocationProp prop = {};
+    CUCHECK(cuMemGetAllocationPropertiesFromHandle(&prop, multi_handle_));
+    multi_device = prop.location.id;
+  }
+
+  auto local_deleter = [handle = local_handle_, size = aligned_bytes_](void *ptr) {
+    CUdeviceptr dptr = (CUdeviceptr)ptr;
+    CUCHECK(cuMemUnmap(dptr, size));
+    CUCHECK(cuMemAddressFree(dptr, size));
+    CUCHECK(cuMemRelease(handle));
+  };
+
+  std::shared_ptr<void> local_sobj(reinterpret_cast<void *>(local_ptr), local_deleter);
+
+  auto multi_deleter = [handle = multi_handle_, size = aligned_bytes_, dev = device_id_,
+                        local_sobj](void *ptr) {
+    CUdeviceptr dptr = (CUdeviceptr)ptr;
+
+    CUCHECK(cuMulticastUnbind(handle, dev, 0, size));
+    CUCHECK(cuMemUnmap(dptr, size));
+    CUCHECK(cuMemAddressFree(dptr, size));
+    CUCHECK(cuMemRelease(handle));
+  };
+
+  std::shared_ptr<void> multi_sobj(reinterpret_cast<void *>(multi_ptr), multi_deleter);
 
   cudaSetDevice(curr_device_id);
 
-  return true;
+  MulticastTensors tensors{multi_sobj, local_sobj, multi_device, device_id_, true};
+
+  return tensors;
 }
 
 }  // namespace communicator
