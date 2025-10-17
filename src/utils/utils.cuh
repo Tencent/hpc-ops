@@ -206,6 +206,12 @@ __device__ __forceinline__ float expf_ftz(float x) {
   return r;
 }
 
+__device__ __forceinline__ float exp2f_ftz(float x) {
+  float r;
+  asm volatile("ex2.approx.ftz.f32 %0, %1;\n" : "=f"(r) : "f"(x));
+  return r;
+}
+
 __device__ __forceinline__ float logf_ftz(float x) {
   // log(x) = lg2(x)log(2)
   // m = log(2) = 0.6931471805599453

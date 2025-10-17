@@ -77,8 +77,10 @@ __global__ void exp_dA_chunked_cumsum(const vec_t<cute::TmaDescriptor, kTmaDescC
   } else {
     if (blockIdx.x == 0) {
       // update tma desc
-      for (int i = ihead; i < kTmaDescCount; i += nheads) {
-        smem_tma_desc[i] = td_global[i];
+      if (ilane == 0) {
+        for (int i = ihead; i < kTmaDescCount; i += nheads) {
+          smem_tma_desc[i] = td_global[i];
+        }
       }
 
       int cu_seqlen = cu_seqlens[ibatch];
@@ -170,6 +172,7 @@ __global__ void exp_dA_chunked_cumsum(const vec_t<cute::TmaDescriptor, kTmaDescC
       __syncwarp();
       cute::tma_desc_commit_group();
       cute::tma_desc_wait_group();
+
       for (int i = ihead; i < kTmaDescCount; i += nheads) {
         cute::tma_descriptor_cp_fence_release(&tensormaps[kTmaDescCount * ibatch + i],
                                               smem_tma_desc[i]);
