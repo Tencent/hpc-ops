@@ -53,12 +53,12 @@ except Exception as e:
 
 
 @pytest.mark.parametrize("num_batch", [4])
-@pytest.mark.parametrize("num_seq_q", [3456])
-@pytest.mark.parametrize("num_seq_kv", [3456])
-@pytest.mark.parametrize("num_head_q", [8])
+@pytest.mark.parametrize("num_seq_q", [3904])
+@pytest.mark.parametrize("num_seq_kv", [3904])
+@pytest.mark.parametrize("num_head_q", [4])
 @pytest.mark.parametrize("num_head_kv", [1])
-@pytest.mark.parametrize("num_dim_qk", [80])
-@pytest.mark.parametrize("num_dim_v", [80])
+@pytest.mark.parametrize("num_dim_qk", [128])
+@pytest.mark.parametrize("num_dim_v", [128])
 def test_attention_prefill_bf16(
     num_batch, num_seq_q, num_seq_kv, num_head_q, num_head_kv, num_dim_qk, num_dim_v
 ):
