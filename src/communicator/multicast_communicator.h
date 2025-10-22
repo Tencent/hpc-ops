@@ -30,7 +30,7 @@ class MulticastCommunicator {
   int device_id_;
 
   std::unique_ptr<Communicator> comm_;
-  std::unique_ptr<MulticastObjectManager> multiobj_;
+  std::unique_ptr<MulticastObjectManager> multimgr_;
 };
 
 }  // namespace communicator

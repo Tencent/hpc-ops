@@ -62,6 +62,9 @@ std::shared_ptr<Channel> Connector::ConnectMayFail(const std::string& file) {
 
   socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + file.size();
   int r = connect(sock, (struct sockaddr*)&addr, addr_len);
+  if (r != 0) {
+    return nullptr;
+  }
 
   auto channel = std::make_shared<Channel>(sock);
 

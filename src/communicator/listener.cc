@@ -5,7 +5,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -14,6 +13,8 @@
 
 #include <memory>
 #include <string>
+
+#include "src/communicator/channel.h"
 
 namespace hpc {
 namespace communicator {

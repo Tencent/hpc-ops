@@ -2,15 +2,18 @@
 
 #include "src/communicator/multicast_communicator.h"
 
-#include <cstdio>
+#include <unistd.h>
+
 #include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
 
 #include "src/communicator/communicator.h"
+#include "src/communicator/multicast_object_manager.h"
 
 namespace hpc {
 namespace communicator {
@@ -26,11 +29,11 @@ MulticastCommunicator::MulticastCommunicator(int64_t rank, int64_t world_size, i
   }
 
   comm_ = std::make_unique<Communicator>(rank, world_size);
-  multiobj_ = std::make_unique<MulticastObjectManager>(device_id_, world_size_);
+  multimgr_ = std::make_unique<MulticastObjectManager>(device_id_, world_size_);
 }
 
 MulticastCommunicator::~MulticastCommunicator() {
-  multiobj_.reset();
+  multimgr_.reset();
   comm_.reset();
 }
 
@@ -45,13 +48,16 @@ bool MulticastCommunicator::CreateTensorSync(int64_t bytes,
   devices->clear();
   devices->resize(world_size_);
 
+  std::set<int> all_fds;
+
   // 1. create memory object and export fd
   int fd = -1;
   std::shared_ptr<void> obj;
   int device = -1;
-  if (!multiobj_->CreateMemoryObjAndExportFd(&fd, bytes, &obj, &device)) {
+  if (!multimgr_->CreateMemoryObjAndExportFd(&fd, bytes, &obj, &device)) {
     throw std::runtime_error("hpc create memory obj and export fd fail");
   }
+  all_fds.insert(fd);
 
   std::vector<int> recv_fds;
   std::string send_data = "MemoryObj-From-Rank-" + std::to_string(rank_);
@@ -65,13 +71,15 @@ bool MulticastCommunicator::CreateTensorSync(int64_t bytes,
 
   // 2. create memory by import fd
   for (int rank = 0; rank < world_size_; ++rank) {
+    int fd = recv_fds[rank];
+    all_fds.insert(fd);
+
     if (rank == rank_) {
       continue;
     }
 
-    int fd = recv_fds[rank];
     std::shared_ptr<void> obj;
-    if (!multiobj_->CreateMemoryObjByImportFd(fd, bytes, &obj, &device)) {
+    if (!multimgr_->CreateMemoryObjByImportFd(fd, bytes, &obj, &device)) {
       throw std::runtime_error("hpc create memory obj by import fd fail");
     }
 
@@ -88,9 +96,10 @@ bool MulticastCommunicator::CreateTensorSync(int64_t bytes,
   if (rank_ == root_) {
     // get multimem fd and broadcast it
     int fd = -1;
-    if (!multiobj_->CreateMulticastObjAndExportFd(&fd, bytes, &multi_handle)) {
+    if (!multimgr_->CreateMulticastHandleAndExportFd(&fd, bytes, &multi_handle)) {
       throw std::runtime_error("hpc multimem obj create multicast obj and export fd fail");
     }
+    all_fds.insert(fd);
 
     std::string data = std::to_string(bytes);
     int rfd = -1;
@@ -111,22 +120,26 @@ bool MulticastCommunicator::CreateTensorSync(int64_t bytes,
       throw std::runtime_error("hpc comm broadcast bytes not consistent");
     }
 
-    if (!multiobj_->CreateMulticastObjByImportFd(rfd, bytes, &multi_handle)) {
+    if (!multimgr_->CreateMulticastHandleByImportFd(rfd, bytes, &multi_handle)) {
       throw std::runtime_error("hpc multimem obj create multicast obj by import fd fail");
     }
+    all_fds.insert(rfd);
   }
 
   std::shared_ptr<void> multi_obj;
-  if (!multiobj_->MapHandleToAddresableObj(multi_handle, &multi_obj, multi_device, bytes)) {
+  if (!multimgr_->MapHandleToMulticastObj(multi_handle, &multi_obj, multi_device, bytes)) {
     throw std::runtime_error("hpc multimem map handle to addressable obj fail");
   }
 
   // 4. bind multicast obj with local memory obj
-  if (!multiobj_->BindLocalMemoryObjToMulticastObj(obj, device, multi_obj, *multi_device, bytes)) {
+  if (!multimgr_->BindLocalMemoryObjToMulticastObj(obj, device, multi_obj, *multi_device, bytes)) {
     throw std::runtime_error("hpc multimem obj create multicast obj by import fd fail");
   }
-
   *multi_sptr = multi_obj;
+
+  for (const auto &fd : all_fds) {
+    ::close(fd);
+  }
 
   return true;
 }
