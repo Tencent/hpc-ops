@@ -12,25 +12,20 @@ import torch
 
 def run_task(rank, world_size, bytes):
     comm = hpc.MulticastCommunicator(rank, world_size, -1)
-    multi_tensor, local_tensor = comm.CreateTensorSync(bytes)
+    tensors = comm.CreateTensorSync(bytes)
 
     print("rank={}".format(rank))
-    print(multi_tensor.data_ptr(), multi_tensor.dtype, multi_tensor.shape, multi_tensor.device)
+    print(tensors)
 
-    local_tensor[:] = 1.0
-    print(local_tensor)
+    for r, tensor in tensors.items():
+        assert tensor.shape == torch.Size([bytes])
+        assert tensor.stride() == (1,)
+        assert tensor.dtype == torch.uint8
 
-    assert multi_tensor.shape == torch.Size([bytes])
-    assert local_tensor.shape == torch.Size([bytes])
-
-    assert multi_tensor.stride() == (1,)
-    assert local_tensor.stride() == (1,)
-
-    assert multi_tensor.dtype == torch.uint8
-    assert local_tensor.dtype == torch.uint8
-
-    assert multi_tensor.device == torch.device("cuda", 0)
-    assert local_tensor.device == torch.device("cuda", rank)
+        if r == -1:
+            assert tensor.device == torch.device("cuda", 0)
+        else:
+            assert tensor.device == torch.device("cuda", r)
 
 
 @pytest.mark.skipif(os.getenv("NV_SANITIZER_INJECTION_PORT_BASE"), reason="skip sanitizer")

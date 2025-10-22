@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "src/communicator/channel.h"
 
@@ -20,6 +21,10 @@ class Communicator {
   bool Broadcast(const std::string &send_data, std::string *recv_data, int root = 0);
   bool BroadcastFd(const int send_fd, int *recv_fd, const std::string &send_data,
                    std::string *recv_data, int root = 0);
+
+  bool Allgather(const std::string &send_data, std::vector<std::string> *recv_datas);
+  bool AllgatherFd(const int send_fd, std::vector<int> *recv_fds, const std::string &send_data,
+                   std::vector<std::string> *recv_datas);
 
   void Barrier();
 

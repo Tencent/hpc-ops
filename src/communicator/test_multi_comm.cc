@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "src/communicator/multicast_communicator.h"
 
@@ -14,13 +15,22 @@ int main(int argc, char *argv[]) {
   auto comm = std::make_shared<hpc::communicator::MulticastCommunicator>(rank, world_size);
 
   {
-    int multi_device = -1;
     int local_device = -1;
 
     int64_t bytes = 1024;
-    auto tensors = comm->CreateTensorSync(bytes);
 
-    printf("rank = %d, ok = %d\n", rank, tensors.ok);
+    std::vector<std::shared_ptr<void>> sptrs;
+    std::vector<int> devices;
+    std::shared_ptr<void> multi_sptr;
+    int multi_device = -1;
+
+    bool ok = comm->CreateTensorSync(bytes, &sptrs, &devices, &multi_sptr, &multi_device);
+
+    printf("rank = %d, ok = %d\n", rank, ok);
+    printf(" multi: %p@CUDA%d\n", multi_sptr.get(), multi_device);
+    for (int rank = 0; rank < sptrs.size(); ++rank) {
+      printf("  %d: %p@CUDA%d\n", rank, sptrs[rank].get(), devices[rank]);
+    }
   }
 
   return 0;

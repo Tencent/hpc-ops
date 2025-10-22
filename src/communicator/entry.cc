@@ -7,10 +7,9 @@
 #include <torch/library.h>
 
 #include <memory>
-#include <tuple>
+#include <vector>
 
 #include "src/communicator/multicast_communicator.h"
-#include "src/communicator/type.h"
 
 namespace hpc {
 namespace communicator {
@@ -23,22 +22,40 @@ class IMulticastCommunicator : public torch::CustomClassHolder {
 
   ~IMulticastCommunicator() { multicomm_.reset(); }
 
-  std::tuple<torch::Tensor, torch::Tensor> CreateTensorSync(int64_t bytes) {
-    auto tensors = multicomm_->CreateTensorSync(bytes);
+  auto CreateTensorSync(int64_t bytes) {
+    std::vector<std::shared_ptr<void>> sptrs;
+    std::vector<int> devices;
+    std::shared_ptr<void> multi_sptr;
+    int multi_device;
 
-    torch::TensorOptions options;
-    auto multi_opt = options.dtype(torch::kUInt8).device(torch::kCUDA, tensors.multi_device);
-    auto local_opt = options.dtype(torch::kUInt8).device(torch::kCUDA, tensors.local_device);
+    TORCH_CHECK(multicomm_->CreateTensorSync(bytes, &sptrs, &devices, &multi_sptr, &multi_device),
+                "create tensor sync fail");
 
-    auto multi_deleter = [keeper = tensors.multi_ptr](void *ptr) {};
-    auto local_deleter = [keeper = tensors.local_ptr](void *ptr) {};
+    c10::Dict<int64_t, torch::Tensor> tensors;
 
-    torch::Tensor multi =
-        torch::from_blob(tensors.multi_ptr.get(), {bytes}, multi_deleter, multi_opt);
-    torch::Tensor local =
-        torch::from_blob(tensors.local_ptr.get(), {bytes}, local_deleter, local_opt);
+    // multi tensor
+    {
+      torch::TensorOptions options;
+      auto opt = options.dtype(torch::kUInt8).device(torch::kCUDA, multi_device);
 
-    return std::make_tuple(multi, local);
+      auto deleter = [keeper = multi_sptr](void *ptr) {};
+      torch::Tensor t = torch::from_blob(multi_sptr.get(), {bytes}, deleter, opt);
+
+      tensors.insert(-1, t);
+    }
+
+    // remote tensor and local tensor
+    for (uint32_t rank = 0; rank < sptrs.size(); ++rank) {
+      torch::TensorOptions options;
+      auto opt = options.dtype(torch::kUInt8).device(torch::kCUDA, devices[rank]);
+
+      auto deleter = [keeper = sptrs[rank]](void *ptr) {};
+      torch::Tensor t = torch::from_blob(sptrs[rank].get(), {bytes}, deleter, opt);
+
+      tensors.insert(rank, t);
+    }
+
+    return tensors;
   }
 
   void Barrier() { multicomm_->Barrier(); }

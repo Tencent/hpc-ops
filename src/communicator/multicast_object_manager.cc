@@ -10,8 +10,6 @@
 #include <stdexcept>
 #include <string>
 
-#include "src/communicator/type.h"
-
 #define CUCHECK(cmd)                                                \
   do {                                                              \
     auto r = cmd;                                                   \
@@ -30,6 +28,62 @@ static int64_t align_to(int64_t bytes, int64_t alignment) {
   return ((bytes + alignment - 1) / alignment) * alignment;
 }
 
+static std::shared_ptr<void> ReserveAddrMapHandleAndSetAccess(CUmemGenericAllocationHandle handle,
+                                                              int64_t aligned_bytes, int *device) {
+  CUmemAllocationProp prop;
+  CUCHECK(cuMemGetAllocationPropertiesFromHandle(&prop, handle));
+
+  CUdeviceptr ptr;
+  CUCHECK(cuMemAddressReserve(&ptr, aligned_bytes, 2 * 1024 * 1024, 0, 0));
+  CUCHECK(cuMemMap(ptr, aligned_bytes, 0, handle, 0));
+
+  CUmemAccessDesc desc = {};
+  desc.location.type = prop.location.type;
+  desc.location.id = prop.location.id;
+  desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  CUCHECK(cuMemSetAccess(ptr, aligned_bytes, &desc, 1));
+
+  auto deleter = [handle = handle, size = aligned_bytes](void *ptr) {
+    CUdeviceptr dptr = (CUdeviceptr)ptr;
+    CUCHECK(cuMemUnmap(dptr, size));
+    CUCHECK(cuMemAddressFree(dptr, size));
+    CUCHECK(cuMemRelease(handle));
+  };
+
+  std::shared_ptr<void> sobj(reinterpret_cast<void *>(ptr), deleter);
+  *device = prop.location.id;
+
+  return sobj;
+}
+
+static std::shared_ptr<void> ReserveAddrMapHandleAndSetAccessMulticast(
+    CUmemGenericAllocationHandle handle, int64_t aligned_bytes, int *device) {
+  CUmemAllocationProp prop;
+  CUCHECK(cuMemGetAllocationPropertiesFromHandle(&prop, handle));
+
+  CUdeviceptr ptr;
+  CUCHECK(cuMemAddressReserve(&ptr, aligned_bytes, 2 * 1024 * 1024, 0, 0));
+  CUCHECK(cuMemMap(ptr, aligned_bytes, 0, handle, 0));
+
+  CUmemAccessDesc desc = {};
+  desc.location.type = prop.location.type;
+  desc.location.id = prop.location.id;
+  desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  CUCHECK(cuMemSetAccess(ptr, aligned_bytes, &desc, 1));
+
+  auto deleter = [handle = handle, dev = prop.location.id, size = aligned_bytes](void *ptr) {
+    CUdeviceptr dptr = (CUdeviceptr)ptr;
+    CUCHECK(cuMemUnmap(dptr, size));
+    CUCHECK(cuMemAddressFree(dptr, size));
+    CUCHECK(cuMemRelease(handle));
+  };
+
+  std::shared_ptr<void> sobj(reinterpret_cast<void *>(ptr), deleter);
+  *device = prop.location.id;
+
+  return sobj;
+}
+
 MulticastObjectManager::MulticastObjectManager(int device_id, int num_devices) {
   multi_handle_ = 0;
   local_handle_ = 0;
@@ -43,13 +97,12 @@ MulticastObjectManager::~MulticastObjectManager() {
   num_devices_ = -1;
 }
 
-bool MulticastObjectManager::CreateMulticastObjAndExportFd(int *fd, int64_t bytes) {
+// root rank, create multicast obj and export it
+bool MulticastObjectManager::CreateMulticastObjAndExportFd(int *fd, int64_t bytes,
+                                                           std::shared_ptr<void> *multi_handle) {
   cudaSetDevice(device_id_);
 
   int64_t aligned_bytes = align_to(bytes, kAlignment);
-
-  bytes_ = bytes;
-  aligned_bytes_ = aligned_bytes;
 
   // create multicast
   CUmulticastObjectProp prop = {};
@@ -58,108 +111,99 @@ bool MulticastObjectManager::CreateMulticastObjAndExportFd(int *fd, int64_t byte
   prop.numDevices = num_devices_;
   prop.size = aligned_bytes;
 
-  CUCHECK(cuMulticastCreate(&multi_handle_, &prop));
-
+  CUmemGenericAllocationHandle handle;
+  CUCHECK(cuMulticastCreate(&handle, &prop));
   // export file descriptor
-  CUCHECK(
-      cuMemExportToShareableHandle(fd, multi_handle_, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
+  CUCHECK(cuMemExportToShareableHandle(fd, handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
 
   // add device to multicast
-  CUCHECK(cuMulticastAddDevice(multi_handle_, device_id_));
+  CUCHECK(cuMulticastAddDevice(handle, device_id_));
+
+  *multi_handle = std::make_shared<CUmemGenericAllocationHandle>(handle);
 
   return true;
 }
 
-bool MulticastObjectManager::CreateMulticastObjByImportFd(int fd, int64_t bytes) {
+// non-root rank, import multicast
+bool MulticastObjectManager::CreateMulticastObjByImportFd(int fd, int64_t bytes,
+                                                          std::shared_ptr<void> *multi_handle) {
+  cudaSetDevice(device_id_);
+
+  int64_t fd64 = fd;
+  CUmemGenericAllocationHandle handle;
+  CUCHECK(cuMemImportFromShareableHandle(&handle, reinterpret_cast<void *>(fd64),
+                                         CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
+
+  // add device to multicast
+  CUCHECK(cuMulticastAddDevice(handle, device_id_));
+
+  *multi_handle = std::make_shared<CUmemGenericAllocationHandle>(handle);
+
+  return true;
+}
+
+bool MulticastObjectManager::MapHandleToAddresableObj(std::shared_ptr<void> multi_handle,
+                                                      std::shared_ptr<void> *multi_obj, int *device,
+                                                      int64_t bytes) {
+  int64_t aligned_bytes = align_to(bytes, kAlignment);
+
+  auto shandle = std::static_pointer_cast<CUmemGenericAllocationHandle>(multi_handle);
+  *multi_obj = ReserveAddrMapHandleAndSetAccessMulticast(*shandle, aligned_bytes, device);
+  return true;
+}
+
+bool MulticastObjectManager::BindLocalMemoryObjToMulticastObj(std::shared_ptr<void> local_obj,
+                                                              int device,
+                                                              std::shared_ptr<void> multi_obj,
+                                                              int multi_device, int64_t bytes) {
+  int64_t aligned_bytes = align_to(bytes, kAlignment);
+
+  CUmemGenericAllocationHandle multi_handle;
+  CUCHECK(cuMemRetainAllocationHandle(&multi_handle, multi_obj.get()));
+
+  CUmemGenericAllocationHandle local_handle;
+  CUCHECK(cuMemRetainAllocationHandle(&local_handle, local_obj.get()));
+
+  // bind local memory to multicast
+  CUCHECK(cuMulticastBindMem(multi_handle, 0, local_handle, 0, aligned_bytes, 0));
+
+  return true;
+}
+
+bool MulticastObjectManager::CreateMemoryObjAndExportFd(int *fd, int64_t bytes,
+                                                        std::shared_ptr<void> *obj, int *device) {
   cudaSetDevice(device_id_);
 
   int64_t aligned_bytes = align_to(bytes, kAlignment);
-  bytes_ = bytes;
-  aligned_bytes_ = aligned_bytes;
 
-  int64_t fd64 = fd;
-  // work rank, import multicast
-  CUCHECK(cuMemImportFromShareableHandle(&multi_handle_, reinterpret_cast<void *>(fd64),
-                                         CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
+  CUmemGenericAllocationHandle handle;
+  CUmemAllocationProp prop = {};
+  prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  prop.location.id = device_id_;
+  CUCHECK(cuMemCreate(&handle, aligned_bytes, &prop, 0));
 
-  CUmemAllocationProp prop;
-  CUCHECK(cuMemGetAllocationPropertiesFromHandle(&prop, multi_handle_));
-  CUCHECK(cuMulticastAddDevice(multi_handle_, device_id_));
+  CUCHECK(cuMemExportToShareableHandle(fd, handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
 
+  *obj = ReserveAddrMapHandleAndSetAccess(handle, aligned_bytes, device);
   return true;
 }
 
-MulticastTensors MulticastObjectManager::AllocateMemoryAndBindToMulticastObj() {
-  int curr_device_id;
-  cudaGetDevice(&curr_device_id);
+bool MulticastObjectManager::CreateMemoryObjByImportFd(int fd, int64_t bytes,
+                                                       std::shared_ptr<void> *obj, int *device) {
+  int64_t aligned_bytes = align_to(bytes, kAlignment);
+
   cudaSetDevice(device_id_);
 
-  CUdeviceptr local_ptr;
-  {
-    CUmemAllocationProp prop = {};
-    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id = device_id_;
-    CUCHECK(cuMemCreate(&local_handle_, aligned_bytes_, &prop, 0));
+  CUmemGenericAllocationHandle handle;
+  int64_t fd64 = fd;
+  // work rank, import multicast
+  CUCHECK(cuMemImportFromShareableHandle(&handle, reinterpret_cast<void *>(fd64),
+                                         CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
 
-    CUCHECK(cuMemAddressReserve(&local_ptr, aligned_bytes_, 2 * 1024 * 1024, 0, 0));
-    CUCHECK(cuMemMap(local_ptr, aligned_bytes_, 0, local_handle_, 0));
-
-    CUmemAccessDesc desc = {};
-    desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    desc.location.id = device_id_;
-    desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    CUCHECK(cuMemSetAccess(local_ptr, aligned_bytes_, &desc, 1));
-  }
-
-  CUdeviceptr multi_ptr;
-  {
-    CUCHECK(cuMemAddressReserve(&multi_ptr, aligned_bytes_, 2 * 1024 * 1024, 0, 0));
-    CUCHECK(cuMemMap(multi_ptr, aligned_bytes_, 0, multi_handle_, 0));
-
-    CUmemAccessDesc desc = {};
-    desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    desc.location.id = device_id_;
-    desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    CUCHECK(cuMemSetAccess(multi_ptr, aligned_bytes_, &desc, 1));
-  }
-
-  CUCHECK(cuMulticastBindMem(multi_handle_, 0, local_handle_, 0, aligned_bytes_, 0));
-
-  int multi_device = -1;
-  {
-    CUmemAllocationProp prop = {};
-    CUCHECK(cuMemGetAllocationPropertiesFromHandle(&prop, multi_handle_));
-    multi_device = prop.location.id;
-  }
-
-  auto local_deleter = [handle = local_handle_, size = aligned_bytes_](void *ptr) {
-    CUdeviceptr dptr = (CUdeviceptr)ptr;
-    CUCHECK(cuMemUnmap(dptr, size));
-    CUCHECK(cuMemAddressFree(dptr, size));
-    CUCHECK(cuMemRelease(handle));
-  };
-
-  std::shared_ptr<void> local_sobj(reinterpret_cast<void *>(local_ptr), local_deleter);
-
-  auto multi_deleter = [handle = multi_handle_, size = aligned_bytes_, dev = device_id_,
-                        local_sobj](void *ptr) {
-    CUdeviceptr dptr = (CUdeviceptr)ptr;
-
-    CUCHECK(cuMulticastUnbind(handle, dev, 0, size));
-    CUCHECK(cuMemUnmap(dptr, size));
-    CUCHECK(cuMemAddressFree(dptr, size));
-    CUCHECK(cuMemRelease(handle));
-  };
-
-  std::shared_ptr<void> multi_sobj(reinterpret_cast<void *>(multi_ptr), multi_deleter);
-
-  cudaSetDevice(curr_device_id);
-
-  MulticastTensors tensors{multi_sobj, local_sobj, multi_device, device_id_, true};
-
-  return tensors;
+  *obj = ReserveAddrMapHandleAndSetAccess(handle, aligned_bytes, device);
+  return true;
 }
 
 }  // namespace communicator

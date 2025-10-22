@@ -10,8 +10,6 @@
 #include <memory>
 #include <tuple>
 
-#include "src/communicator/type.h"
-
 namespace hpc {
 namespace communicator {
 
@@ -20,10 +18,17 @@ class MulticastObjectManager {
   MulticastObjectManager(int device_id, int num_devices);
   ~MulticastObjectManager();
 
-  bool CreateMulticastObjAndExportFd(int *fd, int64_t bytes);
-  bool CreateMulticastObjByImportFd(int fd, int64_t bytes);
+  bool CreateMemoryObjAndExportFd(int *fd, int64_t bytes, std::shared_ptr<void> *obj, int *device);
+  bool CreateMemoryObjByImportFd(int fd, int64_t bytes, std::shared_ptr<void> *obj, int *device);
 
-  MulticastTensors AllocateMemoryAndBindToMulticastObj();
+  bool CreateMulticastObjAndExportFd(int *fd, int64_t bytes, std::shared_ptr<void> *handle);
+  bool CreateMulticastObjByImportFd(int fd, int64_t bytes, std::shared_ptr<void> *handle);
+  bool MapHandleToAddresableObj(std::shared_ptr<void> multi_handle,
+                                std::shared_ptr<void> *multi_obj, int *device, int64_t bytes);
+
+  bool BindLocalMemoryObjToMulticastObj(std::shared_ptr<void> obj, int device,
+                                        std::shared_ptr<void> multi_obj, int multi_device,
+                                        int64_t bytes);
 
  private:
   static constexpr int64_t kAlignment = 2 * 1024 * 1024;  // 2MB

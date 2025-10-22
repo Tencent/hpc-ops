@@ -73,40 +73,100 @@ Communicator::~Communicator() {
 }
 
 bool Communicator::Broadcast(const std::string &send_data, std::string *recv_data, int root) {
+  // we only have root -> client channel
+  // so we first send data to root, then broadcast it
   if (root != root_) {
-    throw std::runtime_error("we only support root = 0 yet!");
-  }
+    std::string rdata;
 
-  bool ok = true;
-  if (rank_ == root) {
-    *recv_data = send_data;
-    for (auto &[rank, chan] : channels_) {
-      ok = chan->Send(send_data) && ok;
+    // recv data from one client;
+    if (rank_ == root) {
+      bool ok = channel_->Send(send_data);
+      if (!ok) {
+        return false;
+      }
+    } else if (rank_ == root_) {
+      bool ok = channels_[root]->Recv(&rdata);
+      if (!ok) {
+        return false;
+      }
     }
-  } else {
-    ok = channel_->Recv(recv_data);
-  }
 
-  return ok;
+    return Broadcast(rdata, recv_data, 0);
+  } else {
+    bool ok = true;
+    if (rank_ == root) {
+      *recv_data = send_data;
+      for (auto &[rank, chan] : channels_) {
+        ok = chan->Send(send_data) && ok;
+      }
+    } else {
+      ok = channel_->Recv(recv_data);
+    }
+
+    return ok;
+  }
 }
 
 bool Communicator::BroadcastFd(const int send_fd, int *recv_fd, const std::string &send_data,
                                std::string *recv_data, int root) {
+  // we only have root -> client channel
+  // so we first send data to root, then broadcast it
   if (root != root_) {
-    throw std::runtime_error("we only support root = 0 yet!");
-  }
+    int rfd = -1;
+    std::string rdata;
 
-  bool ok = true;
-  if (rank_ == root) {
-    *recv_fd = send_fd;
-    *recv_data = send_data;
-    for (auto &[rank, chan] : channels_) {
-      ok = chan->SendFd(send_fd, send_data) && ok;
+    // recv fd and data from one client;
+    if (rank_ == root) {
+      bool ok = channel_->SendFd(send_fd, send_data);
+      if (!ok) {
+        return false;
+      }
+    } else if (rank_ == root_) {
+      bool ok = channels_[root]->RecvFd(&rfd, &rdata);
+      if (!ok) {
+        return false;
+      }
     }
-  } else {
-    ok = channel_->RecvFd(recv_fd, recv_data);
-  }
 
+    return BroadcastFd(rfd, recv_fd, rdata, recv_data, 0);
+  } else {
+    bool ok = true;
+    if (rank_ == root) {
+      *recv_fd = send_fd;
+      *recv_data = send_data;
+      for (auto &[rank, chan] : channels_) {
+        ok = chan->SendFd(send_fd, send_data) && ok;
+      }
+    } else {
+      ok = channel_->RecvFd(recv_fd, recv_data);
+    }
+    return ok;
+  }
+}
+
+bool Communicator::Allgather(const std::string &send_data, std::vector<std::string> *recv_datas) {
+  bool ok = true;
+  recv_datas->clear();
+  for (int root = 0; root < world_size_; ++root) {
+    std::string recv_data;
+    ok = Broadcast(send_data, &recv_data, root) && ok;
+    recv_datas->push_back(recv_data);
+  }
+  return ok;
+}
+
+bool Communicator::AllgatherFd(const int send_fd, std::vector<int> *recv_fds,
+                               const std::string &send_data, std::vector<std::string> *recv_datas) {
+  bool ok = true;
+  recv_fds->clear();
+  recv_datas->clear();
+  for (int root = 0; root < world_size_; ++root) {
+    int recv_fd;
+    std::string recv_data;
+    ok = BroadcastFd(send_fd, &recv_fd, send_data, &recv_data, root) && ok;
+    recv_fds->push_back(recv_fd);
+    recv_datas->push_back(recv_data);
+  }
   return ok;
 }
 

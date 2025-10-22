@@ -6,11 +6,10 @@
 #include <map>
 #include <memory>
 #include <string>
-#include <tuple>
+#include <vector>
 
 #include "src/communicator/communicator.h"
 #include "src/communicator/multicast_object_manager.h"
-#include "src/communicator/type.h"
 
 namespace hpc {
 namespace communicator {
@@ -20,7 +19,9 @@ class MulticastCommunicator {
   MulticastCommunicator(int64_t rank, int64_t world_size, int64_t device_id = -1);
   ~MulticastCommunicator();
 
-  MulticastTensors CreateTensorSync(int64_t bytes);
+  bool CreateTensorSync(int64_t bytes, std::vector<std::shared_ptr<void>> *sptrs,
+                        std::vector<int> *devices, std::shared_ptr<void> *multi_ptr,
+                        int *multi_device);
   void Barrier();
 
  private:
