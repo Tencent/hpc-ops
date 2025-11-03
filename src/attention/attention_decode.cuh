@@ -136,9 +136,9 @@ template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int k
 __global__ void attention_decode_bf16_multistage_ws_kernel(
     const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
     const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaY tma_y,
-    const int *block_ids_ptr, const int *cache_lens, int num_batch, int num_seq_q, int num_dim_qk,
-    int num_dim_v, int num_head_q, int num_head_kv, int heads_per_group, int num_blocks,
-    int max_num_blocks, float one_over_dk_log2e) {
+    const int *block_ids_ptr, const int *num_seq_kvcache_ptr, int num_batch, int num_dim_qk,
+    int num_dim_v, int num_head_q, int num_head_k, int num_head_v, int heads_per_group,
+    int num_kvcache_blocks, int num_seq_max_blocks, float one_over_dk_log2e) {
   using namespace cute;  // NOLINT
 
   int idx = threadIdx.x;
@@ -151,12 +151,12 @@ __global__ void attention_decode_bf16_multistage_ws_kernel(
   int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
   bool is_leader_in_block = (iwarp == 0) && elected;
 
-  int seqlenq = num_seq_q;
-  int cache_len = cache_lens[ibatch];
-  int seqlenk = seqlenq + cache_len;
+  constexpr int kSeqlenQ = 1;
+  int num_seq_kvcache = num_seq_kvcache_ptr[ibatch];
+  int seqlenk = kSeqlenQ + num_seq_kvcache;
   int nblocks = (seqlenk + kBlockSize - 1) / kBlockSize;
 
-  const int *block_ids = block_ids_ptr + ibatch * max_num_blocks;
+  const int *block_ids = block_ids_ptr + ibatch * num_seq_max_blocks;
 
   __shared__ uint64_t bar_q;
   __shared__ uint64_t bar_k_writable[kStage];
@@ -176,10 +176,11 @@ __global__ void attention_decode_bf16_multistage_ws_kernel(
   }
 
   // Tensor Q/K/V/Y
-  auto gQ = tma_q.get_tma_tensor(make_shape(num_head_q, num_dim_qk, num_seq_q, num_batch));
-  auto gK = tma_k.get_tma_tensor(make_shape(kBlockSize, num_dim_qk, num_head_kv, num_blocks));
-  auto gV = tma_v.get_tma_tensor(make_shape(num_dim_v, kBlockSize, num_head_kv, num_blocks));
-  auto gY = tma_y.get_tma_tensor(make_shape(num_head_q, num_dim_v, num_seq_q, num_batch));
+  auto gQ = tma_q.get_tma_tensor(make_shape(num_head_q, num_dim_qk, num_batch));
+  auto gK =
+      tma_k.get_tma_tensor(make_shape(kBlockSize, num_dim_qk, num_head_k, num_kvcache_blocks));
+  auto gV = tma_v.get_tma_tensor(make_shape(num_dim_v, kBlockSize, num_head_v, num_kvcache_blocks));
+  auto gY = tma_y.get_tma_tensor(make_shape(num_head_q, num_dim_v, num_batch));
 
   auto gAtt =
       make_tensor(make_gmem_ptr(static_cast<float *>(nullptr)),
@@ -211,8 +212,8 @@ __global__ void attention_decode_bf16_multistage_ws_kernel(
 
   int num_tile_kv = (seqlenk + kTileN - 1) / kTileN;
   // int num_tile_causal = (seqlenq + kTileN - 1) / kTileN;
-  int num_tile_full = (cache_len + kTileN - 1) / kTileN;
-  int num_tile_causal = num_tile_kv - num_tile_full + (cache_len % kTileN != 0);
+  int num_tile_full = (num_seq_kvcache + kTileN - 1) / kTileN;
+  int num_tile_causal = num_tile_kv - num_tile_full + (num_seq_kvcache % kTileN != 0);
   num_tile_full = num_tile_kv - num_tile_causal;
 
   constexpr int kBlockPerTileN = kTileN / kBlockSize;
@@ -244,11 +245,9 @@ __global__ void attention_decode_bf16_multistage_ws_kernel(
 
     if (is_leader_in_load) {
       // Load Q
-      for (int sqi = 0; sqi < num_seq_q; sqi++) {
-        cute::copy(tma_q.with(bar_q), tQg(_, ihead_kv, _, sqi, ibatch), tQs(_, sqi, _));
-      }
+      cute::copy(tma_q.with(bar_q), tQg(_, ihead_kv, _, ibatch), tQs(_, 0, _));
       set_barrier_transaction_bytes(
-          bar_q, sizeof(Tin) * num_seq_q * umax(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
+          bar_q, sizeof(Tin) * umax(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
 
       int istage_write = 0;
       // Load Causal KV
@@ -360,7 +359,7 @@ __global__ void attention_decode_bf16_multistage_ws_kernel(
       for (int im = 0; im < kM; ++im) {
 #pragma unroll
         for (int in = 0; in < kN; ++in) {
-          int iposq = cache_len + get<0>(tI_mn(im, in)) / heads_per_group;
+          int iposq = num_seq_kvcache + get<0>(tI_mn(im, in)) / heads_per_group;
           int iposk = itile_seq_kv * kTileN + get<1>(tI_mn(im, in));
 
           if ((iposk > iposq) || (iposk >= seqlenk)) {
@@ -481,9 +480,7 @@ __global__ void attention_decode_bf16_multistage_ws_kernel(
     if (is_leader_in_warpgroup) {
       auto tYss = btma_y.partition_S(sY);  // (TMA, TMA_M, TMA_N)
       auto tYgg = btma_y.partition_D(gY);  // (TMA, TMA_M, TMA_N, b)
-      for (int sqi = 0; sqi < num_seq_q; sqi++) {
-        cute::copy(tma_y, tYss(_, sqi, _), tYgg(_, ihead_kv, _, sqi, ibatch));
-      }
+      cute::copy(tma_y, tYss(_, 0, _), tYgg(_, ihead_kv, _, ibatch));
     }
   }
 }
@@ -495,9 +492,9 @@ template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int k
 __global__ void attention_decode_bf16_onestage_kernel(
     const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
     const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaY tma_y,
-    const int *block_ids_ptr, const int *cache_lens, int num_batch, int num_seq_q, int num_dim_qk,
-    int num_dim_v, int num_head_q, int num_head_kv, int heads_per_group, int num_blocks,
-    int max_num_blocks, float one_over_dk_log2e) {
+    const int *block_ids_ptr, const int *num_seq_kvcache_ptr, int num_batch, int num_dim_qk,
+    int num_dim_v, int num_head_q, int num_head_k, int num_head_v, int heads_per_group,
+    int num_kvcache_blocks, int num_seq_max_blocks, float one_over_dk_log2e) {
   using namespace cute;  // NOLINT
 
   int idx = threadIdx.x;
@@ -508,11 +505,11 @@ __global__ void attention_decode_bf16_onestage_kernel(
   int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
   bool is_leader_in_block = (iwarp == 0) && elected;
 
-  int seqlenq = num_seq_q;
-  int cache_len = cache_lens[ibatch];
-  int seqlenk = seqlenq + cache_len;
+  constexpr int kSeqlenQ = 1;
+  int num_seq_kvcache = num_seq_kvcache_ptr[ibatch];
+  int seqlenk = kSeqlenQ + num_seq_kvcache;
   int nblocks = (seqlenk + kBlockSize - 1) / kBlockSize;
-  const int *block_ids = block_ids_ptr + ibatch * max_num_blocks;
+  const int *block_ids = block_ids_ptr + ibatch * num_seq_max_blocks;
 
   __shared__ uint64_t bar_q;
   __shared__ uint64_t bar_k;
@@ -530,10 +527,11 @@ __global__ void attention_decode_bf16_onestage_kernel(
   }
 
   // Tensor Q/K/V/Y
-  auto gQ = tma_q.get_tma_tensor(make_shape(num_head_q, num_dim_qk, num_seq_q, num_batch));
-  auto gK = tma_k.get_tma_tensor(make_shape(kBlockSize, num_dim_qk, num_head_kv, num_blocks));
-  auto gV = tma_v.get_tma_tensor(make_shape(num_dim_v, kBlockSize, num_head_kv, num_blocks));
-  auto gY = tma_y.get_tma_tensor(make_shape(num_head_q, num_dim_v, num_seq_q, num_batch));
+  auto gQ = tma_q.get_tma_tensor(make_shape(num_head_q, num_dim_qk, num_batch));
+  auto gK =
+      tma_k.get_tma_tensor(make_shape(kBlockSize, num_dim_qk, num_head_k, num_kvcache_blocks));
+  auto gV = tma_v.get_tma_tensor(make_shape(num_dim_v, kBlockSize, num_head_v, num_kvcache_blocks));
+  auto gY = tma_y.get_tma_tensor(make_shape(num_head_q, num_dim_v, num_batch));
 
   auto gAtt =
       make_tensor(make_gmem_ptr(static_cast<float *>(nullptr)),
@@ -595,11 +593,9 @@ __global__ void attention_decode_bf16_onestage_kernel(
   // Load Q
   if (is_leader_in_block) {
     initialize_barrier(bar_q, 1);
-    for (int sqi = 0; sqi < num_seq_q; sqi++) {
-      cute::copy(tma_q.with(bar_q), tQg(_, ihead_kv, _, sqi, ibatch), tQs(_, sqi, _));
-    }
+    cute::copy(tma_q.with(bar_q), tQg(_, ihead_kv, _, ibatch), tQs(_, 0, _));
     set_barrier_transaction_bytes(
-        bar_q, sizeof(Tin) * num_seq_q * umax(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
+        bar_q, sizeof(Tin) * umax(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
   }
 
   // init k/v barrier
@@ -622,8 +618,8 @@ __global__ void attention_decode_bf16_onestage_kernel(
 
   int num_tile_kv = (seqlenk + kTileN - 1) / kTileN;
   // int num_tile_causal = (seqlenq + kTileN - 1) / kTileN;
-  int num_tile_full = (cache_len + kTileN - 1) / kTileN;
-  int num_tile_causal = num_tile_kv - num_tile_full + (cache_len % kTileN != 0);
+  int num_tile_full = (num_seq_kvcache + kTileN - 1) / kTileN;
+  int num_tile_causal = num_tile_kv - num_tile_full + (num_seq_kvcache % kTileN != 0);
   num_tile_full = num_tile_kv - num_tile_causal;
 
   constexpr int kBlockPerTileN = kTileN / kBlockSize;
@@ -662,7 +658,7 @@ __global__ void attention_decode_bf16_onestage_kernel(
     for (int im = 0; im < kM; ++im) {
 #pragma unroll
       for (int in = 0; in < kN; ++in) {
-        int iposq = cache_len + get<0>(tI_mn(im, in)) / heads_per_group;
+        int iposq = num_seq_kvcache + get<0>(tI_mn(im, in)) / heads_per_group;
         int iposk = itile_seq_kv * kTileN + get<1>(tI_mn(im, in));
 
         if ((iposk > iposq) || (iposk >= seqlenk)) {
@@ -769,9 +765,7 @@ __global__ void attention_decode_bf16_onestage_kernel(
   if (is_leader_in_block) {
     auto tYss = btma_y.partition_S(sY);  // (TMA, TMA_M, TMA_N)
     auto tYgg = btma_y.partition_D(gY);  // (TMA, TMA_M, TMA_N, b)
-    for (int sqi = 0; sqi < num_seq_q; sqi++) {
-      cute::copy(tma_y, tYss(_, sqi, _), tYgg(_, ihead_kv, _, sqi, ibatch));
-    }
+    cute::copy(tma_y, tYss(_, 0, _), tYgg(_, ihead_kv, _, ibatch));
   }
 }
 

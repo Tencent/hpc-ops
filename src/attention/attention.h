@@ -14,21 +14,13 @@ void attention_prefill_bf16_async(void *y_ptr, const void *q_ptr, const void *k_
                                   int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv,
                                   int ldY, int ldQ, int ldK, int ldV, cudaStream_t stream);
 
-bool attention_decode_bf16_headdim80_async(void *y_ptr, const void *q_ptr, void *kvcache_ptr,
-                                           const int *block_ids_ptr, const int *cache_lens_ptr,
-                                           int num_batch, int num_seq_q, int num_head_q,
-                                           int num_head_kv, int head_per_group, int num_dim_qk,
-                                           int num_dim_v, int num_blocks, int block_size,
-                                           int max_num_blocks, int ldY, int ldQ,
-                                           cudaStream_t stream);
+bool attention_decode_bf16_async(void *y_ptr, const void *q_ptr, void *kcache_ptr, void *vcache_ptr,
+                                 const int *block_ids_ptr, const int *num_seq_kvcache_ptr,
+                                 int num_batch, int num_head_q, int num_head_k, int num_head_v,
+                                 int num_dim_qk, int num_dim_v, int num_kvcache_blocks,
+                                 int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK,
+                                 int ldV, cudaStream_t stream);
 
-bool attention_decode_bf16_headdim128_async(void *y_ptr, const void *q_ptr, void *kvcache_ptr,
-                                            const int *block_ids_ptr, const int *cache_lens_ptr,
-                                            int num_batch, int num_seq_q, int num_head_q,
-                                            int num_head_kv, int heads_per_group, int num_dim_qk,
-                                            int num_dim_v, int num_blocks, int block_size,
-                                            int max_num_blocks, int ldY, int ldQ,
-                                            cudaStream_t stream);
 }  // namespace attention
 }  // namespace hpc
 

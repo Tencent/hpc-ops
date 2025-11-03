@@ -281,6 +281,22 @@ __device__ __forceinline__ float warp_4lane_reduce_sum_xor(float x) {
   return x;
 }
 
+__device__ __forceinline__ float warp_8lane_stride4_reduce_max_xor(float x) {
+  x = fmaxf(__shfl_xor_sync(0xFFFFFFFF, x, 4), x);
+  x = fmaxf(__shfl_xor_sync(0xFFFFFFFF, x, 8), x);
+  x = fmaxf(__shfl_xor_sync(0xFFFFFFFF, x, 16), x);
+
+  return x;
+}
+
+__device__ __forceinline__ float warp_8lane_stride4_reduce_sum_xor(float x) {
+  x += __shfl_xor_sync(0xFFFFFFFF, x, 4);
+  x += __shfl_xor_sync(0xFFFFFFFF, x, 8);
+  x += __shfl_xor_sync(0xFFFFFFFF, x, 16);
+
+  return x;
+}
+
 // ============================
 //    Fragment Retile
 // ============================

@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 
 def flash_attn_with_kvcache_func(
-    Q, K, V, kvcache, block_ids, nblocks, seqlenq, cu_seqlenq, cache_lens
+    Q, K, V, kvcache, block_ids, nblocks, seqlenq, cu_seqlenq, num_seq_kvcache
 ):
     # from flash_attn.flash_attn_interface import flash_attn_with_kvcache
     from flash_attn_interface import flash_attn_with_kvcache
@@ -27,7 +27,7 @@ def flash_attn_with_kvcache_func(
             q=Q,
             k_cache=kvcache[:, 0, :, :].contiguous(),
             v_cache=kvcache[:, 1, :, :].contiguous(),
-            cache_seqlens=cache_lens,
+            cache_seqlens=num_seq_kvcache + 1,
             # block_table=block_ids,
             page_table=block_ids,
             causal=True,
@@ -37,7 +37,7 @@ def flash_attn_with_kvcache_func(
 
 
 def naive_attn_with_paged_kvcache_func(
-    Q, K, V, kvcache, block_ids, nblocks, seqlenq, cu_seqlenq, cache_lens
+    Q, K, V, kvcache, block_ids, nblocks, seqlenq, cu_seqlenq, num_seq_kvcache
 ):
 
     num_batch = seqlenq.shape[0]
@@ -51,7 +51,7 @@ def naive_attn_with_paged_kvcache_func(
     for bi in range(num_batch):
         BQ = Q[bi].transpose(0, 1).float()  # [num_heads, sq, head_dim]
         blk_ids = block_ids[bi, : nblocks[bi]]
-        seqlen = seqlenq[bi] + cache_lens[bi]
+        seqlen = seqlenq[bi] + num_seq_kvcache[bi]
         BK = (
             kvcache[blk_ids, 0, :, :, :]
             .reshape(-1, num_head_kv, head_dim)
@@ -103,7 +103,7 @@ except Exception as e:
 @pytest.mark.parametrize("block_size", [32])
 @pytest.mark.parametrize("num_head_q", [4, 8])
 @pytest.mark.parametrize("num_head_kv", [1])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [80, 128])
 def test_attention_decode_bf16(
     num_batch, num_seq_q, max_seq_kv, block_size, num_head_q, num_head_kv, head_dim
 ):
@@ -124,8 +124,8 @@ def test_attention_decode_bf16(
     ) / math.sqrt(num_dim_qk)
     V = torch.randn((num_batch * num_seq_q, num_head_kv, num_dim_v), dtype=T, device="cuda")
 
-    cache_lens = torch.randint(1, max_seq_kv, (num_batch,), dtype=torch.int32, device="cuda")
-    nblocks = (cache_lens + num_seq_q + block_size - 1) // block_size
+    num_seq_kvcache = torch.randint(1, max_seq_kv, (num_batch,), dtype=torch.int32, device="cuda")
+    nblocks = (num_seq_kvcache + num_seq_q + block_size - 1) // block_size
     total_blocks = sum(nblocks)
     kvcache = torch.randn(
         max_num_blocks, 2, block_size, num_head_kv, num_dim_qk, dtype=T, device="cuda"
@@ -142,7 +142,7 @@ def test_attention_decode_bf16(
         block_ids[i, : nblocks[i]] = packed_block_ids[cu_blocks : cu_blocks + nblocks[i]]
         cu_blocks += nblocks[i]
         for sqi in range(seqlenq[i]):
-            si = sqi + cache_lens[i]
+            si = sqi + num_seq_kvcache[i]
             blk_id = si // block_size
             slot_id = si % block_size
             kvcache[block_ids[i, blk_id], 0, slot_id] = K.reshape(
@@ -152,8 +152,12 @@ def test_attention_decode_bf16(
                 num_batch, num_seq_q, num_head_kv, num_dim_qk
             )[i, sqi]
 
-    gt = gt_attention_func(Q, K, V, kvcache, block_ids, nblocks, seqlenq, cu_seqlenq, cache_lens)
-    my = hpc.attention_decode_bf16(Q, kvcache, block_ids, cache_lens)
+    gt = gt_attention_func(
+        Q, K, V, kvcache, block_ids, nblocks, seqlenq, cu_seqlenq, num_seq_kvcache
+    )
+    my = hpc.attention_decode_bf16(
+        Q, kvcache[:, 0, :, :, :], kvcache[:, 1, :, :, :], block_ids, num_seq_kvcache
+    )
 
     print("\ngt\n")
     print(gt[0, :, :])

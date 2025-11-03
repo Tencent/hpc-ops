@@ -7,21 +7,6 @@ from typing import Callable, Optional, Sequence
 import pytest
 import torch
 import time
-import flashinfer
-
-import tensorrt_llm
-from tensorrt_llm._torch.attention_backend import (
-    AttentionInputType,
-    AttentionBackend,
-    TrtllmAttention,
-)
-from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask, MLAParams
-from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.mode import QuantAlgo
 
 from pathlib import Path
 
@@ -93,7 +78,7 @@ class Scenario:
         return self.batch_size * self.qo_len
 
 
-def creat_kvcache_manager(s: Scenario) -> KVCacheManager:
+def creat_kvcache_manager(s: Scenario):
 
     num_blocks = s.max_num_pages
     tokens_per_block = s.page_size
@@ -102,6 +87,11 @@ def creat_kvcache_manager(s: Scenario) -> KVCacheManager:
     head_dim = s.head_dim
     max_seq_len = s.kv_len
     batch_size = s.batch_size
+
+    import tensorrt_llm
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm.bindings.executor import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
 
     if s.kvcache_dtype == torch.float16:
         kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
@@ -169,9 +159,17 @@ def construct_test_datas(s: Scenario):
 def trtllm_attn_func(
     q_at_layer: torch.Tensor,
     kv_at_layer: torch.Tensor,
-    kv_cache_manager: KVCacheManager,
+    kv_cache_manager,
     s: Scenario,
 ) -> list[torch.Tensor]:
+
+    import tensorrt_llm
+    from tensorrt_llm._torch.attention_backend import (
+        AttentionInputType,
+        TrtllmAttention,
+    )
+    from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask, MLAParams
+    from tensorrt_llm._torch.metadata import KVCacheParams
 
     num_cached_tokens_per_seq = torch.full((s.batch_size,), s.kv_cache_len).int()
     token_nums = torch.full((s.batch_size,), s.kv_len).int()
@@ -209,9 +207,6 @@ def trtllm_attn_func(
 
         qkv = torch.concat([q_at_layer[i], kv_at_layer[i]], dim=-1).contiguous()
 
-        # print(f"prefill:{s.is_prefill}")
-        # import pdb;pdb.set_trace()
-
         for _ in range(20):
             o = attention.forward(
                 qkv,
@@ -237,12 +232,22 @@ def trtllm_attn_func(
     return outputs
 
 
-def flash_attn_func(
+def run_flash_attention_v2(
     q_at_layer: torch.Tensor,
     kv_at_layer: torch.Tensor,
-    kv_cache_manager: KVCacheManager,
+    kv_cache_manager,
     s: Scenario,
 ):
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_with_kvcache
+    except:
+        print("\033[33mfa2 not installed, so skip fa2!\033[0m")
+        return []
+
+    if s.page_size != 256:
+        print("\033[33mfa2 only support page_size 256, so skip fa2!\033[0m")
+        return []
+
     outputs = []
     if s.is_prefill:
         from flash_attn_interface import flash_attn_varlen_func
@@ -284,7 +289,7 @@ def flash_attn_func(
             cache_lens = torch.tensor(
                 [s.kv_cache_len] * s.batch_size, dtype=torch.int32, device="cuda"
             )
-            kvcache = kv_cache_manager.get_buffer(i)
+            kvcache = kv_cache_manager.get_buffers(i)
             request_ids = list(range(s.batch_size))
             block_ids = kv_cache_manager.get_block_ids_per_seq(request_ids).cuda()
             # run flashAttention
@@ -292,7 +297,7 @@ def flash_attn_func(
 
             for _ in range(20):
                 o = flash_attn_with_kvcache(
-                    q=q_at_layer[i],
+                    q=q_at_layer[i].reshape(-1, 1, s.num_heads, s.head_dim),
                     k_cache=kvcache[:, 0, :, :].contiguous(),
                     v_cache=kvcache[:, 1, :, :].contiguous(),
                     cache_seqlens=cache_lens,
@@ -305,12 +310,96 @@ def flash_attn_func(
     return outputs
 
 
+def run_flash_attention_v3(
+    q_at_layer: torch.Tensor,
+    kv_at_layer: torch.Tensor,
+    kv_cache_manager,
+    s: Scenario,
+):
+    try:
+        from flash_attn_interface import flash_attn_with_kvcache
+    except:
+        print("\033[33mfa3 not installed, so skip fa3!\033[0m")
+        return []
+
+    outputs = []
+    if s.is_prefill:
+        from flash_attn_interface import flash_attn_varlen_func
+
+        for i in range(s.num_layers):
+            q = q_at_layer[i].view(s.batch_size * s.qo_len, s.num_heads, s.head_dim).contiguous()
+            k, v = (
+                kv_at_layer[i]
+                .view(s.batch_size * s.qo_len, 2 * s.num_kv_heads * s.head_dim)
+                .split([s.num_kv_heads * s.head_dim, s.num_kv_heads * s.head_dim], -1)
+            )
+            k = k.reshape(-1, s.num_kv_heads, s.head_dim).contiguous()
+            v = v.reshape(-1, s.num_kv_heads, s.head_dim).contiguous()
+
+            for _ in range(20):
+                o = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=torch.tensor(
+                        [i * s.qo_len for i in range(s.batch_size + 1)],
+                        dtype=torch.int32,
+                        device="cuda",
+                    ),
+                    cu_seqlens_k=torch.tensor(
+                        [i * s.qo_len for i in range(s.batch_size + 1)],
+                        dtype=torch.int32,
+                        device="cuda",
+                    ),
+                    max_seqlen_q=s.qo_len,
+                    max_seqlen_k=s.qo_len,
+                    softmax_scale=1.0 / (s.head_dim**0.5),
+                    causal=True,
+                )
+            o = o.reshape(s.batch_size * s.qo_len, s.num_heads * s.head_dim)
+            outputs.append(o)
+    else:
+        for i in range(s.num_layers):
+            cache_lens = torch.tensor(
+                [s.kv_cache_len] * s.batch_size, dtype=torch.int32, device="cuda"
+            )
+            kvcache = kv_cache_manager.get_buffers(i)
+            request_ids = list(range(s.batch_size))
+            block_ids = kv_cache_manager.get_block_ids_per_seq(request_ids).cuda()
+            # run flashAttention
+            from flash_attn_interface import flash_attn_with_kvcache
+
+            for _ in range(20):
+                o = flash_attn_with_kvcache(
+                    q=q_at_layer[i].reshape(-1, 1, s.num_heads, s.head_dim),
+                    k_cache=kvcache[:, 0, :, :].contiguous(),
+                    v_cache=kvcache[:, 1, :, :].contiguous(),
+                    cache_seqlens=cache_lens + 1,
+                    page_table=block_ids,
+                    causal=True,
+                )
+            o = o.reshape(s.batch_size * s.qo_len, s.num_heads * s.head_dim)
+            outputs.append(o)
+
+    return outputs
+
+
 def flashinfer_attn_func(
     q_at_layer: torch.Tensor,
     kv_at_layer: torch.Tensor,
-    kv_cache_manager: KVCacheManager,
+    kv_cache_manager,
     s: Scenario,
 ):
+    try:
+        import flashinfer
+    except:
+        print("\033[33mflashinfer not installed, so skip flashinfer!\033[0m")
+        return []
+
+    if s.page_size != 64:
+        print("\033[33mflashinfer only support page_size 64, so skip flashinfer!\033[0m")
+        return []
+
     outputs = []
     kv_layout = "NHD"
     workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
@@ -368,7 +457,7 @@ def flashinfer_attn_func(
 
         for i in range(s.num_layers):
             q = q_at_layer[i].view(s.batch_size * s.qo_len, s.num_heads, s.head_dim).contiguous()
-            kvcache = kv_cache_manager.get_buffer(i)
+            kvcache = kv_cache_manager.get_buffers(i)
 
             for _ in range(20):
                 o = wrapper.run(q, kvcache)
@@ -382,7 +471,7 @@ def flashinfer_attn_func(
 def hpc_attn_func(
     q_at_layer: torch.Tensor,
     kv_at_layer: torch.Tensor,
-    kv_cache_manager: KVCacheManager,
+    kv_cache_manager,
     s: Scenario,
 ):
     outputs = []
@@ -414,7 +503,9 @@ def hpc_attn_func(
                 [s.kv_cache_len] * s.batch_size, dtype=torch.int32, device="cuda"
             )
             for _ in range(20):
-                my = hpc.attention_decode_bf16(q, kvcache, block_ids, cache_lens)
+                my = hpc.attention_decode_bf16(
+                    q, kvcache[:, 0, :, :, :], kvcache[:, 1, :, :, :], block_ids, cache_lens
+                )
         my = my.reshape(s.batch_size * s.qo_len, s.num_heads * s.head_dim)
         outputs.append(my)
     torch.cuda.synchronize()
@@ -430,35 +521,48 @@ def allclose(
     rtol=rtol,
 ):
     for name, outputs in impls.items():
-        print(f"{name} output: ", float(outputs[layer].abs().mean()))
+        if len(outputs) > 0:
+            print(f"{name} output: ", float(outputs[layer].abs().mean()))
     print("ref outputs: ", float(ref[layer].abs().mean()))
     for name, outputs in impls.items():
-        ref_diff = (ref[layer] - outputs[layer]).abs() / (ref[layer].abs() + 1e-5)
-        print(f"{name} & ref , mean ref diff is ", ref_diff.mean())
-        print(f"{name} & ref , max ref diff is ", ref_diff.max())
-        print(f"{name} & ref,  number of ref diff exceeding the limit is ", (ref_diff > rtol).sum())
-        max_index = torch.argmax(ref_diff)
-        print(
-            f"{name} & ref , the max ref diff index is {max_index}, \
-              the value of {name} is {outputs[layer].reshape(-1)[max_index]}, \
-              the value of ref is {ref[layer].reshape(-1)[max_index]}"
-        )
+        if len(outputs) > 0:
+            ref_diff = (ref[layer] - outputs[layer]).abs() / (ref[layer].abs() + 1e-5)
+            print(f"{name} & ref , mean ref diff is ", ref_diff.mean())
+            print(f"{name} & ref , max ref diff is ", ref_diff.max())
+            print(
+                f"{name} & ref,  number of ref diff exceeding the limit is ",
+                (ref_diff > rtol).sum(),
+            )
+            max_index = torch.argmax(ref_diff)
+            print(
+                f"{name} & ref , the max ref diff index is {max_index}, \
+                the value of {name} is {outputs[layer].reshape(-1)[max_index]}, \
+                the value of ref is {ref[layer].reshape(-1)[max_index]}"
+            )
 
-        abs_diff = (ref[layer] - outputs[layer]).abs()
-        print(f"{name} & ref , mean abs diff is ", abs_diff.mean())
-        print(f"{name} & ref , max abs diff is ", abs_diff.max())
-        print(f"{name} & ref,  number of abs diff exceeding the limit is ", (abs_diff > atol).sum())
-        max_index = torch.argmax(abs_diff)
-        print(
-            f"{name} & ref , the max abs diff index is {max_index}, \
-              the value of {name} is {outputs[layer].reshape(-1)[max_index]}, \
-              the value of ref is {ref[layer].reshape(-1)[max_index]}"
-        )
+            abs_diff = (ref[layer] - outputs[layer]).abs()
+            print(f"{name} & ref , mean abs diff is ", abs_diff.mean())
+            print(f"{name} & ref , max abs diff is ", abs_diff.max())
+            print(
+                f"{name} & ref,  number of abs diff exceeding the limit is ",
+                (abs_diff > atol).sum(),
+            )
+            max_index = torch.argmax(abs_diff)
+            print(
+                f"{name} & ref , the max abs diff index is {max_index}, \
+                the value of {name} is {outputs[layer].reshape(-1)[max_index]}, \
+                the value of ref is {ref[layer].reshape(-1)[max_index]}"
+            )
 
     for name, outputs in impls.items():
-        torch.testing.assert_close(
-            outputs[layer], ref[layer], atol=atol, rtol=rtol, msg=f"Allclose failed: ref<->{name}"
-        ),
+        if len(outputs) > 0:
+            torch.testing.assert_close(
+                outputs[layer],
+                ref[layer],
+                atol=atol,
+                rtol=rtol,
+                msg=f"Allclose failed: ref<->{name}",
+            ),
 
 
 @pytest.mark.skip()
@@ -468,23 +572,26 @@ def test_attention_backend(s: Scenario):
     # run trtllmAttention
     trtllm_outputs = trtllm_attn_func(q_at_layer, kv_at_layer, kvcache_manager, s)
 
-    # run flashattn
-    # fa_outputs = flash_attn_func(q_at_layer, kv_at_layer, kvcache_manager, s)
+    # run flashattn2
+    fa2_outputs = run_flash_attention_v2(q_at_layer, kv_at_layer, kvcache_manager, s)
+
+    # run flashattn3
+    fa3_outputs = run_flash_attention_v3(q_at_layer, kv_at_layer, kvcache_manager, s)
 
     # run flash infer
-    # fi_outputs = flashinfer_attn_func(q_at_layer, kv_at_layer, kvcache_manager, s)
+    fi_outputs = flashinfer_attn_func(q_at_layer, kv_at_layer, kvcache_manager, s)
 
     # run hpc
-    # hpc_outputs = hpc_attn_func(q_at_layer, kv_at_layer, kvcache_manager, s)
+    hpc_outputs = hpc_attn_func(q_at_layer, kv_at_layer, kvcache_manager, s)
 
     print("-------------Result Precision-------------")
     allclose(
-        # fa_outputs,
         trtllm_outputs,
         {
-            # "trtllm": trtllm_outputs,
-            # "flashinfer": fi_outputs,
-            "hpc": hpc_outputs,
+            "fa2_outputs": fa2_outputs,
+            "fa3_outputs": fa3_outputs,
+            "flashinfer": fi_outputs,
+            "hpc_outputs": hpc_outputs,
         },
     )
 

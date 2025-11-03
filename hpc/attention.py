@@ -40,9 +40,10 @@ def attention_prefill_bf16(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
 
 def attention_decode_bf16(
     q: Tensor,
-    kvcache: Tensor,
+    kcache: Tensor,
+    vcache: Tensor,
     block_ids: Tensor,
-    cache_lens: Tensor,
+    num_seq_kvcache: Tensor,
     output: Tensor = None,
 ) -> Tensor:
     """Computes attention decode using bfloat16 precision.
@@ -54,14 +55,18 @@ def attention_decode_bf16(
         q: Query tensor for attention computation
             Shape: [num_batch * num_seq_q, num_head_q, num_dim_qk]
             Dtype: bfloat16
-        kvcache: Key/Value tensor for attention computation in paged format.
+        kcache: Key tensor for attention computation in paged format.
                  Constrainst the unused slots in last block of vcache for each request to be set zeros.
-            Shape: [num_blocks, 2, block_size, num_head_kv, num_dim_qk]
+            Shape: [num_blocks, block_size, num_head_kv, num_dim_qk]
+            Dtype: bfloat16
+        vcache: Value tensor for attention computation in paged format.
+                 Constrainst the unused slots in last block of vcache for each request to be set zeros.
+            Shape: [num_blocks, block_size, num_head_kv, num_dim_qk]
             Dtype: bfloat16
         block_ids: kvcache page block index tensor for get paged kvcache.
             Shape: [num_batch, max_blocks]
             Dtype: int32
-        cache_lens: number tokens in kvcache before cur iteration.
+        num_seq_kvcache: number tokens in kvcache before cur iteration.
             Shape: [num_batch]
             Dtype: int32
         output: Output tensor for store output value inplace.
@@ -80,4 +85,16 @@ def attention_decode_bf16(
         - The query and key tensors must have the same embedding dimension (num_dim_qk)
         - The batch size (num_batch) must be consistent across all input tensors
     """
-    return torch.ops.hpc.attention_decode_bf16(q, kvcache, block_ids, cache_lens, output)
+    return torch.ops.hpc.attention_decode_bf16(
+        q, kcache, vcache, block_ids, num_seq_kvcache, output
+    )
+
+
+@torch.library.register_fake("hpc::attention_prefill_bf16")
+def attention_prefill_bf16_fake(q, k, v):
+    return torch.empty_like(q)
+
+
+@torch.library.register_fake("hpc::attention_decode_bf16")
+def attention_decode_bf16_fake(q, kcache, vcache, block_ids, num_seq_kvcache, output):
+    return torch.empty_like(q)
