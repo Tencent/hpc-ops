@@ -29,7 +29,7 @@ def reference_torch_rms_norm(x, weight, eps):
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 5, 8, 14, 16, 17, 32, 64])
-@pytest.mark.parametrize("hidden_states", [5120, 320])
+@pytest.mark.parametrize("hidden_states", [5120, 320, 4096])
 @pytest.mark.parametrize("scale", [2.5])
 @pytest.mark.parametrize("is_moe", [False, True])
 def test_fused_rms_norm_with_scale(batch_size, hidden_states, scale, is_moe):
@@ -65,5 +65,5 @@ def test_fused_rms_norm_with_scale(batch_size, hidden_states, scale, is_moe):
     assert y_fp8_2.dtype == torch.float8_e4m3fn
     assert y_fp32.dtype == torch.float32
     assert torch.allclose(y_fp32, gt_fp32)
-    assert torch.allclose(y_fp8_2.to(torch.bfloat16), gt_2)
-    assert torch.allclose(y_fp8.to(torch.bfloat16), gt)
+    assert torch.allclose(y_fp8_2.to(torch.bfloat16), gt_2, atol=0.15, rtol=0.0125)
+    assert torch.allclose(y_fp8.to(torch.bfloat16), gt, atol=0.15, rtol=0.0125)

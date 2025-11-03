@@ -56,3 +56,17 @@ def masked_act_mul_and_quant(gate_up: Tensor, scale: Tensor, num_per_expert: Ten
           Dtype: fp8_e4m3
     """
     return torch.ops.hpc.masked_act_mul_and_quant(gate_up, scale, num_per_expert)
+
+
+@torch.library.register_fake("hpc::act_mul_and_quant")
+def act_mul_and_quant_fake(input, scale):
+    return torch.empty(
+        input.shape[0], input.shape[1] // 2, dtype=torch.float8_e4m3fn, device=input.device
+    )
+
+
+@torch.library.register_fake("hpc::masked_act_mul_and_quant")
+def masked_act_mul_and_quant_fake(input, scale, num_per_expert):
+    return torch.empty(
+        input.shape[0], input.shape[1] // 2, dtype=torch.float8_e4m3fn, device=input.device
+    )

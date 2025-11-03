@@ -86,6 +86,9 @@ torch::Tensor entry1(const torch::Tensor &input, torch::Tensor &scale,
 }  // namespace hpc
 
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
-  m.def("act_mul_and_quant", &hpc::activation::entry)
-      .def("masked_act_mul_and_quant", &hpc::activation::entry1);
+  m.def("act_mul_and_quant(Tensor! input, Tensor! scale) -> (Tensor)");
+  m.impl("act_mul_and_quant", torch::kCUDA, &hpc::activation::entry);
+  m.def(
+      "masked_act_mul_and_quant(Tensor! input, Tensor! scale, Tensor! num_per_expert) -> (Tensor)");
+  m.impl("masked_act_mul_and_quant", torch::kCUDA, &hpc::activation::entry1);
 }

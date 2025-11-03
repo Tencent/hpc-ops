@@ -1,11 +1,10 @@
 // Copyright 2025 hpc-ops authors
-
 #include <cuda.h>
 
-#include "src/normalization/fused_rms_norm_with_scale/fused_rms_norm_with_scale.h"
-#include "src/utils/utils.cuh"
+#include <iostream>
 
-constexpr static int kWarpSize = 32;
+#include "src/normalization/fused_rms_norm_with_scale.h"
+#include "src/utils/utils.cuh"
 
 namespace hpc {
 namespace normalization {
@@ -18,6 +17,7 @@ __global__ void fused_rms_norm_with_scale(__nv_bfloat16 *input_ptr, __nv_bfloat1
                                           float *output_ptr_fp32, __nv_fp8_e4m3 *output_ptr_fp8,
                                           __nv_fp8_e4m3 *output_ptr_fp8_scale2, float *scale,
                                           float eps, int batch_size) {
+  constexpr int kWarpSize = 32;
   constexpr int kItemPer16B = 8;
   constexpr float kInvHiddenStates = 1.0f / kHiddenStates;
   constexpr int kIterPerBatch = (kHiddenStates + kWarpPerBatch * kWarpSize * kItemPer16B - 1) /
@@ -161,44 +161,91 @@ __global__ void fused_rms_norm_with_scale(__nv_bfloat16 *input_ptr, __nv_bfloat1
     }                                       \
   }
 
-#define LAUNCH_KERNELS_SWITCH_HIDDEN_STATES()                      \
-  {                                                                \
-    switch (hidden_states) {                                       \
-      case 5120: {                                                 \
-        constexpr int kHiddenStates = 5120;                        \
-        constexpr int kWarpPerBatch = 4;                           \
-        constexpr int kBatchPerBlock = kWarpCount / kWarpPerBatch; \
-        LAUNCH_KERNELS_SWITCH_OUTPUT_HIGH()                        \
-        break;                                                     \
-      }                                                            \
-      case 320: {                                                  \
-        constexpr int kHiddenStates = 320;                         \
-        constexpr int kWarpPerBatch = 1;                           \
-        constexpr int kBatchPerBlock = kWarpCount / kWarpPerBatch; \
-        LAUNCH_KERNELS_SWITCH_OUTPUT_HIGH()                        \
-        break;                                                     \
-      }                                                            \
-      default: {                                                   \
-        throw std::invalid_argument("not support hidden_states!"); \
-        break;                                                     \
-      }                                                            \
-    }                                                              \
-  }
-
-template <typename Tin, typename Tout>
-void fused_rms_norm_with_scale_async(void *input_ptr, void *weight_ptr, void *output_ptr,
+bool fused_rms_norm_with_scale_async(void *input_ptr, void *weight_ptr, void *output_ptr,
                                      void *output_fp32_ptr, void *output_fp8_scale2_ptr,
                                      void *scale, float eps, int batch_size, int hidden_states,
                                      bool is_moe, cudaStream_t stream) {
   constexpr int kWarpCount = 4;
-  dim3 block(kWarpSize * kWarpCount);
-  LAUNCH_KERNELS_SWITCH_HIDDEN_STATES();
-}
+  constexpr int kWarpSize = 32;
 
-template void fused_rms_norm_with_scale_async<__nv_bfloat16, __nv_fp8_e4m3>(void *, void *, void *,
-                                                                            void *, void *, void *,
-                                                                            float, int, int, bool,
-                                                                            cudaStream_t);
+  using Tin = __nv_bfloat16;
+  using Tout = __nv_fp8_e4m3;
+
+  dim3 block(kWarpSize * kWarpCount);
+  if (hidden_states == 5120) {
+    constexpr int kHiddenStates = 5120;
+    constexpr int kWarpPerBatch = 4;
+    constexpr int kBatchPerBlock = kWarpCount / kWarpPerBatch;
+    dim3 grid((batch_size + kBatchPerBlock - 1) / kBatchPerBlock);
+    if (is_moe) {
+      constexpr bool kIsMoe = true;
+      kernels::fused_rms_norm_with_scale<kHiddenStates, kWarpPerBatch, kBatchPerBlock, kIsMoe>
+          <<<grid, block, 0, stream>>>(
+              reinterpret_cast<Tin *>(input_ptr), reinterpret_cast<Tin *>(weight_ptr),
+              reinterpret_cast<float *>(output_fp32_ptr), reinterpret_cast<Tout *>(output_ptr),
+              reinterpret_cast<Tout *>(output_fp8_scale2_ptr), reinterpret_cast<float *>(scale),
+              eps, batch_size);
+    } else {
+      constexpr bool kIsMoe = false;
+      kernels::fused_rms_norm_with_scale<kHiddenStates, kWarpPerBatch, kBatchPerBlock, kIsMoe>
+          <<<grid, block, 0, stream>>>(
+              reinterpret_cast<Tin *>(input_ptr), reinterpret_cast<Tin *>(weight_ptr),
+              reinterpret_cast<float *>(output_fp32_ptr), reinterpret_cast<Tout *>(output_ptr),
+              reinterpret_cast<Tout *>(output_fp8_scale2_ptr), reinterpret_cast<float *>(scale),
+              eps, batch_size);
+    }
+  } else if (hidden_states == 4096) {
+    constexpr int kHiddenStates = 4096;
+    constexpr int kWarpPerBatch = 4;
+    constexpr int kBatchPerBlock = kWarpCount / kWarpPerBatch;
+    dim3 grid((batch_size + kBatchPerBlock - 1) / kBatchPerBlock);
+    if (is_moe) {
+      constexpr bool kIsMoe = true;
+      kernels::fused_rms_norm_with_scale<kHiddenStates, kWarpPerBatch, kBatchPerBlock, kIsMoe>
+          <<<grid, block, 0, stream>>>(
+              reinterpret_cast<Tin *>(input_ptr), reinterpret_cast<Tin *>(weight_ptr),
+              reinterpret_cast<float *>(output_fp32_ptr), reinterpret_cast<Tout *>(output_ptr),
+              reinterpret_cast<Tout *>(output_fp8_scale2_ptr), reinterpret_cast<float *>(scale),
+              eps, batch_size);
+    } else {
+      constexpr bool kIsMoe = false;
+      kernels::fused_rms_norm_with_scale<kHiddenStates, kWarpPerBatch, kBatchPerBlock, kIsMoe>
+          <<<grid, block, 0, stream>>>(
+              reinterpret_cast<Tin *>(input_ptr), reinterpret_cast<Tin *>(weight_ptr),
+              reinterpret_cast<float *>(output_fp32_ptr), reinterpret_cast<Tout *>(output_ptr),
+              reinterpret_cast<Tout *>(output_fp8_scale2_ptr), reinterpret_cast<float *>(scale),
+              eps, batch_size);
+    }
+  } else if (hidden_states == 320) {
+    constexpr int kHiddenStates = 320;
+    constexpr int kWarpPerBatch = 1;
+    constexpr int kBatchPerBlock = kWarpCount / kWarpPerBatch;
+    dim3 grid((batch_size + kBatchPerBlock - 1) / kBatchPerBlock);
+    if (is_moe) {
+      constexpr bool kIsMoe = true;
+      kernels::fused_rms_norm_with_scale<kHiddenStates, kWarpPerBatch, kBatchPerBlock, kIsMoe>
+          <<<grid, block, 0, stream>>>(
+              reinterpret_cast<Tin *>(input_ptr), reinterpret_cast<Tin *>(weight_ptr),
+              reinterpret_cast<float *>(output_fp32_ptr), reinterpret_cast<Tout *>(output_ptr),
+              reinterpret_cast<Tout *>(output_fp8_scale2_ptr), reinterpret_cast<float *>(scale),
+              eps, batch_size);
+    } else {
+      constexpr bool kIsMoe = false;
+      kernels::fused_rms_norm_with_scale<kHiddenStates, kWarpPerBatch, kBatchPerBlock, kIsMoe>
+          <<<grid, block, 0, stream>>>(
+              reinterpret_cast<Tin *>(input_ptr), reinterpret_cast<Tin *>(weight_ptr),
+              reinterpret_cast<float *>(output_fp32_ptr), reinterpret_cast<Tout *>(output_ptr),
+              reinterpret_cast<Tout *>(output_fp8_scale2_ptr), reinterpret_cast<float *>(scale),
+              eps, batch_size);
+    }
+  } else {
+    std::cout << "not supported hidden_size for fused_rms_norm_with_scale_async:" << hidden_states
+              << std::endl;
+    return false;
+  }
+
+  return true;
+}
 
 }  // namespace fused_rms_norm_with_scale
 }  // namespace normalization

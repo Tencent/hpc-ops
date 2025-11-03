@@ -30,3 +30,12 @@ def fused_rms_norm_with_scale(
         a, weight, scale, eps, is_moe
     )
     return (output_fp32, output_fp8, output_fp8_scale2) if is_moe else output_fp8
+
+
+@torch.library.register_fake("hpc::fused_rms_norm_with_scale")
+def fused_rms_norm_with_scale_fake(a, weight, eps, scale, is_moe):
+    return (
+        torch.empty_like(a, dtype=torch.float8_e4m3fn),
+        torch.empty_like(a, dtype=torch.float32),
+        torch.empty_like(a, dtype=torch.float8_e4m3fn),
+    )
