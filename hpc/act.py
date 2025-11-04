@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 
 
-def act_mul_and_quant(gate_up: Tensor, scale: Tensor) -> Tensor:
+def act_mul_and_quant(gate_up: Tensor, scale: Tensor, output: Tensor = None) -> Tensor:
     """Applies activation, multiplication, and quantization to the gate_up projection.
 
     Specifically:
@@ -23,11 +23,11 @@ def act_mul_and_quant(gate_up: Tensor, scale: Tensor) -> Tensor:
           Dtype: float32
 
     Returns:
-      Quantized output tensor.
+      Quantized output tensor. result = silu(gate_up[:, :d/2]) * gate_up[:, d/2:] * scale
           Shape: [N, C]
           Dtype: fp8_e4m3
     """
-    return torch.ops.hpc.act_mul_and_quant(gate_up, scale)
+    return torch.ops.hpc.act_mul_and_quant(gate_up, scale, output)
 
 
 def masked_act_mul_and_quant(gate_up: Tensor, scale: Tensor, num_per_expert: Tensor) -> Tensor:
@@ -59,7 +59,7 @@ def masked_act_mul_and_quant(gate_up: Tensor, scale: Tensor, num_per_expert: Ten
 
 
 @torch.library.register_fake("hpc::act_mul_and_quant")
-def act_mul_and_quant_fake(input, scale):
+def act_mul_and_quant_fake(input, scale, output):
     return torch.empty(
         input.shape[0], input.shape[1] // 2, dtype=torch.float8_e4m3fn, device=input.device
     )

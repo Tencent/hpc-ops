@@ -12,7 +12,8 @@
 namespace hpc {
 namespace activation {
 
-torch::Tensor entry(torch::Tensor &input, torch::Tensor &scale) {
+torch::Tensor entry(const torch::Tensor &input, const torch::Tensor &scale,
+                    std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
   std::vector<int64_t> output_shape(input.sizes().begin(), input.sizes().end());
@@ -20,14 +21,19 @@ torch::Tensor entry(torch::Tensor &input, torch::Tensor &scale) {
 
   auto options = input.options().dtype(torch::kFloat8_e4m3fn);
 
-  torch::Tensor output = torch::empty(output_shape, options);
+  torch::Tensor output_tensor;
+  if (output.has_value()) {
+    output_tensor = output.value();
+  } else {
+    output_tensor = torch::empty(output_shape, options);
+  }
 
   using Tin = __nv_bfloat16;
   using Tout = __nv_fp8_e4m3;
 
-  Tin *input_ptr = reinterpret_cast<Tin *>(input.data_ptr());
-  Tout *output_ptr = reinterpret_cast<Tout *>(output.data_ptr());
-  float *scale_ptr = scale.data_ptr<float>();
+  const auto *input_ptr = reinterpret_cast<const Tin *>(input.const_data_ptr());
+  auto *output_ptr = reinterpret_cast<Tout *>(output_tensor.mutable_data_ptr());
+  const float *scale_ptr = scale.const_data_ptr<float>();
 
   auto input_shape = input.sizes();
   int num_col = input_shape[input_shape.size() - 1];
@@ -38,7 +44,7 @@ torch::Tensor entry(torch::Tensor &input, torch::Tensor &scale) {
 
   act_mul_and_quant_async(output_ptr, input_ptr, scale_ptr, num_row, num_col, stream);
 
-  return output;
+  return output_tensor;
 }
 
 torch::Tensor entry1(const torch::Tensor &input, torch::Tensor &scale,
@@ -86,7 +92,7 @@ torch::Tensor entry1(const torch::Tensor &input, torch::Tensor &scale,
 }  // namespace hpc
 
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
-  m.def("act_mul_and_quant(Tensor! input, Tensor! scale) -> (Tensor)");
+  m.def("act_mul_and_quant(Tensor input, Tensor scale, Tensor? output) -> (Tensor)");
   m.impl("act_mul_and_quant", torch::kCUDA, &hpc::activation::entry);
   m.def(
       "masked_act_mul_and_quant(Tensor! input, Tensor! scale, Tensor! num_per_expert) -> (Tensor)");

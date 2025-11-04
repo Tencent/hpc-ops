@@ -33,13 +33,19 @@ def gt_masked_act_mul_and_quant(gate_up, scale, num_per_expert):
 
 @pytest.mark.parametrize("num_batch", [64, 62 * 1024, 128 * 1024])
 @pytest.mark.parametrize("intermediate_size", [2128, 512, 4608])
-def test_act_mul_and_quant(num_batch, intermediate_size):
+@pytest.mark.parametrize("use_output", [True, False])
+def test_act_mul_and_quant(num_batch, intermediate_size, use_output):
     gate_up_out = torch.randn(
         (num_batch, intermediate_size * 2), dtype=torch.bfloat16, device="cuda"
     )
     scale = torch.tensor([1.24], dtype=torch.float32, device="cuda")
 
-    out = hpc.act_mul_and_quant(gate_up_out, scale)
+    if use_output:
+        out = torch.empty(num_batch, intermediate_size, dtype=torch.float8_e4m3fn, device="cuda")
+        hpc.act_mul_and_quant(gate_up_out, scale, out)
+    else:
+        out = hpc.act_mul_and_quant(gate_up_out, scale)
+
     gt = _act_mul_and_quant(gate_up_out, scale)
 
     assert torch.allclose(out.to(torch.float), gt.to(torch.float))
