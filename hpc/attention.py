@@ -2,7 +2,14 @@ import torch
 from torch import Tensor
 
 
-def attention_prefill_bf16(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+def attention_prefill_bf16(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    seqlens_q: Tensor,
+    cu_seqlens_q: Tensor,
+    max_seqlens_q: int,
+) -> Tensor:
     """Computes attention prefill using bfloat16 precision.
 
     This function performs the attention prefill computation using custom hardware
@@ -12,18 +19,27 @@ def attention_prefill_bf16(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
 
     Args:
         q: Query tensor for attention computation
-            Shape: [num_batch, num_seq_q, num_head_q, num_dim_qk]
+            Shape: [total_seq, num_head_q, num_dim_qk]
             Dtype: bfloat16
         k: Key tensor for attention computation
-            Shape: [num_batch, num_seq_kv, num_head_kv, num_dim_qk]
+            Shape: [total_seq, num_head_kv, num_dim_qk]
             Dtype: bfloat16
         v: Value tensor for attention computation
-            Shape: [num_batch, num_seq_kv, num_head_kv, num_dim_v]
+            Shape: [total_seq, num_head_kv, num_dim_v]
             Dtype: bfloat16
+        seqlens_q: num_seq_q for each batch
+            Shape: [num_batch]
+            Dtype: int32
+        cu_seqlens_q: start_seq_q for each batch
+            Shape: [num_batch + 1]
+            Dtype: int32
+        max_seqlens_q: max seqlens amang all batchs
+            Shape: scalar
+            Dtype: int
 
     Returns:
         Tensor: Attention output tensor in bfloat16 format on CUDA device
-            Shape: [num_batch, num_seq_q, num_head_q, num_dim_v]
+            Shape: [total_seq, num_head_q, num_dim_v]
             Dtype: bfloat16
 
     Raises:
@@ -32,10 +48,10 @@ def attention_prefill_bf16(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
     Note:
         - All input tensors must be on CUDA device and in bfloat16 format
         - The query and key tensors must have the same embedding dimension (num_dim_qk)
-        - The batch size (num_batch) must be consistent across all input tensors
+        - total_seq = sum(seqlens_q[ibatch] for ibatch in range(num_batch))
     """
 
-    return torch.ops.hpc.attention_prefill_bf16(q, k, v)
+    return torch.ops.hpc.attention_prefill_bf16(q, k, v, seqlens_q, cu_seqlens_q, max_seqlens_q)
 
 
 def attention_decode_bf16(
@@ -91,7 +107,7 @@ def attention_decode_bf16(
 
 
 @torch.library.register_fake("hpc::attention_prefill_bf16")
-def attention_prefill_bf16_fake(q, k, v):
+def attention_prefill_bf16_fake(q, k, v, seqlens_q, cu_seqlens_q, max_seqlens_q):
     return torch.empty_like(q)
 
 

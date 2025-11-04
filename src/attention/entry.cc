@@ -11,39 +11,48 @@ namespace hpc {
 namespace attention {
 
 torch::Tensor attention_prefill_bf16_entry(const torch::Tensor &q, const torch::Tensor &k,
-                                           const torch::Tensor &v) {
+                                           const torch::Tensor &v, const torch::Tensor &seqlens_q,
+                                           const torch::Tensor &cu_seqlens_q,
+                                           int64_t max_seqlens_q) {
   auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
   TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
   TORCH_CHECK(k.device().is_cuda(), "k tensor must be cuda");
   TORCH_CHECK(v.device().is_cuda(), "v tensor must be cuda");
+  TORCH_CHECK(seqlens_q.device().is_cuda(), "seqlens_q tensor must be cuda");
+  TORCH_CHECK(cu_seqlens_q.device().is_cuda(), "cu_seqlens_q tensor must be cuda");
 
-  int num_batch = q.size(0);
-  int num_seq_q = q.size(1);
-  int num_head_q = q.size(2);
-  int num_dim_qk = q.size(3);
+  int total_seq_q = q.size(0);
+  int num_head_q = q.size(1);
+  int num_dim_qk = q.size(2);
 
-  int num_seq_kv = v.size(1);
-  int num_head_kv = v.size(2);
-  int num_dim_v = v.size(3);
+  int num_head_kv = v.size(1);
+  int num_dim_v = v.size(2);
+
+  int num_batch = seqlens_q.size(0);
+
+  auto options = q.options().dtype(torch::kBFloat16);
+  torch::Tensor y = torch::empty({total_seq_q, num_head_q, num_dim_v}, options);
+  int num_tmas = 4 * num_batch;
+  torch::Tensor tmas = torch::empty({num_tmas, 64}, options);
 
   const auto *q_ptr = q.const_data_ptr();
   const auto *k_ptr = k.const_data_ptr();
   const auto *v_ptr = v.const_data_ptr();
-
-  auto options = q.options().dtype(torch::kBFloat16);
-  torch::Tensor y = torch::empty({num_batch, num_seq_q, num_head_q, num_dim_v}, options);
+  const auto *seqlens_q_ptr = seqlens_q.const_data_ptr();
+  const auto *cu_seqlens_q_ptr = cu_seqlens_q.const_data_ptr();
+  void *tmas_ptr = tmas.mutable_data_ptr();
 
   using T = __nv_bfloat16;
   auto *y_ptr = reinterpret_cast<T *>(y.mutable_data_ptr());
 
-  int ldQ = q.stride(1);  // num_head_q * num_dim_qk;
-  int ldK = k.stride(1);  // num_head_kv * num_dim_qk;
-  int ldV = v.stride(1);  // num_head_kv * num_dim_v;
-  int ldY = y.stride(1);  // num_head_q * num_dim_v;
+  int ldQ = q.stride(0);  // num_head_q * num_dim_qk;
+  int ldK = k.stride(0);  // num_head_kv * num_dim_qk;
+  int ldV = v.stride(0);  // num_head_kv * num_dim_v;
+  int ldY = y.stride(0);  // num_head_q * num_dim_v;
 
-  attention_prefill_bf16_async(y_ptr, q_ptr, k_ptr, v_ptr, num_batch, num_seq_q, num_seq_kv,
-                               num_dim_qk, num_dim_v, num_head_q, num_head_kv, ldY, ldQ, ldK, ldV,
-                               stream);
+  attention_prefill_bf16_async(y_ptr, q_ptr, k_ptr, v_ptr, seqlens_q_ptr, cu_seqlens_q_ptr,
+                               tmas_ptr, num_batch, total_seq_q, max_seqlens_q, num_dim_qk,
+                               num_dim_v, num_head_q, num_head_kv, ldY, ldQ, ldK, ldV, stream);
 
   return y;
 }
@@ -111,7 +120,9 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
 }  // namespace hpc
 
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
-  m.def("attention_prefill_bf16(Tensor q, Tensor k, Tensor v) -> (Tensor)");
+  m.def(
+      "attention_prefill_bf16(Tensor q, Tensor k, Tensor v, Tensor seqlens_q, Tensor cu_seqlens_q, "
+      "int max_seqlens_q) -> (Tensor)");
   m.impl("attention_prefill_bf16", torch::kCUDA, &hpc::attention::attention_prefill_bf16_entry);
 
   m.def(
