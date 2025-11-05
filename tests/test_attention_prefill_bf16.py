@@ -120,8 +120,9 @@ except Exception as e:
 @pytest.mark.parametrize("num_head_kv", [1])
 @pytest.mark.parametrize("num_dim_qk", [128])
 @pytest.mark.parametrize("num_dim_v", [128])
+@pytest.mark.parametrize("use_output", [True, False])
 def test_attention_prefill_bf16(
-    num_batch, num_seq_q, num_seq_kv, num_head_q, num_head_kv, num_dim_qk, num_dim_v
+    num_batch, num_seq_q, num_seq_kv, num_head_q, num_head_kv, num_dim_qk, num_dim_v, use_output
 ):
 
     torch.cuda.manual_seed(2)
@@ -158,7 +159,11 @@ def test_attention_prefill_bf16(
             max_seqlen_k=max_seqlens_q,
             causal=True,
         )
-        my = hpc.attention_prefill_bf16(Q, K, V, seqlens_q, cu_seqlens_q, max_seqlens_q)
+        if use_output:
+            my = torch.empty_like(Q)
+            hpc.attention_prefill_bf16(Q, K, V, seqlens_q, cu_seqlens_q, max_seqlens_q, output=my)
+        else:
+            my = hpc.attention_prefill_bf16(Q, K, V, seqlens_q, cu_seqlens_q, max_seqlens_q)
 
     gt = gt.reshape(-1, num_head_q, num_dim_v)
     print("\ngt\n")

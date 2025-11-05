@@ -114,9 +114,8 @@ bool attention_decode_bf16_headdim128_smallm_async(
   constexpr int kTileN = 8;
   constexpr int kTileK = 128;
   constexpr int kTileV = 128;
-  constexpr int kBlockSize = 32;
 
-  if (num_dim_qk != kTileK || num_dim_v != kTileV || kBlockSize != block_size) {
+  if (num_dim_qk != kTileK || num_dim_v != kTileV || (block_size != 32 && block_size != 64)) {
     std::cout << "launch launch_attention_decode_bf16_dim128_smallm failed with "
               << "  num_dim_qk: " << num_dim_qk << ", num_dim_v: " << num_dim_v
               << ", block_size:" << block_size << std::endl;
@@ -126,11 +125,21 @@ bool attention_decode_bf16_headdim128_smallm_async(
   int heads_per_group = num_head_q / num_head_k;
   if (heads_per_group == 8 || heads_per_group == 4) {
     constexpr int kHeadsPerGroup = 8;
-    launch_attention_decode_bf16_dim128_smallm<kHeadsPerGroup, kTileM, kTileN, kTileK, kTileV,
-                                               kBlockSize>(
-        y_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr, num_seq_kvcache_ptr, num_batch,
-        num_head_q, num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v,
-        num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+    if (block_size == 32) {
+      constexpr int kBlockSize = 32;
+      launch_attention_decode_bf16_dim128_smallm<kHeadsPerGroup, kTileM, kTileN, kTileK, kTileV,
+                                                 kBlockSize>(
+          y_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr, num_seq_kvcache_ptr, num_batch,
+          num_head_q, num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v,
+          num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+    } else if (block_size == 64) {
+      constexpr int kBlockSize = 64;
+      launch_attention_decode_bf16_dim128_smallm<kHeadsPerGroup, kTileM, kTileN, kTileK, kTileV,
+                                                 kBlockSize>(
+          y_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr, num_seq_kvcache_ptr, num_batch,
+          num_head_q, num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v,
+          num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+    }
   }
 
   return true;

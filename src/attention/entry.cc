@@ -12,8 +12,8 @@ namespace attention {
 
 torch::Tensor attention_prefill_bf16_entry(const torch::Tensor &q, const torch::Tensor &k,
                                            const torch::Tensor &v, const torch::Tensor &seqlens_q,
-                                           const torch::Tensor &cu_seqlens_q,
-                                           int64_t max_seqlens_q) {
+                                           const torch::Tensor &cu_seqlens_q, int64_t max_seqlens_q,
+                                           std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
   TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
   TORCH_CHECK(k.device().is_cuda(), "k tensor must be cuda");
@@ -31,7 +31,13 @@ torch::Tensor attention_prefill_bf16_entry(const torch::Tensor &q, const torch::
   int num_batch = seqlens_q.size(0);
 
   auto options = q.options().dtype(torch::kBFloat16);
-  torch::Tensor y = torch::empty({total_seq_q, num_head_q, num_dim_v}, options);
+  torch::Tensor y;
+  if (output.has_value()) {
+    y = output.value();
+  } else {
+    y = torch::empty({total_seq_q, num_head_q, num_dim_v}, options);
+  }
+
   int num_tmas = 4 * num_batch;
   torch::Tensor tmas = torch::empty({num_tmas, 64}, options);
 
@@ -94,9 +100,11 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   const int *num_seq_kvcache_ptr = num_seq_kvcache.const_data_ptr<int>();
 
   auto options = q.options().dtype(torch::kBFloat16);
-  torch::Tensor y = torch::empty({num_batch * num_seq_q, num_head_q, num_dim_v}, options);
+  torch::Tensor y;
   if (output.has_value()) {
     y = output.value();
+  } else {
+    y = torch::empty({num_batch * num_seq_q, num_head_q, num_dim_v}, options);
   }
 
   auto *y_ptr = y.mutable_data_ptr();
@@ -122,7 +130,7 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "attention_prefill_bf16(Tensor q, Tensor k, Tensor v, Tensor seqlens_q, Tensor cu_seqlens_q, "
-      "int max_seqlens_q) -> (Tensor)");
+      "int max_seqlens_q, Tensor? output) -> (Tensor)");
   m.impl("attention_prefill_bf16", torch::kCUDA, &hpc::attention::attention_prefill_bf16_entry);
 
   m.def(

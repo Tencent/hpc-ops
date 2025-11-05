@@ -9,6 +9,7 @@ def attention_prefill_bf16(
     seqlens_q: Tensor,
     cu_seqlens_q: Tensor,
     max_seqlens_q: int,
+    output: Tensor = None,
 ) -> Tensor:
     """Computes attention prefill using bfloat16 precision.
 
@@ -51,7 +52,9 @@ def attention_prefill_bf16(
         - total_seq = sum(seqlens_q[ibatch] for ibatch in range(num_batch))
     """
 
-    return torch.ops.hpc.attention_prefill_bf16(q, k, v, seqlens_q, cu_seqlens_q, max_seqlens_q)
+    return torch.ops.hpc.attention_prefill_bf16(
+        q, k, v, seqlens_q, cu_seqlens_q, max_seqlens_q, output
+    )
 
 
 def attention_decode_bf16(
@@ -107,7 +110,7 @@ def attention_decode_bf16(
 
 
 @torch.library.register_fake("hpc::attention_prefill_bf16")
-def attention_prefill_bf16_fake(q, k, v, seqlens_q, cu_seqlens_q, max_seqlens_q):
+def attention_prefill_bf16_fake(q, k, v, seqlens_q, cu_seqlens_q, max_seqlens_q, output):
     return torch.empty_like(q)
 
 
