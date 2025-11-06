@@ -28,6 +28,10 @@ class IMulticastCommunicator : public torch::CustomClassHolder {
     std::shared_ptr<void> multi_sptr;
     int multi_device;
 
+    auto target_device = torch::Device(torch::kCUDA, multicomm_->GetDeviceId());
+    torch::TensorOptions options;
+    auto opt = options.dtype(torch::kUInt8).device(target_device);
+
     TORCH_CHECK(multicomm_->CreateTensorSync(bytes, &sptrs, &devices, &multi_sptr, &multi_device),
                 "create tensor sync fail");
 
@@ -35,22 +39,18 @@ class IMulticastCommunicator : public torch::CustomClassHolder {
 
     // multi tensor
     {
-      torch::TensorOptions options;
-      auto opt = options.dtype(torch::kUInt8).device(torch::kCUDA, multi_device);
-
       auto deleter = [keeper = multi_sptr](void *ptr) {};
-      torch::Tensor t = torch::from_blob(multi_sptr.get(), {bytes}, deleter, opt);
+      // use at:: apis to specify target device
+      auto t = at::from_blob(multi_sptr.get(), {bytes}, deleter, opt, target_device);
 
       tensors.insert(-1, t);
     }
 
     // remote tensor and local tensor
     for (uint32_t rank = 0; rank < sptrs.size(); ++rank) {
-      torch::TensorOptions options;
-      auto opt = options.dtype(torch::kUInt8).device(torch::kCUDA, devices[rank]);
-
       auto deleter = [keeper = sptrs[rank]](void *ptr) {};
-      torch::Tensor t = torch::from_blob(sptrs[rank].get(), {bytes}, deleter, opt);
+      // use at:: apis to specify target device
+      auto t = at::from_blob(sptrs[rank].get(), {bytes}, deleter, opt, target_device);
 
       tensors.insert(rank, t);
     }

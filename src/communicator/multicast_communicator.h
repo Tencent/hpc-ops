@@ -23,6 +23,7 @@ class MulticastCommunicator {
                         std::vector<int> *devices, std::shared_ptr<void> *multi_ptr,
                         int *multi_device);
   void Barrier();
+  int GetDeviceId();
 
  private:
   int rank_;

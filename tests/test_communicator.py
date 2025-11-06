@@ -17,15 +17,16 @@ def run_task(rank, world_size, bytes):
     print("rank={}".format(rank))
     print(tensors)
 
+    output = tensors[rank]
     for r, tensor in tensors.items():
         assert tensor.shape == torch.Size([bytes])
         assert tensor.stride() == (1,)
         assert tensor.dtype == torch.uint8
+        assert tensor.device == torch.device("cuda", rank)
+        output += tensor
 
-        if r == -1:
-            assert tensor.device == torch.device("cuda", 0)
-        else:
-            assert tensor.device == torch.device("cuda", r)
+    comm.Barrier()
+    print(output)
 
 
 @pytest.mark.skipif(os.getenv("NV_SANITIZER_INJECTION_PORT_BASE"), reason="skip sanitizer")

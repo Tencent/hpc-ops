@@ -39,6 +39,8 @@ MulticastCommunicator::~MulticastCommunicator() {
 
 void MulticastCommunicator::Barrier() { comm_->Barrier(); }
 
+int MulticastCommunicator::GetDeviceId() { return device_id_; }
+
 bool MulticastCommunicator::CreateTensorSync(int64_t bytes,
                                              std::vector<std::shared_ptr<void>> *sptrs,
                                              std::vector<int> *devices,

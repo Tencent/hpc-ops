@@ -49,7 +49,7 @@ static std::shared_ptr<void> ReserveAddrMapHandleAndSetAccess(CUmemGenericAlloca
 
   CUmemAccessDesc desc = {};
   desc.location.type = prop.location.type;
-  desc.location.id = prop.location.id;
+  desc.location.id = *device;
   desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
   CUCHECK(cuMemSetAccess(ptr, aligned_bytes, &desc, 1));
 
@@ -77,7 +77,7 @@ static std::shared_ptr<void> ReserveAddrMapHandleAndSetAccessMulticast(
 
   CUmemAccessDesc desc = {};
   desc.location.type = prop.location.type;
-  desc.location.id = prop.location.id;
+  desc.location.id = *device;
   desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
   CUCHECK(cuMemSetAccess(ptr, aligned_bytes, &desc, 1));
 
@@ -128,6 +128,7 @@ bool MulticastObjectManager::CreateMemoryObjAndExportFd(int *fd, int64_t bytes,
 
   CUCHECK(cuMemExportToShareableHandle(fd, handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
 
+  *device = device_id_;
   *obj = ReserveAddrMapHandleAndSetAccess(handle, aligned_bytes, device);
   return true;
 }
@@ -142,6 +143,7 @@ bool MulticastObjectManager::CreateMemoryObjByImportFd(int fd, int64_t bytes,
   CUCHECK(cuMemImportFromShareableHandle(&handle, reinterpret_cast<void *>(fd64),
                                          CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
 
+  *device = device_id_;
   *obj = ReserveAddrMapHandleAndSetAccess(handle, aligned_bytes, device);
   return true;
 }
@@ -193,6 +195,8 @@ bool MulticastObjectManager::MapHandleToMulticastObj(std::shared_ptr<void> multi
   int64_t aligned_bytes = align_to(bytes, kAlignment);
 
   auto shandle = std::static_pointer_cast<CUmemGenericAllocationHandle>(multi_handle);
+
+  *device = device_id_;
   *multi_obj = ReserveAddrMapHandleAndSetAccessMulticast(*shandle, aligned_bytes, device);
   return true;
 }
