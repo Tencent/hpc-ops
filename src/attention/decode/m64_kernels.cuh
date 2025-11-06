@@ -1,7 +1,7 @@
 // Copyright 2025 hpc-ops authors
 
-#ifndef SRC_ATTENTION_ATTENTION_DECODE_CUH_
-#define SRC_ATTENTION_ATTENTION_DECODE_CUH_
+#ifndef SRC_ATTENTION_DECODE_M64_KERNELS_CUH_
+#define SRC_ATTENTION_DECODE_M64_KERNELS_CUH_
 
 #include <cuda.h>
 #include <stdio.h>
@@ -10,12 +10,12 @@
 
 #include "cute/tensor.hpp"
 #include "cutlass/arch/reg_reconfig.h"
-#include "src/attention/attention.h"
 #include "src/utils/tma.cuh"
 #include "src/utils/utils.cuh"
 
 namespace hpc {
 namespace attention {
+namespace decode {
 namespace kernels {
 
 template <typename TensorY, typename TensorS>
@@ -770,7 +770,8 @@ __global__ void attention_decode_bf16_onestage_kernel(
 }
 
 }  // namespace kernels
+}  // namespace decode
 }  // namespace attention
 }  // namespace hpc
 
-#endif  // SRC_ATTENTION_ATTENTION_DECODE_CUH_
+#endif  // SRC_ATTENTION_DECODE_M64_KERNELS_CUH_

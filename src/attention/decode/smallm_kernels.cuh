@@ -1,7 +1,7 @@
 // Copyright 2025 hpc-ops authors
 
-#ifndef SRC_ATTENTION_ATTENTION_DECODE_SMALLM_CUH_
-#define SRC_ATTENTION_ATTENTION_DECODE_SMALLM_CUH_
+#ifndef SRC_ATTENTION_DECODE_SMALLM_KERNELS_CUH_
+#define SRC_ATTENTION_DECODE_SMALLM_KERNELS_CUH_
 
 #include <cuda.h>
 #include <stdio.h>
@@ -11,7 +11,6 @@
 #include "cute/tensor.hpp"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/arch/reg_reconfig.h"
-#include "src/attention/attention.h"
 #include "src/utils/tma.cuh"
 #include "src/utils/utils.cuh"
 
@@ -589,4 +588,4 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_kernel(
 }  // namespace attention
 }  // namespace hpc
 
-#endif  // SRC_ATTENTION_ATTENTION_DECODE_SMALLM_CUH_
+#endif  // SRC_ATTENTION_DECODE_SMALLM_KERNELS_CUH_

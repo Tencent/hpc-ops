@@ -7,11 +7,12 @@
 #include <iostream>
 
 #include "cute/tensor.hpp"
-#include "src/attention/attention_decode.h"
-#include "src/attention/attention_decode_smallm.cuh"
+#include "src/attention/decode/smallm_dim128.h"
+#include "src/attention/decode/smallm_kernels.cuh"
 
 namespace hpc {
 namespace attention {
+namespace decode {
 
 template <int kHeadsPerGroup, int kTileM, int kTileN, int kTileK, int kTileV, int kBlockSize>
 void launch_attention_decode_bf16_dim128_smallm(
@@ -103,11 +104,12 @@ void launch_attention_decode_bf16_dim128_smallm(
       num_seq_max_blocks, one_over_dk_log2e);
 }
 
-bool attention_decode_bf16_headdim128_smallm_async(
-    void *y_ptr, const void *q_ptr, void *kcache_ptr, void *vcache_ptr, const int *block_ids_ptr,
-    const int *num_seq_kvcache_ptr, int num_batch, int num_head_q, int num_head_k, int num_head_v,
-    int num_dim_qk, int num_dim_v, int num_kvcache_blocks, int block_size, int num_seq_max_blocks,
-    int ldY, int ldQ, int ldK, int ldV, cudaStream_t stream) {
+bool smallm_dim128_async(void *y_ptr, const void *q_ptr, void *kcache_ptr, void *vcache_ptr,
+                         const int *block_ids_ptr, const int *num_seq_kvcache_ptr, int num_batch,
+                         int num_head_q, int num_head_k, int num_head_v, int num_dim_qk,
+                         int num_dim_v, int num_kvcache_blocks, int block_size,
+                         int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV,
+                         cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   constexpr int kTileM = 64;
@@ -144,5 +146,7 @@ bool attention_decode_bf16_headdim128_smallm_async(
 
   return true;
 }
+
+}  // namespace decode
 }  // namespace attention
 }  // namespace hpc

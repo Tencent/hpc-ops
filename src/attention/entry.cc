@@ -5,7 +5,8 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
-#include "src/attention/attention.h"
+#include "src/attention/decode/decode.h"
+#include "src/attention/prefill/prefill.h"
 
 namespace hpc {
 namespace attention {
