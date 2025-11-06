@@ -3,7 +3,7 @@
 #include <cuda.h>
 #include <stdio.h>
 
-#include <algorithm>
+#include <cub/cub.cuh>
 
 #include "cute/tensor.hpp"
 #include "cutlass/arch/reg_reconfig.h"
@@ -16,34 +16,134 @@ namespace group_gemm {
 
 namespace kernels {
 
-template <int kBlockSwizzle>
-__device__ __forceinline__ auto get_next_tile(int iblock, int num_tile_m, int num_tile_n,
-                                              cutlass::FastDivmod swizzle_divider,
-                                              cutlass::FastDivmod flat_divider) {
-  int itile_m, itile_n;
-  int num_tile_bxn = kBlockSwizzle * num_tile_n;
-  int total_sizzle_blocks = num_tile_m / kBlockSwizzle * num_tile_bxn;
+__device__ __forceinline__ void get_next_tile_horizon(const int *tiles_ptr, int iblock,
+                                                      int num_group, int &igroup, int &itile_m,
+                                                      int &itile_n, int &sum_tile_m,
+                                                      cutlass::FastDivmod flat_divider) {
+  int num_tile_m, itile_m_total;
 
-  if (iblock >= total_sizzle_blocks) {
-    flat_divider(itile_m, itile_n, iblock);
-  } else {
-    int i_bxn, i_bxn_res;
-    swizzle_divider(i_bxn, i_bxn_res, iblock);
+  flat_divider(itile_m_total, itile_n, iblock);
+  for (int i = igroup; i < num_group; i++) {
+    num_tile_m = tiles_ptr[i];
+    sum_tile_m += num_tile_m;
+    if (itile_m_total < sum_tile_m) {
+      igroup = i;
+      sum_tile_m = sum_tile_m - num_tile_m;
+      itile_m = itile_m_total - sum_tile_m;
+      return;
+    }
+  }
+  igroup = -1;
+}
 
-    itile_m = i_bxn * kBlockSwizzle + i_bxn_res % kBlockSwizzle;
-    itile_n = i_bxn_res / kBlockSwizzle;
+__device__ __forceinline__ void get_next_tile_vert(const int *cu_tiles_ptr, int iblock,
+                                                   int num_group, int &igroup, int &itile_m,
+                                                   int &itile_n, int total_m) {
+  int itile_m_total = iblock % total_m;
+  itile_n = iblock / total_m;
+
+  int left = 0;
+  int right = num_group;
+  while (left <= right) {
+    int mid = left + (right - left) / 2;
+    if (cu_tiles_ptr[mid] > itile_m_total) {
+      right = mid - 1;
+    } else {
+      left = mid + 1;
+    }
   }
 
-  return cute::make_tuple(itile_m, itile_n);
+  itile_m = itile_m_total - cu_tiles_ptr[right];
+  igroup = right;
+}
+
+template <typename Tin, typename Tout, typename TmaX, typename TmaY, int kTileM,
+          int kGroupPerThread, int kThreadPerBlock>
+__global__ void update_grouped_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
+                                   cute::TmaDescriptor *tma_xy, const Tin *x_ptr, const Tout *y_ptr,
+                                   const int *seqlens_ptr, const int *cu_seqlens_ptr,
+                                   int *tiles_ptr, int *cu_tiles_ptr, int num_group, int m, int n,
+                                   int k) {
+  using namespace cute;  // NOLINT
+
+  int idx = threadIdx.x;
+  int igroup = blockIdx.x;
+
+  if (igroup == num_group) {
+    int tiles[kGroupPerThread];
+#pragma unroll
+    for (int i = 0; i < kGroupPerThread; i++) {
+      int igroup = idx * kGroupPerThread + i;
+      if (igroup < num_group) {
+        tiles[i] = (seqlens_ptr[igroup] + kTileM - 1) / kTileM;
+        tiles_ptr[igroup] = tiles[i];
+      } else {
+        tiles[i] = 0;
+      }
+    }
+
+    using BlockScan = cub::BlockScan<int, kThreadPerBlock>;
+    __shared__ typename BlockScan::TempStorage temp_storage;
+    int block_aggregate;
+    BlockScan(temp_storage).ExclusiveSum(tiles, tiles, block_aggregate);
+
+#pragma unroll
+    for (int i = 0; i < kGroupPerThread; i++) {
+      int igroup = idx * kGroupPerThread + i;
+      if (igroup < num_group) {
+        cu_tiles_ptr[igroup] = tiles[i];
+      }
+    }
+    if (idx == 0) {
+      cu_tiles_ptr[num_group] = block_aggregate;
+    }
+
+  } else {
+    __shared__ cute::TmaDescriptor smem_tma_desc[2];
+
+    int num_seq = seqlens_ptr[igroup];
+    int cu_seqlen = cu_seqlens_ptr[igroup];
+    auto *x_ibatch_ptr = x_ptr + cu_seqlen * k;
+    auto *y_ibatch_ptr = y_ptr + cu_seqlen * n;
+
+    if (idx < 2) {
+      smem_tma_desc[idx] = td_xy[idx];
+    }
+    __syncwarp();
+
+    // X
+    if (idx == 0) {
+      auto gX = make_tensor(make_gmem_ptr(x_ibatch_ptr), make_shape(num_seq, k),
+                            make_stride(k, Int<1>{}));
+      update_tma_gtensor<TmaX>(smem_tma_desc[idx], gX);
+    }
+
+    // K
+    if (idx == 1) {
+      auto gY = make_tensor(make_gmem_ptr(y_ibatch_ptr), make_shape(n, num_seq),
+                            make_stride(Int<1>{}, n));
+      update_tma_gtensor<TmaY>(smem_tma_desc[idx], gY);
+    }
+
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+      __syncwarp();
+      if (cute::elect_one_sync()) {
+        cute::tma_desc_commit_group();
+        cute::tma_desc_wait_group();
+      }
+      tma_descriptor_cp_fence_release(tma_xy + igroup * 2 + i, smem_tma_desc[i]);
+    }
+  }
 }
 
 template <typename TiledMma, typename TmaA, typename TmaB, typename TmaD, int kTileM, int kTileN,
           int kStage, typename Tin, typename Tout, typename SLayoutA, typename SLayoutB,
-          typename SLayoutCT, int kBlockSwizzle>
+          typename SLayoutCT, bool IsLoopH>
 __global__ void __launch_bounds__(384, 1)
-    group_gemm_fp8_kernel(const __grid_constant__ TmaA tma_a, const __grid_constant__ TmaB tma_b,
-                          const __grid_constant__ TmaD tma_d, int m, int n, int k,
-                          cutlass::FastDivmod swizzle_divider, cutlass::FastDivmod flat_divider) {
+    group_gemm_fp8_kernel(const __grid_constant__ TmaB tma_b, cute::TmaDescriptor *td_xy,
+                          int *seqlens_ptr, float *y_scale, int *tiles_ptr, int *cu_tiles_ptr,
+                          int num_group, int m, int n, int k, cutlass::FastDivmod flat_divider) {
   using namespace cute;  // NOLINT
 
   int idx = threadIdx.x;
@@ -60,12 +160,16 @@ __global__ void __launch_bounds__(384, 1)
   auto *shm_a = (Tin *)shm_data;
   auto *shm_b = (Tin *)shm_a + cosize(SLayoutA{});
   auto *shm_c = (Tout *)(shm_b + cosize(SLayoutB{}));
+  int *shm_tiles = (int *)(shm_c + cosize(SLayoutCT{}));
+
+  TmaA tma_a;
+  TmaD tma_d;
 
   auto sA = make_tensor(make_smem_ptr(shm_a), SLayoutA{});
   auto sB = make_tensor(make_smem_ptr(shm_b), SLayoutB{});
 
   auto gA = tma_a.get_tma_tensor(make_shape(m, k));
-  auto gB = tma_b.get_tma_tensor(make_shape(n, k));
+  auto gB = tma_b.get_tma_tensor(make_shape(n, k, num_group));
   auto gC = make_tensor(make_gmem_ptr((Tout *)(nullptr)), make_shape(Int<kTileN>{}, Int<kTileM>{}),
                         make_stride(Int<kTileM>{}, Int<1>{}));
 
@@ -75,10 +179,9 @@ __global__ void __launch_bounds__(384, 1)
   auto tAg = btma_a.partition_S(gA);  // (TMA, TMA_M, TMA_K)
   auto tAs = btma_a.partition_D(sA);  // (TMA, _1, _1, kStage)
 
-  auto tBg = btma_b.partition_S(gB);  // (TMA, TMA_N, TMA_K)
+  auto tBg = btma_b.partition_S(gB);  // (TMA, TMA_N, TMA_K, num_group)
   auto tBs = btma_b.partition_D(sB);  // (TMA, _1, _1, kStage)
 
-  int num_tile_m = size<1>(tAg);
   int num_tile_n = size<1>(tBg);
 
   if (is_leader_in_block) {
@@ -96,6 +199,21 @@ __global__ void __launch_bounds__(384, 1)
     writable[idx] = 0x7ffff000001ffffc;  // initialize_barrier(2);
   }
    */
+
+  int total_m = cu_tiles_ptr[num_group];
+  if (total_m <= 0) {
+    return;
+  }
+
+  if constexpr (IsLoopH) {
+    for (int i = idx; i < num_group; i += blockDim.x) {
+      shm_tiles[i] = tiles_ptr[i];
+    }
+  } else {
+    for (int i = idx; i < (num_group + 1); i += blockDim.x) {
+      shm_tiles[i] = cu_tiles_ptr[i];
+    }
+  }
 
   // sync to avoid ahead thread use(wait) readable when it is not initizlized yet
   __syncthreads();
@@ -117,24 +235,36 @@ __global__ void __launch_bounds__(384, 1)
       int iblock = blockIdx.x;
       int ntile_k = size<2>(tAg);
 
+      int igroup = 0;
+      int sum_tile_m = 0;
+      int itile_m, itile_n;
       while (true) {
-        auto [itile_m, itile_n] = get_next_tile<kBlockSwizzle>(iblock, num_tile_m, num_tile_n,
-                                                               swizzle_divider, flat_divider);
-
-        if (itile_m >= num_tile_m) {
-          break;
+        if constexpr (IsLoopH) {
+          get_next_tile_horizon(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, sum_tile_m,
+                                flat_divider);
+          if (igroup < 0) {
+            break;
+          }
+        } else {
+          get_next_tile_vert(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, total_m);
+          if (itile_n >= num_tile_n) {
+            break;
+          }
         }
+
         iblock += gridDim.x;
+
+        auto *td_x = td_xy + igroup * 2;
 
 #pragma unroll 1
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
           // load a, b
           wait_barrier(writable[ismem_write], phase);
 
-          cute::copy(tma_a.with(readable[ismem_write]), tAg(_, itile_m, itile_k),
+          cute::copy(tma_a.with(td_x, readable[ismem_write]), tAg(_, itile_m, itile_k),
                      tAs(_, 0, 0, ismem_write));
 
-          cute::copy(tma_b.with(readable[ismem_write]), tBg(_, itile_n, itile_k),
+          cute::copy(tma_b.with(readable[ismem_write]), tBg(_, itile_n, itile_k, igroup),
                      tBs(_, 0, 0, ismem_write));
 
           set_barrier_transaction_bytes(readable[ismem_write], kTransactionBytes);
@@ -172,25 +302,32 @@ __global__ void __launch_bounds__(384, 1)
     int phase = 0;
 
     int iblock = blockIdx.x;
+    int igroup = 0;
+    int sum_tile_m = 0;
+    int itile_m, itile_n;
     while (true) {
-      auto [itile_m, itile_n] = get_next_tile<kBlockSwizzle>(iblock, num_tile_m, num_tile_n,
-                                                             swizzle_divider, flat_divider);
-
-      if (itile_m >= num_tile_m) {
-        break;
+      if constexpr (IsLoopH) {
+        get_next_tile_horizon(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, sum_tile_m,
+                              flat_divider);
+        if (igroup < 0) {
+          break;
+        }
+      } else {
+        get_next_tile_vert(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, total_m);
+        if (itile_n >= num_tile_n) {
+          break;
+        }
       }
+
       iblock += gridDim.x;
 
       auto tDr = make_tensor_like(tCr);
       clear(tDr);
 
       int ntile_k = size<2>(tAg);
-      int ntile_todo = ntile_k;
 #pragma unroll 1
-      for (; ntile_todo > 0; --ntile_todo) {
-        if (elected_idx_in_warpgroup) {
-          wait_barrier(readable[ismem_read], phase);
-        }
+      for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
+        wait_barrier(readable[ismem_read], phase);
 
         tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
         // mma
@@ -227,7 +364,7 @@ __global__ void __launch_bounds__(384, 1)
 
 #pragma unroll
       for (int i = 0; i < size(tCr); ++i) {
-        tCrh(i) = (Tout)(tDr(i));
+        tCrh(i) = (Tout)(tDr(i) * y_scale[igroup]);
       }
 
       // Epilogue
@@ -238,6 +375,9 @@ __global__ void __launch_bounds__(384, 1)
 
       auto tCr4s = thr_copy_c.retile_S(tCrh);
       auto tCs4r = thr_copy_c.partition_D(sCT);
+
+      tma_store_wait<0>();
+      asm volatile("barrier.sync %0, 128;\n" ::"r"(iwarpgroup) : "memory");
 
       cute::copy(tiled_copy_c, tCr4s, tCs4r);
       asm volatile("barrier.sync %0, 128;\n" ::"r"(iwarpgroup) : "memory");
@@ -250,9 +390,9 @@ __global__ void __launch_bounds__(384, 1)
         auto tDs = btma_d.partition_S(sCT);  // (TMA, _2, _1)
         auto tDg = btma_d.partition_D(gD);   // (TMA, TMA_M, TMA_N)
 
-        // cute::copy(tma_d, tDs(_, iwarpgroup, Int<0>{}), tDg(_, itile_m * 2 + iwarpgroup,
-        // itile_n));
-        cute::copy(tma_d, tDs(_, iwarpgroup, Int<0>{}), tDg(_, itile_n, itile_m));
+        auto *td_y = td_xy + igroup * 2 + 1;
+        cute::copy(tma_d.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
+                   tDg(_, itile_n * 2 + iwarpgroup, itile_m));
         tma_store_arrive();
       }
     }
@@ -263,7 +403,8 @@ __global__ void __launch_bounds__(384, 1)
 
 void group_gemm_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                           const void *seqlens_ptr, const void *cu_seqlens_ptr, const void *y_scale,
-                          int num_group, int m, int n, int k, cudaStream_t stream) {
+                          void *tmas_ptr, void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m,
+                          int n, int k, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   using Tin = cute::float_e4m3_t;
@@ -272,13 +413,12 @@ void group_gemm_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
   constexpr int kTileM = 16;
   constexpr int kTileN = 128;
   constexpr int kTileK = 128;
-  constexpr int kStage = 6;
-  constexpr int kBlockSwizzle = 4;
+  constexpr int kStage = 8;
 
   auto X = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x_ptr)), make_shape(m, k),
                        make_stride(k, Int<1>{}));
-  auto W = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(w_ptr)), make_shape(n, k),
-                       make_stride(k, Int<1>{}));
+  auto W = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(w_ptr)),
+                       make_shape(n, k, num_group), make_stride(k, Int<1>{}, n * k));
   auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(y_ptr)), make_shape(n, m),
                        make_stride(Int<1>{}, n));
 
@@ -287,15 +427,16 @@ void group_gemm_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
   auto slayout_w = tile_to_shape(GMMA::Layout_K_SW128_Atom<Tin>{},
                                  make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{}));
 
-  auto cpbox_yt =
-      tile_to_shape(GMMA::Layout_MN_SW128_Atom<Tout>{}, make_shape(Int<kTileN>{}, Int<kTileM>{}));
+  auto cpbox_yt = tile_to_shape(GMMA::Layout_MN_SW64_Atom<Tout>{},
+                                make_shape(Int<kTileN / 2>{}, Int<kTileM>{}));
 
   auto slayout_yt =
-      tile_to_shape(GMMA::Layout_MN_SW128_Atom<Tout>{}, make_shape(Int<kTileN>{}, Int<kTileM>{}));
+      tile_to_shape(GMMA::Layout_MN_SW64_Atom<Tout>{}, make_shape(Int<kTileN>{}, Int<kTileM>{}));
 
   int shm_xw = sizeof(Tin) * (cosize(slayout_x) + cosize(slayout_w));
   int shm_y = sizeof(Tout) * cosize(slayout_yt);
-  int shm_size = shm_xw + shm_y;
+  int shm_seq = sizeof(int) * (num_group + 1);
+  int shm_size = shm_xw + shm_y + shm_seq;
 
   auto tma_x = make_tma_copy(SM90_TMA_LOAD{}, X, slayout_x(_, _, 0));
   auto tma_w = make_tma_copy(SM90_TMA_LOAD{}, W, slayout_w(_, _, 0));
@@ -304,25 +445,58 @@ void group_gemm_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
   auto warpgroup_layout = make_layout(make_shape(Int<2>{}, Int<1>{}, Int<1>{}));
   auto tiled_mma = make_tiled_mma(SM90_64x16x32_F32E4M3E4M3_SS_TN<>{}, warpgroup_layout);
 
-  auto kernel =
-      kernels::group_gemm_fp8_kernel<decltype(tiled_mma), decltype(tma_x), decltype(tma_w),
-                                     decltype(tma_y), kTileM, kTileN, kStage, Tin, Tout,
-                                     decltype(slayout_x), decltype(slayout_w), decltype(slayout_yt),
-                                     kBlockSwizzle>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+  auto *tma_xy = static_cast<cute::TmaDescriptor *>(tmas_ptr);
 
-  int num_tile_m = (m + kTileM - 1) / kTileM;
-  int num_tile_n = (n + kTileN - 1) / kTileN;
-  int num_tile = num_tile_m * num_tile_n;
-  int num_tile_bxn = kBlockSwizzle * num_tile_n;
-  cutlass::FastDivmod swizzle_divider(num_tile_bxn);
-  cutlass::FastDivmod flat_divider(num_tile_n);
+  // 0. update tma
+  {
+    vec_t<cute::TmaDescriptor, 2> td_xy{
+        *tma_x.get_tma_descriptor(),
+        *tma_y.get_tma_descriptor(),
+    };
 
-  dim3 block(size(tiled_mma) + 128);
-  dim3 grid(std::min(get_sm_count(), num_tile));
+    constexpr int kGroupPerThread = 8;
+    constexpr int kThreadPerBlock = 32;
+    kernels::update_grouped_tma<Tin, Tout, decltype(tma_x), decltype(tma_y), kTileM,
+                                kGroupPerThread, kThreadPerBlock>
+        <<<num_group + 1, kThreadPerBlock, 0, stream>>>(
+            td_xy, tma_xy, (const Tin *)x_ptr, (const Tout *)y_ptr, (const int *)seqlens_ptr,
+            (const int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k);
+  }
 
-  kernel<<<grid, block, shm_size, stream>>>(tma_x, tma_w, tma_y, m, n, k, swizzle_divider,
-                                            flat_divider);
+  // 1. group gemm
+  {
+    int num_tile_n = (n + kTileN - 1) / kTileN;
+    cutlass::FastDivmod flat_divider(num_tile_n);
+
+    dim3 block(size(tiled_mma) + 128);
+    dim3 grid(get_sm_count());
+
+    if (k <= 1024 || n <= 1024) {
+      constexpr bool IsLoopH = true;
+      auto kernel =
+          kernels::group_gemm_fp8_kernel<decltype(tiled_mma), decltype(tma_x), decltype(tma_w),
+                                         decltype(tma_y), kTileM, kTileN, kStage, Tin, Tout,
+                                         decltype(slayout_x), decltype(slayout_w),
+                                         decltype(slayout_yt), IsLoopH>;
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+
+      kernel<<<grid, block, shm_size, stream>>>(tma_w, tma_xy, (int *)seqlens_ptr, (float *)y_scale,
+                                                (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m,
+                                                n, k, flat_divider);
+    } else {
+      constexpr bool IsLoopH = false;
+      auto kernel =
+          kernels::group_gemm_fp8_kernel<decltype(tiled_mma), decltype(tma_x), decltype(tma_w),
+                                         decltype(tma_y), kTileM, kTileN, kStage, Tin, Tout,
+                                         decltype(slayout_x), decltype(slayout_w),
+                                         decltype(slayout_yt), IsLoopH>;
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+
+      kernel<<<grid, block, shm_size, stream>>>(tma_w, tma_xy, (int *)seqlens_ptr, (float *)y_scale,
+                                                (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m,
+                                                n, k, flat_divider);
+    }
+  }
 }
 
 }  // namespace group_gemm

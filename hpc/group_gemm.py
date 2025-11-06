@@ -3,7 +3,12 @@ from torch import Tensor
 
 
 def group_gemm_fp8(
-    x: Tensor, weight: Tensor, seqlens: Tensor, cu_seqlens: Tensor, y_scale: Tensor
+    x: Tensor,
+    weight: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    y_scale: Tensor,
+    output: Tensor = None,
 ) -> Tensor:
     """Performs group GEMM operation with FP8 precision.
 
@@ -40,4 +45,9 @@ def group_gemm_fp8(
         - All input tensors must be on CUDA device
 
     """
-    return torch.ops.hpc.group_gemm_fp8(x, weight, seqlens, cu_seqlens, y_scale)
+    return torch.ops.hpc.group_gemm_fp8(x, weight, seqlens, cu_seqlens, y_scale, output)
+
+
+@torch.library.register_fake("hpc::group_gemm_fp8")
+def group_gemm_fp8_fake(x, weight, seqlens, cu_seqlens, y_scale, output):
+    return torch.empty((x.shape[0], weight.shape[1]), dtype=torch.bfloat16)

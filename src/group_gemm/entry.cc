@@ -12,7 +12,7 @@ namespace group_gemm {
 
 torch::Tensor group_gemm_fp8(const torch::Tensor &x, const torch::Tensor &weight,
                              const torch::Tensor &seqlens, const torch::Tensor &cu_seqlens,
-                             const torch::Tensor &y_scale) {
+                             const torch::Tensor &y_scale, std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
   TORCH_CHECK(weight.device().is_cuda(), "weight tensor must be cuda");
@@ -29,8 +29,16 @@ torch::Tensor group_gemm_fp8(const torch::Tensor &x, const torch::Tensor &weight
   int num_group = seqlens.size(0);
 
   auto options = x.options();
-  torch::Tensor y = torch::empty({m, n}, options.dtype(torch::kBFloat16));
-  torch::Tensor tmas = torch::empty({num_group, 64}, options);
+  torch::Tensor y;
+  if (output.has_value()) {
+    y = output.value();
+  } else {
+    y = torch::empty({m, n}, options.dtype(torch::kBFloat16));
+  }
+  torch::Tensor tmas = torch::empty({num_group * 2, 128}, options);
+
+  torch::Tensor tiles = torch::empty({num_group}, options.dtype(torch::kInt32));
+  torch::Tensor cu_tiles = torch::empty({num_group + 1}, options.dtype(torch::kInt32));
 
   const auto *x_ptr = x.const_data_ptr();
   const auto *weight_ptr = weight.const_data_ptr();
@@ -40,8 +48,11 @@ torch::Tensor group_gemm_fp8(const torch::Tensor &x, const torch::Tensor &weight
   auto *tmas_ptr = tmas.mutable_data_ptr();
   auto *y_ptr = y.mutable_data_ptr();
 
-  group_gemm_fp8_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, y_scale_ptr,
-                       num_group, m, n, k, stream);
+  auto *tiles_ptr = tiles.mutable_data_ptr();
+  auto *cu_tiles_ptr = cu_tiles.mutable_data_ptr();
+
+  group_gemm_fp8_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, y_scale_ptr, tmas_ptr,
+                       tiles_ptr, cu_tiles_ptr, num_group, m, n, k, stream);
 
   return y;
 }
@@ -49,4 +60,9 @@ torch::Tensor group_gemm_fp8(const torch::Tensor &x, const torch::Tensor &weight
 }  // namespace group_gemm
 }  // namespace hpc
 
-TORCH_LIBRARY_FRAGMENT(hpc, m) { m.def("group_gemm_fp8", &hpc::group_gemm::group_gemm_fp8); }
+TORCH_LIBRARY_FRAGMENT(hpc, m) {
+  m.def(
+      "group_gemm_fp8(Tensor x, Tensor weight, Tensor seqlens, Tensor cu_seqlens, Tensor y_scale, "
+      "Tensor? output) -> (Tensor)");
+  m.impl("group_gemm_fp8", torch::kCUDA, &hpc::group_gemm::group_gemm_fp8);
+}
