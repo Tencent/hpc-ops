@@ -6,40 +6,11 @@
 #include <algorithm>
 
 #include "cute/tensor.hpp"
+#include "src/attention/prefill/config.h"
 #include "src/attention/prefill/kernels.cuh"
 #include "src/attention/prefill/multi_stage_dim128.h"
 #include "src/utils/tma.cuh"
 #include "src/utils/utils.cuh"
-
-#define PREFILL_MS_HEAD_DIM_SWITCH(head_dim, ...)                                    \
-  [&]() -> bool {                                                                    \
-    if (head_dim == 80) {                                                            \
-      constexpr int kTileM = 64;                                                     \
-      constexpr int kTileN = 64;                                                     \
-      constexpr int kTileK = 80;                                                     \
-      constexpr int kTileV = 80;                                                     \
-      constexpr int kStage = 1;                                                      \
-      auto LayoutQK = GMMA::Layout_K_SW32_Atom<Tin>{};                               \
-      auto LayoutV = GMMA::Layout_MN_SW32_Atom<Tin>{};                               \
-      auto LayoutY = GMMA::Layout_K_SW32_Atom<Tout>{};                               \
-      auto QKMMA = SM90_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>{};   \
-      auto PVMMA = SM90_64x80x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::MN>{};  \
-      return __VA_ARGS__();                                                          \
-    } else if (head_dim == 128) {                                                    \
-      constexpr int kTileM = 64;                                                     \
-      constexpr int kTileN = 64;                                                     \
-      constexpr int kTileK = 128;                                                    \
-      constexpr int kTileV = 128;                                                    \
-      constexpr int kStage = 1;                                                      \
-      auto LayoutQK = GMMA::Layout_K_SW128_Atom<Tin>{};                              \
-      auto LayoutV = GMMA::Layout_MN_SW128_Atom<Tin>{};                              \
-      auto LayoutY = GMMA::Layout_K_SW128_Atom<Tout>{};                              \
-      auto QKMMA = SM90_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>{};   \
-      auto PVMMA = SM90_64x128x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::MN>{}; \
-      return __VA_ARGS__();                                                          \
-    }                                                                                \
-    return false;                                                                    \
-  }()
 
 namespace hpc {
 namespace attention {
@@ -72,60 +43,47 @@ void multi_stage_dim128_async(void *y_ptr, const void *q_ptr, const void *k_ptr,
                        make_shape(max_seq_q, num_dim_v, num_head_q),
                        make_stride(ldY, Int<1>{}, num_dim_v));
 
-  bool status = PREFILL_MS_HEAD_DIM_SWITCH(num_dim_qk, [&]() -> bool {
-    auto slayout_q = tile_to_shape(LayoutQK, make_shape(Int<kTileM>{}, Int<kTileK>{}));
-    auto slayout_k =
-        tile_to_shape(LayoutQK, make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{}));
-    auto slayout_v =
-        tile_to_shape(LayoutV, make_shape(Int<kTileV>{}, Int<kTileN>{}, Int<kStage>{}));
-    auto slayout_y = tile_to_shape(LayoutY, make_shape(Int<kTileM>{}, Int<kTileV>{}));
-    auto cpbox_v = tile_to_shape(LayoutV, make_shape(Int<kTileV>{}, Int<kTileN>{}));
+  using TiledMmaQK = SM90_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>;
+  using TiledMmaPV = SM90_64x128x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::MN>;
+  using Config = AttentionPrefillConfig<Tin, Tout, TiledMmaQK, TiledMmaPV, 64, 64, 128, 128, 1, 2,
+                                        1, 128, 128, 128, 128>;
 
-    auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, Q, slayout_q);
-    auto tma_k = make_tma_copy(SM90_TMA_LOAD{}, K, slayout_k(_, _, 0));
-    auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, V, cpbox_v);
-    auto tma_y = make_tma_copy(SM90_TMA_STORE{}, Y, slayout_y);
+  Config config;
+  auto [tma_q, tma_k, tma_v, tma_y] = config.get_tma(Q, K, V, Y);
 
-    using TiledMmaQK = decltype(make_tiled_mma(QKMMA));
-    using TiledMmaPV = decltype(make_tiled_mma(PVMMA));
+  // 0. update tma
+  {
+    vec_t<cute::TmaDescriptor, 4> td_qkvy{
+        *tma_q.get_tma_descriptor(),
+        *tma_k.get_tma_descriptor(),
+        *tma_v.get_tma_descriptor(),
+        *tma_y.get_tma_descriptor(),
+    };
+    kernels::update_batched_tma<Tin, decltype(tma_q), decltype(tma_k), decltype(tma_v),
+                                decltype(tma_y)><<<num_batch, 32, 0, stream>>>(
+        td_qkvy, tma_qkvy, (const Tin *)q_ptr, (const Tin *)k_ptr, (const Tin *)v_ptr,
+        (const Tout *)y_ptr, (const int *)seqlens_q_ptr, (const int *)cu_seqlens_q_ptr, num_batch,
+        max_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_kv, ldQ, ldK, ldV, ldY);
+  }
 
-    int shm_qkv = (cosize(slayout_q) + cosize(slayout_k) + cosize(slayout_v)) * sizeof(Tin);
-    int shm_y = cosize(slayout_y) * sizeof(Tout);
-    int shm_size = std::max(shm_qkv, shm_y);
+  // 1. compute attention
+  {
+    int kv_group = num_head_q / num_head_kv;
+    cutlass::FastDivmod HeadKV(kv_group);
 
-    // 0. update tma
-    {
-      vec_t<cute::TmaDescriptor, 4> td_qkvy{
-          *tma_q.get_tma_descriptor(),
-          *tma_k.get_tma_descriptor(),
-          *tma_v.get_tma_descriptor(),
-          *tma_y.get_tma_descriptor(),
-      };
-      kernels::update_batched_tma<Tin, decltype(tma_q), decltype(tma_k), decltype(tma_v),
-                                  decltype(tma_y)><<<num_batch, 32, 0, stream>>>(
-          td_qkvy, tma_qkvy, (const Tin *)q_ptr, (const Tin *)k_ptr, (const Tin *)v_ptr,
-          (const Tout *)y_ptr, (const int *)seqlens_q_ptr, (const int *)cu_seqlens_q_ptr, num_batch,
-          max_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_kv, ldQ, ldK, ldV, ldY);
-    }
+    dim3 block(size(Config::TiledMmaQK{}));
+    dim3 grid((max_seq_q + Config::kTileM - 1) / Config::kTileM, num_head_q, num_batch);
 
-    // 1. compute attention
-    {
-      int kv_group = num_head_q / num_head_kv;
-      cutlass::FastDivmod HeadKV(kv_group);
+    int shm_size = config.get_shm_size();
 
-      dim3 block(size(TiledMmaQK{}));
-      dim3 grid((max_seq_q + kTileM - 1) / kTileM, num_head_q, num_batch);
-      auto kernel = kernels::attention_prefill_bf16_multi_stage_kernel<
-          Tout, Tin, kTileM, kTileN, kTileK, kTileV, kStage, TiledMmaQK, TiledMmaPV,
-          decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y), decltype(slayout_q),
-          decltype(slayout_k), decltype(slayout_v), decltype(slayout_y)>;
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-      kernel<<<grid, block, shm_size, stream>>>(tma_qkvy, (int *)seqlens_q_ptr, num_batch,
-                                                max_seq_q, num_dim_qk, num_dim_v, num_head_q,
-                                                num_head_kv, one_over_dk_log2e, HeadKV);
-    }
-    return true;
-  });
+    auto kernel = kernels::attention_prefill_bf16_multi_stage_kernel<
+        decltype(config), decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y)>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+
+    kernel<<<grid, block, shm_size, stream>>>(tma_qkvy, (int *)seqlens_q_ptr, num_batch, max_seq_q,
+                                              num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+                                              one_over_dk_log2e, HeadKV);
+  }
 }
 
 }  // namespace prefill

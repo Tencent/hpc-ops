@@ -507,9 +507,7 @@ __global__ void __launch_bounds__(384, 1) attention_prefill_bf16_warp_specializa
   }
 }
 
-template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int kTileV, int kStage,
-          typename TiledMmaQK, typename TiledMmaPV, typename TmaQ, typename TmaK, typename TmaV,
-          typename TmaY, typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutY>
+template <typename Config, typename TmaQ, typename TmaK, typename TmaV, typename TmaY>
 __global__ void attention_prefill_bf16_multi_stage_kernel(cute::TmaDescriptor *td_qkvy,
                                                           int *seqlens_q_ptr, int num_batch,
                                                           int max_seq_q, int num_dim_qk,
@@ -517,6 +515,21 @@ __global__ void attention_prefill_bf16_multi_stage_kernel(cute::TmaDescriptor *t
                                                           int num_head_kv, float one_over_dk_log2e,
                                                           cutlass::FastDivmod HeadKV) {
   using namespace cute;  // NOLINT
+
+  using Tout = typename Config::Tout;
+  using Tin = typename Config::Tin;
+  using TiledMmaQK = typename Config::TiledMmaQK;
+  using TiledMmaPV = typename Config::TiledMmaPV;
+  using SLayoutQ = typename Config::SLayoutQ;
+  using SLayoutK = typename Config::SLayoutK;
+  using SLayoutV = typename Config::SLayoutV;
+  using SLayoutY = typename Config::SLayoutY;
+
+  constexpr int kTileM = Config::kTileM;
+  constexpr int kTileN = Config::kTileN;
+  constexpr int kTileK = Config::kTileK;
+  constexpr int kTileV = Config::kTileV;
+  constexpr int kStage = Config::kStage;
 
   int idx = threadIdx.x;
   int itile_m = blockIdx.x;
