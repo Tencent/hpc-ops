@@ -5,7 +5,7 @@
 #include <cuda_bf16.h>
 #include <stdio.h>
 
-#include "src/sampler/fused_repetition_penalties_softmax.h"
+#include "src/sampler/sampler.h"
 #include "src/utils/utils.cuh"
 
 namespace hpc {

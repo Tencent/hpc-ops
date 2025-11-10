@@ -6,16 +6,15 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
-#include "src/sampler/fused_repetition_penalties_softmax.h"
+#include "src/sampler/sampler.h"
 
 namespace hpc {
 namespace sampler {
-namespace fused_repetition_penalties_softmax {
 
-torch::Tensor entry(const torch::Tensor& logits, std::optional<torch::Tensor> penalties_masks_ptrs,
-                    std::optional<torch::Tensor> repetition_penalties,
-                    double repetition_penalties_val, std::optional<torch::Tensor> temperature,
-                    double temperature_val) {
+torch::Tensor fused_repetition_penalties_softmax_entry(
+    const torch::Tensor& logits, std::optional<torch::Tensor> penalties_masks_ptrs,
+    std::optional<torch::Tensor> repetition_penalties, double repetition_penalties_val,
+    std::optional<torch::Tensor> temperature, double temperature_val) {
   TORCH_CHECK(logits.is_contiguous(), "logits tensor must be contiguous");
   TORCH_CHECK(logits.dim() == 2, "logits tensor must be dim == 2");
   int num_batch = logits.size(0);
@@ -78,11 +77,74 @@ torch::Tensor entry(const torch::Tensor& logits, std::optional<torch::Tensor> pe
   return out;
 }
 
-}  // namespace fused_repetition_penalties_softmax
+torch::Tensor topk_mask_logits_entry(const torch::Tensor& logits, std::optional<torch::Tensor> topk,
+                                     int64_t topk_val,
+                                     std::optional<torch::Tensor> reject_threshold,
+                                     double reject_threshold_val) {
+  auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
+  TORCH_CHECK(logits.is_contiguous(), "input tensor must be contiguous");
+  TORCH_CHECK(logits.dtype() == torch::kFloat32,
+              "logits must be float32 for current implementation");
+
+  if (topk.has_value()) {
+    TORCH_CHECK(topk->is_contiguous(), "topk tensor must be contiguous");
+  }
+  if (reject_threshold.has_value()) {
+    TORCH_CHECK(reject_threshold->is_contiguous(), "reject_threshold tensor must be contiguous");
+  }
+
+  int batch_size = logits.size(0);
+  int vocab_size = logits.size(1);
+  TORCH_CHECK(vocab_size % 8 == 0, "hpc sample only support vocab_size % 8 == 0");
+
+  // Used for temp storage of topk tokens and logits of first stage topk
+  // Fixed size for current implementation
+  constexpr int kBlockPerBatch = 8;
+  constexpr int kSortItemsPerThread = 4;
+  constexpr int kMaxTopK = 32;
+
+  torch::Tensor middle_logits = torch::empty({batch_size, kMaxTopK * kBlockPerBatch},
+                                             torch::dtype(torch::kFloat32).device(logits.device()));
+  torch::Tensor middle_tokens = torch::empty({batch_size, kMaxTopK * kBlockPerBatch},
+                                             torch::dtype(torch::kInt32).device(logits.device()));
+  torch::Tensor sample_tokens =
+      torch::empty({batch_size, 1}, torch::dtype(torch::kInt32).device(logits.device()));
+
+  torch::Tensor output_logits =
+      torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(logits.device()));
+
+  void* output_logits_ptr = output_logits.mutable_data_ptr();
+  void* sample_tokens_ptr = sample_tokens.mutable_data_ptr();
+  void* middle_logits_ptr = middle_logits.mutable_data_ptr();
+  void* middle_tokens_ptr = middle_tokens.mutable_data_ptr();
+  void* logits_ptr = logits.data_ptr();
+  void* topk_ptr = nullptr;
+  if (topk.has_value()) {
+    topk_ptr = topk->data_ptr();
+  }
+  void* reject_threshold_ptr = nullptr;
+  if (reject_threshold.has_value()) {
+    reject_threshold_ptr = reject_threshold->data_ptr();
+  }
+
+  topk_mask_logits_async(output_logits_ptr, sample_tokens_ptr, middle_logits_ptr, middle_tokens_ptr,
+                         logits_ptr, topk_ptr, topk_val, reject_threshold_ptr, reject_threshold_val,
+                         batch_size, vocab_size, stream);
+
+  return output_logits;
+}
 }  // namespace sampler
 }  // namespace hpc
 
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
-  m.def("fused_repetition_penalties_softmax",
-        &hpc::sampler::fused_repetition_penalties_softmax::entry);
+  m.def(
+      "fused_repetition_penalties_softmax(Tensor logits, Tensor? penalties_masks_ptrs, Tensor? "
+      "repetition_penalties, float repetition_penalties_val, Tensor? temperature, float "
+      "temperature_val) -> Tensor");
+  m.impl("fused_repetition_penalties_softmax", torch::kCUDA,
+         &hpc::sampler::fused_repetition_penalties_softmax_entry);
+  m.def(
+      "topk_mask_logits(Tensor logits, Tensor? topk, int topk_val, Tensor? reject_threshold, "
+      "float reject_threshold_val) -> Tensor");
+  m.impl("topk_mask_logits", torch::kCUDA, &hpc::sampler::topk_mask_logits_entry);
 }

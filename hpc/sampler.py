@@ -1,6 +1,7 @@
+from typing import Optional, Tuple, Union
+
 import torch
 from torch import Tensor
-from typing import Union, Optional, Tuple
 
 
 def _to_tensor_scalar_tuple(x) -> Tuple[Optional[Tensor], float]:
@@ -35,4 +36,33 @@ def fused_repetition_penalties_softmax(
         penalties_masks_ptrs,
         *_to_tensor_scalar_tuple(repetition_penalties),
         *_to_tensor_scalar_tuple(temperature),
+    )
+
+
+def topk_mask_logits(
+    logits: Tensor,
+    topk: Union[Optional[Tensor], int] = 0,
+    reject_threshold: Union[Optional[Tensor], float] = 0.0,
+) -> Tensor:
+    """TopK Sampling.
+    The output logits keep the TopK values in their original positions and set all others to -inf. This operation is NOT in-place.
+    Args:
+        logits: Input logits
+            Shape: [batch_size, vocab_size]
+            Dtype: float
+        topk: TopK tensor for each batch or int for all batches
+            Shape: [batch_size] or int
+            Dtype: int
+        reject_threshold: reject_threshold is used to filt the low probability tokens
+            Shape: [batch_size] or float
+            Dtype: float
+    Return:
+        output_logits: New output logits tensor that keeps TopK logits in original position and set others to -inf
+            Shape: [batch_size, vocab_size]
+            Dtype: float
+    """
+    return torch.ops.hpc.topk_mask_logits(
+        logits,
+        *_to_tensor_scalar_tuple(topk),
+        *_to_tensor_scalar_tuple(reject_threshold),
     )

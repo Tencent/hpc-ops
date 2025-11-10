@@ -1,13 +1,17 @@
-import sys
 import os
-import pytest
+import sys
 from pathlib import Path
+from typing import Optional
+
+import pytest
 
 sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
 
-import hpc
-import torch
 import math
+
+import torch
+
+import hpc
 
 
 def set_penalties_mask_ref(mask, tokens):
@@ -73,3 +77,37 @@ def test_fused_repetition_penalties_softmax(
     )
 
     assert torch.allclose(gt_y, y)
+
+
+def torch_topk_mask_logits(logits, topk):
+    dim = -1
+    masked_logits = torch.full_like(logits, float("-inf"))
+    top_values, top_indices = torch.topk(logits, topk, dim=dim)
+    masked_logits.scatter_(dim, top_indices, top_values)
+    return masked_logits
+
+
+def reference_topk_mask_logits(logits, topk):
+    try:
+        import flashinfer
+
+        return flashinfer.sampling.top_k_mask_logits(logits, topk)
+    except ImportError:
+        print("flashinfer not found, using torch topk mask logits")
+        return torch_topk_mask_logits(logits, topk)
+
+
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("vocab_size", [129024, 128512, 129280, 129152])
+@pytest.mark.parametrize("topk", [20])
+def test_topk_mask_logits(batch_size, vocab_size, topk):
+
+    logits = torch.randn(batch_size, vocab_size).cuda()
+
+    reject_threshold = 0 * torch.max(logits, dim=-1)[0] / 1000
+
+    my_output_logits = hpc.sampler.topk_mask_logits(logits, topk, reject_threshold)
+
+    gt_output_logits = reference_topk_mask_logits(logits, topk)
+
+    assert torch.allclose(gt_output_logits, my_output_logits)
