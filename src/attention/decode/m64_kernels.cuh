@@ -247,7 +247,7 @@ __global__ void attention_decode_bf16_multistage_ws_kernel(
       // Load Q
       cute::copy(tma_q.with(bar_q), tQg(_, ihead_kv, _, ibatch), tQs(_, 0, _));
       set_barrier_transaction_bytes(
-          bar_q, sizeof(Tin) * umax(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
+          bar_q, sizeof(Tin) * max(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
 
       int istage_write = 0;
       // Load Causal KV
@@ -595,7 +595,7 @@ __global__ void attention_decode_bf16_onestage_kernel(
     initialize_barrier(bar_q, 1);
     cute::copy(tma_q.with(bar_q), tQg(_, ihead_kv, _, ibatch), tQs(_, 0, _));
     set_barrier_transaction_bytes(
-        bar_q, sizeof(Tin) * umax(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
+        bar_q, sizeof(Tin) * max(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
   }
 
   // init k/v barrier

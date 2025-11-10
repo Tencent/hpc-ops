@@ -310,7 +310,7 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_kernel(
       // Load Q
       cute::copy(tma_q.with(q_readable), tQg(_, ihead_kv, _, ibatch), tQs(_, 0, _));
       set_barrier_transaction_bytes(
-          q_readable, sizeof(Tin) * umax(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
+          q_readable, sizeof(Tin) * max(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
     }
   }
 
