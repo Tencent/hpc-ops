@@ -46,6 +46,94 @@ __device__ __forceinline__ auto &view(vec_t<T, N> &v) {
   return *reinterpret_cast<V *>(&v);
 }
 
+template <typename T, int... Dims>
+class vec_view;
+
+template <typename T, int Dim>
+class vec_view<T, Dim> {
+  T *data_;
+
+ public:
+  using value_type = vec_t<T, Dim>;
+  static constexpr int size() { return Dim; }
+
+  __device__ __forceinline__ vec_view(T *data) : data_(data) {}
+
+  constexpr __device__ __forceinline__ T &operator[](int i) { return data_[i]; }
+
+  constexpr const __device__ __forceinline__ T &operator[](int i) const { return data_[i]; }
+
+  __device__ __forceinline__ operator vec_t<T, Dim>() const {
+    vec_t<T, Dim> ret;
+#pragma unroll
+    for (int i = 0; i < Dim; ++i) {
+      ret.data[i] = data_[i];
+    }
+    return ret;
+  }
+
+  __device__ __forceinline__ vec_view &operator=(const vec_t<T, Dim> &rhs) {
+#pragma unroll
+    for (int i = 0; i < Dim; ++i) {
+      data_[i] = rhs.data[i];
+    }
+    return *this;
+  }
+};
+
+template <typename T, int First, int... Rest>
+class vec_view<T, First, Rest...> {
+  T *data_;
+
+ public:
+  static constexpr int inner_size = (Rest * ...);
+  using inner_view_type = vec_view<T, Rest...>;
+  using inner_value_type = typename inner_view_type::value_type;
+  using value_type = vec_t<inner_value_type, First>;
+  static constexpr int size() { return First; }
+  __device__ __forceinline__ vec_view(T *data) : data_(data) {}
+
+  __device__ __forceinline__ constexpr auto operator[](int i) {
+    return vec_view<T, Rest...>(data_ + i * inner_size);
+  }
+
+  __device__ __forceinline__ constexpr auto operator[](int i) const {
+    return vec_view<T, Rest...>(data_ + i * inner_size);
+  }
+
+  __device__ __forceinline__ operator vec_t<vec_t<T, inner_size>, First>() const {
+    vec_t<vec_t<T, inner_size>, First> ret;
+#pragma unroll
+    for (int i = 0; i < First; ++i) {
+#pragma unroll
+      for (int j = 0; j < inner_size; ++j) {
+        ret.data[i].data[j] = data_[i * inner_size + j];
+      }
+    }
+    return ret;
+  }
+
+  template <int N>
+  __device__ __forceinline__ vec_view &operator=(const vec_t<vec_t<T, N>, First> &rhs) {
+    static_assert(N == inner_size, "size mismatch in assignment");
+#pragma unroll
+    for (int i = 0; i < First; ++i) {
+#pragma unroll
+      for (int j = 0; j < inner_size; ++j) {
+        data_[i * inner_size + j] = rhs.data[i].data[j];
+      }
+    }
+    return *this;
+  }
+};
+
+template <int... NewDims, typename T, int N>
+__device__ __forceinline__ auto reshape(vec_t<T, N> &v) {
+  constexpr int total_elements = (NewDims * ...);
+  static_assert(total_elements == N, "total elements must match in reshape");
+  return vec_view<T, NewDims...>(v.data);
+}
+
 template <typename U, typename T, int N>
 __device__ __forceinline__ auto to(const vec_t<T, N> &v) {
   if constexpr (std::is_same_v<T, float> && std::is_same_v<U, __nv_bfloat16>) {
@@ -54,6 +142,14 @@ __device__ __forceinline__ auto to(const vec_t<T, N> &v) {
 #pragma unroll
     for (int i = 0; i < N; ++i) {
       o[i] = __float2bfloat16(v[i]);
+    }
+    return o;
+  } else if constexpr (std::is_same_v<T, float> && std::is_same_v<U, __half2>) {
+    using V = vec_t<U, N / 2>;
+    V o;
+#pragma unroll
+    for (int i = 0; i < N / 2; ++i) {
+      o[i] = __float22half2_rn(*reinterpret_cast<const float2 *>(&v[2 * i]));
     }
     return o;
   } else if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<U, float>) {
@@ -115,6 +211,11 @@ __device__ __forceinline__ auto to(const vec_t<T, N> &v) {
   }
 }
 
+template <typename U, typename T, int... Rest>
+__device__ __forceinline__ auto to(const vec_view<T, Rest...> &view) {
+  return to<U>(static_cast<typename vec_view<T, Rest...>::value_type>(view));
+}
+
 template <typename T, int N>
 __device__ __forceinline__ auto load(const void *ptr) {
   using V = vec_t<T, N>;
@@ -151,9 +252,8 @@ __device__ __forceinline__ void store(void *ptr, const vec_t<T, N> &v) {
 
   constexpr int kBytes = sizeof(T) * N;
 
-  static_assert(
-      kBytes == 1 || kBytes == 2 || kBytes == 4 || kBytes == 8 || kBytes == 16 || kBytes == 32,
-      "not support for T x N");
+  static_assert(kBytes == 1 || kBytes == 2 || kBytes == 4 || kBytes == 8 || kBytes == 16,
+                "not support for T x N");
 
   if constexpr (kBytes == 1) {
     using S = uint8_t;
@@ -173,6 +273,11 @@ __device__ __forceinline__ void store(void *ptr, const vec_t<T, N> &v) {
   }
 
   return;
+}
+
+template <typename T, int... Dims>
+__device__ __forceinline__ void store(void *ptr, const vec_view<T, Dims...> &view) {
+  store(ptr, static_cast<typename vec_view<T, Dims...>::value_type>(view));
 }
 
 template <typename T, typename... Args>
