@@ -67,6 +67,7 @@ torch::Tensor attention_prefill_bf16_entry(const torch::Tensor &q, const torch::
 torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor &kcache,
                                           torch::Tensor &vcache, const torch::Tensor &block_ids,
                                           const torch::Tensor &num_seq_kvcache,
+                                          bool new_kv_included,
                                           std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
   TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
@@ -116,9 +117,9 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   int ldY = y.stride(0);  // num_head_q * num_dim_v;
 
   bool running = attention_decode_bf16_async(
-      y_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr, num_seq_kvcache_ptr, num_batch,
-      num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
-      num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+      y_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr, num_seq_kvcache_ptr, new_kv_included,
+      num_batch, num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks,
+      block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
 
   TORCH_CHECK(running, "attn decode kernel launch failed!");
 
@@ -136,6 +137,6 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 
   m.def(
       "attention_decode_bf16(Tensor q, Tensor! kcache, Tensor! vcache, Tensor block_ids, Tensor "
-      "num_seq_kvcache, Tensor? output) -> (Tensor)");
+      "num_seq_kvcache, bool new_kv_included, Tensor? output) -> (Tensor)");
   m.impl("attention_decode_bf16", torch::kCUDA, &hpc::attention::attention_decode_bf16_entry);
 }

@@ -104,9 +104,18 @@ except Exception as e:
 @pytest.mark.parametrize("num_head_q", [4, 8])
 @pytest.mark.parametrize("num_head_kv", [1])
 @pytest.mark.parametrize("head_dim", [80, 128])
+@pytest.mark.parametrize("new_kv_included", [True, False])
 @pytest.mark.parametrize("use_output", [True, False])
 def test_attention_decode_bf16(
-    num_batch, num_seq_q, max_seq_kv, block_size, num_head_q, num_head_kv, head_dim, use_output
+    num_batch,
+    num_seq_q,
+    max_seq_kv,
+    block_size,
+    num_head_q,
+    num_head_kv,
+    head_dim,
+    new_kv_included,
+    use_output,
 ):
     # torch.manual_seed(10086)
     # torch.cuda.manual_seed(10086)
@@ -164,12 +173,18 @@ def test_attention_decode_bf16(
             kvcache[:, 0, :, :, :],
             kvcache[:, 1, :, :, :],
             block_ids,
-            num_seq_kvcache,
+            num_seq_kvcache + 1 if new_kv_included else num_seq_kvcache,
+            new_kv_included=new_kv_included,
             output=my,
         )
     else:
         my = hpc.attention_decode_bf16(
-            Q, kvcache[:, 0, :, :, :], kvcache[:, 1, :, :, :], block_ids, num_seq_kvcache
+            Q,
+            kvcache[:, 0, :, :, :],
+            kvcache[:, 1, :, :, :],
+            block_ids,
+            num_seq_kvcache + 1 if new_kv_included else num_seq_kvcache,
+            new_kv_included=new_kv_included,
         )
 
     print("\ngt\n")

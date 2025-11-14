@@ -136,9 +136,9 @@ template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int k
 __global__ void attention_decode_bf16_multistage_ws_kernel(
     const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
     const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaY tma_y,
-    const int *block_ids_ptr, const int *num_seq_kvcache_ptr, int num_batch, int num_dim_qk,
-    int num_dim_v, int num_head_q, int num_head_k, int num_head_v, int heads_per_group,
-    int num_kvcache_blocks, int num_seq_max_blocks, float one_over_dk_log2e) {
+    const int *block_ids_ptr, const int *num_seq_kvcache_ptr, bool new_kv_included, int num_batch,
+    int num_dim_qk, int num_dim_v, int num_head_q, int num_head_k, int num_head_v,
+    int heads_per_group, int num_kvcache_blocks, int num_seq_max_blocks, float one_over_dk_log2e) {
   using namespace cute;  // NOLINT
 
   int idx = threadIdx.x;
@@ -153,7 +153,15 @@ __global__ void attention_decode_bf16_multistage_ws_kernel(
 
   constexpr int kSeqlenQ = 1;
   int num_seq_kvcache = num_seq_kvcache_ptr[ibatch];
+  if (new_kv_included) {
+    num_seq_kvcache -= kSeqlenQ;
+  }
   int seqlenk = kSeqlenQ + num_seq_kvcache;
+
+  if (seqlenk <= 0) {
+    return;
+  }
+
   int nblocks = (seqlenk + kBlockSize - 1) / kBlockSize;
 
   const int *block_ids = block_ids_ptr + ibatch * num_seq_max_blocks;

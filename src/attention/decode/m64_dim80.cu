@@ -15,11 +15,14 @@ namespace attention {
 namespace decode {
 
 template <int kHeadsPerGroup, int kTileM, int kTileN, int kTileK, int kTileV, int kBlockSize>
-void launch_attention_decode_bf16_dim80(
-    void *y_ptr, const void *q_ptr, void *kcache_ptr, void *vcache_ptr, const int *block_ids_ptr,
-    const int *num_seq_kvcache_ptr, int num_batch, int num_head_q, int num_head_k, int num_head_v,
-    int heads_per_group, int num_dim_qk, int num_dim_v, int num_kvcache_blocks, int block_size,
-    int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV, cudaStream_t stream) {
+void launch_attention_decode_bf16_dim80(void *y_ptr, const void *q_ptr, void *kcache_ptr,
+                                        void *vcache_ptr, const int *block_ids_ptr,
+                                        const int *num_seq_kvcache_ptr, bool new_kv_included,
+                                        int num_batch, int num_head_q, int num_head_k,
+                                        int num_head_v, int heads_per_group, int num_dim_qk,
+                                        int num_dim_v, int num_kvcache_blocks, int block_size,
+                                        int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV,
+                                        cudaStream_t stream) {
   using namespace cute;  // NOLINT
   constexpr int kStage = 2;
 
@@ -88,16 +91,16 @@ void launch_attention_decode_bf16_dim80(
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
   kernel<<<grid, block, shm_size, stream>>>(
-      tma_q, tma_k, tma_v, tma_y, block_ids_ptr, num_seq_kvcache_ptr, num_batch, num_dim_qk,
-      num_dim_v, num_head_q, num_head_k, num_head_v, heads_per_group, num_kvcache_blocks,
-      num_seq_max_blocks, one_over_dk_log2e);
+      tma_q, tma_k, tma_v, tma_y, block_ids_ptr, num_seq_kvcache_ptr, new_kv_included, num_batch,
+      num_dim_qk, num_dim_v, num_head_q, num_head_k, num_head_v, heads_per_group,
+      num_kvcache_blocks, num_seq_max_blocks, one_over_dk_log2e);
 }
 
 bool m64_dim80_async(void *y_ptr, const void *q_ptr, void *kcache_ptr, void *vcache_ptr,
-                     const int *block_ids_ptr, const int *num_seq_kvcache_ptr, int num_batch,
-                     int num_head_q, int num_head_k, int num_head_v, int num_dim_qk, int num_dim_v,
-                     int num_kvcache_blocks, int block_size, int num_seq_max_blocks, int ldY,
-                     int ldQ, int ldK, int ldV, cudaStream_t stream) {
+                     const int *block_ids_ptr, const int *num_seq_kvcache_ptr, bool new_kv_included,
+                     int num_batch, int num_head_q, int num_head_k, int num_head_v, int num_dim_qk,
+                     int num_dim_v, int num_kvcache_blocks, int block_size, int num_seq_max_blocks,
+                     int ldY, int ldQ, int ldK, int ldV, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   constexpr int kTileM = 64;
@@ -120,15 +123,15 @@ bool m64_dim80_async(void *y_ptr, const void *q_ptr, void *kcache_ptr, void *vca
       constexpr int kBlockSize = 32;
       launch_attention_decode_bf16_dim80<kHeadsPerGroup, kTileM, kTileN, kTileK, kTileV,
                                          kBlockSize>(
-          y_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr, num_seq_kvcache_ptr, num_batch,
-          num_head_q, num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v,
+          y_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr, num_seq_kvcache_ptr, new_kv_included,
+          num_batch, num_head_q, num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v,
           num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
     } else if (block_size == 64) {
       constexpr int kBlockSize = 64;
       launch_attention_decode_bf16_dim80<kHeadsPerGroup, kTileM, kTileN, kTileK, kTileV,
                                          kBlockSize>(
-          y_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr, num_seq_kvcache_ptr, num_batch,
-          num_head_q, num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v,
+          y_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr, num_seq_kvcache_ptr, new_kv_included,
+          num_batch, num_head_q, num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v,
           num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
     }
   }

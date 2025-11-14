@@ -63,6 +63,7 @@ def attention_decode_bf16(
     vcache: Tensor,
     block_ids: Tensor,
     num_seq_kvcache: Tensor,
+    new_kv_included: bool = False,
     output: Tensor = None,
 ) -> Tensor:
     """Computes attention decode using bfloat16 precision.
@@ -88,6 +89,9 @@ def attention_decode_bf16(
         num_seq_kvcache: number tokens in kvcache before cur iteration.
             Shape: [num_batch]
             Dtype: int32
+        new_kv_included: the seqlen in num_seq_kvcache include new kv or not.
+            Shape: scalar
+            Dtype: bool
         output: Output tensor for store output value inplace.
             Shape: [num_batch * num_seq_q, num_head_q, num_dim_qk]
             Dtype: bfloat16
@@ -105,7 +109,7 @@ def attention_decode_bf16(
         - The batch size (num_batch) must be consistent across all input tensors
     """
     return torch.ops.hpc.attention_decode_bf16(
-        q, kcache, vcache, block_ids, num_seq_kvcache, output
+        q, kcache, vcache, block_ids, num_seq_kvcache, new_kv_included, output
     )
 
 
@@ -115,5 +119,7 @@ def attention_prefill_bf16_fake(q, k, v, seqlens_q, cu_seqlens_q, max_seqlens_q,
 
 
 @torch.library.register_fake("hpc::attention_decode_bf16")
-def attention_decode_bf16_fake(q, kcache, vcache, block_ids, num_seq_kvcache, output):
+def attention_decode_bf16_fake(
+    q, kcache, vcache, block_ids, num_seq_kvcache, new_kv_included, output
+):
     return torch.empty_like(q)
