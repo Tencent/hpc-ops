@@ -45,7 +45,7 @@ void multi_stage_dim128_async(void *y_ptr, const void *q_ptr, const void *k_ptr,
 
   using TiledMmaQK = SM90_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>;
   using TiledMmaPV = SM90_64x128x16_F32BF16BF16_RS<GMMA::Major::K, GMMA::Major::MN>;
-  using Config = AttentionPrefillConfig<Tin, Tout, TiledMmaQK, TiledMmaPV, 64, 64, 128, 128, 1, 2,
+  using Config = AttentionPrefillConfig<Tin, Tout, TiledMmaQK, TiledMmaPV, 64, 64, 128, 128, 1, 1,
                                         1, 128, 128, 128, 128>;
 
   Config config;

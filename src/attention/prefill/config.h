@@ -24,6 +24,7 @@ struct AttentionPrefillConfig {
   static constexpr int kTileK = kTileK_;
   static constexpr int kTileV = kTileV_;
   static constexpr int kStage = kStage_;
+  static constexpr int kWarpgroupM = kWarpgroupM_;
 
   template <int kSwizzle, typename T, bool kKmajor = true>
   static constexpr auto slayout_selector() {
@@ -67,8 +68,8 @@ struct AttentionPrefillConfig {
                                           make_shape(Int<kTileV>{}, Int<kTileN>{}, Int<kStage>{})));
   using SLayoutY =
       decltype(tile_to_shape(SLayoutYAtom{}, make_shape(Int<kTileM>{}, Int<kTileV>{})));
-  using CopyBoxY =
-      decltype(tile_to_shape(SLayoutYAtom{}, make_shape(Int<kTileM / 2>{}, Int<kTileV>{})));
+  using CopyBoxY = decltype(tile_to_shape(SLayoutYAtom{},
+                                          make_shape(Int<kTileM / kWarpgroupM>{}, Int<kTileV>{})));
 
   template <typename TQ, typename TK, typename TV, typename TY>
   auto get_tma(TQ q, TK k, TV v, TY y) {

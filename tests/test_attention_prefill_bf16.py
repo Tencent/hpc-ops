@@ -113,9 +113,9 @@ except Exception as e:
     gt_attention_func = naive_attn_varlen_func
 
 
-@pytest.mark.parametrize("num_batch", [4])
-@pytest.mark.parametrize("num_seq_q", [3904])
-@pytest.mark.parametrize("num_seq_kv", [3904])
+@pytest.mark.parametrize("num_batch", [1, 4])
+@pytest.mark.parametrize("num_seq_q", [2007, 3907])
+@pytest.mark.parametrize("num_seq_kv", [2007, 3907])
 @pytest.mark.parametrize("num_head_q", [4])
 @pytest.mark.parametrize("num_head_kv", [1])
 @pytest.mark.parametrize("num_dim_qk", [128])
