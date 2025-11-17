@@ -404,7 +404,7 @@ __global__ void __launch_bounds__(384, 1)
 void group_gemm_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                           const void *seqlens_ptr, const void *cu_seqlens_ptr, const void *y_scale,
                           void *tmas_ptr, void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m,
-                          int n, int k, cudaStream_t stream) {
+                          int n, int k, bool update_tma, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   using Tin = cute::float_e4m3_t;
@@ -448,7 +448,7 @@ void group_gemm_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
   auto *tma_xy = static_cast<cute::TmaDescriptor *>(tmas_ptr);
 
   // 0. update tma
-  {
+  if (update_tma) {
     vec_t<cute::TmaDescriptor, 2> td_xy{
         *tma_x.get_tma_descriptor(),
         *tma_y.get_tma_descriptor(),

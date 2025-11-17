@@ -117,9 +117,11 @@ def test_group_gemm2(num_group, n, k):
 
             torch.cuda.synchronize()
 
+            my = torch.randn((total_seq, n), dtype=torch.bfloat16, device="cuda")
+
             for _ in range(1):
                 gt = naive_group_gemm(x, w, cu_seqlens, scale)
-                my = hpc.group_gemm_fp8(x, w, seqlens, cu_seqlens, scale_hpc)
+                hpc.group_gemm_fp8(x, w, seqlens, cu_seqlens, scale_hpc, output=my, tma_desc=None)
                 torch.cuda.synchronize()
 
             print("gt")

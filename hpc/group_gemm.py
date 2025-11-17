@@ -1,5 +1,6 @@
 import torch
 from torch import Tensor
+from typing import Tuple
 
 
 def group_gemm_fp8(
@@ -9,6 +10,7 @@ def group_gemm_fp8(
     cu_seqlens: Tensor,
     y_scale: Tensor,
     output: Tensor = None,
+    tma_desc: Tensor = None,
 ) -> Tensor:
     """Performs group GEMM operation with FP8 precision.
 
@@ -17,10 +19,10 @@ def group_gemm_fp8(
 
     Args:
         x: Input activation tensor
-            Shape: [total_seq, hidden_dim]
+            Shape: [total_seq, hidden_size]
             Dtype: fp8
         weight: Weight tensor for group matrix multiplication
-            Shape: [num_groups, output_dim, hidden_dim]
+            Shape: [num_groups, output_dim, hidden_size]
             Dtype: fp8
         seqlens: Sequence lengths for each group
             Shape: [num_group]
@@ -45,9 +47,9 @@ def group_gemm_fp8(
         - All input tensors must be on CUDA device
 
     """
-    return torch.ops.hpc.group_gemm_fp8(x, weight, seqlens, cu_seqlens, y_scale, output)
+    return torch.ops.hpc.group_gemm_fp8(x, weight, seqlens, cu_seqlens, y_scale, output, tma_desc)
 
 
 @torch.library.register_fake("hpc::group_gemm_fp8")
-def group_gemm_fp8_fake(x, weight, seqlens, cu_seqlens, y_scale, output):
+def group_gemm_fp8_fake(x, weight, seqlens, cu_seqlens, y_scale, output, tma_des):
     return torch.empty((x.shape[0], weight.shape[1]), dtype=torch.bfloat16)
