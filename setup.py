@@ -52,6 +52,7 @@ extra_compile_args = {
         "-std=c++17",
         "--expt-relaxed-constexpr",
         "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+        "-DNDEBUG",
         include_flags,
         cute_include,
         *cxx_flags,
