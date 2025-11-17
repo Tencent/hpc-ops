@@ -53,8 +53,10 @@ __global__ void topk_stage1(float* output_logits, float* mid_logits, int* mid_to
 
   vec_t<float, kSortItemsPerThread> logits_local;
   vec_t<int, kSortItemsPerThread> tokens_local;
-  auto& logits_load_vec = view<kSortItemsPerThread / kItemsPerThread>(logits_local);
-  auto& tokens_local_vec = view<kSortItemsPerThread / kItemsPerThread>(tokens_local);
+  auto& logits_load_vec =
+      reshape<kSortItemsPerThread / kItemsPerThread, kItemsPerThread>(logits_local);
+  auto& tokens_local_vec =
+      reshape<kSortItemsPerThread / kItemsPerThread, kItemsPerThread>(tokens_local);
 
   int load_idx = 0;
   int sort_idx = 0;

@@ -55,9 +55,29 @@ __global__ void reshape(float *output, const float *input) {
   store(output + 2, hv2);
 }
 
+__global__ void reshape2(float *output, const float *input) {
+  vec_t<int, 30> v;
+
+  auto &vs = reshape<2, 3, 5>(v);
+  for (int i = 0; i < size(vs); ++i) {
+    for (int j = 0; j < size(vs[i]); ++j) {
+      for (int k = 0; k < size(vs[i][j]); ++k) {
+        vs[i][j][k] = (i + 1) * 100 + (j + 1) * 10 + (k + 1);
+      }
+    }
+  }
+
+  for (int i = 0; i < size(v); ++i) {
+    printf("v[%d] = %d\n", i, v[i]);
+  }
+}
+
 }  // namespace hpc
 
 int main() {
+  float *ptr;
+  hpc::reshape2<<<1, 1>>>(ptr, ptr);
+
   cudaDeviceSynchronize();
   auto err = cudaGetLastError();
   printf("err = %d, str = %s\n", err, cudaGetErrorString(err));

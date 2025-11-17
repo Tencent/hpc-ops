@@ -111,7 +111,7 @@ __global__ void fused_rms_norm_with_scale(__nv_bfloat16 *input_ptr, __nv_bfloat1
           reg_input[iter][i] = reg_input[iter][i] * reg_weight[iter][i] * local_mean;
         }
 
-        auto &split_input = view<2>(reg_input[iter]);
+        auto &split_input = reshape<2, kItemPer16B / 2>(reg_input[iter]);
         if constexpr (kIsMoe) {
           store(&output_ptr_fp32[istore], split_input[0]);
           store(&output_ptr_fp32[istore + kItemPer16B / 2], split_input[1]);

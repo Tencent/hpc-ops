@@ -35,107 +35,42 @@ struct vec_t {
   static constexpr int num = N;
   static constexpr int kNum = N;
 
-  __device__ __forceinline__ T &operator[](int idx) { return data[idx]; }
+  __device__ __forceinline__ constexpr T &operator[](int idx) { return data[idx]; }
 
-  __device__ __forceinline__ const T &operator[](int idx) const { return data[idx]; }
+  __device__ __forceinline__ constexpr const T &operator[](int idx) const { return data[idx]; }
 };
 
-template <int K, typename T, int N>
-__device__ __forceinline__ auto &view(vec_t<T, N> &v) {
-  using V = vec_t<vec_t<T, N / K>, K>;
-  return *reinterpret_cast<V *>(&v);
+template <typename T, int N, int... Dims>
+struct traits_vec_t;
+
+template <typename T, int N, int Dim>
+struct traits_vec_t<T, N, Dim> {
+  static_assert(N == Dim, "dimension mismatch");
+  using type = vec_t<T, Dim>;
+};
+
+template <typename T, int N, int First, int... Rest>
+struct traits_vec_t<T, N, First, Rest...> {
+  static_assert(N % First == 0, "first dimension must divide total size");
+  using inner_type = typename traits_vec_t<T, N / First, Rest...>::type;
+  using type = vec_t<inner_type, First>;
+};
+
+template <typename T, int N>
+__device__ __forceinline__ constexpr int size(vec_t<T, N> &v) {
+  return N;
 }
 
-template <typename T, int... Dims>
-class vec_view;
+template <int... Dims, typename T, int N>
+__device__ __forceinline__ constexpr auto &reshape(vec_t<T, N> &v) {
+  constexpr int num_elements = (Dims * ...);
 
-template <typename T, int Dim>
-class vec_view<T, Dim> {
-  T *data_;
-
- public:
-  using value_type = vec_t<T, Dim>;
-  static constexpr int size() { return Dim; }
-
-  __device__ __forceinline__ vec_view(T *data) : data_(data) {}
-
-  constexpr __device__ __forceinline__ T &operator[](int i) { return data_[i]; }
-
-  constexpr const __device__ __forceinline__ T &operator[](int i) const { return data_[i]; }
-
-  __device__ __forceinline__ operator vec_t<T, Dim>() const {
-    vec_t<T, Dim> ret;
-#pragma unroll
-    for (int i = 0; i < Dim; ++i) {
-      ret.data[i] = data_[i];
-    }
-    return ret;
-  }
-
-  __device__ __forceinline__ vec_view &operator=(const vec_t<T, Dim> &rhs) {
-#pragma unroll
-    for (int i = 0; i < Dim; ++i) {
-      data_[i] = rhs.data[i];
-    }
-    return *this;
-  }
-};
-
-template <typename T, int First, int... Rest>
-class vec_view<T, First, Rest...> {
-  T *data_;
-
- public:
-  static constexpr int inner_size = (Rest * ...);
-  using inner_view_type = vec_view<T, Rest...>;
-  using inner_value_type = typename inner_view_type::value_type;
-  using value_type = vec_t<inner_value_type, First>;
-  static constexpr int size() { return First; }
-  __device__ __forceinline__ vec_view(T *data) : data_(data) {}
-
-  __device__ __forceinline__ constexpr auto operator[](int i) {
-    return vec_view<T, Rest...>(data_ + i * inner_size);
-  }
-
-  __device__ __forceinline__ constexpr auto operator[](int i) const {
-    return vec_view<T, Rest...>(data_ + i * inner_size);
-  }
-
-  __device__ __forceinline__ operator vec_t<vec_t<T, inner_size>, First>() const {
-    vec_t<vec_t<T, inner_size>, First> ret;
-#pragma unroll
-    for (int i = 0; i < First; ++i) {
-#pragma unroll
-      for (int j = 0; j < inner_size; ++j) {
-        ret.data[i].data[j] = data_[i * inner_size + j];
-      }
-    }
-    return ret;
-  }
-
-  template <int N>
-  __device__ __forceinline__ vec_view &operator=(const vec_t<vec_t<T, N>, First> &rhs) {
-    static_assert(N == inner_size, "size mismatch in assignment");
-#pragma unroll
-    for (int i = 0; i < First; ++i) {
-#pragma unroll
-      for (int j = 0; j < inner_size; ++j) {
-        data_[i * inner_size + j] = rhs.data[i].data[j];
-      }
-    }
-    return *this;
-  }
-};
-
-template <int... NewDims, typename T, int N>
-__device__ __forceinline__ auto reshape(vec_t<T, N> &v) {
-  constexpr int total_elements = (NewDims * ...);
-  static_assert(total_elements == N, "total elements must match in reshape");
-  return vec_view<T, NewDims...>(v.data);
+  using ResultType = typename traits_vec_t<T, N, Dims...>::type;
+  return *reinterpret_cast<ResultType *>(&v);
 }
 
 template <typename U, typename T, int N>
-__device__ __forceinline__ auto to(const vec_t<T, N> &v) {
+__device__ __forceinline__ constexpr auto to(const vec_t<T, N> &v) {
   if constexpr (std::is_same_v<T, float> && std::is_same_v<U, __nv_bfloat16>) {
     using V = vec_t<__nv_bfloat16, N>;
     V o;
@@ -211,13 +146,8 @@ __device__ __forceinline__ auto to(const vec_t<T, N> &v) {
   }
 }
 
-template <typename U, typename T, int... Rest>
-__device__ __forceinline__ auto to(const vec_view<T, Rest...> &view) {
-  return to<U>(static_cast<typename vec_view<T, Rest...>::value_type>(view));
-}
-
 template <typename T, int N>
-__device__ __forceinline__ auto load(const void *ptr) {
+__device__ __forceinline__ constexpr auto load(const void *ptr) {
   using V = vec_t<T, N>;
   V v;
 
@@ -247,7 +177,7 @@ __device__ __forceinline__ auto load(const void *ptr) {
 }
 
 template <typename T, int N>
-__device__ __forceinline__ void store(void *ptr, const vec_t<T, N> &v) {
+__device__ __forceinline__ constexpr void store(void *ptr, const vec_t<T, N> &v) {
   using V = vec_t<T, N>;
 
   constexpr int kBytes = sizeof(T) * N;
@@ -275,13 +205,8 @@ __device__ __forceinline__ void store(void *ptr, const vec_t<T, N> &v) {
   return;
 }
 
-template <typename T, int... Dims>
-__device__ __forceinline__ void store(void *ptr, const vec_view<T, Dims...> &view) {
-  store(ptr, static_cast<typename vec_view<T, Dims...>::value_type>(view));
-}
-
 template <typename T, typename... Args>
-__device__ __forceinline__ void store(void *ptr, T val, Args... vals) {
+__device__ __forceinline__ constexpr void store(void *ptr, T val, Args... vals) {
   constexpr int N = sizeof...(Args);
   using V = vec_t<T, 1 + N>;
 
@@ -407,7 +332,7 @@ __device__ __forceinline__ float warp_8lane_stride4_reduce_sum_xor(float x) {
 // ============================
 
 template <typename Tensor>
-__device__ __forceinline__ auto retile_fragment(Tensor &&tensor) {
+__device__ __forceinline__ constexpr auto retile_fragment(Tensor &&tensor) {
   using namespace cute;  // NOLINT
 
   constexpr int R = decltype(tensor.layout())::rank;
@@ -424,6 +349,19 @@ __device__ __forceinline__ auto retile_fragment(Tensor &&tensor) {
       make_stride(get<0>(thr_vmk.stride()), get<2>(thr_vmk.stride()), get<1>(tile_mk.stride()))));
 
   return make_tensor(static_cast<Tensor &&>(tensor).data(), make_layout(m_layout, k_layout));
+}
+
+// ================================
+//    Synchronization Primitives
+// ================================
+
+__device__ __forceinline__ void syncwarpgroup(int barrier_id) {
+  asm volatile("barrier.cta.sync %0, 128;\n" ::"r"(barrier_id) : "memory");
+}
+
+template <int N>
+__device__ __forceinline__ void bar_sync(int barrier_id) {
+  asm volatile("barrier.cta.sync %0, %1;\n" ::"r"(barrier_id), "n"(N) : "memory");
 }
 
 }  // namespace hpc

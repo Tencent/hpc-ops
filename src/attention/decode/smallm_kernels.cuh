@@ -18,10 +18,6 @@ namespace hpc {
 namespace attention {
 namespace kernels {
 
-__device__ __forceinline__ void syncwarpgroup(int iwarpgroup) {
-  asm volatile("barrier.sync %0, 128;\n" ::"r"(iwarpgroup) : "memory");
-}
-
 template <int kTileN, int kN, typename TensorY, typename TensorS>
 __device__ __forceinline__ void final_online_softmax(TensorY &tYr_mn, TensorS &gSum,
                                                      float *smem_sum, int iwarpgroup, int iwarp,

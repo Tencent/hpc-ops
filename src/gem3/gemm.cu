@@ -238,8 +238,11 @@ __global__ void __launch_bounds__(384, 1)
       auto tCr4s = thr_copy_c.retile_S(tCrh);
       auto tCs4r = thr_copy_c.partition_D(sC);
 
+      cute::tma_store_wait<0>();
+      syncwarpgroup(iwarpgroup);
+
       cute::copy(tiled_copy_c, tCr4s, tCs4r);
-      asm volatile("barrier.sync %0, 128;\n" ::"r"(iwarpgroup) : "memory");
+      syncwarpgroup(iwarpgroup);
       cute::tma_store_fence();
 
       if (is_leader_in_warpgroup) {
