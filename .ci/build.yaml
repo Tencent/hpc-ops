@@ -206,7 +206,7 @@ stages:
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
 
-            sudo docker exec -e PYTORCH_NO_CUDA_MEMORY_CACHING=1 -t hpc-ops-cicd bash -c "cd ${workpath}/ && compute-sanitizer --tool=memcheck --kernel-name regex="hpc.+" pytest tests"
+            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make sanitizer-memcheck"
 
       - name: compute-sanitizer::initcheck
         id: F2Q
@@ -227,7 +227,7 @@ stages:
             echo ${{BK_CI_BUILD_TASK_ID}}
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-            # sudo docker exec -e PYTORCH_NO_CUDA_MEMORY_CACHING=1 -t hpc-ops-cicd bash -c "cd ${workpath}/ && compute-sanitizer --tool=initcheck pytest tests"
+            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make sanitizer-initcheck"
 
       - name: compute-sanitizer::synccheck
         id: BTt
@@ -248,7 +248,7 @@ stages:
             echo ${{BK_CI_BUILD_TASK_ID}}
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-            sudo docker exec -e PYTORCH_NO_CUDA_MEMORY_CACHING=1 -t hpc-ops-cicd bash -c "cd ${workpath}/ && compute-sanitizer --tool=synccheck --kernel-name regex="hpc.+" pytest tests"
+            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make sanitizer-synccheck"
 
       - name: compute-sanitizer::racecheck
         id: ywt
@@ -269,7 +269,7 @@ stages:
             echo ${{BK_CI_BUILD_TASK_ID}}
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-            sudo docker exec -e PYTORCH_NO_CUDA_MEMORY_CACHING=1 -t hpc-ops-cicd bash -c "cd ${workpath}/ && compute-sanitizer --tool=racecheck --kernel-name regex="hpc.+" pytest tests"
+            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make sanitizer-racecheck"
 
 finally:
   job_SCd:
