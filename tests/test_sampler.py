@@ -104,9 +104,9 @@ def test_topk_mask_logits(batch_size, vocab_size, topk):
 
     logits = torch.randn(batch_size, vocab_size).cuda()
 
-    reject_threshold = 0 * torch.max(logits, dim=-1)[0] / 1000
+    topk = torch.tensor([topk] * batch_size).to(torch.int32).cuda()
 
-    my_output_logits = hpc.sampler.topk_mask_logits(logits, topk, reject_threshold)
+    my_output_logits = hpc.sampler.topk_mask_logits(logits, topk)
 
     gt_output_logits = reference_topk_mask_logits(logits, topk)
 

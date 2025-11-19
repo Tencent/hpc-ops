@@ -88,6 +88,7 @@ torch::Tensor topk_mask_logits_entry(const torch::Tensor& logits, std::optional<
 
   if (topk.has_value()) {
     TORCH_CHECK(topk->is_contiguous(), "topk tensor must be contiguous");
+    TORCH_CHECK(topk->scalar_type() == torch::kInt32, "topk dtype must be int32");
   }
   if (reject_threshold.has_value()) {
     TORCH_CHECK(reject_threshold->is_contiguous(), "reject_threshold tensor must be contiguous");
@@ -100,7 +101,6 @@ torch::Tensor topk_mask_logits_entry(const torch::Tensor& logits, std::optional<
   // Used for temp storage of topk tokens and logits of first stage topk
   // Fixed size for current implementation
   constexpr int kBlockPerBatch = 8;
-  constexpr int kSortItemsPerThread = 4;
   constexpr int kMaxTopK = 32;
 
   torch::Tensor middle_logits = torch::empty({batch_size, kMaxTopK * kBlockPerBatch},

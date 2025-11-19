@@ -144,13 +144,13 @@ __global__ void topk_stage1(float* output_logits, float* mid_logits, int* mid_to
     // if (need_sort) { // modified: we do sort for all warps
     block_reduce_sort.Sort(logits_load_vec[0].data, tokens_local_vec[0].data, std::greater());
     // }
-
-    if (ilane < kBlockReduceKeepTopKTheads) {
-      store(&warp_reduce_logits[(iwarp * kBlockReduceKeepTopKTheads + ilane) * kItemsPerThread],
-            logits_load_vec[0]);
-      store(&warp_reduce_tokens[(iwarp * kBlockReduceKeepTopKTheads + ilane) * kItemsPerThread],
-            tokens_local_vec[0]);
-    }
+  }
+  __syncthreads();
+  if (iwarp < kBlockReduceWarpCount && ilane < kBlockReduceKeepTopKTheads) {
+    store(&warp_reduce_logits[(iwarp * kBlockReduceKeepTopKTheads + ilane) * kItemsPerThread],
+          logits_load_vec[0]);
+    store(&warp_reduce_tokens[(iwarp * kBlockReduceKeepTopKTheads + ilane) * kItemsPerThread],
+          tokens_local_vec[0]);
   }
   __syncthreads();
 
@@ -161,13 +161,13 @@ __global__ void topk_stage1(float* output_logits, float* mid_logits, int* mid_to
     logits_load_vec[0] = load<float, kItemsPerThread>(&warp_reduce_logits[ismem_load_store]);
     tokens_local_vec[0] = load<int, kItemsPerThread>(&warp_reduce_tokens[ismem_load_store]);
     block_reduce_sort.Sort(logits_load_vec[0].data, tokens_local_vec[0].data, std::greater());
-
-    if (ilane < kBlockReduceKeepTopKTheads) {
-      store(&warp_reduce_logits[(iwarp * kBlockReduceKeepTopKTheads + ilane) * kItemsPerThread],
-            logits_load_vec[0]);
-      store(&warp_reduce_tokens[(iwarp * kBlockReduceKeepTopKTheads + ilane) * kItemsPerThread],
-            tokens_local_vec[0]);
-    }
+  }
+  __syncthreads();
+  if (iwarp < kBlockReduceWarpCount2 && ilane < kBlockReduceKeepTopKTheads) {
+    store(&warp_reduce_logits[(iwarp * kBlockReduceKeepTopKTheads + ilane) * kItemsPerThread],
+          logits_load_vec[0]);
+    store(&warp_reduce_tokens[(iwarp * kBlockReduceKeepTopKTheads + ilane) * kItemsPerThread],
+          tokens_local_vec[0]);
   }
 
   __syncthreads();
@@ -200,7 +200,6 @@ template <int kThreadsPerBlock, int kBlockPerBatch, int kItemsPerThread, int kSo
 __global__ void topk_stage2(float* output_logits, int* out, float* middle_logits,
                             int* middle_tokens, int* topk, int topk_val) {
   constexpr int kWarpSize = 32;
-  constexpr int kWarpCount = kThreadsPerBlock / kWarpSize;
   constexpr int kKeepTopKTheads = kMaxTopK / kSortItemsPerThread;
   using BlockRadixSort = cub::BlockRadixSort<float, kThreadsPerBlock, kSortItemsPerThread, int>;
   __shared__ typename BlockRadixSort::TempStorage temp_storage;

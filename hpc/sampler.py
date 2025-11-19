@@ -4,9 +4,12 @@ import torch
 from torch import Tensor
 
 
-def _to_tensor_scalar_tuple(x) -> Tuple[Optional[Tensor], float]:
+def _to_tensor_scalar_tuple(x) -> Tuple[Optional[Tensor], Union[int, float]]:
     if isinstance(x, torch.Tensor):
-        return (x, 0.0)
+        if x.dtype == torch.float:
+            return (x, 0.0)
+        elif x.dtype == torch.int32:
+            return (x, 0)
     else:
         return (None, x)
 
