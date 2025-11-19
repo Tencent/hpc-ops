@@ -53,7 +53,7 @@ sanitizer-synccheck:$(PY_TEST)
 
 sanitizer-racecheck:$(PY_TEST)
 	@for test in $^; do \
-	  PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer --tool=racecheck --require-cuda-init=no --kernel-name regex="hpc.+" python3 -m pytest -v --no-header --disable-warnings $$test || exit 1; \
+	  PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer --tool=racecheck --require-cuda-init=no --kernel-name regex="hpc.+" python3 -m pytest -v --no-header --disable-warnings $$test 2>&1 | python3 tools/racecheck-has-error.py || exit 1;\
 	done
 
 sanitizer-initcheck:$(PY_TEST)
