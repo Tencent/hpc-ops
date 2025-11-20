@@ -504,7 +504,12 @@ def hpc_attn_func(
             )
             for _ in range(20):
                 my = hpc.attention_decode_bf16(
-                    q, kvcache[:, 0, :, :, :], kvcache[:, 1, :, :, :], block_ids, cache_lens
+                    q,
+                    kvcache[:, 0, :, :, :],
+                    kvcache[:, 1, :, :, :],
+                    block_ids,
+                    cache_lens,
+                    splitk=4,
                 )
         my = my.reshape(s.batch_size * s.qo_len, s.num_heads * s.head_dim)
         outputs.append(my)
@@ -604,10 +609,10 @@ if __name__ == "__main__":
             num_heads=4,
             num_kv_heads=1,
             head_dim=128,
-            batch_size=200,
+            batch_size=30,
             qo_len=1,
             kv_cache_len=1024,
-            page_size=32,
+            page_size=64,
             stage=AttnStage.DECODE,
         )
     )

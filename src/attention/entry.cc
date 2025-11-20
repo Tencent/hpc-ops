@@ -67,9 +67,10 @@ torch::Tensor attention_prefill_bf16_entry(const torch::Tensor &q, const torch::
 torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor &kcache,
                                           torch::Tensor &vcache, const torch::Tensor &block_ids,
                                           const torch::Tensor &num_seq_kvcache,
-                                          bool new_kv_included,
+                                          bool new_kv_included, int64_t splitk,
                                           std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+  constexpr int kSplitK = 4;
   TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
   TORCH_CHECK(kcache.device().is_cuda(), "v tensor must be cuda");
   TORCH_CHECK(vcache.device().is_cuda(), "v tensor must be cuda");
@@ -79,6 +80,7 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   TORCH_CHECK(block_ids.scalar_type() == torch::kInt32, "block_ids dtype must be int32");
   TORCH_CHECK(num_seq_kvcache.scalar_type() == torch::kInt32,
               "num_seq_kvcache dtype must be int32");
+  TORCH_CHECK(splitk <= 0 || splitk == kSplitK, "we only support splitk == 4");
 
   int num_batch = num_seq_kvcache.size(0);
   int num_seq_q = q.size(0) / num_batch;
@@ -109,6 +111,18 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
     y = torch::empty({num_batch * num_seq_q, num_head_q, num_dim_v}, options);
   }
 
+  torch::Tensor lse;
+  torch::Tensor split_out;
+
+  if (splitk > 0) {
+    lse = torch::empty({num_batch, kSplitK, num_head_q}, q.options().dtype(torch::kFloat32));
+    split_out = torch::empty({num_batch, kSplitK, num_head_q, num_dim_v},
+                             q.options().dtype(torch::kFloat32));
+  }
+
+  auto *lse_ptr = splitk > 0 ? lse.mutable_data_ptr() : nullptr;
+  auto *split_out_ptr = splitk > 0 ? split_out.mutable_data_ptr() : nullptr;
+
   auto *y_ptr = y.mutable_data_ptr();
 
   int ldQ = q.stride(0);  // num_head_q * num_dim_qk;
@@ -117,9 +131,10 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   int ldY = y.stride(0);  // num_head_q * num_dim_v;
 
   bool running = attention_decode_bf16_async(
-      y_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr, num_seq_kvcache_ptr, new_kv_included,
-      num_batch, num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks,
-      block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+      y_ptr, lse_ptr, split_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+      num_seq_kvcache_ptr, new_kv_included, splitk, num_batch, num_head_q, num_head_k, num_head_v,
+      num_dim_qk, num_dim_v, num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV,
+      stream);
 
   TORCH_CHECK(running, "attn decode kernel launch failed!");
 
@@ -137,6 +152,6 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 
   m.def(
       "attention_decode_bf16(Tensor q, Tensor! kcache, Tensor! vcache, Tensor block_ids, Tensor "
-      "num_seq_kvcache, bool new_kv_included, Tensor? output) -> (Tensor)");
+      "num_seq_kvcache, bool new_kv_included, int splitk, Tensor? output) -> (Tensor)");
   m.impl("attention_decode_bf16", torch::kCUDA, &hpc::attention::attention_decode_bf16_entry);
 }

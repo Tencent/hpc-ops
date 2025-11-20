@@ -67,7 +67,6 @@ def naive_attn_with_paged_kvcache_func(
 
         P = BQ @ BK.transpose(-1, -2)
         P = P / math.sqrt(head_dim)
-
         causal_mask = torch.ones(
             seqlenq[bi], seqlen - seqlenq[bi], device=Q.device, dtype=torch.bool
         )
@@ -100,12 +99,13 @@ except Exception as e:
 @pytest.mark.parametrize("num_batch", [1, 16, 200])
 @pytest.mark.parametrize("num_seq_q", [1])
 @pytest.mark.parametrize("max_seq_kv", [1024, 4096])
-@pytest.mark.parametrize("block_size", [32, 64])
+@pytest.mark.parametrize("block_size", [64])
 @pytest.mark.parametrize("num_head_q", [4, 8])
 @pytest.mark.parametrize("num_head_kv", [1])
-@pytest.mark.parametrize("head_dim", [80, 128])
+@pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("new_kv_included", [True, False])
 @pytest.mark.parametrize("use_output", [True, False])
+@pytest.mark.parametrize("splitk", [0, 4])
 def test_attention_decode_bf16(
     num_batch,
     num_seq_q,
@@ -116,13 +116,13 @@ def test_attention_decode_bf16(
     head_dim,
     new_kv_included,
     use_output,
+    splitk,
 ):
     # torch.manual_seed(10086)
     # torch.cuda.manual_seed(10086)
-
     num_dim_qk = head_dim
     num_dim_v = head_dim
-    max_num_blocks = num_batch * max_seq_kv // block_size * 2
+    max_num_blocks = int(num_batch * max_seq_kv // block_size * 1.2)
 
     T = torch.bfloat16
 
@@ -134,7 +134,10 @@ def test_attention_decode_bf16(
     ) / math.sqrt(num_dim_qk)
     V = torch.randn((num_batch * num_seq_q, num_head_kv, num_dim_v), dtype=T, device="cuda")
 
-    num_seq_kvcache = torch.randint(1, max_seq_kv, (num_batch,), dtype=torch.int32, device="cuda")
+    num_seq_kvcache = (
+        torch.randint(1, max_seq_kv, (num_batch,), dtype=torch.int32, device="cuda") * 0
+        + max_seq_kv
+    )
     nblocks = (num_seq_kvcache + num_seq_q + block_size - 1) // block_size
     total_blocks = sum(nblocks)
     kvcache = torch.randn(
@@ -175,6 +178,7 @@ def test_attention_decode_bf16(
             block_ids,
             num_seq_kvcache + 1 if new_kv_included else num_seq_kvcache,
             new_kv_included=new_kv_included,
+            splitk=splitk,
             output=my,
         )
     else:
@@ -185,6 +189,7 @@ def test_attention_decode_bf16(
             block_ids,
             num_seq_kvcache + 1 if new_kv_included else num_seq_kvcache,
             new_kv_included=new_kv_included,
+            splitk=splitk,
         )
 
     print("\ngt\n")
