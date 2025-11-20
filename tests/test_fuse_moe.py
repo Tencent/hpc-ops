@@ -10,8 +10,6 @@ import math
 import pytest
 from pathlib import Path
 
-file_available = os.path.exists("/cfs_cloud_code/theocheng/fused_moe_topk")
-
 
 def naive_gather_expert_inputs(x, topk_ids):
     num_expert, num_topk = topk_ids.shape
@@ -36,7 +34,8 @@ def naive_gather_expert_inputs(x, topk_ids):
 def naive_group_gemm(x, w, cu_seqlens, scale):
 
     m, k = x.shape
-    num_group, n, _ = w.shape
+    _, n, _ = w.shape
+    num_group = len(cu_seqlens) - 1
 
     y = torch.zeros((m, n), dtype=torch.bfloat16, device=x.device)
 
@@ -49,7 +48,12 @@ def naive_group_gemm(x, w, cu_seqlens, scale):
         w_group = w[i]
 
         y_group = torch._scaled_mm(
-            x_group, w_group.t(), scale_a=scale, scale_b=scale, bias=None, out_dtype=torch.bfloat16
+            x_group,
+            w_group.t(),
+            scale_a=scale,
+            scale_b=torch.ones((1), dtype=torch.float, device="cuda"),
+            bias=None,
+            out_dtype=torch.bfloat16,
         )
         y[start_idx:end_idx] = y_group
 
@@ -109,13 +113,87 @@ def naive_fuse_moe(
     return y
 
 
-@pytest.mark.skipif(not file_available, reason="fused_moe_topk files does not exists!!!")
+@pytest.mark.parametrize("num_seq", [128])
+@pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("hidden_size", [4096])
-@pytest.mark.parametrize("intermediate_size", [8192])
+@pytest.mark.parametrize("intermediate_size", [4096])
 @pytest.mark.parametrize("num_expert", [128])
 @pytest.mark.parametrize("eprank", [0])
-def test_count_and_gather(hidden_size, intermediate_size, num_expert, eprank):
-    torch.cuda.manual_seed(10086)
+def test_fuse_moe(num_seq, num_topk, hidden_size, intermediate_size, num_expert, eprank):
+    dtype = torch.float8_e4m3fn
+
+    topk_ids = torch.randint(0, num_expert, (num_seq, num_topk), dtype=torch.int32, device="cuda")
+
+    x = (torch.randn((num_seq, hidden_size), dtype=torch.float, device="cuda") / 100).to(dtype)
+    gate_up_weight = torch.randn(
+        (num_expert, intermediate_size * 2, hidden_size), dtype=torch.float, device="cuda"
+    ).to(dtype)
+    down_weight = torch.randn(
+        (num_expert, hidden_size, intermediate_size),
+        dtype=torch.float,
+        device="cuda",
+    ).to(dtype)
+    gate_up_scale = torch.ones((num_expert), dtype=torch.float, device="cuda") / 2
+    down_scale = torch.ones((num_expert), dtype=torch.float, device="cuda") / 2
+    act_and_mul_scale = torch.ones((num_expert), dtype=torch.float, device="cuda") / 2
+    topk_scale = torch.ones((num_seq, num_topk), dtype=torch.float, device="cuda") / 2
+
+    for _ in range(1):
+        gt = naive_fuse_moe(
+            x,
+            gate_up_weight,
+            down_weight,
+            gate_up_scale,
+            down_scale,
+            act_and_mul_scale,
+            topk_ids,
+            topk_scale,
+            eprank,
+        )
+        my = hpc.fuse_moe(
+            x,
+            gate_up_weight,
+            down_weight,
+            gate_up_scale,
+            down_scale,
+            act_and_mul_scale,
+            topk_ids,
+            topk_scale,
+            eprank,
+        )
+
+        torch.cuda.synchronize()
+
+    print("gt")
+    print(gt)
+
+    print("my")
+    print(my)
+
+    abs_diff = torch.abs(gt - my)
+    vals, idxs = torch.topk(abs_diff.view(-1), 10)
+    idxs = [torch.unravel_index(idx, gt.shape) for idx in idxs]
+
+    for i, idx in enumerate(idxs):
+        cpu_idx = tuple(tensor.cpu().item() for tensor in idx)
+        print(
+            "{:+.4f} vs {:+.4f} with diff = {:.4f}, @ {}".format(gt[idx], my[idx], vals[i], cpu_idx)
+        )
+
+    assert gt.device == my.device
+    assert gt.shape == my.shape
+    assert torch.allclose(my.to(torch.float), gt.to(torch.float), rtol=0.08, atol=0.01)
+
+
+file_available = os.path.exists("/cfs_cloud_code/theocheng/fused_moe_topk")
+
+
+@pytest.mark.skipif(not file_available, reason="fused_moe_topk files does not exists!!!")
+@pytest.mark.parametrize("hidden_size", [4096])
+@pytest.mark.parametrize("intermediate_size", [4096])
+@pytest.mark.parametrize("num_expert", [128])
+@pytest.mark.parametrize("eprank", [0])
+def test_fuse_moe_realdata(hidden_size, intermediate_size, num_expert, eprank):
     dtype = torch.float8_e4m3fn
 
     path = Path("/cfs_cloud_code/theocheng/fused_moe_topk")
@@ -134,10 +212,10 @@ def test_count_and_gather(hidden_size, intermediate_size, num_expert, eprank):
                 dtype
             )
             gate_up_weight = torch.randn(
-                (num_expert, intermediate_size, hidden_size), dtype=torch.float, device="cuda"
+                (num_expert, intermediate_size * 2, hidden_size), dtype=torch.float, device="cuda"
             ).to(dtype)
             down_weight = torch.randn(
-                (num_expert, hidden_size, intermediate_size // 2),
+                (num_expert, hidden_size, intermediate_size),
                 dtype=torch.float,
                 device="cuda",
             ).to(dtype)

@@ -143,10 +143,10 @@ def fuse_moe(
             Shape: [num_seq, hidden_size]
             Dtype: fp8
         gate_up_weight: Combined weight tensor for gate and up projections
-            Shape: [num_expert, intermediate_size, hidden_size]
+            Shape: [num_expert, intermediate_size * 2, hidden_size]
             Dtype: fp8
         down_weight: Weight tensor for down projection
-            Shape: [num_expert, hidden_size, intermediate_size//2]
+            Shape: [num_expert, hidden_size, intermediate_size]
             Dtype: fp8
         gate_up_scale: Scaling factors for gate-up projection outputs
             Shape: [num_expert]

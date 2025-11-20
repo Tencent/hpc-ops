@@ -16,12 +16,12 @@ namespace fuse_moe {
 
 namespace kernels {
 
-__global__ void count_kernel(const int *topk_ids_ptr, int *seqlens_ptr, int total_num_seq,
+__global__ void count_kernel(const int *topk_ids_ptr, int *seqlens_ptr, int total_num_topk,
                              int start_expert, int end_expert) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
   int iexpert = topk_ids_ptr[idx];
-  if ((idx < total_num_seq) && (iexpert >= start_expert) && (iexpert < end_expert)) {
+  if ((idx < total_num_topk) && (iexpert >= start_expert) && (iexpert < end_expert)) {
     atomicAdd(&seqlens_ptr[iexpert - start_expert], 1);
   }
 }
@@ -29,7 +29,7 @@ __global__ void count_kernel(const int *topk_ids_ptr, int *seqlens_ptr, int tota
 template <int kThreadPerBlock, int kGroupPerThread, int kTileM>
 __global__ void count_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, int *seqlens_ptr,
                              int *cu_seqlens_ptr, int *tiles_ptr, int *cu_tiles_ptr, int num_seq,
-                             int num_topk, int total_num_seq, int num_expert, int start_expert,
+                             int num_topk, int total_num_topk, int num_expert, int start_expert,
                              int end_expert) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -40,7 +40,7 @@ __global__ void count_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, int *se
   }
   __syncthreads();
 
-  for (int i = idx; i < total_num_seq; i += blockDim.x) {
+  for (int i = idx; i < total_num_topk; i += blockDim.x) {
     int iexpert = topk_ids_ptr[i];
     if ((iexpert >= start_expert) && (iexpert < end_expert)) {
       atomicAdd(&seqlens_shm[iexpert - start_expert], 1);
@@ -98,7 +98,7 @@ template <typename T1, typename T2, typename TmaX, typename TmaY, int kWarpPerBl
 __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 2> td_xy,
                               cute::TmaDescriptor *tma_xy, T1 *y_ptr, T2 *yg_ptr, const T1 *x_ptr,
                               const int *topk_ids_ptr, int *topk_pos_ptr, int *seqlens_ptr,
-                              int *cu_seqlens_ptr, int total_num_seq, int hidden_size,
+                              int *cu_seqlens_ptr, int total_num_topk, int hidden_size,
                               int intermediate_size, int start_expert, int end_expert,
                               int num_block_for_copy, cutlass::FastDivmod topk_divider) {
   constexpr int kThreadPerWarp = 32;
@@ -106,35 +106,36 @@ __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 2> td_xy,
   int iblock = blockIdx.x;
   int iwarp = idx / kThreadPerWarp;
   int ilane = idx % kThreadPerWarp;
-  int ielem = iblock * kWarpPerBlock + iwarp;
-
-  int iexpert = topk_ids_ptr[ielem];
+  int itopk = iblock * kWarpPerBlock + iwarp;
 
   if (iblock < num_block_for_copy) {
-    if ((ielem < total_num_seq) && (iexpert >= start_expert) && (iexpert < end_expert)) {
-      int pos_in_expert;
-      if (ilane == 0) {
-        pos_in_expert = atomicAdd(&seqlens_ptr[iexpert - start_expert], 1);
+    if (itopk < total_num_topk) {
+      int iexpert = topk_ids_ptr[itopk];
+      if ((iexpert >= start_expert) && (iexpert < end_expert)) {
+        int pos_in_expert;
+        if (ilane == 0) {
+          pos_in_expert = atomicAdd(&seqlens_ptr[iexpert - start_expert], 1);
+        }
+
+        pos_in_expert = __shfl_sync(0xFFFFFFFF, pos_in_expert, 0);
+
+        int irow = cu_seqlens_ptr[iexpert] + pos_in_expert;
+
+        int iseq, res;
+        topk_divider(iseq, res, itopk);
+
+        auto y_irow_ptr = y_ptr + irow * hidden_size;
+        auto x_irow_ptr = x_ptr + iseq * hidden_size;
+
+        constexpr int kNumItemPer16B = 16 / sizeof(T1);
+        int total_items = hidden_size / kNumItemPer16B;
+
+        for (int i = ilane; i < total_items; i += kThreadPerWarp) {
+          store<T1, kNumItemPer16B>(y_irow_ptr + i * kNumItemPer16B,
+                                    load<T1, kNumItemPer16B>(x_irow_ptr + i * kNumItemPer16B));
+        }
+        topk_pos_ptr[itopk] = irow;
       }
-
-      pos_in_expert = __shfl_sync(0xFFFFFFFF, pos_in_expert, 0);
-
-      int irow = cu_seqlens_ptr[iexpert] + pos_in_expert;
-
-      int iseq, itopk;
-      topk_divider(iseq, itopk, ielem);
-
-      auto y_irow_ptr = y_ptr + irow * hidden_size;
-      auto x_irow_ptr = x_ptr + iseq * hidden_size;
-
-      constexpr int kNumItemPer16B = 16 / sizeof(T1);
-      int total_items = hidden_size / kNumItemPer16B;
-
-      for (int i = ilane; i < total_items; i += kThreadPerWarp) {
-        store<T1, kNumItemPer16B>(y_irow_ptr + i * kNumItemPer16B,
-                                  load<T1, kNumItemPer16B>(x_irow_ptr + i * kNumItemPer16B));
-      }
-      topk_pos_ptr[ielem] = irow;
     }
   } else {
     if (idx < 32) {
@@ -220,7 +221,7 @@ void count_and_gather_async(void *y_ptr, void *yg_ptr, const void *x_ptr, const 
 
   auto *tma_xy = static_cast<cute::TmaDescriptor *>(tmas_ptr);
 
-  int total_num_seq = num_seq * num_topk;
+  int total_num_topk = num_seq * num_topk;
   int start_expert = eprank * num_expert;
   int end_expert = (eprank + 1) * num_expert;
 
@@ -235,7 +236,7 @@ void count_and_gather_async(void *y_ptr, void *yg_ptr, const void *x_ptr, const 
         <<<grid, block, num_expert * 4, stream>>>(
             (const int *)topk_ids_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
             (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_seq, num_topk,
-            total_num_seq, num_expert, start_expert, end_expert);
+            total_num_topk, num_expert, start_expert, end_expert);
   }
 
   // 1. gather token and update tmas
@@ -246,7 +247,7 @@ void count_and_gather_async(void *y_ptr, void *yg_ptr, const void *x_ptr, const 
     };
 
     constexpr int kWarpPerBlock = 4;
-    int num_block_for_copy = (total_num_seq + kWarpPerBlock - 1) / kWarpPerBlock;
+    int num_block_for_copy = (total_num_topk + kWarpPerBlock - 1) / kWarpPerBlock;
 
     cutlass::FastDivmod topk_divider(num_topk);
 
@@ -257,7 +258,7 @@ void count_and_gather_async(void *y_ptr, void *yg_ptr, const void *x_ptr, const 
         <<<grid, block, 0, stream>>>(td_xy, tma_xy, (Tin *)y_ptr, (Tout *)yg_ptr,
                                      (const Tin *)x_ptr, (const int *)topk_ids_ptr,
                                      (int *)topk_pos_ptr, (int *)seqlens_ptr, (int *)cu_seqlens_ptr,
-                                     total_num_seq, hidden_size, intermediate_size, start_expert,
+                                     total_num_topk, hidden_size, intermediate_size, start_expert,
                                      end_expert, num_block_for_copy, topk_divider);
   }
 }
