@@ -10,7 +10,7 @@ import math
 import pytest
 
 
-def naive_group_gemm(x, w, cu_seqlens, scale):
+def naive_group_gemm(x, w, seqlens, cu_seqlens, scale):
 
     m, k = x.shape
     num_group, n, _ = w.shape
@@ -19,8 +19,10 @@ def naive_group_gemm(x, w, cu_seqlens, scale):
 
     start_idx = 0
     for i in range(num_group):
-        start_idx = cu_seqlens[i].item()
-        end_idx = cu_seqlens[i + 1].item()
+        start_idx = int(cu_seqlens[i].item())
+        end_idx = int(start_idx + seqlens[i].item())  # cu_seqlens[i + 1].item()
+        if seqlens[i].item() == 0:
+            continue
 
         x_group = x[start_idx:end_idx]
         w_group = w[i]
@@ -35,19 +37,21 @@ def naive_group_gemm(x, w, cu_seqlens, scale):
     return y
 
 
-@pytest.mark.parametrize("num_group", [16])
-@pytest.mark.parametrize("m", [10])
-@pytest.mark.parametrize("n", [8192])
-@pytest.mark.parametrize("k", [4096])
-def test_group_gemm1(num_group, m, n, k):
+@pytest.mark.parametrize("num_group", [8])
+@pytest.mark.parametrize("actual_m", [8, 16, 32, 64, 128, 256, 512])
+@pytest.mark.parametrize("m", [512])
+@pytest.mark.parametrize("n", [4096])
+@pytest.mark.parametrize("k", [7168])
+def test_group_gemm1(num_group, actual_m, m, n, k):
     torch.cuda.manual_seed(10086)
     dtype = torch.float8_e4m3fn
 
     # seqlens = torch.tensor([57, 59,  4, 11,  6,  9,  3,  6,  6,  6,  2,  6,  3,  6,  9,  6], device='cuda:0', dtype=torch.int32)
-    seqlens = torch.full((num_group,), m, dtype=torch.int32, device="cuda")
+    seqlens = torch.full((num_group,), actual_m, dtype=torch.int32, device="cuda")
 
     total_seq = torch.sum(seqlens)
-    print(total_seq)
+    mean_seq = int(total_seq / num_group)
+    print(total_seq, mean_seq)
     x = torch.randn((total_seq, k), dtype=torch.float, device="cuda").to(dtype)
     w = torch.randn((num_group, n, k), dtype=torch.float, device="cuda").to(dtype)
     scale = torch.tensor(1.0, dtype=torch.float, device="cuda")
@@ -57,10 +61,13 @@ def test_group_gemm1(num_group, m, n, k):
         torch.cat([torch.tensor([0], dtype=torch.int32, device="cuda"), seqlens]), dim=0
     ).to(torch.int32)
     print(seqlens)
+    print(cu_seqlens)
 
     for _ in range(1):
-        gt = naive_group_gemm(x, w, cu_seqlens, scale)
-        my = hpc.group_gemm_fp8(x, w, seqlens, cu_seqlens, scale_hpc)
+        gt = naive_group_gemm(x, w, seqlens, cu_seqlens, scale)
+        my = hpc.group_gemm_fp8(
+            x, w, seqlens, cu_seqlens, scale_hpc, num_seq_per_group_avg=mean_seq
+        )
 
     print("gt")
     print(gt[:10, 15])
@@ -106,6 +113,7 @@ def test_group_gemm2(num_group, n, k):
             print("i:", i, " seqlens:", seqlens)
 
             total_seq = torch.sum(seqlens)
+            mean_seq = total_seq // num_group
             x = torch.randn((total_seq, k), dtype=torch.float, device="cuda").to(dtype)
             w = torch.randn((num_group, n, k), dtype=torch.float, device="cuda").to(dtype)
             scale = torch.tensor(1.0, dtype=torch.float, device="cuda")
@@ -120,8 +128,17 @@ def test_group_gemm2(num_group, n, k):
             my = torch.randn((total_seq, n), dtype=torch.bfloat16, device="cuda")
 
             for _ in range(1):
-                gt = naive_group_gemm(x, w, cu_seqlens, scale)
-                hpc.group_gemm_fp8(x, w, seqlens, cu_seqlens, scale_hpc, output=my, tma_desc=None)
+                gt = naive_group_gemm(x, w, seqlens, cu_seqlens, scale)
+                hpc.group_gemm_fp8(
+                    x,
+                    w,
+                    seqlens,
+                    cu_seqlens,
+                    scale_hpc,
+                    num_seq_per_group_avg=mean_seq,
+                    output=my,
+                    tma_desc=None,
+                )
                 torch.cuda.synchronize()
 
             print("gt")

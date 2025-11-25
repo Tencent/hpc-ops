@@ -9,6 +9,7 @@ def group_gemm_fp8(
     seqlens: Tensor,
     cu_seqlens: Tensor,
     y_scale: Tensor,
+    num_seq_per_group_avg: int = 32,
     output: Tensor = None,
     tma_desc: Tensor = None,
 ) -> Tensor:
@@ -47,9 +48,13 @@ def group_gemm_fp8(
         - All input tensors must be on CUDA device
 
     """
-    return torch.ops.hpc.group_gemm_fp8(x, weight, seqlens, cu_seqlens, y_scale, output, tma_desc)
+    return torch.ops.hpc.group_gemm_fp8(
+        x, weight, seqlens, cu_seqlens, y_scale, num_seq_per_group_avg, output, tma_desc
+    )
 
 
 @torch.library.register_fake("hpc::group_gemm_fp8")
-def group_gemm_fp8_fake(x, weight, seqlens, cu_seqlens, y_scale, output, tma_des):
+def group_gemm_fp8_fake(
+    x, weight, seqlens, cu_seqlens, y_scale, num_seq_per_group_avg, output, tma_des
+):
     return torch.empty((x.shape[0], weight.shape[1]), dtype=torch.bfloat16)

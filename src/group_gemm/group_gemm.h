@@ -12,7 +12,8 @@ namespace group_gemm {
 void group_gemm_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                           const void *seqlens_ptr, const void *cu_seqlens_ptr, const void *y_scale,
                           void *tmas_ptr, void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m,
-                          int n, int k, bool update_tma, cudaStream_t stream);
+                          int n, int k, int num_seq_per_group_avg, bool update_tma,
+                          cudaStream_t stream);
 
 }  // namespace group_gemm
 }  // namespace hpc

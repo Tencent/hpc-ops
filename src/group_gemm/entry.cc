@@ -15,6 +15,7 @@ namespace group_gemm {
 torch::Tensor group_gemm_fp8_entry(const torch::Tensor &x, const torch::Tensor &weight,
                                    const torch::Tensor &seqlens, const torch::Tensor &cu_seqlens,
                                    const torch::Tensor &y_scale,
+                                   const int64_t num_seq_per_group_avg,
                                    std::optional<torch::Tensor> output,
                                    std::optional<torch::Tensor> tma_desc) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
@@ -64,7 +65,8 @@ torch::Tensor group_gemm_fp8_entry(const torch::Tensor &x, const torch::Tensor &
   auto *cu_tiles_ptr = cu_tiles.mutable_data_ptr();
 
   group_gemm_fp8_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, y_scale_ptr, tmas_ptr,
-                       tiles_ptr, cu_tiles_ptr, num_group, m, n, k, update_tma, stream);
+                       tiles_ptr, cu_tiles_ptr, num_group, m, n, k, num_seq_per_group_avg,
+                       update_tma, stream);
 
   return y;
 }
@@ -75,6 +77,6 @@ torch::Tensor group_gemm_fp8_entry(const torch::Tensor &x, const torch::Tensor &
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "group_gemm_fp8(Tensor x, Tensor weight, Tensor seqlens, Tensor cu_seqlens, Tensor y_scale, "
-      "Tensor? output, Tensor? tma_desc) -> (Tensor)");
+      "int num_seq_per_group_avg, Tensor? output, Tensor? tma_desc) -> (Tensor)");
   m.impl("group_gemm_fp8", torch::kCUDA, &hpc::group_gemm::group_gemm_fp8_entry);
 }

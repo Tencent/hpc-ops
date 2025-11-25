@@ -7,7 +7,7 @@ def count_and_gather(
     x: Tensor,
     topk_ids: Tensor,
     num_expert: int,
-    eprank: int,
+    rank_ep: int,
     intermediate_size: int,
 ) -> Tuple[
     torch.Tensor,
@@ -35,7 +35,7 @@ def count_and_gather(
         num_expert: Number of experts available on the current device
             Shape: scalar
             DType: int
-        eprank: Current device rank in expert parallelism
+        rank_ep: Current device rank in expert parallelism
             Shape: scalar
             DType: int
 
@@ -77,7 +77,7 @@ def count_and_gather(
         - The function modifies the output buffers in-place when provided
         - Expert assignments in topk_ids should be in range [0, num_expert-1]
     """
-    return torch.ops.hpc.count_and_gather(x, topk_ids, num_expert, eprank, intermediate_size)
+    return torch.ops.hpc.count_and_gather(x, topk_ids, num_expert, rank_ep, intermediate_size)
 
 
 def reduce(
@@ -130,7 +130,8 @@ def fuse_moe(
     act_and_mul_scale: Tensor,
     topk_ids: Tensor,
     topk_scale: Tensor,
-    eprank: int,
+    rank_ep: int,
+    num_expert_total: int,
 ) -> Tensor:
     """Performs Mixture of Experts (MoE) forward operation with FP8 precision.
 
@@ -143,27 +144,29 @@ def fuse_moe(
             Shape: [num_seq, hidden_size]
             Dtype: fp8
         gate_up_weight: Combined weight tensor for gate and up projections
-            Shape: [num_expert, intermediate_size * 2, hidden_size]
+            Shape: [num_expert_local, intermediate_size * 2, hidden_size]
             Dtype: fp8
         down_weight: Weight tensor for down projection
-            Shape: [num_expert, hidden_size, intermediate_size]
+            Shape: [num_expert_local, hidden_size, intermediate_size]
             Dtype: fp8
         gate_up_scale: Scaling factors for gate-up projection outputs
-            Shape: [num_expert]
+            Shape: [num_expert_local]
             Dtype: float32
         down_scale: Scaling factors for down projection outputs
-            Shape: [num_expert]
+            Shape: [num_expert_local]
             Dtype: float32
         act_and_mul_scale: Scaling factor for activation and multiplication
             Shape: [1]
             Dtype: float32
         topk_ids: Token indices assigned to each expert
-            Shape: [num_expert, num_topk]
+            Shape: [num_seq, num_topk]
             Dtype: int32
         topk_scale: Weighting factors for each token-expert assignment
-            Shape: [num_expert, num_topk]
+            Shape: [num_seq, num_topk]
             Dtype: float32
-        eprank: Expert parallel rank (for distributed training)
+        rank_ep: Expert parallel rank (for distributed training)
+            Dtype: int32
+        num_expert_total: the total number of expert
             Dtype: int32
 
     Returns:
@@ -194,12 +197,13 @@ def fuse_moe(
         act_and_mul_scale,
         topk_ids,
         topk_scale,
-        eprank,
+        rank_ep,
+        num_expert_total,
     )
 
 
 @torch.library.register_fake("hpc::count_and_gather")
-def count_and_gather_fake(x, topk_ids, num_expert, eprank, intermediate_size):
+def count_and_gather_fake(x, topk_ids, num_expert, rank_ep, intermediate_size):
     return (
         torch.empty((topk_ids.shape[0] * topk_ids.shape[1], x.shape[1]), dtype=torch.float8_e4m3fn),
         torch.empty(
@@ -229,6 +233,7 @@ def fuse_moe_fake(
     act_and_mul_scale,
     topk_ids,
     topk_scale,
-    eprank,
+    rank_ep,
+    num_expert_total,
 ):
     return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)

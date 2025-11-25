@@ -15,7 +15,7 @@ namespace fuse_moe {
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor>
 count_and_gather_entry(const torch::Tensor &x, const torch::Tensor &topk_ids,
-                       const int64_t num_expert, const int64_t eprank,
+                       const int64_t num_expert, const int64_t rank_ep,
                        const int64_t intermediate_size) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
@@ -54,7 +54,7 @@ count_and_gather_entry(const torch::Tensor &x, const torch::Tensor &topk_ids,
 
   count_and_gather_async(y_ptr, yg_ptr, x_ptr, topk_ids_ptr, topk_pos_ptr, seqlens_ptr,
                          cu_seqlens_ptr, tmas_ptr, tiles_ptr, cu_tiles_ptr, num_seq, hidden_size,
-                         intermediate_size, num_topk, num_expert, eprank, stream);
+                         intermediate_size, num_topk, num_expert, rank_ep, stream);
 
   return std::make_tuple(y, yg, topk_pos, seqlens, cu_seqlens, tiles, cu_tiles, tmas);
 }
@@ -97,7 +97,8 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
                              const torch::Tensor &down_weight, const torch::Tensor &gate_up_scale,
                              const torch::Tensor &down_scale,
                              const torch::Tensor &act_and_mul_scale, const torch::Tensor &topk_ids,
-                             const torch::Tensor &topk_scale, int64_t eprank) {
+                             const torch::Tensor &topk_scale, int64_t rank_ep,
+                             int64_t num_expert_total) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
@@ -177,7 +178,8 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
                  gate_up_scale_ptr, gate_up_tmas_ptr, act_and_mul_scale_ptr, down_input_ptr,
                  down_output_ptr, down_weight_ptr, down_scale_ptr, down_tmas_ptr, topk_ids_ptr,
                  topk_scale_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr,
-                 num_seq, hidden_size, intermediate_size, num_topk, num_expert, eprank, stream);
+                 num_seq, hidden_size, intermediate_size, num_topk, num_expert_total, num_expert,
+                 rank_ep, stream);
 
   return y;
 }
@@ -187,7 +189,7 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
 
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
-      "count_and_gather(Tensor x, Tensor topk_ids, int num_expert, int eprank, int "
+      "count_and_gather(Tensor x, Tensor topk_ids, int num_expert, int rank_ep, int "
       "intermediate_size"
       ") -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
   m.impl("count_and_gather", torch::kCUDA, &hpc::fuse_moe::count_and_gather_entry);
@@ -200,6 +202,6 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "fuse_moe(Tensor x, Tensor gate_up_weight, Tensor down_weight, Tensor gate_up_scale, "
       "Tensor down_scale, Tensor act_and_mul_scale, Tensor topk_ids, Tensor topk_scale,"
-      "int eprank) -> (Tensor)");
+      "int rank_ep, int num_expert_total) -> (Tensor)");
   m.impl("fuse_moe", torch::kCUDA, &hpc::fuse_moe::fuse_moe_entry);
 }
