@@ -67,10 +67,10 @@ torch::Tensor attention_prefill_bf16_entry(const torch::Tensor &q, const torch::
 torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor &kcache,
                                           torch::Tensor &vcache, const torch::Tensor &block_ids,
                                           const torch::Tensor &num_seq_kvcache,
-                                          bool new_kv_included, int64_t splitk,
+                                          bool new_kv_included, bool use_splitk,
                                           std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
-  constexpr int kSplitK = 4;
+
   TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
   TORCH_CHECK(kcache.device().is_cuda(), "v tensor must be cuda");
   TORCH_CHECK(vcache.device().is_cuda(), "v tensor must be cuda");
@@ -80,7 +80,6 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   TORCH_CHECK(block_ids.scalar_type() == torch::kInt32, "block_ids dtype must be int32");
   TORCH_CHECK(num_seq_kvcache.scalar_type() == torch::kInt32,
               "num_seq_kvcache dtype must be int32");
-  TORCH_CHECK(splitk <= 0 || splitk == kSplitK, "we only support splitk == 4");
 
   int num_batch = num_seq_kvcache.size(0);
   int num_seq_q = q.size(0) / num_batch;
@@ -114,9 +113,21 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   torch::Tensor lse;
   torch::Tensor split_out;
 
+  int splitk = 0;
+  // small batch increase splitk number to maximize sm usage.
+  // 1. batch <= 32. split one request seqlenk to 16 parts.
+  // 2. batch > 32. split one request seqlenk to 4 parts.
+  if (use_splitk) {
+    if (num_batch <= 32) {
+      splitk = 16;
+    } else {
+      splitk = 4;
+    }
+  }
+
   if (splitk > 0) {
-    lse = torch::empty({num_batch, kSplitK, num_head_q}, q.options().dtype(torch::kFloat32));
-    split_out = torch::empty({num_batch, kSplitK, num_head_q, num_dim_v},
+    lse = torch::empty({num_batch, splitk, num_head_q}, q.options().dtype(torch::kFloat32));
+    split_out = torch::empty({num_batch, splitk, num_head_q, num_dim_v},
                              q.options().dtype(torch::kFloat32));
   }
 
@@ -152,6 +163,6 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 
   m.def(
       "attention_decode_bf16(Tensor q, Tensor! kcache, Tensor! vcache, Tensor block_ids, Tensor "
-      "num_seq_kvcache, bool new_kv_included, int splitk, Tensor? output) -> (Tensor)");
+      "num_seq_kvcache, bool new_kv_included, bool use_splitk, Tensor? output) -> (Tensor)");
   m.impl("attention_decode_bf16", torch::kCUDA, &hpc::attention::attention_decode_bf16_entry);
 }

@@ -105,7 +105,7 @@ except Exception as e:
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("new_kv_included", [True, False])
 @pytest.mark.parametrize("use_output", [True, False])
-@pytest.mark.parametrize("splitk", [0, 4])
+@pytest.mark.parametrize("splitk", [True, False])
 def test_attention_decode_bf16(
     num_batch,
     num_seq_q,

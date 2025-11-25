@@ -64,7 +64,7 @@ def attention_decode_bf16(
     block_ids: Tensor,
     num_seq_kvcache: Tensor,
     new_kv_included: bool = False,
-    splitk: int = 0,
+    splitk: bool = True,
     output: Tensor = None,
 ) -> Tensor:
     """Computes attention decode using bfloat16 precision.
@@ -91,6 +91,9 @@ def attention_decode_bf16(
             Shape: [num_batch]
             Dtype: int32
         new_kv_included: the seqlen in num_seq_kvcache include new kv or not.
+            Shape: scalar
+            Dtype: bool
+        splitk: use the split k implemention or not.
             Shape: scalar
             Dtype: bool
         output: Output tensor for store output value inplace.
