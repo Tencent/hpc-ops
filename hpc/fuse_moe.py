@@ -9,6 +9,7 @@ def count_and_gather(
     num_expert: int,
     rank_ep: int,
     intermediate_size: int,
+    num_seq_per_group_avg: int,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -203,7 +204,9 @@ def fuse_moe(
 
 
 @torch.library.register_fake("hpc::count_and_gather")
-def count_and_gather_fake(x, topk_ids, num_expert, rank_ep, intermediate_size):
+def count_and_gather_fake(
+    x, topk_ids, num_expert, rank_ep, intermediate_size, num_seq_per_group_avg
+):
     return (
         torch.empty((topk_ids.shape[0] * topk_ids.shape[1], x.shape[1]), dtype=torch.float8_e4m3fn),
         torch.empty(

@@ -29,7 +29,7 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
   count_and_gather_async(gate_up_input_ptr, gate_up_output_ptr, input_ptr, topk_ids_ptr,
                          topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, tiles_ptr,
                          cu_tiles_ptr, num_seq, hidden_size, intermediate_size, num_topk,
-                         num_expert_local, rank_ep, stream);
+                         num_expert_local, rank_ep, num_seq_per_group_avg, stream);
 
   // 1. call gate_up linear
   group_gemm::group_gemm_fp8_async(

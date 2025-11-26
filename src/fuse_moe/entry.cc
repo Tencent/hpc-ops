@@ -16,7 +16,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
            torch::Tensor, torch::Tensor>
 count_and_gather_entry(const torch::Tensor &x, const torch::Tensor &topk_ids,
                        const int64_t num_expert, const int64_t rank_ep,
-                       const int64_t intermediate_size) {
+                       const int64_t intermediate_size, const int64_t num_seq_per_group_avg) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
   TORCH_CHECK(topk_ids.device().is_cuda(), "topk_ids tensor must be cuda");
@@ -54,7 +54,8 @@ count_and_gather_entry(const torch::Tensor &x, const torch::Tensor &topk_ids,
 
   count_and_gather_async(y_ptr, yg_ptr, x_ptr, topk_ids_ptr, topk_pos_ptr, seqlens_ptr,
                          cu_seqlens_ptr, tmas_ptr, tiles_ptr, cu_tiles_ptr, num_seq, hidden_size,
-                         intermediate_size, num_topk, num_expert, rank_ep, stream);
+                         intermediate_size, num_topk, num_expert, rank_ep, num_seq_per_group_avg,
+                         stream);
 
   return std::make_tuple(y, yg, topk_pos, seqlens, cu_seqlens, tiles, cu_tiles, tmas);
 }
@@ -190,7 +191,7 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "count_and_gather(Tensor x, Tensor topk_ids, int num_expert, int rank_ep, int "
-      "intermediate_size"
+      "intermediate_size, int num_seq_per_group_avg"
       ") -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
   m.impl("count_and_gather", torch::kCUDA, &hpc::fuse_moe::count_and_gather_entry);
 

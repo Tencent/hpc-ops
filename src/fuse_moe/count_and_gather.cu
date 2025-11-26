@@ -187,20 +187,16 @@ __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 2> td_xy,
 
 }  // namespace kernels
 
-void count_and_gather_async(void *y_ptr, void *yg_ptr, const void *x_ptr, const void *topk_ids_ptr,
-                            void *topk_pos_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
-                            void *tmas_ptr, void *tiles_ptr, void *cu_tiles_ptr, int num_seq,
-                            int hidden_size, int intermediate_size, int num_topk, int num_expert,
-                            int eprank, cudaStream_t stream) {
+template <int kTileM, int kTileN, int kTileK, int kStage>
+void launch_count_and_gather(void *y_ptr, void *yg_ptr, const void *x_ptr, const void *topk_ids_ptr,
+                             void *topk_pos_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
+                             void *tmas_ptr, void *tiles_ptr, void *cu_tiles_ptr, int num_seq,
+                             int hidden_size, int intermediate_size, int num_topk, int num_expert,
+                             int eprank, int num_seq_per_group_avg, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   using Tin = cute::float_e4m3_t;
   using Tout = cute::bfloat16_t;
-
-  constexpr int kTileM = 16;
-  constexpr int kTileN = 128;
-  constexpr int kTileK = 128;
-  constexpr int kStage = 8;
 
   int m = num_seq;
   int n = intermediate_size;
@@ -262,5 +258,38 @@ void count_and_gather_async(void *y_ptr, void *yg_ptr, const void *x_ptr, const 
                                      end_expert, num_block_for_copy, topk_divider);
   }
 }
+
+void count_and_gather_async(void *y_ptr, void *yg_ptr, const void *x_ptr, const void *topk_ids_ptr,
+                            void *topk_pos_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
+                            void *tmas_ptr, void *tiles_ptr, void *cu_tiles_ptr, int num_seq,
+                            int hidden_size, int intermediate_size, int num_topk, int num_expert,
+                            int eprank, int num_seq_per_group_avg, cudaStream_t stream) {
+  constexpr int kTileN = 128;
+  constexpr int kTileK = 128;
+
+  if (num_seq_per_group_avg <= 16) {
+    constexpr int kTileM = 16;
+    constexpr int kStage = 8;
+    launch_count_and_gather<kTileM, kTileN, kTileK, kStage>(
+        y_ptr, yg_ptr, x_ptr, topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tmas_ptr,
+        tiles_ptr, cu_tiles_ptr, num_seq, hidden_size, intermediate_size, num_topk, num_expert,
+        eprank, num_seq_per_group_avg, stream);
+  } else if (num_seq_per_group_avg <= 32) {
+    constexpr int kTileM = 32;
+    constexpr int kStage = 8;
+    launch_count_and_gather<kTileM, kTileN, kTileK, kStage>(
+        y_ptr, yg_ptr, x_ptr, topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tmas_ptr,
+        tiles_ptr, cu_tiles_ptr, num_seq, hidden_size, intermediate_size, num_topk, num_expert,
+        eprank, num_seq_per_group_avg, stream);
+  } else {
+    constexpr int kTileM = 64;
+    constexpr int kStage = 8;
+    launch_count_and_gather<kTileM, kTileN, kTileK, kStage>(
+        y_ptr, yg_ptr, x_ptr, topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tmas_ptr,
+        tiles_ptr, cu_tiles_ptr, num_seq, hidden_size, intermediate_size, num_topk, num_expert,
+        eprank, num_seq_per_group_avg, stream);
+  }
+}
+
 }  // namespace fuse_moe
 }  // namespace hpc

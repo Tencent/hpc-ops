@@ -119,7 +119,7 @@ def naive_fuse_moe(
     return y
 
 
-@pytest.mark.parametrize("num_seq", [8, 128])
+@pytest.mark.parametrize("num_seq", [8, 128, 300])
 @pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("intermediate_size", [4096])

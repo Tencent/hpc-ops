@@ -16,7 +16,7 @@ void count_and_gather_async(void *y_ptr, void *yg_ptr, const void *x_ptr, const 
                             void *topk_pos_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
                             void *tmas_ptr, void *tiles_ptr, void *cu_tiles_ptr, int num_seq,
                             int hidden_size, int intermediate_size, int num_topk, int num_expert,
-                            int rank_ep, cudaStream_t stream);
+                            int rank_ep, int num_seq_per_group_avg, cudaStream_t stream);
 
 void reduce_async(void *y_ptr, const void *x_ptr, const void *topk_pos_ptr,
                   const void *topk_scale_ptr, int total_num_seq, int num_seq, int hidden_size,
