@@ -8,6 +8,7 @@
 
 #include "src/attention/prefill/multi_stage_dim128.h"
 #include "src/attention/prefill/warp_spec_dim128.h"
+#include "src/attention/prefill/warp_spec_with_kvcache_dim128.h"
 #include "src/utils/utils.h"
 
 namespace hpc {
@@ -36,6 +37,20 @@ void attention_prefill_bf16_async(void *y_ptr, const void *q_ptr, const void *k_
                                       stream);
     }
   }
+}
+
+void attention_with_kvcache_prefill_bf16_async(
+    void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
+    const void *seqlens_q_ptr, const void *cu_seqlens_q_ptr, const void *block_ids_ptr,
+    const void *seqlens_kvcache_ptr, void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q,
+    int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
+    int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV,
+    cudaStream_t stream) {
+  prefill::warp_spec_with_kvcache_dim128_async(
+      y_ptr, q_ptr, kcache_ptr, vcache_ptr, seqlens_q_ptr, cu_seqlens_q_ptr, block_ids_ptr,
+      seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q, num_dim_qk, num_dim_v,
+      num_head_q, num_head_kv, num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK,
+      ldV, stream);
 }
 
 }  // namespace attention
