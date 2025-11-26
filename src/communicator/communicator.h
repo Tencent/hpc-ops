@@ -15,7 +15,7 @@ namespace communicator {
 
 class Communicator {
  public:
-  Communicator(int rank, int world_size, const std::string &group_name = "hpc-comm.sock");
+  Communicator(int rank, int world_size, const std::string &comm_name);
   ~Communicator();
 
   bool Broadcast(const std::string &send_data, std::string *recv_data, int root = 0);

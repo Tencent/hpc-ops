@@ -20,7 +20,6 @@ __global__ void fused_allreduce_rmsnorm_kernel(
     __nv_bfloat16 *__restrict__ out_res_ptr, uint32_t **signal, int rank, int world_size,
     const float rms_norm_eps, const int num_tokens) {
   constexpr int kNumWarp = kNumThreadPerBlcok / 32;
-  constexpr int kNumVecPerRow = kHiddenSize / kVecSize;
   constexpr float kInvHiddenStates = 1.0f / kHiddenSize;
 
   using T = __nv_bfloat162;

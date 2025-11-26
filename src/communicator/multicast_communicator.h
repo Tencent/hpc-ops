@@ -16,8 +16,7 @@ namespace communicator {
 
 class MulticastCommunicator {
  public:
-  MulticastCommunicator(int rank, int world_size, int device_id = -1,
-                        const std::string &group_name = "hpc-comm.sock");
+  MulticastCommunicator(int rank, int world_size, int device_id, const std::string &comm_name);
   ~MulticastCommunicator();
 
   bool CreateTensorSync(int64_t bytes, std::vector<std::shared_ptr<void>> *sptrs,

@@ -19,7 +19,7 @@ namespace hpc {
 namespace communicator {
 
 MulticastCommunicator::MulticastCommunicator(int rank, int world_size, int device_id,
-                                             const std::string &group_name) {
+                                             const std::string &comm_name) {
   rank_ = rank;
   world_size_ = world_size;
 
@@ -29,7 +29,7 @@ MulticastCommunicator::MulticastCommunicator(int rank, int world_size, int devic
     device_id_ = device_id;
   }
 
-  comm_ = std::make_unique<Communicator>(rank, world_size, group_name);
+  comm_ = std::make_unique<Communicator>(rank, world_size, comm_name);
   multimgr_ = std::make_unique<MulticastObjectManager>(device_id_, world_size_);
 }
 

@@ -18,6 +18,7 @@
 static const std::string built_json() {
   std::ostringstream oss;
 
+  // NOLINTBEGIN clang-format off
   oss << "{" << "\n";
   oss << " \"version\": " << "\"" << HPC_VERSION_STR << "\",\n";
   oss << " \"git-hash\": " << "\"" << HPC_GIT_HASH_STR << "\",\n";
@@ -36,6 +37,7 @@ static const std::string built_json() {
   oss << " \"built-ts\": " << "\"" << __TIMESTAMP__ << "." << "\",\n";
   oss << " \"_C\": " << "\"" << __FILE__ << "\"\n";
   oss << "}\n";
+  // NOLINTEND clang-format on
 
   return oss.str();
 }

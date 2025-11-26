@@ -18,8 +18,8 @@ namespace communicator {
 class IMulticastCommunicator : public torch::CustomClassHolder {
  public:
   IMulticastCommunicator(int64_t rank, int64_t world_size, int64_t device_id = -1,
-                         const std::string &group_name = "hpc-comm.sock") {
-    multicomm_ = std::make_unique<MulticastCommunicator>(rank, world_size, device_id, group_name);
+                         const std::string &comm_name = "hpc-comm.sock") {
+    multicomm_ = std::make_unique<MulticastCommunicator>(rank, world_size, device_id, comm_name);
   }
 
   ~IMulticastCommunicator() { multicomm_.reset(); }
@@ -78,18 +78,10 @@ class IMulticastCommunicator : public torch::CustomClassHolder {
 
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.class_<hpc::communicator::IMulticastCommunicator>("MulticastCommunicator")
-      .def(torch::init(
-               [](int64_t rank, int64_t world_size, int64_t device_id, std::string group_name) {
-                 return c10::make_intrusive<hpc::communicator::IMulticastCommunicator>(
-                     rank, world_size, device_id, group_name);
-               }),
-           "MulticastCommunicator init",
-           {
-               torch::arg("rank"),
-               torch::arg("world_size"),
-               torch::arg("device_id") = -1,
-               torch::arg("group_name") = "hpc-comm.sock",
-           })
+      .def(torch::init<int64_t, int64_t, int64_t, const std::string &>(),
+           "initialize multicast communcommunicator",
+           {torch::arg("rank"), torch::arg("world_size"), torch::arg("device_id") = -1,
+            torch::arg("comm_name") = "hpc-comm.sock"})
       .def("CreateTensorSync", &hpc::communicator::IMulticastCommunicator::CreateTensorSync)
       .def("Barrier", &hpc::communicator::IMulticastCommunicator::Barrier)
       .def("GetRank", &hpc::communicator::IMulticastCommunicator::GetRank)
