@@ -18,7 +18,8 @@
 namespace hpc {
 namespace communicator {
 
-MulticastCommunicator::MulticastCommunicator(int64_t rank, int64_t world_size, int64_t device_id) {
+MulticastCommunicator::MulticastCommunicator(int rank, int world_size, int device_id,
+                                             const std::string &group_name) {
   rank_ = rank;
   world_size_ = world_size;
 
@@ -28,7 +29,7 @@ MulticastCommunicator::MulticastCommunicator(int64_t rank, int64_t world_size, i
     device_id_ = device_id;
   }
 
-  comm_ = std::make_unique<Communicator>(rank, world_size);
+  comm_ = std::make_unique<Communicator>(rank, world_size, group_name);
   multimgr_ = std::make_unique<MulticastObjectManager>(device_id_, world_size_);
 }
 
@@ -39,7 +40,11 @@ MulticastCommunicator::~MulticastCommunicator() {
 
 void MulticastCommunicator::Barrier() { comm_->Barrier(); }
 
-int MulticastCommunicator::GetDeviceId() { return device_id_; }
+int64_t MulticastCommunicator::GetRank() { return rank_; }
+
+int64_t MulticastCommunicator::GetWorldSize() { return world_size_; }
+
+int64_t MulticastCommunicator::GetDeviceId() { return device_id_; }
 
 bool MulticastCommunicator::CreateTensorSync(int64_t bytes,
                                              std::vector<std::shared_ptr<void>> *sptrs,

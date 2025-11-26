@@ -7,6 +7,7 @@
 #include <torch/library.h>
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "src/communicator/multicast_communicator.h"
@@ -16,8 +17,9 @@ namespace communicator {
 
 class IMulticastCommunicator : public torch::CustomClassHolder {
  public:
-  IMulticastCommunicator(int64_t rank, int64_t world_size, int64_t device_id = -1) {
-    multicomm_ = std::make_unique<MulticastCommunicator>(rank, world_size, device_id);
+  IMulticastCommunicator(int64_t rank, int64_t world_size, int64_t device_id = -1,
+                         const std::string &group_name = "hpc-comm.sock") {
+    multicomm_ = std::make_unique<MulticastCommunicator>(rank, world_size, device_id, group_name);
   }
 
   ~IMulticastCommunicator() { multicomm_.reset(); }
@@ -39,10 +41,11 @@ class IMulticastCommunicator : public torch::CustomClassHolder {
 
     // multi tensor
     {
+      // Although a tensor is returned here, users should never manipulate
+      // this tensor using torch's ops; it is merely a container of multimem pointers.
       auto deleter = [keeper = multi_sptr](void *ptr) {};
       // use at:: apis to specify target device
       auto t = at::from_blob(multi_sptr.get(), {bytes}, deleter, opt, target_device);
-
       tensors.insert(-1, t);
     }
 
@@ -60,6 +63,12 @@ class IMulticastCommunicator : public torch::CustomClassHolder {
 
   void Barrier() { multicomm_->Barrier(); }
 
+  int64_t GetRank() { return multicomm_->GetRank(); }
+
+  int64_t GetWorldSize() { return multicomm_->GetWorldSize(); }
+
+  int64_t GetDeviceId() { return multicomm_->GetDeviceId(); }
+
  private:
   std::unique_ptr<MulticastCommunicator> multicomm_;
 };
@@ -69,7 +78,21 @@ class IMulticastCommunicator : public torch::CustomClassHolder {
 
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.class_<hpc::communicator::IMulticastCommunicator>("MulticastCommunicator")
-      .def(torch::init<int64_t, int64_t, int64_t>())
+      .def(torch::init(
+               [](int64_t rank, int64_t world_size, int64_t device_id, std::string group_name) {
+                 return c10::make_intrusive<hpc::communicator::IMulticastCommunicator>(
+                     rank, world_size, device_id, group_name);
+               }),
+           "MulticastCommunicator init",
+           {
+               torch::arg("rank"),
+               torch::arg("world_size"),
+               torch::arg("device_id") = -1,
+               torch::arg("group_name") = "hpc-comm.sock",
+           })
       .def("CreateTensorSync", &hpc::communicator::IMulticastCommunicator::CreateTensorSync)
-      .def("Barrier", &hpc::communicator::IMulticastCommunicator::Barrier);
+      .def("Barrier", &hpc::communicator::IMulticastCommunicator::Barrier)
+      .def("GetRank", &hpc::communicator::IMulticastCommunicator::GetRank)
+      .def("GetWorldSize", &hpc::communicator::IMulticastCommunicator::GetWorldSize)
+      .def("GetDeviceId", &hpc::communicator::IMulticastCommunicator::GetDeviceId);
 }

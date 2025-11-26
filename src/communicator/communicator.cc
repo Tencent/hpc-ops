@@ -14,7 +14,8 @@
 namespace hpc {
 namespace communicator {
 
-Communicator::Communicator(int rank, int world_size) {
+Communicator::Communicator(int rank, int world_size, const std::string &comm_name)
+    : kRegistery_(comm_name) {
   rank_ = rank;
   world_size_ = world_size;
 

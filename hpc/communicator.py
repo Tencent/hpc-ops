@@ -3,7 +3,7 @@ from torch import Tensor
 from typing import Dict, Tuple
 
 
-class MulticastComm:
+class MulticastCommunicator:
     """A multicast communication handler for distributed tensor operations.
 
     This class provides functionality for creating synchronized tensors and
@@ -17,7 +17,7 @@ class MulticastComm:
 
     Example:
         >>> # Initialize communication for rank 0 in a 4-GPU setup
-        >>> comm = MulticastComm(rank=0, world_size=4, device_id=-1)
+        >>> comm = MulticastCommunicator(rank=0, world_size=4, device_id=-1)
         >>> # With device_id=-1, rank 0 will use GPU 0, rank 1 will use GPU 1, etc.
         >>> # Create synchronized tensors of size 1024
         >>> tensor_map = comm.CreateTensorSync(1024)
@@ -34,8 +34,8 @@ class MulticastComm:
         such as model parallelism or distributed data loading.
     """
 
-    def __init__(self, rank: int, world_size: int, device_id: int = -1):
-        """Initializes the MulticastComm instance.
+    def __init__(self, rank: int, world_size: int, device_id: int = -1, comm_name="hpc-comm.sock"):
+        """Initializes the MulticastCommunicator instance.
 
         Args:
             rank: The rank of the current process in the distributed group.
@@ -45,6 +45,7 @@ class MulticastComm:
             device_id: The device ID for tensor operations. Use -1 to automatically
                 use the rank as the GPU device ID. Otherwise, specifies a specific
                 GPU device ID for all processes. Defaults to -1.
+            group_name: the unique id of a group name
 
         Raises:
             ValueError: If rank is not in [0, world_size-1] or world_size < 1.
@@ -53,16 +54,9 @@ class MulticastComm:
 
         Example:
             >>> # Each rank uses its rank as GPU ID (default behavior)
-            >>> comm1 = MulticastComm(rank=0, world_size=4, device_id=-1)
+            >>> comm1 = MulticastCommunicator(rank=0, world_size=4, device_id=-1)
             >>> # Rank 0 will use GPU 0, rank 1 will use GPU 1, etc.
             >>>
-            >>> # All ranks use the same GPU device (device_id=0)
-            >>> comm2 = MulticastComm(rank=1, world_size=4, device_id=0)
-            >>> # All processes will use GPU 0 regardless of their rank
-            >>>
-            >>> # CPU-based communication
-            >>> comm3 = MulticastComm(rank=0, world_size=2, device_id=-2)
-            >>> # Uses CPU for all operations
         """
         pass
 
@@ -91,7 +85,7 @@ class MulticastComm:
 
         Example:
             >>> # With device_id=-1 (default), each rank uses its rank as GPU ID
-            >>> comm = MulticastComm(rank=0, world_size=2, device_id=-1)
+            >>> comm = MulticastCommunicator(rank=0, world_size=2, device_id=-1)
             >>> tensor_map = comm.CreateTensorSync(512)
             >>>
             >>> # Access different tensors in the map
@@ -122,7 +116,7 @@ class MulticastComm:
                 communication errors or process disconnection.
 
         Example:
-            >>> comm = MulticastComm(rank=0, world_size=4, device_id=-1)
+            >>> comm = MulticastCommunicator(rank=0, world_size=4, device_id=-1)
             >>>
             >>> # Perform some distributed operations
             >>> tensor_map = comm.CreateTensorSync(1024)
@@ -139,6 +133,15 @@ class MulticastComm:
             in distributed computations, especially when operations depend
             on results from other processes.
         """
+        pass
+
+    def GetRank(self) -> int:
+        pass
+
+    def GetWorldSize(self) -> int:
+        pass
+
+    def GetDeviceId(self) -> int:
         pass
 
 

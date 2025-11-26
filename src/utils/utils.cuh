@@ -26,7 +26,6 @@ __device__ __forceinline__ void brkpt() { asm volatile("brkpt;" ::); }
 // ============================
 //    Load/Store(vectorized)
 // ============================
-
 template <typename T, int N>
 struct vec_t {
   T data[N];
@@ -221,6 +220,46 @@ __device__ __forceinline__ constexpr void store(void *ptr, T val, Args... vals) 
 }
 
 // ============================
+//    Multimem Load/Store Ops
+// ============================
+
+template <typename T, int N>
+__device__ __forceinline__ auto multi_load_reduce_add(const void *ptr) {
+  if constexpr (std::is_same_v<T, __nv_bfloat162> && N == 4) {
+    using V = vec_t<T, N>;
+    V v;
+    auto *l = reinterpret_cast<uint4 *>(&v);
+    asm volatile(
+        "multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2"
+        " {%0,%1,%2,%3}, [%4];"
+        : "=r"(l->x), "=r"(l->y), "=r"(l->z), "=r"(l->w)
+        : "l"(ptr)
+        : "memory");
+    return v;
+  }
+}
+
+template <typename T, int N>
+__device__ __forceinline__ void multi_store(void *mc_ptr, const vec_t<T, N> &v) {
+  constexpr int kBytes = sizeof(T) * N;
+  static_assert(kBytes == 8 || kBytes == 16, "not support for T x N");
+
+  if constexpr (kBytes == 8) {
+    const uint2 *s = reinterpret_cast<const uint2 *>(&v);
+    asm volatile("multimem.st.relaxed.sys.global.v2.f32 [%0], {%1,%2};"
+                 :
+                 : "l"(mc_ptr), "r"(s->x), "r"(s->y)
+                 : "memory");
+  } else if constexpr (kBytes == 16) {
+    const uint4 *s = reinterpret_cast<const uint4 *>(&v);
+    asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%0], {%1,%2,%3,%4};"
+                 :
+                 : "l"(mc_ptr), "r"(s->x), "r"(s->y), "r"(s->z), "r"(s->w)
+                 : "memory");
+  }
+}
+
+// ============================
 //       Fast Math API
 // ============================
 
@@ -357,6 +396,57 @@ __device__ __forceinline__ constexpr auto retile_fragment(Tensor &&tensor) {
   return make_tensor(static_cast<Tensor &&>(tensor).data(), make_layout(m_layout, k_layout));
 }
 
+// ============================
+//    Atom CAS Primitives
+// ============================
+
+__device__ __forceinline__ int atom_cas_relaxed(uint32_t *addr, uint32_t compare, uint32_t value) {
+  uint32_t old_val;
+  asm volatile("atom.global.relaxed.sys.cas.b32 %0, [%1], %2, %3;"
+               : "=r"(old_val)
+               : "l"(addr), "r"(compare), "r"(value)
+               : "memory");
+  return old_val;
+}
+
+__device__ __forceinline__ int atom_cas_release(uint32_t *addr, uint32_t compare, uint32_t value) {
+  uint32_t old_val;
+  asm volatile("atom.global.release.sys.cas.b32 %0, [%1], %2, %3;"
+               : "=r"(old_val)
+               : "l"(addr), "r"(compare), "r"(value)
+               : "memory");
+  return old_val;
+}
+
+__device__ __forceinline__ int atom_cas_acquire(uint32_t *addr, uint32_t compare, uint32_t value) {
+  uint32_t old_val;
+  asm volatile("atom.global.acquire.sys.cas.b32 %0, [%1], %2, %3;"
+               : "=r"(old_val)
+               : "l"(addr), "r"(compare), "r"(value)
+               : "memory");
+  return old_val;
+}
+
+__device__ __forceinline__ void put_signal_relaxed(uint32_t *addr) {
+  while (atom_cas_relaxed(addr, 0, 1) != 0) {
+  }
+}
+
+__device__ __forceinline__ void put_signal_release(uint32_t *addr) {
+  while (atom_cas_release(addr, 0, 1) != 0) {
+  }
+}
+
+__device__ __forceinline__ void wait_signal_relaxed(uint32_t *addr) {
+  while (atom_cas_relaxed(addr, 1, 0) != 1) {
+  }
+}
+
+__device__ __forceinline__ void wait_signal_acquire(uint32_t *addr) {
+  while (atom_cas_acquire(addr, 1, 0) != 1) {
+  }
+}
+
 // ================================
 //    Synchronization Primitives
 // ================================
@@ -369,7 +459,6 @@ template <int N>
 __device__ __forceinline__ void bar_sync(int barrier_id) {
   asm volatile("barrier.cta.sync %0, %1;\n" ::"r"(barrier_id), "n"(N) : "memory");
 }
-
 }  // namespace hpc
 
 #endif  // SRC_UTILS_UTILS_CUH_

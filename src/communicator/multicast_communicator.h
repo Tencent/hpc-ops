@@ -16,14 +16,20 @@ namespace communicator {
 
 class MulticastCommunicator {
  public:
-  MulticastCommunicator(int64_t rank, int64_t world_size, int64_t device_id = -1);
+  MulticastCommunicator(int rank, int world_size, int device_id = -1,
+                        const std::string &group_name = "hpc-comm.sock");
   ~MulticastCommunicator();
 
   bool CreateTensorSync(int64_t bytes, std::vector<std::shared_ptr<void>> *sptrs,
                         std::vector<int> *devices, std::shared_ptr<void> *multi_ptr,
                         int *multi_device);
   void Barrier();
-  int GetDeviceId();
+
+  int64_t GetRank();
+
+  int64_t GetWorldSize();
+
+  int64_t GetDeviceId();
 
  private:
   int rank_;
