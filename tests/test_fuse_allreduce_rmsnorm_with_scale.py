@@ -45,10 +45,11 @@ def run_task(rank, world_size, N, H, num_max_blocks):
     # avoid real communication
     torch.manual_seed(seed)
     input_list = [
-        torch.rand((N, H), dtype=torch.bfloat16).to(device=device) for _ in range(world_size)
+        torch.rand((N, H), dtype=torch.bfloat16).to(device=device) / (world_size * 2)
+        for _ in range(world_size)
     ]
     N_pad = (N + world_size - 1) // world_size * world_size
-    residual = torch.rand((N_pad, H), dtype=torch.bfloat16).to(device=device)
+    residual = torch.rand((N_pad, H), dtype=torch.bfloat16).to(device=device) / (world_size * 2)
     weight = torch.randn((H,), dtype=torch.bfloat16).to(device=device)
     rms_norm_eps = 1e-6
 
@@ -93,6 +94,7 @@ def run_task(rank, world_size, N, H, num_max_blocks):
         ),
         residual[start:end, :],
         weight,
+        rms_norm_eps,
         scale,
         fp8_out_hdl.get_multimem_buff(
             symm_input[start:end, :].shape,
@@ -103,7 +105,6 @@ def run_task(rank, world_size, N, H, num_max_blocks):
         rank,
         world_size,
         num_max_blocks,
-        rms_norm_eps,
         True,
         out_residual[start:end, :],
         scale2,
@@ -146,8 +147,8 @@ def run_task(rank, world_size, N, H, num_max_blocks):
     assert torch.allclose(
         ref_fp8_output.to(torch.bfloat16),
         symm_fp8_output[:N, :].to(torch.bfloat16),
-        atol=2,
-        rtol=0.3,
+        atol=0.15,
+        rtol=0.15,
     ), errors_to_string(
         calculate_errors(
             ref_fp8_output.to(torch.bfloat16), symm_fp8_output[:N, :].to(torch.bfloat16)
@@ -157,8 +158,8 @@ def run_task(rank, world_size, N, H, num_max_blocks):
     assert torch.allclose(
         ref_fp8_output2.to(torch.bfloat16),
         symm_fp8_output2[:N, :].to(torch.bfloat16),
-        atol=2,
-        rtol=0.3,
+        atol=0.15,
+        rtol=0.15,
     ), errors_to_string(
         calculate_errors(
             ref_fp8_output2.to(torch.bfloat16), symm_fp8_output2[:N, :].to(torch.bfloat16)

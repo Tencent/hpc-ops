@@ -171,3 +171,14 @@ def errors_to_string(error_results, precision=6):
 
     # Join all lines into a single string
     return "\n".join(lines)
+
+
+def allclose(ref_tensor, real_tensor, atol=1e-8, rtol=1e-5):
+    is_true = torch.allclose(ref_tensor, real_tensor, atol=atol, rtol=rtol)
+    if not is_true:
+        print(
+            errors_to_string(
+                calculate_errors(ref_tensor.to(torch.float32), real_tensor.to(torch.float16))
+            )
+        )
+    return is_true
