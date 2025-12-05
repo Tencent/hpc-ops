@@ -12,7 +12,7 @@
 namespace hpc {
 namespace activation {
 
-torch::Tensor entry(const torch::Tensor &input, const torch::Tensor &scale,
+torch::Tensor entry(const torch::Tensor &input, const torch::Tensor &scale, bool use_bf16_mul,
                     std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
@@ -42,7 +42,7 @@ torch::Tensor entry(const torch::Tensor &input, const torch::Tensor &scale,
     num_row *= input_shape[i];
   }
 
-  act_mul_and_quant_async(output_ptr, input_ptr, scale_ptr, num_row, num_col, stream);
+  act_mul_and_quant_async(output_ptr, input_ptr, scale_ptr, num_row, num_col, use_bf16_mul, stream);
 
   return output_tensor;
 }
@@ -92,7 +92,9 @@ torch::Tensor entry1(const torch::Tensor &input, torch::Tensor &scale,
 }  // namespace hpc
 
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
-  m.def("act_mul_and_quant(Tensor input, Tensor scale, Tensor? output) -> (Tensor)");
+  m.def(
+      "act_mul_and_quant(Tensor input, Tensor scale, bool use_bf16_mul, Tensor? output) -> "
+      "(Tensor)");
   m.impl("act_mul_and_quant", torch::kCUDA, &hpc::activation::entry);
   m.def(
       "masked_act_mul_and_quant(Tensor! input, Tensor! scale, Tensor! num_per_expert) -> (Tensor)");

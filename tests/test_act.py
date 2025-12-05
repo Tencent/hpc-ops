@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/li
 import hpc
 import torch
 import pytest
+from utils import calculate_errors, errors_to_string
 
 
 def _act_mul_and_quant(gate_up, scale):
@@ -15,7 +16,7 @@ def _act_mul_and_quant(gate_up, scale):
         return x / (1 + (-x).exp())
 
     gate, up = torch.chunk(gate_up.float(), 2, dim=1)
-    out = silu(gate) * up * scale
+    out = (silu(gate).to(torch.bfloat16) * up.to(torch.bfloat16)).to(torch.float32) * scale
     outfp8 = out.to(torch.float8_e4m3fn)
     return outfp8
 
@@ -31,6 +32,20 @@ def gt_masked_act_mul_and_quant(gate_up, scale, num_per_expert):
     return outfp8
 
 
+def gt_vllm_silu_and_quant(x, scale):
+    from vllm import _custom_ops as ops
+
+    b = x.shape[0]
+    h = x.shape[1]
+
+    y1 = torch.empty(b, h // 2, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty_like(y1).to(torch.float8_e4m3fn)
+
+    torch.ops._C.silu_and_mul(y1, x)
+    torch.ops._C.static_scaled_fp8_quant(y, y1, scale)
+    return y
+
+
 @pytest.mark.parametrize("num_batch", [64, 62 * 1024, 128 * 1024])
 @pytest.mark.parametrize("intermediate_size", [2128, 512, 4608])
 @pytest.mark.parametrize("use_output", [True, False])
@@ -42,13 +57,15 @@ def test_act_mul_and_quant(num_batch, intermediate_size, use_output):
 
     if use_output:
         out = torch.empty(num_batch, intermediate_size, dtype=torch.float8_e4m3fn, device="cuda")
-        hpc.act_mul_and_quant(gate_up_out, scale, out)
+        hpc.act_mul_and_quant(gate_up_out, scale, output=out)
     else:
         out = hpc.act_mul_and_quant(gate_up_out, scale)
 
     gt = _act_mul_and_quant(gate_up_out, scale)
 
-    assert torch.allclose(out.to(torch.float), gt.to(torch.float))
+    assert torch.allclose(out.to(torch.float), gt.to(torch.float)), errors_to_string(
+        calculate_errors(gt.to(torch.float), out.to(torch.float))
+    )
     assert gt.device == out.device
     assert gt.dtype == out.dtype
     assert gt.shape == out.shape

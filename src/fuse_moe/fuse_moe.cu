@@ -19,7 +19,8 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
                     const void *topk_ids_ptr, const void *topk_scale_ptr, void *topk_pos_ptr,
                     void *seqlens_ptr, void *cu_seqlens_ptr, void *tiles_ptr, void *cu_tiles_ptr,
                     int num_seq, int hidden_size, int intermediate_size, int num_topk,
-                    int num_expert_total, int num_expert_local, int rank_ep, cudaStream_t stream) {
+                    int num_expert_total, int num_expert_local, int rank_ep, bool use_bf16_mul,
+                    cudaStream_t stream) {
   int total_num_seq = num_seq * num_topk;
   int num_seq_per_group_avg = total_num_seq / num_expert_total;
   using T1 = __nv_bfloat16;
@@ -39,7 +40,7 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
   // 2. call act and mul ??? EP seq_len
   activation::act_mul_and_quant_async((T2 *)down_input_ptr, (const T1 *)gate_up_output_ptr,
                                       (const float *)act_and_mul_scale_ptr, total_num_seq,
-                                      intermediate_size, stream);
+                                      intermediate_size, use_bf16_mul, stream);
 
   // 3. call down linear
   group_gemm::group_gemm_fp8_async(down_output_ptr, down_input_ptr, down_weight_ptr, seqlens_ptr,

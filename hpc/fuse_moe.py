@@ -133,6 +133,7 @@ def fuse_moe(
     topk_scale: Tensor,
     rank_ep: int,
     num_expert_total: int,
+    use_bf16_mul: bool = True,
 ) -> Tensor:
     """Performs Mixture of Experts (MoE) forward operation with FP8 precision.
 
@@ -169,6 +170,7 @@ def fuse_moe(
             Dtype: int32
         num_expert_total: the total number of expert
             Dtype: int32
+        use_bf16_mul: use bf16 for silu mul or not.
 
     Returns:
         torch.Tensor: Output tensor after MoE computation
@@ -200,6 +202,7 @@ def fuse_moe(
         topk_scale,
         rank_ep,
         num_expert_total,
+        use_bf16_mul,
     )
 
 
@@ -238,5 +241,6 @@ def fuse_moe_fake(
     topk_scale,
     rank_ep,
     num_expert_total,
+    use_bf16_mul,
 ):
     return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)

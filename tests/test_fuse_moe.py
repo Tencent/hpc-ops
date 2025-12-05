@@ -70,7 +70,7 @@ def naive_act_mul_and_quant(gate_up, scale):
         return x / (1 + (-x).exp())
 
     gate, up = torch.chunk(gate_up.float(), 2, dim=1)
-    out = silu(gate) * up * scale
+    out = (silu(gate).to(torch.bfloat16) * up.to(torch.bfloat16)).float() * scale
     outfp8 = out.to(torch.float8_e4m3fn)
     return outfp8
 

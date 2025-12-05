@@ -99,7 +99,7 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
                              const torch::Tensor &down_scale,
                              const torch::Tensor &act_and_mul_scale, const torch::Tensor &topk_ids,
                              const torch::Tensor &topk_scale, int64_t rank_ep,
-                             int64_t num_expert_total) {
+                             int64_t num_expert_total, bool use_bf16_mul) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
@@ -180,7 +180,7 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
                  down_output_ptr, down_weight_ptr, down_scale_ptr, down_tmas_ptr, topk_ids_ptr,
                  topk_scale_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr,
                  num_seq, hidden_size, intermediate_size, num_topk, num_expert_total, num_expert,
-                 rank_ep, stream);
+                 rank_ep, use_bf16_mul, stream);
 
   return y;
 }
@@ -203,6 +203,6 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "fuse_moe(Tensor x, Tensor gate_up_weight, Tensor down_weight, Tensor gate_up_scale, "
       "Tensor down_scale, Tensor act_and_mul_scale, Tensor topk_ids, Tensor topk_scale,"
-      "int rank_ep, int num_expert_total) -> (Tensor)");
+      "int rank_ep, int num_expert_total, bool use_bf16_mul) -> (Tensor)");
   m.impl("fuse_moe", torch::kCUDA, &hpc::fuse_moe::fuse_moe_entry);
 }

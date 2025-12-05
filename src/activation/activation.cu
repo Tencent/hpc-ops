@@ -9,9 +9,9 @@
 
 namespace hpc {
 namespace activation {
-
 namespace kernels {
 
+template <bool kUseBFloat16PrecisionMultiply = true>
 __global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_up_ptr,
                                          const float *scale_ptr, const int num_row,
                                          const int num_col, cutlass::FastDivmod block1D22D) {
@@ -23,43 +23,38 @@ __global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr, const __nv_bflo
 
   int irow = iblocky;
 
-  __nv_bfloat162 gate[4];
-  __nv_bfloat162 up[4];
+  using T = __nv_bfloat162;
 
   float scale = scale_ptr[0];
 
   const auto *gate_row_ptr = gate_up_ptr + irow * num_col * 2;
   const auto *up_row_ptr = gate_row_ptr + num_col;
-  const auto *out_row_ptr = out_ptr + irow * num_col;
+  auto *out_row_ptr = out_ptr + irow * num_col;
 
   int icol = it * 8;
 
   if (icol < num_col) {
-    *((int4 *)&gate) = *((int4 *)(gate_row_ptr + icol));
-    *((int4 *)&up) = *((int4 *)(up_row_ptr + icol));
+    auto gate = to<float>(load<T, 4>(gate_row_ptr + icol));
+    auto up = to<float>(load<T, 4>(up_row_ptr + icol));
 
-    float2 out[4];
+    vec_t<float, 8> out;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      float2 g2 = __bfloat1622float2(gate[i]);
-      float2 u2 = __bfloat1622float2(up[i]);
-
-      out[i].x = silu(g2.x) * u2.x;
-      out[i].y = silu(g2.y) * u2.y;
+    for (int i = 0; i < size(out); ++i) {
+      auto g = gate[i];
+      auto m = [&] {
+        if constexpr (kUseBFloat16PrecisionMultiply) {
+          auto u = __float2bfloat16_rn(up[i]);
+          return __bfloat162float(__float2bfloat16_rn(silu(g)) * u);
+        } else {
+          auto u = up[i];
+          return silu(g) * u;
+        }
+      }();
+      out[i] = m * scale;
     }
 
-    float4 f1 = make_float4(out[0].x * scale, out[0].y * scale, out[1].x * scale, out[1].y * scale);
-    float4 f2 = make_float4(out[2].x * scale, out[2].y * scale, out[3].x * scale, out[3].y * scale);
-
-    __nv_fp8x4_e4m3 o1{f1};
-    __nv_fp8x4_e4m3 o2{f2};
-
-    int2 out_2i;
-
-    out_2i.x = *(int *)(&o1);
-    out_2i.y = *(int *)(&o2);
-
-    *((int2 *)(out_row_ptr + icol)) = out_2i;
+    auto out_fp8 = to<__nv_fp8x4_e4m3>(out);
+    store(out_row_ptr + icol, out_fp8);
   }
 }
 
@@ -122,7 +117,7 @@ __global__ void masked_act_mul_and_quant_kernel(
 
 void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_up_ptr,
                              const float *scale_ptr, const int num_row, const int num_col,
-                             cudaStream_t stream) {
+                             bool use_bf16_mul, cudaStream_t stream) {
   // num_col == 2128 x 2
   // gate + up
 
@@ -133,8 +128,13 @@ void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_u
   cutlass::FastDivmod block1D22D(num_col_block);
   dim3 grid(num_row * num_col_block);
 
-  kernels::act_mul_and_quant_kernel<<<grid, block, 0, stream>>>(
-      out_ptr, gate_up_ptr, scale_ptr, num_row, intermediate_size, block1D22D);
+  if (use_bf16_mul) {
+    kernels::act_mul_and_quant_kernel<true><<<grid, block, 0, stream>>>(
+        out_ptr, gate_up_ptr, scale_ptr, num_row, intermediate_size, block1D22D);
+  } else {
+    kernels::act_mul_and_quant_kernel<false><<<grid, block, 0, stream>>>(
+        out_ptr, gate_up_ptr, scale_ptr, num_row, intermediate_size, block1D22D);
+  }
 }
 
 void masked_act_mul_and_quant_async(__nv_fp8_e4m3 *output_ptr, const __nv_bfloat16 *input_ptr,
