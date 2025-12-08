@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/li
 
 import hpc
 import torch
+from utils import allclose
 
 
 def test_add():
@@ -13,9 +14,6 @@ def test_add():
     b = torch.randn(3, 5, device="cuda")
 
     gt = a + b
-    c = hpc.add(a, b)
+    my = hpc.add(a, b)
 
-    assert torch.allclose(c, gt)
-    assert c.device == a.device
-    assert c.dtype == a.dtype
-    assert c.shape == a.shape
+    assert allclose(gt, my)

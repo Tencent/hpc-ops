@@ -10,6 +10,7 @@ import math
 sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
 
 import hpc
+from utils import allclose
 
 
 def get_diff_item(input, other, rtol, atol, topk=1):
@@ -393,65 +394,6 @@ def mamba_prefill_hpc_torch_ref(x, dt, A, B, C, D, z, dt_bias, cu_seqlens, seq_i
             gt_states[bi, ni] = final_states
 
     return gt_ys, gt_states
-
-
-# @pytest.mark.parametrize("batch_size", [1])
-# @pytest.mark.parametrize("max_seqlen", [4])
-# @pytest.mark.parametrize("nheads", [8])
-# @pytest.mark.parametrize("ngroups", [2])
-# @pytest.mark.parametrize("head_dim", [80])
-# @pytest.mark.parametrize("dstate", [128])
-# def test_mamba_prefill(batch_size, max_seqlen, nheads, ngroups, head_dim, dstate):
-#     torch.random.manual_seed(0)
-#     seqlens = torch.randint(1, max_seqlen, (batch_size,), dtype=torch.int32, device='cuda') * 0 + 22
-#     total_seqlen = seqlens.sum()
-
-#     x = torch.rand(total_seqlen, nheads, head_dim, dtype=torch.bfloat16, device='cuda')
-#     x.normal_(0, 0.1)
-#     dt = torch.rand(total_seqlen, nheads, dtype=torch.bfloat16, device='cuda')
-#     B = torch.rand(total_seqlen, ngroups, dstate, dtype=torch.bfloat16, device='cuda')
-#     C = torch.rand(total_seqlen, ngroups, dstate, dtype=torch.bfloat16, device='cuda')
-#     z = torch.rand(total_seqlen, nheads, head_dim, dtype=torch.bfloat16, device='cuda')
-#     A = -torch.rand(nheads, dtype=torch.float32).cuda() - 1.0
-#     D = torch.rand(nheads, dtype=torch.float32).cuda()
-#     dt_bias = torch.rand(nheads, dtype=torch.float32).cuda() - 4.0
-
-#     x = x.float()
-#     dt = dt.float()
-#     B = B.float()
-#     C = C.float()
-#     z = z.float()
-#     cu_seqlens = (torch.cat(
-#         [
-#             torch.zeros(1).to(torch.device("cuda")),
-#             torch.cumsum(seqlens, dim=0)
-#         ],
-#         dim=0,
-#     ).to(torch.int32).to(torch.device("cuda")))
-
-#     seq_idx = torch.repeat_interleave(
-#         torch.arange(batch_size,
-#                         dtype=torch.int32,
-#                         device=cu_seqlens.device),
-#         cu_seqlens.diff(),
-#         output_size=cu_seqlens[-1]).unsqueeze(0)
-
-#     # y, states = mamba_prefill_trtllm_triton_ref(
-#     #     x, dt, A, B, C, D, z, dt_bias, cu_seqlens, seq_idx
-#     # )
-
-#     y, states = mamba_prefill_hpc_torch_ref(
-#         x, dt, A, B, C, D, z, dt_bias, cu_seqlens, seq_idx
-#     )
-
-#    gt_y, gt_states = mamba_prefill_torch_ref(
-#        x, dt, A, B, C, D, z, dt_bias, cu_seqlens, seq_idx
-#    )
-
-#     assert torch.allclose(gt_y, y, rtol=1e-2, atol=1e-1)
-#     assert torch.allclose(gt_states, states, rtol=1e-2, atol=2e-3)
-
-# test_mamba_prefill(1, 4, 1, 1, 80, 128)
 
 
 def exp_dA_chunked_cumsum_torch_ref(seqlens, dt, A, dt_bias, chunk_size):
@@ -1022,17 +964,17 @@ def test_mamba_prefill_by_step(batch_size, max_seqlen, nheads, ngroups, head_dim
         seqlens, dt, A, dt_bias, chunk_size
     )
 
-    assert torch.allclose(split_metadata, gt_split_metadata)
+    assert allclose(gt_split_metadata, split_metadata)
     assert total_chunks == gt_total_chunks
     for bi in range(batch_size):
-        assert torch.allclose(
-            yscale[:, split_metadata[1][bi] : split_metadata[1][bi] + split_metadata[3][bi]],
+        assert allclose(
             gt_yscale[:, split_metadata[1][bi] : split_metadata[1][bi] + split_metadata[3][bi]],
+            yscale[:, split_metadata[1][bi] : split_metadata[1][bi] + split_metadata[3][bi]],
             rtol=1e-3,
         )
-        assert torch.allclose(
-            xscale[:, split_metadata[1][bi] : split_metadata[1][bi] + split_metadata[3][bi]],
+        assert allclose(
             gt_xscale[:, split_metadata[1][bi] : split_metadata[1][bi] + split_metadata[3][bi]],
+            xscale[:, split_metadata[1][bi] : split_metadata[1][bi] + split_metadata[3][bi]],
             rtol=5e-3,
         )
 
@@ -1065,9 +1007,9 @@ def test_mamba_prefill_by_step(batch_size, max_seqlen, nheads, ngroups, head_dim
         nheads * head_dim,
         nheads,
     )
-    assert torch.allclose(conv_states, gt_conv_states, atol=1e-5, rtol=1e-3)
-    assert torch.allclose(zxbcdt[:, nheads * head_dim : -nheads], gt_xbc, atol=1e-5, rtol=1e-2)
-    assert torch.allclose(y, gt_scaled_x, atol=1e-5, rtol=1e-2)
+    assert allclose(gt_conv_states, conv_states, atol=1e-5, rtol=1e-3)
+    assert allclose(gt_xbc, zxbcdt[:, nheads * head_dim : -nheads], atol=1e-5, rtol=1e-2)
+    assert allclose(gt_scaled_x, y, atol=1e-5, rtol=1e-2)
 
     # Step 2. chunked state
     x = zxbcdt[:, nheads * head_dim : 2 * nheads * head_dim].clone().reshape(-1, nheads, head_dim)
@@ -1088,7 +1030,7 @@ def test_mamba_prefill_by_step(batch_size, max_seqlen, nheads, ngroups, head_dim
         head_dim,
         dstate,
     )
-    assert torch.allclose(chunk_states, gt_chunk_states, atol=2e-3, rtol=1e-2)
+    assert allclose(gt_chunk_states, chunk_states, atol=2e-3, rtol=1e-2)
 
     # Step 3 state passing
     gt_chunk_states_cumsum, gt_ssm_states_result = state_passing_torch_ref(
@@ -1102,8 +1044,8 @@ def test_mamba_prefill_by_step(batch_size, max_seqlen, nheads, ngroups, head_dim
         indices,
         chunk_size,
     )
-    assert torch.allclose(ssm_states, gt_ssm_states_result)
-    assert torch.allclose(chunk_states_cumsum, gt_chunk_states_cumsum, rtol=1e-2)
+    assert allclose(gt_ssm_states_result, ssm_states)
+    assert allclose(gt_chunk_states_cumsum, chunk_states_cumsum, rtol=1e-2)
 
     # Step 4 compute pre_y
     C = (
@@ -1124,7 +1066,7 @@ def test_mamba_prefill_by_step(batch_size, max_seqlen, nheads, ngroups, head_dim
             ichunk = split_metadata[2][bi + 1] - (bi + 1) - 1
             ilast = split_metadata[5][bi] * chunk_size - split_metadata[3][bi]
             gt_pre_y[:, ichunk, -ilast:, :] = pre_y[:, ichunk, -ilast:, :]
-        assert torch.allclose(pre_y, gt_pre_y, rtol=1e-3, atol=1e-5)
+        assert allclose(gt_pre_y, pre_y, rtol=1e-3, atol=1e-5)
 
     # Step 5 chunk scan
     x = zxbcdt[:, nheads * head_dim : 2 * nheads * head_dim].clone().reshape(-1, nheads, head_dim)
@@ -1160,12 +1102,10 @@ def test_mamba_prefill_by_step(batch_size, max_seqlen, nheads, ngroups, head_dim
     norm_y = F.normalize(y, dim=-1)
     norm_gt_y = F.normalize(gt_y, dim=-1)
     # import pdb;pdb.set_trace
-    assert torch.allclose(norm_y, norm_gt_y, rtol=2e-2, atol=1e-1)
-    assert torch.allclose(y, trt_gt_y, rtol=2e-2, atol=1e-1)
-    assert torch.allclose(conv_states[indices], trt_gt_conv_states[indices], rtol=1e-3, atol=1e-5)
-    assert torch.allclose(
-        ssm_states[indices], trt_gt_ssm_states.transpose(-1, -2), rtol=1e-2, atol=2e-3
-    )
+    assert allclose(norm_gt_y, norm_y, rtol=2e-2, atol=1e-1)
+    assert allclose(trt_gt_y, y, rtol=2e-2, atol=1e-1)
+    assert allclose(trt_gt_conv_states[indices], conv_states[indices], rtol=1e-3, atol=1e-5)
+    assert allclose(trt_gt_ssm_states.transpose(-1, -2), ssm_states[indices], rtol=1e-2, atol=2e-3)
 
 
 @pytest.mark.parametrize("batch_size", [4])
@@ -1282,8 +1222,6 @@ def test_mamba_prefill(batch_size, max_seqlen, nheads, ngroups, head_dim, dstate
         ngroups,
         chunk_size,
     )
-    assert torch.allclose(y, trt_gt_y, rtol=2e-2, atol=1e-1)
-    assert torch.allclose(conv_states[indices], trt_gt_conv_states[indices], rtol=1e-3, atol=1e-5)
-    assert torch.allclose(
-        ssm_states[indices], trt_gt_ssm_states.transpose(-1, -2), rtol=1e-2, atol=2e-3
-    )
+    assert allclose(trt_gt_y, y, rtol=2e-2, atol=1e-1)
+    assert allclose(trt_gt_conv_states[indices], conv_states[indices], rtol=1e-3, atol=1e-5)
+    assert allclose(trt_gt_ssm_states.transpose(-1, -2), ssm_states[indices], rtol=1e-2, atol=2e-3)

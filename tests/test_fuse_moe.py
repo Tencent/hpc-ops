@@ -9,6 +9,7 @@ import torch
 import math
 import pytest
 from pathlib import Path
+from utils import allclose
 
 
 def naive_gather_expert_inputs(x, topk_ids):
@@ -191,7 +192,7 @@ def test_fuse_moe(num_seq, num_topk, hidden_size, intermediate_size, num_expert,
 
     assert gt.device == my.device
     assert gt.shape == my.shape
-    assert torch.allclose(my.to(torch.float), gt.to(torch.float), rtol=0.08, atol=0.01)
+    assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.08, atol=0.01)
 
 
 file_available = os.path.exists("/cfs_cloud_code/theocheng/fused_moe_topk")
@@ -282,8 +283,4 @@ def test_fuse_moe_realdata(hidden_size, intermediate_size, num_expert, rank_ep):
                             )
                         )
 
-                    assert gt.device == my.device
-                    assert gt.shape == my.shape
-                    assert torch.allclose(
-                        my.to(torch.float), gt.to(torch.float), rtol=0.08, atol=0.01
-                    )
+                    assert allclose(gt.to(torch.float32), my.to(torch.float), rtol=0.08, atol=0.01)

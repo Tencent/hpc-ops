@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/li
 
 import hpc
 import torch
-from utils import calculate_errors, errors_to_string, allclose
+from utils import allclose
 
 
 def reference_scale3(x, scale_tensor, scale2_tensor, is_moe):
@@ -37,13 +37,13 @@ def test_scale3(batch_size, hidden_states, scale, is_moe):
     my_fp8, my_fp8_scale2, my_fp32 = my
     gt_fp8, gt_fp8_scale2, gt_fp32 = gt
     assert my_fp8.dtype == torch.float8_e4m3fn
-    assert allclose(my_fp8.to(torch.bfloat16), gt_fp8.to(torch.bfloat16), atol=0.15, rtol=0.0125)
+    assert allclose(gt_fp8.to(torch.float32), my_fp8.to(torch.float32), atol=0.15, rtol=0.0125)
     if is_moe:
         assert my_fp32.dtype == torch.float32
-        assert allclose(my_fp32, gt_fp32)
+        assert allclose(gt_fp32, my_fp32)
         assert allclose(
-            my_fp8_scale2.to(torch.bfloat16),
-            gt_fp8_scale2.to(torch.bfloat16),
+            gt_fp8_scale2.to(torch.float32),
+            my_fp8_scale2.to(torch.float32),
             atol=0.15,
             rtol=0.00125,
         )

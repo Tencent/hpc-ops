@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/li
 
 import hpc
 import torch
+from utils import allclose
 
 
 @pytest.mark.parametrize("batch_size", [1])
@@ -52,4 +53,4 @@ def test_topk_per_row(batch_size, num_sp_tokens, max_seqlen, top_k):
     print(gt)
     print(my)
 
-    assert torch.allclose(gt, my)
+    assert allclose(gt, my)

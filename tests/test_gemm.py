@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/li
 import hpc
 import torch
 import math
+from utils import allclose
 
 
 def test_gemm():
@@ -43,7 +44,4 @@ def test_gemm():
             "{:+.4f} vs {:+.4f} with diff = {:.4f}, @ {}".format(gt[idx], my[idx], vals[i], cpu_idx)
         )
 
-    assert gt.device == my.device
-    assert gt.dtype == my.dtype
-    assert gt.shape == my.shape
-    assert torch.allclose(my.to(torch.float), gt.to(torch.float), rtol=0.08, atol=0.01)
+    assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.08, atol=0.01)

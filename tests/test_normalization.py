@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/li
 import hpc
 import torch
 import math
+from utils import allclose
 
 
 def reference_torch_rms_norm_with_scale(x, weight, scale, eps):
@@ -61,9 +62,6 @@ def test_fused_rms_norm_with_scale(batch_size, hidden_states, scale, is_moe):
     else:
         y_fp32, y_fp8, y_fp8_2 = gt_fp32, output, output
 
-    assert y_fp8.dtype == torch.float8_e4m3fn
-    assert y_fp8_2.dtype == torch.float8_e4m3fn
-    assert y_fp32.dtype == torch.float32
-    assert torch.allclose(y_fp32, gt_fp32)
-    assert torch.allclose(y_fp8_2.to(torch.bfloat16), gt_2, atol=0.15, rtol=0.0125)
-    assert torch.allclose(y_fp8.to(torch.bfloat16), gt, atol=0.15, rtol=0.0125)
+    assert allclose(gt_fp32, y_fp32)
+    assert allclose(gt_2, y_fp8_2.to(torch.bfloat16), atol=0.15, rtol=0.0125)
+    assert allclose(gt, y_fp8.to(torch.bfloat16), atol=0.15, rtol=0.0125)

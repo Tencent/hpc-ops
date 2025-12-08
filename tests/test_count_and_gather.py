@@ -9,6 +9,7 @@ import torch
 import math
 import pytest
 from pathlib import Path
+from utils import allclose
 
 file_available = os.path.exists("/cfs_cloud_code/theocheng/fused_moe_topk")
 
@@ -66,7 +67,4 @@ def test_count_and_gather(hidden_size, intermediate_size, num_expert, eprank):
                             gt[idx], my[idx], vals[i], cpu_idx
                         )
                     )
-
-                assert gt.device == my.device
-                assert gt.shape == my.shape
-                assert torch.allclose(my.to(torch.float), gt.to(torch.float), rtol=0.08, atol=0.01)
+                assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.08, atol=0.01)

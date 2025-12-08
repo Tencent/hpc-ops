@@ -9,6 +9,7 @@ import torch
 sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
 
 import hpc
+from utils import allclose
 
 
 def causal_conv1d_update_ref(
@@ -114,8 +115,8 @@ def test_mamba_causal_conv1d_update(batch_size, nheads, state_len, d_conv, d_inn
         nheads,
     )
 
-    assert torch.allclose(xbc, xbc_ref, rtol=1e-2)
-    assert torch.allclose(conv_states, conv_states_ref)
+    assert allclose(xbc, xbc_ref, rtol=1e-2)
+    assert allclose(conv_states, conv_states_ref)
 
 
 def causal_conv1d_update_with_spec_ref(
@@ -239,5 +240,5 @@ def test_mamba_causal_conv1d_update_with_spec(
         2,
         num_accept_tokens,
     )
-    assert torch.allclose(xbc.to(torch.float32), xbc_ref.to(torch.float32), rtol=1e-2)
-    assert torch.allclose(conv_states.to(torch.float32), conv_states_ref.to(torch.float32))
+    assert allclose(xbc.to(torch.float32), xbc_ref.to(torch.float32), rtol=1e-2)
+    assert allclose(conv_states.to(torch.float32), conv_states_ref.to(torch.float32))

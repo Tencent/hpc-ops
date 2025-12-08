@@ -9,7 +9,7 @@ import hpc
 import multiprocessing
 import torch
 
-from utils import calculate_errors, errors_to_string
+from utils import allclose
 
 
 def rmsnorm(x, w, rms_norm_eps):
@@ -95,17 +95,14 @@ def run_task(rank, world_size, N, H, num_max_blocks):
         out_residual[start:end, :],
     )
 
-    assert torch.allclose(
+    assert allclose(
         ref_residual[start : min(end, N), :],
         out_residual[start : min(end, N), :],
         atol=atol,
         rtol=rtol,
-    ), errors_to_string(
-        calculate_errors(ref_residual[start : min(end, N), :], out_residual[start : min(end, N), :])
     )
-    assert torch.allclose(ref_output, symm_output[:N, :], atol=atol, rtol=rtol), errors_to_string(
-        calculate_errors(ref_output, symm_output[:N, :])
-    )
+
+    assert allclose(ref_output, symm_output[:N, :], atol=atol, rtol=rtol)
 
     # inplace
     hpc.fuse_allreduce_rmsnorm(
@@ -122,14 +119,10 @@ def run_task(rank, world_size, N, H, num_max_blocks):
         num_max_blocks,
     )
 
-    assert torch.allclose(
+    assert allclose(
         ref_residual[start : min(end, N), :], residual[start : min(end, N), :], atol=atol, rtol=rtol
-    ), errors_to_string(
-        calculate_errors(ref_residual[start : min(end, N), :], residual[start : min(end, N), :])
     )
-    assert torch.allclose(ref_output, symm_input[:N, :], atol=atol, rtol=rtol), errors_to_string(
-        calculate_errors(ref_output, symm_input[:N, :])
-    )
+    assert allclose(ref_output, symm_input[:N, :], atol=atol, rtol=rtol)
 
 
 @pytest.mark.skipif(os.getenv("NV_SANITIZER_INJECTION_PORT_BASE"), reason="skip sanitizer")

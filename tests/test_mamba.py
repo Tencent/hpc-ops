@@ -10,6 +10,7 @@ import math
 sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
 
 import hpc
+from utils import allclose
 
 
 def selective_state_update_ref(
@@ -169,10 +170,7 @@ def test_mamba_selective_scan_update(batch_size, nheads, num_group, dstate, head
     gt = gt_ssm_states
     my = my_ssm_states
 
-    assert gt.device == my.device
-    assert gt.dtype == my.dtype
-    assert gt.shape == my.shape
-    assert torch.allclose(my.to(torch.float), gt.to(torch.float), atol=1e-5)
+    assert allclose(gt.to(torch.float32), my.to(torch.float32), atol=1e-5)
 
     # test out
     gt = gt_out
@@ -189,7 +187,4 @@ def test_mamba_selective_scan_update(batch_size, nheads, num_group, dstate, head
         print(gt[t].item())
         print(my[t].item())
 
-    assert gt.device == my.device
-    assert gt.dtype == my.dtype
-    assert gt.shape == my.shape
-    assert torch.allclose(my.to(torch.float), gt.to(torch.float), atol=0.5)
+    assert allclose(gt.to(torch.float32), my.to(torch.float32), atol=0.5)

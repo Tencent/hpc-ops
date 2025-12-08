@@ -12,6 +12,7 @@ import math
 import torch
 
 import hpc
+from utils import allclose
 
 
 def set_penalties_mask_ref(mask, tokens):
@@ -76,7 +77,7 @@ def test_fused_repetition_penalties_softmax(
         logits_hpc_input, penalties_masks_ptrs, repetition_penalties, temperature
     )
 
-    assert torch.allclose(gt_y, y)
+    assert allclose(gt_y, y)
 
 
 def torch_topk_mask_logits(logits, topk):
@@ -110,4 +111,4 @@ def test_topk_mask_logits(batch_size, vocab_size, topk):
 
     gt_output_logits = reference_topk_mask_logits(logits, topk)
 
-    assert torch.allclose(gt_output_logits, my_output_logits)
+    assert allclose(gt_output_logits, my_output_logits)

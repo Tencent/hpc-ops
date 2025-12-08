@@ -8,6 +8,7 @@ import hpc
 import torch
 import math
 import pytest
+from utils import allclose
 
 
 def naive_group_gemm(x, w, seqlens, cu_seqlens, scale):
@@ -85,10 +86,7 @@ def test_group_gemm1(num_group, actual_m, m, n, k):
             "{:+.4f} vs {:+.4f} with diff = {:.4f}, @ {}".format(gt[idx], my[idx], vals[i], cpu_idx)
         )
 
-    assert gt.device == my.device
-    assert gt.dtype == my.dtype
-    assert gt.shape == my.shape
-    assert torch.allclose(my.to(torch.float), gt.to(torch.float), rtol=0.08, atol=0.01)
+    assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.08, atol=0.01)
 
 
 file_available = os.path.exists("/cfs_cloud_code/theocheng/hpc-ops/group_seqlens.pt")
@@ -159,7 +157,4 @@ def test_group_gemm2(num_group, n, k):
                     )
                 )
 
-            assert gt.device == my.device
-            assert gt.dtype == my.dtype
-            assert gt.shape == my.shape
-            assert torch.allclose(my.to(torch.float), gt.to(torch.float), rtol=0.08, atol=0.01)
+            assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.08, atol=0.01)

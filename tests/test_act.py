@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/li
 import hpc
 import torch
 import pytest
-from utils import calculate_errors, errors_to_string
+from utils import allclose
 
 
 def _act_mul_and_quant(gate_up, scale):
@@ -63,12 +63,7 @@ def test_act_mul_and_quant(num_batch, intermediate_size, use_output):
 
     gt = _act_mul_and_quant(gate_up_out, scale)
 
-    assert torch.allclose(out.to(torch.float), gt.to(torch.float)), errors_to_string(
-        calculate_errors(gt.to(torch.float), out.to(torch.float))
-    )
-    assert gt.device == out.device
-    assert gt.dtype == out.dtype
-    assert gt.shape == out.shape
+    assert allclose(gt.to(torch.float32), out.to(torch.float32))
 
 
 @pytest.mark.parametrize("num_expert", [32])
@@ -146,4 +141,4 @@ def test_masked_act_mul_and_quant(num_expert, num_max_tokens_per_expert, num_int
     print(gt)
     print(my)
 
-    assert torch.allclose(my.to(torch.float), gt.to(torch.float), atol=0.15, rtol=0.0125)
+    assert allclose(gt.to(torch.float32), my.to(torch.float32), atol=0.15, rtol=0.0125)

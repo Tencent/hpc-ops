@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 
 import hpc
+from utils import allclose
 
 
 def apply_rotary_pos_emb_neox_reference(x, cos_sin):
@@ -479,10 +480,10 @@ def test_rope_norm_blocked_prefill(num_req, num_q_head_head_dim, num_kv_heads, u
         k_norm_weight=k_norm_weight,
     )
 
-    assert torch.allclose(my_out_q, torch_out_q, atol=5e-2)
-    assert torch.allclose(my_out_k, torch_out_k, atol=5e-2)
-    assert torch.allclose(kcache, torch_kcache, atol=5e-2)
-    assert torch.allclose(vcache, torch_vcache, atol=5e-2)
+    assert allclose(torch_out_q, my_out_q, atol=5e-2)
+    assert allclose(torch_out_k, my_out_k, atol=5e-2)
+    assert allclose(torch_kcache, kcache, atol=5e-2)
+    assert allclose(torch_vcache, vcache, atol=5e-2)
 
 
 @pytest.mark.parametrize("num_req", [7])
@@ -553,6 +554,6 @@ def test_rope_norm_blocked_decode(num_req, num_q_head_head_dim, num_kv_heads, us
         k_norm_weight=k_norm_weight,
     )
 
-    assert torch.allclose(my_out_q, torch_out_q, atol=5e-2)
-    assert torch.allclose(kcache, torch_kcache, atol=5e-2)
-    assert torch.allclose(vcache, torch_vcache, atol=5e-2)
+    assert allclose(torch_out_q, my_out_q, atol=5e-2)
+    assert allclose(torch_kcache, kcache, atol=5e-2)
+    assert allclose(torch_vcache, vcache, atol=5e-2)

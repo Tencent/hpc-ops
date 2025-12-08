@@ -9,7 +9,7 @@ import hpc
 import multiprocessing
 import torch
 
-from utils import calculate_errors, errors_to_string
+from utils import allclose
 
 
 def rmsnorm(x, w, rms_norm_eps):
@@ -129,41 +129,32 @@ def run_task(rank, world_size, N, H, num_max_blocks):
     rtol = 1e-01
     atol = 1e-01
 
-    assert torch.allclose(
+    assert allclose(
         ref_residual[start : min(end, N), :],
         out_residual[start : min(end, N), :],
         atol=atol,
         rtol=rtol,
-    ), errors_to_string(
-        calculate_errors(ref_residual[start : min(end, N), :], out_residual[start : min(end, N), :])
     )
 
-    assert torch.allclose(
+    assert allclose(
         ref_fp32_output,
         symm_fp32_output[:N, :],
         atol=atol,
         rtol=rtol,
-    ), errors_to_string(calculate_errors(ref_fp32_output, symm_fp32_output[:N, :]))
-    assert torch.allclose(
+    )
+
+    assert allclose(
         ref_fp8_output.to(torch.bfloat16),
         symm_fp8_output[:N, :].to(torch.bfloat16),
         atol=0.15,
         rtol=0.15,
-    ), errors_to_string(
-        calculate_errors(
-            ref_fp8_output.to(torch.bfloat16), symm_fp8_output[:N, :].to(torch.bfloat16)
-        )
     )
 
-    assert torch.allclose(
+    assert allclose(
         ref_fp8_output2.to(torch.bfloat16),
         symm_fp8_output2[:N, :].to(torch.bfloat16),
         atol=0.15,
         rtol=0.15,
-    ), errors_to_string(
-        calculate_errors(
-            ref_fp8_output2.to(torch.bfloat16), symm_fp8_output2[:N, :].to(torch.bfloat16)
-        )
     )
 
 

@@ -9,6 +9,7 @@ import hpc
 import torch
 import math
 import torch.nn.functional as F
+from utils import allclose
 
 
 def naive_attn_with_kvcache_func(
@@ -176,17 +177,4 @@ def test_attention_with_kvcache_prefill_bf16(
     print("\nmy\n")
     print(my[0, :, 0], my.shape)
 
-    abs_diff = torch.abs(gt - my)
-    vals, idxs = torch.topk(abs_diff.flatten(), 10)
-    idxs = [torch.unravel_index(idx, gt.shape) for idx in idxs]
-
-    for i, idx in enumerate(idxs):
-        cpu_idx = tuple(tensor.cpu().item() for tensor in idx)
-        print(
-            "{:+.4f} vs {:+.4f} with diff = {:.4f}, @ {}".format(gt[idx], my[idx], vals[i], cpu_idx)
-        )
-
-    assert torch.allclose(my, gt, atol=0.0156)
-    assert gt.device == my.device
-    assert gt.dtype == my.dtype
-    assert gt.shape == my.shape
+    assert allclose(gt, my, atol=0.0156)

@@ -174,6 +174,9 @@ def errors_to_string(error_results, precision=6):
 
 
 def allclose(ref_tensor, real_tensor, atol=1e-8, rtol=1e-5):
+    assert ref_tensor.dtype == real_tensor.dtype
+    assert ref_tensor.device == real_tensor.device
+    assert ref_tensor.shape == real_tensor.shape
     is_true = torch.allclose(ref_tensor, real_tensor, atol=atol, rtol=rtol)
     if not is_true:
         print(
