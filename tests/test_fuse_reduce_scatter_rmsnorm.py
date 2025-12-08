@@ -9,7 +9,7 @@ import hpc
 import multiprocessing
 import torch
 
-from utils import allclose
+from utils import calculate_errors, errors_to_string
 
 
 def rmsnorm(x, w, rms_norm_eps):
@@ -19,11 +19,11 @@ def rmsnorm(x, w, rms_norm_eps):
     )
 
 
-def ref_allreduce_rmsnorm(input_list, residual, weight, rms_norm_eps):
-    input_sum = torch.zeros_like(input_list[0])
+def ref_reduce_scatter_rmsnorm(input_list, residual, weight, rms_norm_eps, start, end):
+    input_sum = torch.zeros_like(input_list[0][start:end])
     for input in input_list:
-        input_sum += input
-    output_residual = input_sum + residual
+        input_sum += input[start:end]
+    output_residual = input_sum + residual[start:end]
     output = rmsnorm(output_residual, weight, rms_norm_eps)
     return output_residual, output
 
@@ -56,8 +56,11 @@ def run_task(rank, world_size, N, H, num_max_blocks):
     symm_output, out_hdl = hpc.empty_multimem(comm, [N_pad, H], dtype=torch.bfloat16, device=device)
     out_residual = torch.empty_like(residual)
 
-    ref_residual, ref_output = ref_allreduce_rmsnorm(
-        input_list, residual[:N, :], weight, rms_norm_eps
+    # ref
+    start = N_pad // world_size * rank
+    end = N_pad // world_size * (rank + 1)
+    ref_residual, ref_output = ref_reduce_scatter_rmsnorm(
+        input_list, residual[:N, :], weight, rms_norm_eps, start, end
     )
 
     # NOTE(landojiang): copy from vllm/tests/kernels/test_layernorm.py::54
@@ -71,12 +74,10 @@ def run_task(rank, world_size, N, H, num_max_blocks):
     rtol = 1e-01
     atol = 1e-01
 
-    start = N_pad // world_size * rank
-    end = N_pad // world_size * (rank + 1)
     offset = start * H * symm_input.element_size()
 
     # not inplace
-    hpc.fuse_allreduce_rmsnorm(
+    hpc.fuse_reduce_scatter_rmsnorm(
         symm_input[start:end, :],
         in_hdl.get_multimem_buff(
             symm_input[start:end, :].shape, dtype=symm_input.dtype, storage_offset=offset
@@ -95,17 +96,18 @@ def run_task(rank, world_size, N, H, num_max_blocks):
         out_residual[start:end, :],
     )
 
-    assert allclose(
-        ref_residual[start : min(end, N), :],
+    assert torch.allclose(
+        ref_residual,
         out_residual[start : min(end, N), :],
         atol=atol,
         rtol=rtol,
-    )
-
-    assert allclose(ref_output, symm_output[:N, :], atol=atol, rtol=rtol)
+    ), errors_to_string(calculate_errors(ref_residual, out_residual[start : min(end, N), :]))
+    assert torch.allclose(
+        ref_output, symm_output[start : min(end, N), :], atol=atol, rtol=rtol
+    ), errors_to_string(calculate_errors(ref_output, symm_output[start : min(end, N), :]))
 
     # inplace
-    hpc.fuse_allreduce_rmsnorm(
+    hpc.fuse_reduce_scatter_rmsnorm(
         symm_input[start:end, :],
         in_hdl.get_multimem_buff(
             symm_input[start:end, :].shape, dtype=symm_input.dtype, storage_offset=offset
@@ -119,17 +121,19 @@ def run_task(rank, world_size, N, H, num_max_blocks):
         num_max_blocks,
     )
 
-    assert allclose(
-        ref_residual[start : min(end, N), :], residual[start : min(end, N), :], atol=atol, rtol=rtol
-    )
-    assert allclose(ref_output, symm_input[:N, :], atol=atol, rtol=rtol)
+    assert torch.allclose(
+        ref_residual, residual[start : min(end, N), :], atol=atol, rtol=rtol
+    ), errors_to_string(calculate_errors(ref_residual, residual[start : min(end, N), :]))
+    assert torch.allclose(
+        ref_output, symm_input[start : min(end, N), :], atol=atol, rtol=rtol
+    ), errors_to_string(calculate_errors(ref_output, symm_input[start : min(end, N), :]))
 
 
 @pytest.mark.skipif(os.getenv("NV_SANITIZER_INJECTION_PORT_BASE"), reason="skip sanitizer")
 @pytest.mark.parametrize("world_size", [3, 8])
-@pytest.mark.parametrize("N", [128, 77])
-@pytest.mark.parametrize("H", [5120, 7168])
-@pytest.mark.parametrize("num_max_blocks", [16, 78])
+@pytest.mark.parametrize("N", [128, 77, 4567, 16384])
+@pytest.mark.parametrize("H", [7168])
+@pytest.mark.parametrize("num_max_blocks", [16])
 def test_fuse_allreduce_rmsnorm(world_size, N, H, num_max_blocks):
     ctx = multiprocessing.get_context("spawn")
 

@@ -7,6 +7,8 @@
 
 #include "src/allreduce/fuse_allreduce_rmsnorm.h"
 #include "src/allreduce/fuse_allreduce_rmsnorm_with_scale.h"
+#include "src/allreduce/fuse_reduce_scatter_rmsnorm.h"
+#include "src/allreduce/reduce_scatter.h"
 
 namespace hpc {
 
@@ -58,7 +60,8 @@ void fuse_allreduce_rmsnorm_entry(const torch::Tensor &input,     // [..., hidde
   int hidden_size = input.size(-1);
   int num_tokens = input.numel() / hidden_size;
 
-  TORCH_CHECK(hidden_size == 4096 || hidden_size == 5120, "unsupported hidden_size");
+  TORCH_CHECK(hidden_size == 4096 || hidden_size == 5120 || hidden_size == 7168,
+              "unsupported hidden_size");
   bool ptrs_are_aligned = (reinterpret_cast<int64_t>(input_ptr) % 16 == 0 &&
                            reinterpret_cast<int64_t>(mc_input_ptr) % 16 == 0 &&
                            reinterpret_cast<int64_t>(in_res_ptr) % 16 == 0 &&
@@ -155,6 +158,114 @@ void fuse_allreduce_rmsnorm_with_scale_entry(
       mc_fp8_output2_ptr, mc_fp32_output_ptr, signal_ptr, rank, world_size, num_max_blocks,
       rms_norm_eps, num_tokens, hidden_size, is_moe, stream);
 }
+
+void fuse_reduce_scatter_rmsnorm_entry(
+    const torch::Tensor &input,        // [..., hidden_size]
+    const torch::Tensor &mc_input,     // [..., hidden_size] multimem_ptr
+    const torch::Tensor &in_residual,  // [..., hidden_size]
+    const torch::Tensor &weight,       // [hidden_size]
+    torch::Tensor &signal,             // [world_size] signal ptrs
+    int64_t rank, int64_t world_size, int64_t num_max_blocks, double rms_norm_eps,
+    torch::Tensor &output,          // [..., hidden_size]
+    torch::Tensor &mc_output,       // [..., hidden_size] multimem_ptr
+    torch::Tensor &out_residual) {  // [..., hidden_size]
+  auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+  TORCH_CHECK(input.is_contiguous(), "input tensor must be contigous");
+  TORCH_CHECK(mc_input.is_contiguous(), "mc_input tensor must be contigous");
+  TORCH_CHECK(in_residual.is_contiguous(), "input residual tensor must be contigous");
+  TORCH_CHECK(output.is_contiguous(), "output tensor must be contigous");
+  TORCH_CHECK(mc_output.is_contiguous(), "mc_output tensor must be contigous");
+  TORCH_CHECK(out_residual.is_contiguous(), "output residual tensor must be contigous");
+  TORCH_CHECK(weight.is_contiguous(), "weight tensor must be contigous");
+  TORCH_CHECK(signal.is_contiguous(), "signal tensor must be contigous");
+
+  TORCH_CHECK(input.scalar_type() == torch::kBFloat16, "input tensor data type must be bfloat16");
+  TORCH_CHECK(mc_input.scalar_type() == torch::kBFloat16,
+              "mc_input tensor data type must be bfloat16");
+  TORCH_CHECK(in_residual.scalar_type() == torch::kBFloat16,
+              "residual tensor data type must be bfloat16");
+  TORCH_CHECK(output.scalar_type() == torch::kBFloat16, "output tensor data type must be bfloat16");
+  TORCH_CHECK(mc_output.scalar_type() == torch::kBFloat16,
+              "mc_output tensor data type must be bfloat16");
+  TORCH_CHECK(out_residual.scalar_type() == torch::kBFloat16,
+              "output residual tensor data type must be bfloat16");
+  TORCH_CHECK(weight.scalar_type() == torch::kBFloat16, "weight tensor data type must be bfloat16");
+  TORCH_CHECK(signal.scalar_type() == torch::kInt64, "signal tensor data type must be int64");
+
+  const auto *input_ptr = input.const_data_ptr();
+  const auto *mc_input_ptr = mc_input.const_data_ptr();
+  const auto *in_res_ptr = in_residual.const_data_ptr();
+  const auto *weight_ptr = weight.const_data_ptr();
+
+  auto *output_ptr = output.mutable_data_ptr();
+  auto *mc_output_ptr = mc_output.mutable_data_ptr();
+  auto *out_res_ptr = out_residual.mutable_data_ptr();
+  auto *signal_ptr = signal.mutable_data_ptr();
+
+  int hidden_size = input.size(-1);
+  int num_tokens = input.numel() / hidden_size;
+
+  TORCH_CHECK(hidden_size == 7168, "unsupported hidden_size");
+  bool ptrs_are_aligned = (reinterpret_cast<int64_t>(input_ptr) % 16 == 0 &&
+                           reinterpret_cast<int64_t>(mc_input_ptr) % 16 == 0 &&
+                           reinterpret_cast<int64_t>(in_res_ptr) % 16 == 0 &&
+                           reinterpret_cast<int64_t>(output_ptr) % 16 == 0 &&
+                           reinterpret_cast<int64_t>(mc_output_ptr) % 16 == 0 &&
+                           reinterpret_cast<int64_t>(out_res_ptr) % 16 == 0 &&
+                           reinterpret_cast<int64_t>(weight_ptr) % 16 == 0 &&
+                           reinterpret_cast<int64_t>(signal_ptr) % 16 == 0);
+  TORCH_CHECK(ptrs_are_aligned, "pointer must be aligned to 16");
+
+  fuse_reduce_scatter_rmsnorm_async(input_ptr, mc_input_ptr, in_res_ptr, weight_ptr, output_ptr,
+                                    mc_output_ptr, out_res_ptr, signal_ptr, rank, world_size,
+                                    num_max_blocks, rms_norm_eps, num_tokens, hidden_size, stream);
+}
+
+void reduce_scatter_entry(const torch::Tensor &input,     // [..., hidden_size]
+                          const torch::Tensor &mc_input,  // [..., hidden_size] multimem_ptr
+                          torch::Tensor &signal,          // [world_size] signal ptrs
+                          int64_t rank, int64_t world_size, int64_t num_max_blocks,
+                          torch::Tensor &output,       // [..., hidden_size]
+                          torch::Tensor &mc_output) {  // [..., hidden_size] multimem_ptr
+  auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+  TORCH_CHECK(input.is_contiguous(), "input tensor must be contigous");
+  TORCH_CHECK(mc_input.is_contiguous(), "mc_input tensor must be contigous");
+  TORCH_CHECK(output.is_contiguous(), "output tensor must be contigous");
+  TORCH_CHECK(mc_output.is_contiguous(), "mc_output tensor must be contigous");
+  TORCH_CHECK(signal.is_contiguous(), "signal tensor must be contigous");
+
+  TORCH_CHECK(input.scalar_type() == torch::kBFloat16, "input tensor data type must be bfloat16");
+  TORCH_CHECK(mc_input.scalar_type() == torch::kBFloat16,
+              "mc_input tensor data type must be bfloat16");
+  TORCH_CHECK(output.scalar_type() == torch::kBFloat16, "output tensor data type must be bfloat16");
+  TORCH_CHECK(mc_output.scalar_type() == torch::kBFloat16,
+              "mc_output tensor data type must be bfloat16");
+  TORCH_CHECK(signal.scalar_type() == torch::kInt64, "signal tensor data type must be int64");
+
+  const auto *input_ptr = input.const_data_ptr();
+  const auto *mc_input_ptr = mc_input.const_data_ptr();
+
+  auto *output_ptr = output.mutable_data_ptr();
+  auto *mc_output_ptr = mc_output.mutable_data_ptr();
+  auto *signal_ptr = signal.mutable_data_ptr();
+
+  int hidden_size = input.size(-1);
+  int num_tokens = input.numel() / hidden_size;
+
+  TORCH_CHECK(hidden_size == 7168, "unsupported hidden_size");
+  bool ptrs_are_aligned = (reinterpret_cast<int64_t>(input_ptr) % 16 == 0 &&
+                           reinterpret_cast<int64_t>(mc_input_ptr) % 16 == 0 &&
+                           reinterpret_cast<int64_t>(output_ptr) % 16 == 0 &&
+                           reinterpret_cast<int64_t>(mc_output_ptr) % 16 == 0 &&
+                           reinterpret_cast<int64_t>(signal_ptr) % 16 == 0);
+  TORCH_CHECK(ptrs_are_aligned, "pointer must be aligned to 16");
+
+  reduce_scatter_async(input_ptr, mc_input_ptr, output_ptr, mc_output_ptr, signal_ptr, rank,
+                       world_size, num_max_blocks, num_tokens, hidden_size, stream);
+}
+
 }  // namespace allreduce
 
 }  // namespace hpc
@@ -174,4 +285,24 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "out_residual, Tensor ? scale2, Tensor ? mc_fp8_output2, Tensor ? mc_fp32_output) -> ()");
   m.impl("fuse_allreduce_rmsnorm_with_scale", torch::kCUDA,
          &hpc::allreduce::fuse_allreduce_rmsnorm_with_scale_entry);
+}
+
+TORCH_LIBRARY_FRAGMENT(hpc, m) {
+  m.def(
+      "fuse_reduce_scatter_rmsnorm(Tensor input, Tensor mc_input, Tensor in_residual, Tensor "
+      "weight, "
+      "Tensor signal, "
+      "int rank, int world_size, int num_max_blocks, float rms_norm_eps, Tensor! output, Tensor! "
+      "mc_output, Tensor! out_residual) -> ()");
+  m.impl("fuse_reduce_scatter_rmsnorm", torch::kCUDA,
+         &hpc::allreduce::fuse_reduce_scatter_rmsnorm_entry);
+}
+
+TORCH_LIBRARY_FRAGMENT(hpc, m) {
+  m.def(
+      "reduce_scatter(Tensor input, Tensor mc_input, "
+      "Tensor signal, "
+      "int rank, int world_size, int num_max_blocks, Tensor! output, Tensor! "
+      "mc_output) -> ()");
+  m.impl("reduce_scatter", torch::kCUDA, &hpc::allreduce::reduce_scatter_entry);
 }

@@ -5,7 +5,7 @@
 
 #include <algorithm>
 
-#include "src/allreduce/fuse_allreduce_rmsnorm.h"
+#include "src/allreduce/fuse_reduce_scatter_rmsnorm.h"
 #include "src/utils/utils.cuh"
 
 namespace hpc {
@@ -13,7 +13,7 @@ namespace allreduce {
 namespace kernels {
 
 template <int kVecSize = 8, int kHiddenSize, int kNumThreadPerBlcok>
-__global__ void fused_allreduce_rmsnorm_kernel(
+__global__ void fused_reduce_scatter_rmsnorm_kernel(
     const __nv_bfloat16 *__restrict__ input_ptr, const __nv_bfloat16 *__restrict__ mc_input_ptr,
     const __nv_bfloat16 *__restrict__ in_res_ptr, const __nv_bfloat16 *__restrict__ weight_ptr,
     __nv_bfloat16 *__restrict__ output_ptr, __nv_bfloat16 *__restrict__ mc_output_ptr,
@@ -47,7 +47,7 @@ __global__ void fused_allreduce_rmsnorm_kernel(
     const int offset = itoken * kHiddenSize + idx * kVecSize;
     auto *mcptr_in = mc_input_ptr + offset;
     auto *residual_in = in_res_ptr + offset;
-    auto *mcptr_out = mc_output_ptr + offset;
+    auto *out = output_ptr + offset;
     auto *residual_out = out_res_ptr + offset;
 
     // 1. reduce sum input and residual
@@ -85,7 +85,7 @@ __global__ void fused_allreduce_rmsnorm_kernel(
     for (int i = 0; i < size(in_sum); i++) {
       in_sum[i] = in_sum[i] * var * weight[i];
     }
-    multi_store(mcptr_out, to<T>(in_sum));
+    store(out, to<T>(in_sum));
   }
 
   __syncthreads();
@@ -100,47 +100,19 @@ __global__ void fused_allreduce_rmsnorm_kernel(
 
 }  // namespace kernels
 
-void fuse_allreduce_rmsnorm_async(const void *input_ptr, const void *mc_input_ptr,
-                                  const void *in_res_ptr, const void *weight_ptr, void *output_ptr,
-                                  void *mc_output_ptr, void *out_res_ptr, void *signal_ptr,
-                                  int64_t rank, int64_t world_size, int64_t num_max_blocks,
-                                  double rms_norm_eps, int num_tokens, int hidden_size,
-                                  cudaStream_t stream) {
+void fuse_reduce_scatter_rmsnorm_async(const void *input_ptr, const void *mc_input_ptr,
+                                       const void *in_res_ptr, const void *weight_ptr,
+                                       void *output_ptr, void *mc_output_ptr, void *out_res_ptr,
+                                       void *signal_ptr, int64_t rank, int64_t world_size,
+                                       int64_t num_max_blocks, double rms_norm_eps, int num_tokens,
+                                       int hidden_size, cudaStream_t stream) {
   constexpr int kVecSize = 8;
-  if (hidden_size == 4096) {
-    constexpr int kNumThreadPerBlcok = 512;
-    constexpr int kHiddenSize = 4096;
-    dim3 grid(num_max_blocks);
-    dim3 block(kNumThreadPerBlcok);
-    kernels::fused_allreduce_rmsnorm_kernel<kVecSize, kHiddenSize, kNumThreadPerBlcok>
-        <<<grid, block, 0, stream>>>(
-            static_cast<const __nv_bfloat16 *>(input_ptr),
-            static_cast<const __nv_bfloat16 *>(mc_input_ptr),
-            static_cast<const __nv_bfloat16 *>(in_res_ptr),
-            static_cast<const __nv_bfloat16 *>(weight_ptr),
-            static_cast<__nv_bfloat16 *>(output_ptr), static_cast<__nv_bfloat16 *>(mc_output_ptr),
-            static_cast<__nv_bfloat16 *>(out_res_ptr), reinterpret_cast<uint32_t **>(signal_ptr),
-            static_cast<int>(rank), static_cast<int>(world_size), rms_norm_eps, num_tokens);
-  } else if (hidden_size == 5120) {
-    constexpr int kNumThreadPerBlcok = 640;
-    constexpr int kHiddenSize = 5120;
-    dim3 grid(num_max_blocks);
-    dim3 block(kNumThreadPerBlcok);
-    kernels::fused_allreduce_rmsnorm_kernel<kVecSize, kHiddenSize, kNumThreadPerBlcok>
-        <<<grid, block, 0, stream>>>(
-            static_cast<const __nv_bfloat16 *>(input_ptr),
-            static_cast<const __nv_bfloat16 *>(mc_input_ptr),
-            static_cast<const __nv_bfloat16 *>(in_res_ptr),
-            static_cast<const __nv_bfloat16 *>(weight_ptr),
-            static_cast<__nv_bfloat16 *>(output_ptr), static_cast<__nv_bfloat16 *>(mc_output_ptr),
-            static_cast<__nv_bfloat16 *>(out_res_ptr), reinterpret_cast<uint32_t **>(signal_ptr),
-            static_cast<int>(rank), static_cast<int>(world_size), rms_norm_eps, num_tokens);
-  } else if (hidden_size == 7168) {
+  if (hidden_size == 7168) {
     constexpr int kNumThreadPerBlcok = 896;
     constexpr int kHiddenSize = 7168;
     dim3 grid(num_max_blocks);
     dim3 block(kNumThreadPerBlcok);
-    kernels::fused_allreduce_rmsnorm_kernel<kVecSize, kHiddenSize, kNumThreadPerBlcok>
+    kernels::fused_reduce_scatter_rmsnorm_kernel<kVecSize, kHiddenSize, kNumThreadPerBlcok>
         <<<grid, block, 0, stream>>>(
             static_cast<const __nv_bfloat16 *>(input_ptr),
             static_cast<const __nv_bfloat16 *>(mc_input_ptr),
