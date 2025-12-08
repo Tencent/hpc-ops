@@ -61,7 +61,6 @@ def attention_with_kvcache_prefill_bf16(
     q: Tensor,
     kcache: Tensor,
     vcache: Tensor,
-    seqlens_q: Tensor,
     cu_seqlens_q: Tensor,
     block_ids: Tensor,
     seqlens_kvcache: Tensor,
@@ -87,9 +86,6 @@ def attention_with_kvcache_prefill_bf16(
                  Constrainst the unused slots in last block of vcache for each request to be set zeros.
             Shape: [num_blocks, block_size, num_head_kv, num_dim_v]
             Dtype: bfloat16
-        seqlens_q: num_seq_q for each batch
-            Shape: [num_batch]
-            Dtype: int32
         cu_seqlens_q: start_seq_q for each batch
             Shape: [num_batch + 1]
             Dtype: int32
@@ -121,7 +117,6 @@ def attention_with_kvcache_prefill_bf16(
         q,
         kcache,
         vcache,
-        seqlens_q,
         cu_seqlens_q,
         block_ids,
         seqlens_kvcache,
@@ -197,7 +192,7 @@ def attention_prefill_bf16_fake(q, k, v, seqlens_q, cu_seqlens_q, max_seqlens_q,
 
 @torch.library.register_fake("hpc::attention_with_kvcache_prefill_bf16")
 def attention_with_kvcache_prefill_bf16_fake(
-    q, kcache, vcache, seqlens_q, cu_seqlens_q, block_ids, seqlens_kvcache, max_seqlens_q, output
+    q, kcache, vcache, cu_seqlens_q, block_ids, seqlens_kvcache, max_seqlens_q, output
 ):
     return torch.empty_like(q)
 

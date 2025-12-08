@@ -66,14 +66,13 @@ torch::Tensor attention_prefill_bf16_entry(const torch::Tensor &q, const torch::
 
 torch::Tensor attention_with_kvcache_prefill_bf16_entry(
     const torch::Tensor &q, const torch::Tensor &kcache, const torch::Tensor &vcache,
-    const torch::Tensor &seqlens_q, const torch::Tensor &cu_seqlens_q,
-    const torch::Tensor block_ids, const torch::Tensor seqlens_kvcache, int64_t max_seqlens_q,
+    const torch::Tensor &cu_seqlens_q, const torch::Tensor block_ids,
+    const torch::Tensor seqlens_kvcache, int64_t max_seqlens_q,
     std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
   TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
   TORCH_CHECK(kcache.device().is_cuda(), "kcache tensor must be cuda");
   TORCH_CHECK(vcache.device().is_cuda(), "vcache tensor must be cuda");
-  TORCH_CHECK(seqlens_q.device().is_cuda(), "seqlens_q tensor must be cuda");
   TORCH_CHECK(cu_seqlens_q.device().is_cuda(), "cu_seqlens_q tensor must be cuda");
   TORCH_CHECK(block_ids.device().is_cuda(), "block_ids tensor must be cuda");
   TORCH_CHECK(seqlens_kvcache.device().is_cuda(), "seqlens_kvcache tensor must be cuda");
@@ -82,7 +81,7 @@ torch::Tensor attention_with_kvcache_prefill_bf16_entry(
   int num_head_q = q.size(1);
   int num_dim_qk = q.size(2);
 
-  int num_batch = seqlens_q.size(0);
+  int num_batch = cu_seqlens_q.size(0) - 1;
 
   int num_kvcache_blocks = kcache.size(0);
   int block_size = kcache.size(1);
@@ -106,7 +105,6 @@ torch::Tensor attention_with_kvcache_prefill_bf16_entry(
   const auto *q_ptr = q.const_data_ptr();
   const auto *kcache_ptr = kcache.const_data_ptr();
   const auto *vcache_ptr = vcache.const_data_ptr();
-  const auto *seqlens_q_ptr = seqlens_q.const_data_ptr();
   const auto *cu_seqlens_q_ptr = cu_seqlens_q.const_data_ptr();
   const auto *block_ids_ptr = block_ids.const_data_ptr();
   const auto *seqlens_kvcache_ptr = seqlens_kvcache.const_data_ptr();
@@ -121,10 +119,9 @@ torch::Tensor attention_with_kvcache_prefill_bf16_entry(
   int ldY = y.stride(0);       // num_head_q * num_dim_v;
 
   attention_with_kvcache_prefill_bf16_async(
-      y_ptr, q_ptr, kcache_ptr, vcache_ptr, seqlens_q_ptr, cu_seqlens_q_ptr, block_ids_ptr,
-      seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seqlens_q, num_dim_qk, num_dim_v,
-      num_head_q, num_head_kv, num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK,
-      ldV, stream);
+      y_ptr, q_ptr, kcache_ptr, vcache_ptr, cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr,
+      tmas_ptr, num_batch, total_seq_q, max_seqlens_q, num_dim_qk, num_dim_v, num_head_q,
+      num_head_kv, num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
 
   return y;
 }
@@ -227,8 +224,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.impl("attention_prefill_bf16", torch::kCUDA, &hpc::attention::attention_prefill_bf16_entry);
 
   m.def(
-      "attention_with_kvcache_prefill_bf16(Tensor q, Tensor kcache, Tensor vcache, Tensor "
-      "seqlens_q, "
+      "attention_with_kvcache_prefill_bf16(Tensor q, Tensor kcache, Tensor vcache,"
       "Tensor cu_seqlens_q, "
       "Tensor block_ids, Tensor num_seq_kvcache, int max_seqlens_q, Tensor? output) -> (Tensor)");
   m.impl("attention_with_kvcache_prefill_bf16", torch::kCUDA,

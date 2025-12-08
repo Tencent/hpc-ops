@@ -49,7 +49,9 @@ def naive_attn_with_kvcache_func(
         scores = torch.matmul(BQ, BK.transpose(-2, -1)) / math.sqrt(num_dim_qk)
         if causal:
             causal_mask = (
-                torch.tril(torch.ones(num_seq_q, num_seq_kv, device=q.device, dtype=torch.bool))
+                torch.tril(torch.ones(num_seq_kv, num_seq_kv, device=q.device, dtype=torch.bool))[
+                    (num_seq_kv - num_seq_q) :, :
+                ]
                 .unsqueeze(0)
                 .unsqueeze(0)
             )  # (1, 1, num_seq_q, num_seq_kv)
@@ -73,9 +75,9 @@ except Exception as e:
     gt_attention_func = naive_attn_with_kvcache_func
 
 
-@pytest.mark.parametrize("num_batch", [4])
-@pytest.mark.parametrize("num_seq_q", [3907])
-@pytest.mark.parametrize("num_seq_kv", [3907])
+@pytest.mark.parametrize("num_batch", [1, 2, 4, 8])
+@pytest.mark.parametrize("num_seq_q", [100, 500, 1000, 1500])
+@pytest.mark.parametrize("num_seq_kv", [1500, 3000])
 @pytest.mark.parametrize("block_size", [64])
 @pytest.mark.parametrize("num_head_q", [4])
 @pytest.mark.parametrize("num_head_kv", [1])
@@ -151,7 +153,6 @@ def test_attention_with_kvcache_prefill_bf16(
                 Q.reshape(-1, num_head_q, num_dim_qk),
                 kvcache[:, 0, :, :, :],
                 kvcache[:, 1, :, :, :],
-                seqlens_q,
                 cu_seqlens_q,
                 block_ids,
                 seqlens_kvcache,
@@ -163,7 +164,6 @@ def test_attention_with_kvcache_prefill_bf16(
                 Q.reshape(-1, num_head_q, num_dim_qk),
                 kvcache[:, 0, :, :, :],
                 kvcache[:, 1, :, :, :],
-                seqlens_q,
                 cu_seqlens_q,
                 block_ids,
                 seqlens_kvcache,
