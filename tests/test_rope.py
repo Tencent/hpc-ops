@@ -80,6 +80,40 @@ def generate_cos_sin_cache(max_position, head_dim, base=10000.0):
     return cos_sin
 
 
+def sample_and_extract_qkv(req_length, qkv):
+
+    device = qkv.device
+    req_length = torch.tensor(req_length).to(device)
+    batch_size = req_length.size(0)
+
+    # rand a ratio
+    rand_factors = torch.rand(batch_size, device=device)
+    q_length = (rand_factors * req_length).long() + 1
+    q_length = torch.min(q_length, req_length)
+
+    # ensure not larger
+    req_cumsum = torch.cumsum(req_length, dim=0)
+
+    slices = []
+
+    for i in range(batch_size):
+        curr_original_end = req_cumsum[i].item()
+        curr_new_len = q_length[i].item()
+        slice_start = curr_original_end - curr_new_len
+        slice_end = curr_original_end
+        slices.append(qkv[slice_start:slice_end])
+
+    qkv_new = torch.cat(slices, dim=0)
+
+    q_cumsum = torch.cumsum(q_length, dim=0)
+
+    # add a zero
+    zero_pad = torch.tensor([0], device=device, dtype=q_cumsum.dtype)
+    q_index = torch.cat((zero_pad, q_cumsum), dim=0)
+
+    return q_index.to(torch.int32), qkv_new
+
+
 def generate_kv_block_indices(kcache, req_length: list):
 
     num_req = len(req_length)
@@ -169,6 +203,7 @@ def torch_rope_norm_blocked_prefill(
     qkv,
     cos_sin,
     num_seqlen_per_req,
+    q_index,
     kv_indices,
     is_prefill=True,
     use_qknorm=False,
@@ -177,6 +212,9 @@ def torch_rope_norm_blocked_prefill(
 ):
     """Test RoPE prefill mode with PyTorch reference implementation."""
     assert is_prefill
+    assert (
+        q_index.shape[0] == num_seqlen_per_req.shape[0] + 1
+    )  # q_index is a prefix sum of each len
     dtype = qkv.dtype
     num_kv_heads = kcache.shape[2]
     v_head_dim = vcache.shape[3]
@@ -184,8 +222,9 @@ def torch_rope_norm_blocked_prefill(
     num_q_heads = (
         qkv.shape[1] - num_kv_heads * qk_head_dim - num_kv_heads * v_head_dim
     ) // qk_head_dim
+    q_seq_lens = (q_index[1:] - q_index[:-1]).tolist()
 
-    num_rows = num_seqlen_per_req.sum().item()
+    num_rows = q_index[-1].item()
     num_req = num_seqlen_per_req.shape[0]
     q_input = qkv[:, : num_q_heads * qk_head_dim].to(torch.float32)
     k_input = qkv[
@@ -198,8 +237,11 @@ def torch_rope_norm_blocked_prefill(
     token_offset = 0
     for batch_idx in range(num_req):
         seq_len = num_seqlen_per_req[batch_idx].item()
-        cos_sin_for_tokens[token_offset : token_offset + seq_len] = cos_sin[:seq_len]
-        token_offset += seq_len
+        q_seq_len = q_seq_lens[batch_idx]
+        cos_sin_for_tokens[token_offset : token_offset + q_seq_len] = cos_sin[
+            seq_len - q_seq_len : seq_len
+        ]
+        token_offset += q_seq_len
 
     q_input = q_input.view(num_rows, num_q_heads, qk_head_dim)
     k_input = k_input.view(num_rows, num_kv_heads, qk_head_dim)
@@ -215,9 +257,11 @@ def torch_rope_norm_blocked_prefill(
     # update kvcache
     kv_block_size = kcache.shape[1]
     token_idx = 0
+    # breakpoint()
     for req_idx in range(num_req):
         seq_len = num_seqlen_per_req[req_idx].item()
-        for pos_in_seq in range(seq_len):
+        q_seq_len = q_seq_lens[req_idx]
+        for pos_in_seq in range(seq_len - q_seq_len, seq_len):
             block_idx_in_req = pos_in_seq // kv_block_size
             pos_in_block = pos_in_seq % kv_block_size
             cache_block_idx = kv_indices[req_idx, block_idx_in_req].item()
@@ -296,6 +340,7 @@ def torch_rope_norm_blocked_decode(
     qkv,
     cos_sin,
     num_seqlen_per_req,
+    q_index,
     kv_indices,
     is_prefill=False,
     use_qknorm=False,
@@ -399,18 +444,20 @@ def test_rope_norm_blocked_prefill(num_req, num_q_head_head_dim, num_kv_heads, u
         max_rope_position,
         dtype,
     )
+    q_index, qkv_new = sample_and_extract_qkv(req_length, qkv)
 
     # clone input for torch ref, incase inplace update
-    qkv_ref = qkv.clone()
+    qkv_ref = qkv_new.clone()
     kcache_ref = kcache.clone()
     vcache_ref = vcache.clone()
 
     my_out_q, my_out_k = hpc.rope_norm_blocked_kvcache(
         kcache,
         vcache,
-        qkv,
+        qkv_new,
         cos_sin,
         num_seqlen_per_req,
+        q_index,
         kv_indices,
         True,  # is_refill
         use_qknorm,
@@ -424,6 +471,7 @@ def test_rope_norm_blocked_prefill(num_req, num_q_head_head_dim, num_kv_heads, u
         qkv_ref,
         cos_sin,
         num_seqlen_per_req,
+        q_index,
         kv_indices,
         is_prefill=True,
         use_qknorm=use_qknorm,
@@ -483,6 +531,7 @@ def test_rope_norm_blocked_decode(num_req, num_q_head_head_dim, num_kv_heads, us
         qkv,
         cos_sin,
         num_seqlen_per_req,
+        num_seqlen_per_req,
         kv_indices,
         False,  # is_refill
         use_qknorm,
@@ -495,6 +544,7 @@ def test_rope_norm_blocked_decode(num_req, num_q_head_head_dim, num_kv_heads, us
         vcache_ref,
         qkv_ref,
         cos_sin,
+        num_seqlen_per_req,
         num_seqlen_per_req,
         kv_indices,
         is_prefill=False,

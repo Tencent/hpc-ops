@@ -16,9 +16,10 @@ namespace rope {
 std::tuple<torch::Tensor, torch::Tensor> rope_norm_blocked_kvcache_entry(
     torch::Tensor &kcache, torch::Tensor &vcache, const torch::Tensor &qkv,
     const torch::Tensor &cos_sin, const torch::Tensor &num_seqlen_per_req,
-    const torch::Tensor &kvcache_indices, bool is_prefill, bool use_qk_norm,
-    std::optional<torch::Tensor> q_norm_weight_opt, std::optional<torch::Tensor> k_norm_weight_opt,
-    std::optional<torch::Tensor> out_q_opt, std::optional<torch::Tensor> out_k_opt) {
+    const torch::Tensor &q_index, const torch::Tensor &kvcache_indices, bool is_prefill,
+    bool use_qk_norm, std::optional<torch::Tensor> q_norm_weight_opt,
+    std::optional<torch::Tensor> k_norm_weight_opt, std::optional<torch::Tensor> out_q_opt,
+    std::optional<torch::Tensor> out_k_opt) {
   auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
   // kcache and vcache maybe not contiguous, we access them by stride
   TORCH_CHECK(qkv.is_contiguous(), "qkv tensor must be contiguous");
@@ -76,6 +77,7 @@ std::tuple<torch::Tensor, torch::Tensor> rope_norm_blocked_kvcache_entry(
   const auto *qkv_ptr = reinterpret_cast<const T *>(qkv.const_data_ptr());
   const auto *cos_sin_ptr = cos_sin.const_data_ptr<float>();
   const auto *num_tokens_per_batch_ptr = num_seqlen_per_req.const_data_ptr<int>();
+  const auto *q_index_ptr = q_index.const_data_ptr<int>();
   const auto *kvcache_indices_ptr = kvcache_indices.const_data_ptr<int>();
   const float *q_norm_weight_ptr = nullptr;
   const float *k_norm_weight_ptr = nullptr;
@@ -90,7 +92,7 @@ std::tuple<torch::Tensor, torch::Tensor> rope_norm_blocked_kvcache_entry(
   // Launch kernel
   apply_rotary_pos_emb_blocked_kvcache_bf16_async(
       out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
-      kvcache_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
+      q_index_ptr, kvcache_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
       vcache_block_offset, num_batch, max_num_kv_block_per_batch, kv_block_size, num_rows,
       num_q_heads, num_kv_heads, qk_head_dim, v_head_dim, is_prefill, use_qk_norm, stream);
 
@@ -104,7 +106,8 @@ std::tuple<torch::Tensor, torch::Tensor> rope_norm_blocked_kvcache_entry(
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "rope_norm_blocked_kvcache(Tensor! kcache, Tensor! vcache, Tensor qkv, Tensor cos_sin, "
-      "Tensor num_seqlen_per_req, Tensor kvcache_indices, bool is_prefill, bool use_qk_norm, "
+      "Tensor num_seqlen_per_req, Tensor q_index, Tensor kvcache_indices, bool is_prefill, bool "
+      "use_qk_norm, "
       "Tensor? q_norm_weight, Tensor? k_norm_weight, Tensor? out_q=None, Tensor? out_k=None) -> "
       "(Tensor, Tensor)");
   m.impl("rope_norm_blocked_kvcache", torch::kCUDA, &hpc::rope::rope_norm_blocked_kvcache_entry);

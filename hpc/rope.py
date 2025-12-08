@@ -10,6 +10,7 @@ def rope_norm_blocked_kvcache(
     qkv: Tensor,
     cos_sin: Tensor,
     num_seqlen_per_req: Tensor,
+    q_index: Tensor,
     kvcache_indices: Tensor,
     is_prefill: bool,
     use_qk_norm: bool,
@@ -39,6 +40,9 @@ def rope_norm_blocked_kvcache(
             Dtype: float32
         num_seqlen_per_req: Sequence length for each request.
             Shape: [num_requests].
+            Dtype: int32
+        q_index: Query indices for each request.
+            Shape: [num_requests + 1].
             Dtype: int32
         kvcache_indices: Block indices in cache pool for each request.
             Shape: [num_requests, max_blocks_per_req].
@@ -82,6 +86,7 @@ def rope_norm_blocked_kvcache(
         qkv,
         cos_sin,
         num_seqlen_per_req,
+        q_index,
         kvcache_indices,
         is_prefill,
         use_qk_norm,
@@ -99,6 +104,7 @@ def rope_norm_blocked_kvcache_fake(
     qkv,
     cos_sin,
     num_seqlen_per_req,
+    q_index,
     kvcache_indices,
     is_prefill,
     use_qk_norm,

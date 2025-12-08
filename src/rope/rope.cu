@@ -61,9 +61,9 @@ template <typename DType = __nv_bfloat16, int kNumWarpsPerBlock = 4, int kNumQHe
 __global__ void apply_rotary_pos_emb_prefill_kernel(
     DType *out_q_ptr, DType *out_k_ptr, DType *kcache_ptr, DType *vcache_ptr,
     const DType *in_qkv_ptr, const float *cos_sin_ptr, const int *num_tokens_per_batch_ptr,
-    const int *kv_block_indices_ptr, const float *q_norm_weight_ptr, const float *k_norm_weight_ptr,
-    int kcache_block_offset, int vcache_block_offset, int num_batch, int max_num_kv_block_per_batch,
-    cutlass::FastDivmod kv_block_size_divider, int num_rows) {
+    const int *q_index_ptr, const int *kv_block_indices_ptr, const float *q_norm_weight_ptr,
+    const float *k_norm_weight_ptr, int kcache_block_offset, int vcache_block_offset, int num_batch,
+    int max_num_kv_block_per_batch, cutlass::FastDivmod kv_block_size_divider, int num_rows) {
   constexpr int kNumElemPerRow =
       kNumQHeads * kQKHeadDim + kNumKVHeads * kQKHeadDim + kNumKVHeads * kVHeadDim;
 
@@ -109,23 +109,17 @@ __global__ void apply_rotary_pos_emb_prefill_kernel(
   if (tid < kNumWarpsPerBlock) {
     int global_row = bid * kNumWarpsPerBlock + tid;
     if (global_row < num_rows) {
-      int cumsum = 0;
       int batch_id = 0;
       for (int i = 0; i < num_batch; ++i) {
-        if (global_row < cumsum + num_tokens_per_batch_ptr[i]) {
+        if (global_row < q_index_ptr[i + 1]) {
           batch_id = i;
           break;
         }
-        cumsum += num_tokens_per_batch_ptr[i];
       }
       batch_id_shm[tid] = batch_id;
-
       // Compute cumsum up to batch_id
-      int cumsum_before_batch = 0;
-      for (int i = 0; i < batch_id; ++i) {
-        cumsum_before_batch += num_tokens_per_batch_ptr[i];
-      }
-      token_id_in_batch_shm[tid] = global_row - cumsum_before_batch;
+      token_id_in_batch_shm[tid] =
+          global_row + num_tokens_per_batch_ptr[batch_id] - q_index_ptr[batch_id + 1];
     }
   }
 
@@ -586,7 +580,7 @@ __global__ void apply_rotary_pos_emb_decoding_kernel(
 void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
     __nv_bfloat16 *out_q_ptr, __nv_bfloat16 *out_k_ptr, __nv_bfloat16 *kcache_ptr,
     __nv_bfloat16 *vcache_ptr, const __nv_bfloat16 *in_qkv_ptr, const float *cos_sin_ptr,
-    const int *num_tokens_per_batch_ptr, const int *kv_block_indices_ptr,
+    const int *num_tokens_per_batch_ptr, const int *q_index_ptr, const int *kv_block_indices_ptr,
     const float *q_norm_weight_ptr, const float *k_norm_weight_ptr, int kcache_block_offset,
     int vcache_block_offset, int num_batch, int max_num_kv_block_per_batch, int kv_block_size,
     int num_rows, int num_q_heads, int num_kv_heads, int qk_head_dim, int v_head_dim,
@@ -610,7 +604,7 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, true>
             <<<grid, block, 0, stream>>>(
                 out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                num_tokens_per_batch_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
+                num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
                 k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
                 max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
       } else {
@@ -618,7 +612,7 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, false>
             <<<grid, block, 0, stream>>>(
                 out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                num_tokens_per_batch_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
+                num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
                 k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
                 max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
       }
@@ -665,7 +659,7 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, true>
             <<<grid, block, 0, stream>>>(
                 out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                num_tokens_per_batch_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
+                num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
                 k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
                 max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
       } else {
@@ -673,7 +667,7 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, false>
             <<<grid, block, 0, stream>>>(
                 out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                num_tokens_per_batch_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
+                num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
                 k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
                 max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
       }
@@ -720,7 +714,7 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, true>
             <<<grid, block, 0, stream>>>(
                 out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                num_tokens_per_batch_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
+                num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
                 k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
                 max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
       } else {
@@ -728,7 +722,7 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, false>
             <<<grid, block, 0, stream>>>(
                 out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                num_tokens_per_batch_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
+                num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
                 k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
                 max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
       }
