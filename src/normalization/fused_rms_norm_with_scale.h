@@ -15,14 +15,13 @@
 
 namespace hpc {
 namespace normalization {
-namespace fused_rms_norm_with_scale {
 
-bool fused_rms_norm_with_scale_async(void* input_ptr, void* weight_ptr, void* output_ptr,
-                                     void* output_fp32_ptr, void* output_fp8_scale2_ptr,
-                                     void* scale, float eps, int batch_size, int hidden_state,
-                                     bool is_moe, cudaStream_t stream);
+bool fused_rms_norm_with_scale_async(const void* input_ptr, const void* weight_ptr,
+                                     void* output_ptr, void* output_fp32_ptr,
+                                     void* output_fp8_scale2_ptr, const void* scale, float eps,
+                                     int batch_size, int hidden_state, bool is_moe,
+                                     cudaStream_t stream);
 
-}  // namespace fused_rms_norm_with_scale
 }  // namespace normalization
 }  // namespace hpc
 

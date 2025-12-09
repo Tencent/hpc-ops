@@ -8,14 +8,14 @@
 
 namespace hpc {
 namespace normalization {
-namespace fused_rms_norm_with_scale {
 
 namespace kernels {
 
 template <int kHiddenStates, int kWarpPerBatch, int kBatchPerBlock, bool kIsMoe>
-__global__ void fused_rms_norm_with_scale(__nv_bfloat16 *input_ptr, __nv_bfloat16 *weight_ptr,
-                                          float *output_ptr_fp32, __nv_fp8_e4m3 *output_ptr_fp8,
-                                          __nv_fp8_e4m3 *output_ptr_fp8_scale2, float *scale,
+__global__ void fused_rms_norm_with_scale(const __nv_bfloat16 *input_ptr,
+                                          const __nv_bfloat16 *weight_ptr, float *output_ptr_fp32,
+                                          __nv_fp8_e4m3 *output_ptr_fp8,
+                                          __nv_fp8_e4m3 *output_ptr_fp8_scale2, const float *scale,
                                           float eps, int batch_size) {
   constexpr int kWarpSize = 32;
   constexpr int kItemPer16B = 8;
@@ -138,37 +138,15 @@ __global__ void fused_rms_norm_with_scale(__nv_bfloat16 *input_ptr, __nv_bfloat1
 
 }  // namespace kernels
 
-#define LAUNCH_KERNELS()                                                                           \
-  {                                                                                                \
-    auto kernel =                                                                                  \
-        &kernels::fused_rms_norm_with_scale<kHiddenStates, kWarpPerBatch, kBatchPerBlock, kIsMoe>; \
-    dim3 grid((batch_size + kBatchPerBlock - 1) / kBatchPerBlock);                                 \
-    kernel<<<grid, block, 0, stream>>>(                                                            \
-        reinterpret_cast<Tin *>(input_ptr), reinterpret_cast<Tin *>(weight_ptr),                   \
-        reinterpret_cast<float *>(output_fp32_ptr), reinterpret_cast<Tout *>(output_ptr),          \
-        reinterpret_cast<Tout *>(output_fp8_scale2_ptr), reinterpret_cast<float *>(scale), eps,    \
-        batch_size);                                                                               \
-  }
-
-#define LAUNCH_KERNELS_SWITCH_OUTPUT_HIGH() \
-  {                                         \
-    if (is_moe) {                           \
-      constexpr bool kIsMoe = true;         \
-      LAUNCH_KERNELS()                      \
-    } else {                                \
-      constexpr bool kIsMoe = false;        \
-      LAUNCH_KERNELS()                      \
-    }                                       \
-  }
-
-bool fused_rms_norm_with_scale_async(void *input_ptr, void *weight_ptr, void *output_ptr,
-                                     void *output_fp32_ptr, void *output_fp8_scale2_ptr,
-                                     void *scale, float eps, int batch_size, int hidden_states,
-                                     bool is_moe, cudaStream_t stream) {
+bool fused_rms_norm_with_scale_async(const void *input_ptr, const void *weight_ptr,
+                                     void *output_ptr, void *output_fp32_ptr,
+                                     void *output_fp8_scale2_ptr, const void *scale, float eps,
+                                     int batch_size, int hidden_states, bool is_moe,
+                                     cudaStream_t stream) {
   constexpr int kWarpCount = 4;
   constexpr int kWarpSize = 32;
 
-  using Tin = __nv_bfloat16;
+  using Tin = const __nv_bfloat16;
   using Tout = __nv_fp8_e4m3;
 
   dim3 block(kWarpSize * kWarpCount);
@@ -183,16 +161,16 @@ bool fused_rms_norm_with_scale_async(void *input_ptr, void *weight_ptr, void *ou
           <<<grid, block, 0, stream>>>(
               reinterpret_cast<Tin *>(input_ptr), reinterpret_cast<Tin *>(weight_ptr),
               reinterpret_cast<float *>(output_fp32_ptr), reinterpret_cast<Tout *>(output_ptr),
-              reinterpret_cast<Tout *>(output_fp8_scale2_ptr), reinterpret_cast<float *>(scale),
-              eps, batch_size);
+              reinterpret_cast<Tout *>(output_fp8_scale2_ptr),
+              reinterpret_cast<const float *>(scale), eps, batch_size);
     } else {
       constexpr bool kIsMoe = false;
       kernels::fused_rms_norm_with_scale<kHiddenStates, kWarpPerBatch, kBatchPerBlock, kIsMoe>
           <<<grid, block, 0, stream>>>(
               reinterpret_cast<Tin *>(input_ptr), reinterpret_cast<Tin *>(weight_ptr),
               reinterpret_cast<float *>(output_fp32_ptr), reinterpret_cast<Tout *>(output_ptr),
-              reinterpret_cast<Tout *>(output_fp8_scale2_ptr), reinterpret_cast<float *>(scale),
-              eps, batch_size);
+              reinterpret_cast<Tout *>(output_fp8_scale2_ptr),
+              reinterpret_cast<const float *>(scale), eps, batch_size);
     }
   } else if (hidden_states == 4096) {
     constexpr int kHiddenStates = 4096;
@@ -205,16 +183,16 @@ bool fused_rms_norm_with_scale_async(void *input_ptr, void *weight_ptr, void *ou
           <<<grid, block, 0, stream>>>(
               reinterpret_cast<Tin *>(input_ptr), reinterpret_cast<Tin *>(weight_ptr),
               reinterpret_cast<float *>(output_fp32_ptr), reinterpret_cast<Tout *>(output_ptr),
-              reinterpret_cast<Tout *>(output_fp8_scale2_ptr), reinterpret_cast<float *>(scale),
-              eps, batch_size);
+              reinterpret_cast<Tout *>(output_fp8_scale2_ptr),
+              reinterpret_cast<const float *>(scale), eps, batch_size);
     } else {
       constexpr bool kIsMoe = false;
       kernels::fused_rms_norm_with_scale<kHiddenStates, kWarpPerBatch, kBatchPerBlock, kIsMoe>
           <<<grid, block, 0, stream>>>(
               reinterpret_cast<Tin *>(input_ptr), reinterpret_cast<Tin *>(weight_ptr),
               reinterpret_cast<float *>(output_fp32_ptr), reinterpret_cast<Tout *>(output_ptr),
-              reinterpret_cast<Tout *>(output_fp8_scale2_ptr), reinterpret_cast<float *>(scale),
-              eps, batch_size);
+              reinterpret_cast<Tout *>(output_fp8_scale2_ptr),
+              reinterpret_cast<const float *>(scale), eps, batch_size);
     }
   } else if (hidden_states == 320) {
     constexpr int kHiddenStates = 320;
@@ -227,16 +205,16 @@ bool fused_rms_norm_with_scale_async(void *input_ptr, void *weight_ptr, void *ou
           <<<grid, block, 0, stream>>>(
               reinterpret_cast<Tin *>(input_ptr), reinterpret_cast<Tin *>(weight_ptr),
               reinterpret_cast<float *>(output_fp32_ptr), reinterpret_cast<Tout *>(output_ptr),
-              reinterpret_cast<Tout *>(output_fp8_scale2_ptr), reinterpret_cast<float *>(scale),
-              eps, batch_size);
+              reinterpret_cast<Tout *>(output_fp8_scale2_ptr),
+              reinterpret_cast<const float *>(scale), eps, batch_size);
     } else {
       constexpr bool kIsMoe = false;
       kernels::fused_rms_norm_with_scale<kHiddenStates, kWarpPerBatch, kBatchPerBlock, kIsMoe>
           <<<grid, block, 0, stream>>>(
               reinterpret_cast<Tin *>(input_ptr), reinterpret_cast<Tin *>(weight_ptr),
               reinterpret_cast<float *>(output_fp32_ptr), reinterpret_cast<Tout *>(output_ptr),
-              reinterpret_cast<Tout *>(output_fp8_scale2_ptr), reinterpret_cast<float *>(scale),
-              eps, batch_size);
+              reinterpret_cast<Tout *>(output_fp8_scale2_ptr),
+              reinterpret_cast<const float *>(scale), eps, batch_size);
     }
   } else {
     std::cout << "not supported hidden_size for fused_rms_norm_with_scale_async:" << hidden_states
@@ -247,6 +225,5 @@ bool fused_rms_norm_with_scale_async(void *input_ptr, void *weight_ptr, void *ou
   return true;
 }
 
-}  // namespace fused_rms_norm_with_scale
 }  // namespace normalization
 }  // namespace hpc

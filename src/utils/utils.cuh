@@ -333,6 +333,17 @@ __device__ __forceinline__ float warp_reduce_max_down(float x) {
   return x;
 }
 
+__device__ __forceinline__ float half_warp_reduce_max_down(float x) {
+  const int width = 16;
+
+#pragma unroll
+  for (int ioffset = width / 2; ioffset >= 1; ioffset /= 2) {
+    x = fmaxf(x, __shfl_xor_sync(0xFFFFFFFF, x, ioffset, width));
+  }
+
+  return x;
+}
+
 __device__ __forceinline__ float warp_reduce_sum_xor(float x) {
 #pragma unroll
   for (int ioffset = 16; ioffset >= 1; ioffset /= 2) {
