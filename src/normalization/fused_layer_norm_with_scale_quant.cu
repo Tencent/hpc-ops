@@ -170,7 +170,6 @@ __global__ void fused_layer_norm_with_scale_quant(
     vec_t<float, kIterPerBatch> local_max;
     // kGroupSize = 128, kItemPer16B = 8, therefore each warp processes 8 * 32 / 128 = 2 consecutive
     // groups, and there are kIterPerBatch of such consecutive groups.
-    constexpr int kGroupPerWarp = kWarpSize * kItemPer16B / kGroupSize;
     constexpr int kHalfWarpSize = 16;
 
 #pragma unroll

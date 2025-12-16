@@ -17,7 +17,6 @@ __global__ void per_token_group_quant(const __nv_bfloat16 *input_ptr, __nv_fp8_e
   constexpr int kWarpSize = 32;
   constexpr int kItemPer16B = 8;
   constexpr int kReadPerIter = 2;
-  constexpr float kInvHiddenStates = 1.0f / kHiddenStates;
   constexpr int kIterPerBatch = (kHiddenStates + kWarpPerBatch * kWarpSize * kItemPer16B - 1) /
                                 (kWarpPerBatch * kWarpSize * kItemPer16B);
 
@@ -53,7 +52,6 @@ __global__ void per_token_group_quant(const __nv_bfloat16 *input_ptr, __nv_fp8_e
     vec_t<float, kIterPerBatch> local_max;
     // kGroupSize = 128, kItemPer16B = 8, therefore each warp processes 8 * 32 / 128 = 2 consecutive
     // groups, and there are kIterPerBatch of such consecutive groups.
-    constexpr int kGroupPerWarp = kWarpSize * kItemPer16B / kGroupSize;
     constexpr int kHalfWarpSize = 16;
 
 #pragma unroll
