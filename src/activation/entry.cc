@@ -5,6 +5,7 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <tuple>
 #include <vector>
 
 #include "src/activation/activation.h"
@@ -88,6 +89,42 @@ torch::Tensor entry1(const torch::Tensor &input, torch::Tensor &scale,
   return output;
 }
 
+std::tuple<torch::Tensor, torch::Tensor> act_mul_and_blockwise_quant_entry(
+    const torch::Tensor &input) {
+  auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+  std::vector<int64_t> output_shape(input.sizes().begin(), input.sizes().end());
+  output_shape[output_shape.size() - 1] /= 2;
+
+  auto output_scale_shape = output_shape;
+  output_scale_shape[output_scale_shape.size() - 1] /= 128;
+
+  auto options = input.options();
+
+  torch::Tensor output_tensor = torch::empty(output_shape, options.dtype(torch::kFloat8_e4m3fn));
+
+  std::vector<int64_t> output_scale_stride{1, output_scale_shape[0]};
+  torch::Tensor output_scale_tensor =
+      torch::empty_strided(output_scale_shape, output_scale_stride, options.dtype(torch::kFloat32));
+
+  using Tin = __nv_bfloat16;
+  using Tout = __nv_fp8_e4m3;
+
+  const auto *input_ptr = reinterpret_cast<const Tin *>(input.const_data_ptr());
+  auto *output_ptr = reinterpret_cast<Tout *>(output_tensor.mutable_data_ptr());
+  auto *output_scale_ptr = reinterpret_cast<float *>(output_scale_tensor.mutable_data_ptr());
+
+  auto input_shape = input.sizes();
+  int num_col = input_shape[input_shape.size() - 1];
+  int num_row = 1;
+  for (uint32_t i = 0; i < input_shape.size() - 1; ++i) {
+    num_row *= input_shape[i];
+  }
+
+  act_mul_and_blockwise_quant_async(output_ptr, output_scale_ptr, input_ptr, num_row, num_col,
+                                    stream);
+  return std::make_tuple(output_tensor, output_scale_tensor);
+}
 }  // namespace activation
 }  // namespace hpc
 
@@ -99,4 +136,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "masked_act_mul_and_quant(Tensor! input, Tensor! scale, Tensor! num_per_expert) -> (Tensor)");
   m.impl("masked_act_mul_and_quant", torch::kCUDA, &hpc::activation::entry1);
+  m.def("act_mul_and_blockwise_quant(Tensor input) -> (Tensor output, Tensor output_scale)");
+  m.impl("act_mul_and_blockwise_quant", torch::kCUDA,
+         &hpc::activation::act_mul_and_blockwise_quant_entry);
 }
