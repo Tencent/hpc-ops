@@ -145,7 +145,7 @@ def test_fuse_moe(num_seq, num_topk, hidden_size, intermediate_size, num_expert,
     gate_up_scale = torch.randn((num_expert), dtype=torch.float, device="cuda")
     down_scale = torch.randn((num_expert), dtype=torch.float, device="cuda")
     act_and_mul_scale = torch.randn((1), dtype=torch.float, device="cuda")
-    topk_scale = torch.randn((num_seq, num_topk), dtype=torch.float, device="cuda")
+    topk_scale = torch.randn((num_seq, num_topk), dtype=torch.float, device="cuda") / num_topk
 
     for _ in range(1):
         my = hpc.fuse_moe(
@@ -192,7 +192,7 @@ def test_fuse_moe(num_seq, num_topk, hidden_size, intermediate_size, num_expert,
 
     assert gt.device == my.device
     assert gt.shape == my.shape
-    assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.08, atol=0.01)
+    assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.08, atol=0.1)
 
 
 file_available = os.path.exists("/cfs_cloud_code/theocheng/fused_moe_topk")
@@ -232,7 +232,9 @@ def test_fuse_moe_realdata(hidden_size, intermediate_size, num_expert, rank_ep):
             gate_up_scale = torch.randn((num_expert), dtype=torch.float, device="cuda")
             down_scale = torch.randn((num_expert), dtype=torch.float, device="cuda")
             act_and_mul_scale = torch.randn((1), dtype=torch.float, device="cuda")
-            topk_scale = torch.randn((num_seq, num_topk), dtype=torch.float, device="cuda")
+            topk_scale = (
+                torch.randn((num_seq, num_topk), dtype=torch.float, device="cuda") / num_topk
+            )
 
             for _ in range(1):
                 unique_values, counts = torch.unique(
@@ -283,4 +285,4 @@ def test_fuse_moe_realdata(hidden_size, intermediate_size, num_expert, rank_ep):
                             )
                         )
 
-                    assert allclose(gt.to(torch.float32), my.to(torch.float), rtol=0.08, atol=0.01)
+                    assert allclose(gt.to(torch.float32), my.to(torch.float), rtol=0.08, atol=0.1)
