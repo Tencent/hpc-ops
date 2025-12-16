@@ -27,10 +27,11 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
   using T2 = __nv_fp8_e4m3;
 
   // 0. call count_and_gather_async
-  count_and_gather_async(gate_up_input_ptr, gate_up_output_ptr, input_ptr, topk_ids_ptr,
-                         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, tiles_ptr,
-                         cu_tiles_ptr, num_seq, hidden_size, intermediate_size, num_topk,
-                         num_expert_local, rank_ep, num_seq_per_group_avg, stream);
+  count_and_gather_async(gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr,
+                         input_ptr, topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr,
+                         gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr, cu_tiles_ptr, num_seq,
+                         hidden_size, intermediate_size, num_topk, num_expert_local, rank_ep,
+                         num_seq_per_group_avg, stream);
 
   // 1. call gate_up linear
   group_gemm::group_gemm_fp8_async(
@@ -46,7 +47,7 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
   group_gemm::group_gemm_fp8_async(down_output_ptr, down_input_ptr, down_weight_ptr, seqlens_ptr,
                                    cu_seqlens_ptr, down_scale_ptr, down_tmas_ptr, tiles_ptr,
                                    cu_tiles_ptr, num_expert_local, total_num_seq, hidden_size,
-                                   intermediate_size / 2, num_seq_per_group_avg, true, stream);
+                                   intermediate_size / 2, num_seq_per_group_avg, false, stream);
 
   // 4. call reduce //delete total_num_seq
   reduce_async(output_ptr, down_output_ptr, topk_pos_ptr, topk_scale_ptr, total_num_seq, num_seq,

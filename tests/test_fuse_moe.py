@@ -122,8 +122,8 @@ def naive_fuse_moe(
 
 @pytest.mark.parametrize("num_seq", [8, 128, 300])
 @pytest.mark.parametrize("num_topk", [8])
-@pytest.mark.parametrize("hidden_size", [4096])
-@pytest.mark.parametrize("intermediate_size", [4096])
+@pytest.mark.parametrize("hidden_size", [4096, 512, 1024])
+@pytest.mark.parametrize("intermediate_size", [4096, 512, 1024])
 @pytest.mark.parametrize("num_expert", [128])
 @pytest.mark.parametrize("rank_ep", [0])
 def test_fuse_moe(num_seq, num_topk, hidden_size, intermediate_size, num_expert, rank_ep):

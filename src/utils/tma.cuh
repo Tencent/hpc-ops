@@ -33,7 +33,7 @@ __device__ __forceinline__ void tma_descriptor_replace_shapes_in_shared_mem(
 #endif
 }
 
-template <typename Tma, typename GTensor, bool kUpdateStride = true>
+template <typename Tma, typename GTensor, bool kUpdateShape = true>
 __device__ __forceinline__ void update_tma_gtensor(cute::TmaDescriptor &smem_tma_desc,
                                                    const GTensor &gtensor) {
   cute::array<uint32_t, 5> shape{1, 1, 1, 1, 1};
@@ -44,7 +44,7 @@ __device__ __forceinline__ void update_tma_gtensor(cute::TmaDescriptor &smem_tma
   const void *gmem_ptr = gtensor.data().get();
   cute::tma_descriptor_replace_addr_in_shared_mem(smem_tma_desc, gmem_ptr);
 
-  if constexpr (kUpdateStride) {
+  if constexpr (kUpdateShape) {
     tma_descriptor_replace_shapes_in_shared_mem(smem_tma_desc, shape);
   } else {
     // update stride to byte representation
