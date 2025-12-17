@@ -142,7 +142,7 @@ def test_masked_act_mul_and_quant(num_expert, num_max_tokens_per_expert, num_int
         (num_tokens, num_intermediate_size * 2), dtype=torch.bfloat16, device="cuda"
     )
 
-    scale = torch.randn((1, num_intermediate_size), dtype=torch.bfloat16, device="cuda")
+    scale = torch.randn((1,), dtype=torch.float32, device="cuda")
 
     num_per_expert = torch.tensor(
         [

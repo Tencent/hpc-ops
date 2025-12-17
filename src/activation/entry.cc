@@ -60,6 +60,9 @@ torch::Tensor entry1(const torch::Tensor &input, torch::Tensor &scale,
   TORCH_CHECK(scale.device().is_cuda(), "scale tensor's device must be cuda");
   TORCH_CHECK(num_per_expert.device().is_cuda(), "num_per_expert tensor's device must be cuda");
 
+  TORCH_CHECK(input.size(-1) % 8 == 0, "hidden dim must be divided by 8")
+  TORCH_CHECK(scale.numel() == 1, "only support per tensor qunat")
+
   std::vector<int64_t> output_shape(input.sizes().begin(), input.sizes().end());
   output_shape[output_shape.size() - 1] /= 2;
 
@@ -71,7 +74,7 @@ torch::Tensor entry1(const torch::Tensor &input, torch::Tensor &scale,
   using Tout = __nv_fp8_e4m3;
 
   const auto *input_ptr = reinterpret_cast<const Tin *>(input.const_data_ptr());
-  const auto *scale_ptr = reinterpret_cast<const Tin *>(scale.const_data_ptr());
+  const auto *scale_ptr = reinterpret_cast<const float *>(scale.const_data_ptr());
   auto *output_ptr = reinterpret_cast<Tout *>(output.data_ptr());
 
   const auto *num_per_expert_ptr = num_per_expert.const_data_ptr<int>();
@@ -133,8 +136,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "act_mul_and_quant(Tensor input, Tensor scale, bool use_bf16_mul, Tensor? output) -> "
       "(Tensor)");
   m.impl("act_mul_and_quant", torch::kCUDA, &hpc::activation::entry);
-  m.def(
-      "masked_act_mul_and_quant(Tensor! input, Tensor! scale, Tensor! num_per_expert) -> (Tensor)");
+  m.def("masked_act_mul_and_quant(Tensor input, Tensor scale, Tensor num_per_expert) -> (Tensor)");
   m.impl("masked_act_mul_and_quant", torch::kCUDA, &hpc::activation::entry1);
   m.def("act_mul_and_blockwise_quant(Tensor input) -> (Tensor output, Tensor output_scale)");
   m.impl("act_mul_and_blockwise_quant", torch::kCUDA,

@@ -60,7 +60,7 @@ __global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr, const __nv_bflo
 
 // input : gate + up
 __global__ void masked_act_mul_and_quant_kernel(
-    __nv_fp8_e4m3 *output_ptr, const __nv_bfloat16 *input_ptr, const __nv_bfloat16 *scale_ptr,
+    __nv_fp8_e4m3 *output_ptr, const __nv_bfloat16 *input_ptr, const float *scale_ptr,
     const int *num_per_expert_ptr, int num_total_tokens, int num_intermediate_size,
     int num_tokens_per_expert, cutlass::FastDivmod Block2YX, cutlass::FastDivmod Row2EandT,
     int num_block_row) {
@@ -70,6 +70,8 @@ __global__ void masked_act_mul_and_quant_kernel(
   int iblocky;
 
   Block2YX(iblocky, iblockx, blockIdx.x);
+
+  float scale = scale_ptr[0];
 
 #pragma unroll 1
   for (int irow0 = iblocky * kRows; irow0 < num_total_tokens; irow0 += num_block_row * kRows) {
@@ -90,19 +92,17 @@ __global__ void masked_act_mul_and_quant_kernel(
 
       const auto *gate_row_ptr = input_ptr + irow * (num_intermediate_size * 2);
       const auto *up_row_ptr = gate_row_ptr + num_intermediate_size;
-      const auto *scale_row_ptr = scale_ptr;
       auto *output_row_ptr = output_ptr + irow * num_intermediate_size;
 
       int icol = it * 8;
       if (icol < num_intermediate_size) {
         auto gate = to<float>(load<__nv_bfloat162, 4>(gate_row_ptr + icol));
         auto up = to<float>(load<__nv_bfloat162, 4>(up_row_ptr + icol));
-        auto scale = to<float>(load<__nv_bfloat162, 4>(scale_row_ptr + icol));
         decltype(gate) out;
 
 #pragma unroll
         for (int i = 0; i < decltype(gate)::kNum; ++i) {
-          out[i] = silu(gate[i]) * up[i] * scale[i];
+          out[i] = silu(gate[i]) * up[i] * scale;
         }
 
         auto out_fp8 = to<__nv_fp8x4_e4m3>(out);
@@ -198,7 +198,7 @@ void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_u
 }
 
 void masked_act_mul_and_quant_async(__nv_fp8_e4m3 *output_ptr, const __nv_bfloat16 *input_ptr,
-                                    const __nv_bfloat16 *scale_ptr, const int *num_per_expert_ptr,
+                                    const float *scale_ptr, const int *num_per_expert_ptr,
                                     int num_total_tokens, int num_intermediate_size,
                                     int num_tokens_per_expert, cudaStream_t stream) {
   dim3 block(256);

@@ -16,7 +16,7 @@ void act_mul_and_quant_async(__nv_fp8_e4m3 *y_ptr, const __nv_bfloat16 *x_ptr,
                              bool use_bf16_mul, cudaStream_t stream);
 
 void masked_act_mul_and_quant_async(__nv_fp8_e4m3 *output_ptr, const __nv_bfloat16 *input_ptr,
-                                    const __nv_bfloat16 *scale_ptr, const int *num_per_expert_ptr,
+                                    const float *scale_ptr, const int *num_per_expert_ptr,
                                     int num_total_tokens, int num_intermediate_size,
                                     int num_tokens_per_expert, cudaStream_t stream);
 

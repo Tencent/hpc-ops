@@ -46,11 +46,14 @@ def masked_act_mul_and_quant(gate_up: Tensor, scale: Tensor, num_per_expert: Ten
 
     Args:
       gate_up: Concatenated gate and up projections.
-          Shape: [N, 2*C] (N = batch size, C = hidden dimension)
+          Shape: [N, 2*C] (N = num_expert * num_token_padded_per_expert, C = hidden dimension)
           Dtype: bfloat16
       scale: Quantization scale factor.
           Only the first tensor element is used.
           Dtype: float32
+      num_per_expert: Real num tokens of per expert
+          Shape: [num_expert, ]
+          Dtype: int32
 
     Returns:
       Quantized output tensor.
