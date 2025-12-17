@@ -32,9 +32,13 @@ __global__ void hasnan_kernel(const void *ptr, int64_t num, vec_t<char, kPrintLi
     } else if constexpr (std::is_same_v<T, __half>) {
       yes = __hisnan(v);
     } else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-      yes = *(reinterpret_cast<uint8_t *>(&v)) == uint8_t(0x7F);
+      bool yes_1 = *(reinterpret_cast<uint8_t *>(&v)) == uint8_t(0x7F);
+      bool yes_2 = *(reinterpret_cast<uint8_t *>(&v)) == uint8_t(0xFF);
+      yes = yes_1 | yes_2;
     } else if constexpr (std::is_same_v<T, __nv_fp8_e5m2>) {
-      yes = *(reinterpret_cast<uint8_t *>(&v)) == uint8_t(0x7F);
+      bool yes_1 = *(reinterpret_cast<uint8_t *>(&v)) == uint8_t(0x7F);
+      bool yes_2 = *(reinterpret_cast<uint8_t *>(&v)) == uint8_t(0xFF);
+      yes = yes_1 | yes_2;
     } else if constexpr (std::is_same_v<T, uint8_t>) {
       yes = *(reinterpret_cast<uint8_t *>(&v)) == uint8_t(0x80);
     } else if constexpr (std::is_same_v<T, __nv_fp8_e8m0>) {

@@ -1,14 +1,16 @@
-import sys
 import os
+import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
 
-import hpc
-import torch
 import random
 import string
+
 import pytest
+import torch
+
+import hpc
 
 
 def generate_random_string(n):
@@ -33,8 +35,16 @@ def generate_random_string(n):
 @pytest.mark.parametrize("tensor_size", [1, 2 * 1024 * 1024])
 def test_has_nan(capfd, dtype, tag_length, tensor_size):
     a = torch.tensor([float("nan")] * tensor_size, dtype=dtype, device="cuda")
+    b = torch.tensor([float("-nan")] * tensor_size, dtype=dtype, device="cuda")
     tag = generate_random_string(tag_length)
-    hpc.has_nan(a, tag)
+
+    hpc.has_nan(a, "+" + str(a.dtype)[6:])
+    torch.cuda.synchronize()
+    out, _ = capfd.readouterr()
+    assert len(out) > 0
+    print(out)
+
+    hpc.has_nan(b, "-" + str(b.dtype)[6:])
     torch.cuda.synchronize()
     out, _ = capfd.readouterr()
     assert len(out) > 0
