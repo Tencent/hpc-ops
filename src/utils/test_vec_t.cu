@@ -75,7 +75,7 @@ __global__ void reshape2(float *output, const float *input) {
 }  // namespace hpc
 
 int main() {
-  float *ptr;
+  float *ptr = nullptr;
   hpc::reshape2<<<1, 1>>>(ptr, ptr);
 
   cudaDeviceSynchronize();

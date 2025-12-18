@@ -384,7 +384,7 @@ __device__ __forceinline__ float warp_8lane_stride4_reduce_sum_xor(float x) {
 }
 
 // ============================
-//    Fragment Retile
+//      Attention Utility
 // ============================
 
 template <typename Tensor>
@@ -405,6 +405,87 @@ __device__ __forceinline__ constexpr auto retile_fragment(Tensor &&tensor) {
       make_stride(get<0>(thr_vmk.stride()), get<2>(thr_vmk.stride()), get<1>(tile_mk.stride()))));
 
   return make_tensor(static_cast<Tensor &&>(tensor).data(), make_layout(m_layout, k_layout));
+}
+
+// STensor shape is (M, N) and row major
+// Dtensor shape is (M, N) and column major
+template <typename STensor, typename DTensor>
+__device__ __forceinline__ constexpr void smem_trans_and_interleave0189_mn_mn(const STensor &sV,
+                                                                              DTensor &&sVt,
+                                                                              int ilane) {
+  using namespace cute;  // NOLINT
+  using T = typename STensor::value_type;
+  using Layout = typename STensor::layout_type;
+
+  static_assert(sizeof(T) == 1, "sV T must be 1 byte dtype");
+  static_assert(STensor::rank == 2, "sV rank support rank 2");
+  constexpr int kM = shape<0>(Layout{});
+  constexpr int kN = shape<1>(Layout{});
+
+  static_assert(((kM == 16) && (kN == 32)) || ((kM == 32) && (kN == 16)),
+                "sV shape must be 16x32 or 32x16");
+
+  auto tile = make_tile(Int<8>{}, Int<16>{});
+  auto vtile = make_tile(Int<16>{}, Int<16>{});
+  auto sV_tile = flat_divide(sV, tile);
+  auto sVt_tile = flat_divide(sVt, vtile);
+
+  auto m = size<2>(sV_tile);
+  auto n = size<3>(sV_tile);
+
+  auto mt = size<2>(sVt_tile);
+  auto nt = size<3>(sVt_tile);
+
+  auto s2r_tiled_copy =
+      make_tiled_copy(Copy_Atom<SM75_U16x8_LDSM_T, T>{},
+                      make_layout(make_shape(Int<4>{}, Int<8>{}, Int<1>{}, Int<1>{}),
+                                  make_stride(Int<1>{}, Int<4>{}, Int<0>{}, Int<0>{})),
+                      make_layout(make_shape(Int<2>{}, Int<2>{}, m, n),
+                                  make_stride(Int<2>{}, Int<1>{}, Int<4>{}, Int<4>{} * m)));
+
+  auto r2s_tiled_copy =
+      make_tiled_copy(Copy_Atom<SM90_U32x4_STSM_N, T>{},
+                      make_layout(make_shape(Int<4>{}, Int<8>{}, Int<1>{}, Int<1>{}),
+                                  make_stride(Int<1>{}, Int<4>{}, Int<0>{}, Int<0>{})),
+                      make_layout(make_shape(Int<4>{}, Int<2>{}, mt, nt),
+                                  make_stride(Int<1>{}, Int<4>{}, Int<8>{}, Int<8>{})));
+
+  auto s2r_thr_copy = s2r_tiled_copy.get_slice(ilane);
+  auto tVs4r = s2r_thr_copy.partition_S(sV_tile);
+  auto tVr4s = make_fragment_like(s2r_thr_copy.partition_D(sV_tile));
+  auto v = recast<uint32_t>(coalesce(tVr4s));
+
+  auto r2s_thr_copy = r2s_tiled_copy.get_slice(ilane);
+  auto tVtr4s = make_fragment_like(r2s_thr_copy.partition_S(sVt_tile));
+  auto tVts4r = r2s_thr_copy.partition_D(sVt_tile);
+  auto vt = recast<uint32_t>(coalesce(tVtr4s));
+
+  cute::copy(s2r_tiled_copy, tVs4r, tVr4s);
+
+  vt(0) = __byte_perm(v(0), v(1), 0x6420);
+  vt(1) = __byte_perm(v(0), v(1), 0x7531);
+
+  vt(2) = __byte_perm(v(2), v(3), 0x6420);
+  vt(3) = __byte_perm(v(2), v(3), 0x7531);
+
+  cute::copy(r2s_tiled_copy, tVtr4s, tVts4r);
+}
+
+template <typename STensor, typename DTensor>
+__device__ __forceinline__ constexpr void smem_trans_and_interleave0189_mn_nm(const STensor &sV,
+                                                                              DTensor &&sVtp,
+                                                                              int ilane) {
+  auto sVt = make_tensor(sVtp.data(), cute::select<1, 0>(sVtp.layout()));
+  smem_trans_and_interleave0189_mn_mn(sV, sVt, ilane);
+}
+
+template <typename STensor, typename DTensor>
+__device__ __forceinline__ constexpr void smem_trans_and_interleave0189_nm_nm(const STensor &sVp,
+                                                                              DTensor &&sVtp,
+                                                                              int ilane) {
+  auto sV = make_tensor(sVp.data(), cute::select<1, 0>(sVp.layout()));
+  auto sVt = make_tensor(sVtp.data(), cute::select<1, 0>(sVtp.layout()));
+  smem_trans_and_interleave0189_mn_mn(sV, sVt, ilane);
 }
 
 // ============================
