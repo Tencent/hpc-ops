@@ -288,7 +288,7 @@ finally:
           #!/bin/bash
           set -xe
 
-          workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}
+          workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
           sudo rm -rf $workpath
 
 notices:
