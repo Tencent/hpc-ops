@@ -8,6 +8,7 @@
 
 #include "cute/tensor.hpp"
 #include "src/attention/decode/smallm_dim128.h"
+#include "src/attention/decode/smallm_splitk_combine_kernels.cuh"
 #include "src/attention/decode/smallm_splitk_kernels.cuh"
 
 namespace hpc {
@@ -131,6 +132,7 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
   constexpr int kTileN = 8;
   constexpr int kTileK = 128;
   constexpr int kTileV = 128;
+  constexpr int kConsumers = 1;
 
   if (num_dim_qk != kTileK || num_dim_v != kTileV || (block_size != 32 && block_size != 64) ||
       (splitk != 4 && splitk != 16)) {
@@ -168,7 +170,7 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
       dim3 grid(num_batch);
       dim3 block(32 * num_head_q);
       kernels::attention_decode_bf16_smallm_splitk_combine_kernel<Tout, kTileM, kTileV, kSplitK,
-                                                                  kSplitMinLen>
+                                                                  kSplitMinLen, kConsumers>
           <<<grid, block, 0, stream>>>(reinterpret_cast<Tout *>(y_ptr),
                                        reinterpret_cast<const float *>(splitk_out_ptr),
                                        reinterpret_cast<const float *>(lse_ptr),
@@ -200,7 +202,7 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
       dim3 grid(num_batch);
       dim3 block(32 * num_head_q);
       kernels::attention_decode_bf16_smallm_splitk_combine_kernel<Tout, kTileM, kTileV, kSplitK,
-                                                                  kSplitMinLen>
+                                                                  kSplitMinLen, kConsumers>
           <<<grid, block, 0, stream>>>(reinterpret_cast<Tout *>(y_ptr),
                                        reinterpret_cast<const float *>(splitk_out_ptr),
                                        reinterpret_cast<const float *>(lse_ptr),

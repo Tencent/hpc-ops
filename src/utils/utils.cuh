@@ -540,6 +540,16 @@ __device__ __forceinline__ void wait_signal_acquire(uint32_t *addr) {
 }
 
 // ================================
+//    Memory-order-aware LD/ST Primitives
+// ================================
+
+__device__ int __forceinline__ load_global_volatile(int *ptr) {
+  int val;
+  asm volatile("ld.volatile.global.s32 {%0}, [%1];\n" : "=r"(val) : "l"(ptr));
+  return val;
+}
+
+// ================================
 //    Synchronization Primitives
 // ================================
 

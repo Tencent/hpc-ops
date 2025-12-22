@@ -1,0 +1,232 @@
+import sys
+import os
+import pytest
+from pathlib import Path
+
+sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
+
+import hpc
+import torch
+import math
+import torch.nn.functional as F
+
+
+def naive_attn_with_paged_kvcache_func(
+    Q,
+    K,
+    V,
+    kvcache,
+    block_ids,
+    nblocks,
+    seqlenq,
+    cu_seqlenq,
+    num_seq_kvcache,
+    QS,
+    KS,
+    VS,
+):
+
+    num_batch = seqlenq.shape[0]
+    num_head_q = Q.shape[1]
+    num_head_kv = K.shape[1]
+    head_dim = K.shape[2]
+    block_size = kvcache.shape[2]
+    head_per_group = num_head_q // num_head_kv
+    Q = Q.reshape(num_batch, -1, num_head_q, head_dim)
+    output = torch.empty_like(Q, dtype=torch.bfloat16)
+    for bi in range(num_batch):
+        BQ = Q[bi].transpose(0, 1).float()  # [num_heads, sq, head_dim]
+        blk_ids = block_ids[bi, : nblocks[bi]]
+        seqlen = seqlenq[bi] + num_seq_kvcache[bi]
+        BK = (
+            kvcache[blk_ids, 0, :, :, :]
+            .reshape(-1, num_head_kv, head_dim)
+            .transpose(0, 1)[:, :seqlen, :]
+            .repeat_interleave(head_per_group, dim=0)
+        ).float()
+        BV = (
+            kvcache[blk_ids, 1, :, :, :]
+            .reshape(-1, num_head_kv, head_dim)
+            .transpose(0, 1)[:, :seqlen, :]
+            .repeat_interleave(head_per_group, dim=0)
+        ).float()
+
+        P = BQ @ BK.transpose(-1, -2)
+
+        P = P / math.sqrt(head_dim) * QS[bi][:, None, None] * KS
+        causal_mask = torch.ones(
+            seqlenq[bi], seqlen - seqlenq[bi], device=Q.device, dtype=torch.bool
+        )
+        tail_causal_mask = torch.tril(
+            torch.ones(seqlenq[bi], seqlenq[bi], device=Q.device, dtype=torch.bool)
+        )
+        causal_mask = torch.cat([causal_mask, tail_causal_mask], dim=-1).unsqueeze(0)
+
+        P = P.masked_fill(~causal_mask, float("-inf"))
+        attn_weights = F.softmax(P, dim=-1)
+
+        # attn_weights = P
+        Y = torch.matmul(attn_weights, BV) * VS
+        output[bi] = Y.transpose(0, 1)
+
+    return output.reshape(-1, num_head_q, head_dim)
+
+
+try:
+    # fa2
+    # from flash_attn.flash_attn_interface import flash_attn_with_kvcache
+    # fa3
+    from flash_attn_interface import flash_attn_with_kvcache
+
+    # gt_attention_func = flash_attn_with_kvcache_func
+    gt_attention_func = naive_attn_with_paged_kvcache_func
+except Exception as e:
+    print(f"execute naive_attn_func: {e}")
+    gt_attention_func = naive_attn_with_paged_kvcache_func
+
+
+@pytest.mark.parametrize("num_batch", [1, 16, 128])
+@pytest.mark.parametrize("num_seq_q", [1])
+@pytest.mark.parametrize("max_seq_kv", [2048, 4096])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("num_head_q", [4])
+@pytest.mark.parametrize("num_head_kv", [1])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("new_kv_included", [True])
+@pytest.mark.parametrize("use_output", [False])
+@pytest.mark.parametrize("splitk", [True])
+def test_attention_decode_fp8(
+    num_batch,
+    num_seq_q,
+    max_seq_kv,
+    block_size,
+    num_head_q,
+    num_head_kv,
+    head_dim,
+    new_kv_included,
+    use_output,
+    splitk,
+):
+    torch.manual_seed(10086)
+    torch.cuda.manual_seed(10086)
+    num_dim_qk = head_dim
+    num_dim_v = head_dim
+    max_num_blocks = int(num_batch * max_seq_kv // block_size * 1.2)
+
+    T = torch.float8_e4m3fn
+
+    Q = torch.randn(
+        (num_batch * num_seq_q, num_head_q, num_dim_qk), dtype=torch.bfloat16, device="cuda"
+    ) / math.sqrt(num_dim_qk)
+    QS = Q.float().abs().max(-1)[0] / 10
+    Q = (Q / QS[:, :, None]).to(T)
+    K = (
+        torch.randn(
+            (num_batch * num_seq_q, num_head_kv, num_dim_qk), dtype=torch.bfloat16, device="cuda"
+        )
+        / math.sqrt(num_dim_qk)
+    ).to(T)
+    V = torch.randn(
+        (num_batch * num_seq_q, num_head_kv, num_dim_v), dtype=torch.bfloat16, device="cuda"
+    ).to(T)
+
+    KS = torch.randn((1), dtype=torch.float32, device="cuda")
+    VS = torch.randn((1), dtype=torch.float32, device="cuda")
+
+    print(QS * KS)
+
+    num_seq_kvcache = torch.randint(1, max_seq_kv, (num_batch,), dtype=torch.int32, device="cuda")
+
+    print(num_seq_kvcache)
+
+    nblocks = (num_seq_kvcache + num_seq_q + block_size - 1) // block_size
+    total_blocks = sum(nblocks)
+    kvcache = torch.randn(
+        max_num_blocks, 2, block_size, num_head_kv, num_dim_qk, dtype=torch.bfloat16, device="cuda"
+    ).to(T)
+    packed_block_ids = torch.randperm(max_num_blocks)[:total_blocks].to(torch.int32).cuda()
+
+    max_num_block2 = max(nblocks)
+    block_ids = torch.empty(num_batch, max_num_block2, dtype=torch.int32, device="cuda")
+    seqlenq = torch.tensor([num_seq_q] * num_batch, dtype=torch.int32, device="cuda")
+    cu_seqlenq = torch.cumsum(seqlenq, dtype=torch.int32, dim=0)
+
+    cu_blocks = 0
+    for i in range(num_batch):
+        block_ids[i, : nblocks[i]] = packed_block_ids[cu_blocks : cu_blocks + nblocks[i]]
+        cu_blocks += nblocks[i]
+        for sqi in range(seqlenq[i]):
+            si = sqi + num_seq_kvcache[i]
+            blk_id = si // block_size
+            slot_id = si % block_size
+            kvcache[block_ids[i, blk_id], 0, slot_id] = K.reshape(
+                num_batch, num_seq_q, num_head_kv, num_dim_qk
+            )[i, sqi]
+            kvcache[block_ids[i, blk_id], 1, slot_id] = V.reshape(
+                num_batch, num_seq_q, num_head_kv, num_dim_qk
+            )[i, sqi]
+
+    gt = gt_attention_func(
+        Q,
+        K,
+        V,
+        kvcache,
+        block_ids,
+        nblocks,
+        seqlenq,
+        cu_seqlenq,
+        num_seq_kvcache,
+        QS,
+        KS,
+        VS,
+    )
+
+    if use_output:
+        my = torch.empty_like(Q, dtype=torch.bfloat16)
+        hpc.attention_decode_fp8(
+            Q,
+            kvcache[:, 0, :, :, :],
+            kvcache[:, 1, :, :, :],
+            block_ids,
+            num_seq_kvcache + 1 if new_kv_included else num_seq_kvcache,
+            QS,
+            KS,
+            VS,
+            new_kv_included=new_kv_included,
+            splitk=splitk,
+            output=my,
+        )
+    else:
+        for i in range(1):
+            my = hpc.attention_decode_fp8(
+                Q,
+                kvcache[:, 0, :, :, :],
+                kvcache[:, 1, :, :, :],
+                block_ids,
+                num_seq_kvcache + 1 if new_kv_included else num_seq_kvcache,
+                QS,
+                KS,
+                VS,
+                new_kv_included=new_kv_included,
+                splitk=splitk,
+            )
+
+    print("\ngt\n")
+    print(gt[0, :, :])
+    print("\nmy\n")
+    print(my[0, :, :])
+
+    abs_diff = torch.abs(gt - my)
+    vals, idxs = torch.topk(abs_diff.flatten(), 10)
+    idxs = [torch.unravel_index(idx, gt.shape) for idx in idxs]
+
+    for i, idx in enumerate(idxs):
+        cpu_idx = tuple(tensor.cpu().item() for tensor in idx)
+        print(
+            "{:+.4f} vs {:+.4f} with diff = {:.4f}, @ {}".format(gt[idx], my[idx], vals[i], cpu_idx)
+        )
+
+    assert torch.allclose(my, gt, atol=0.0156)
+    assert gt.device == my.device
+    assert gt.dtype == my.dtype
+    assert gt.shape == my.shape
