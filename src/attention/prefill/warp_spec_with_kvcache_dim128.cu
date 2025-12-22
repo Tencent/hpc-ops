@@ -59,7 +59,7 @@ void launch_warp_spec_with_kvcache_dim128(
         *tma_q.get_tma_descriptor(),
         *tma_y.get_tma_descriptor(),
     };
-    kernels::update_batched_tma_with_kvcache<Tin, decltype(tma_q), decltype(tma_y)>
+    kernels::update_batched_tma_with_kvcache<Tin, Tout, decltype(tma_q), decltype(tma_y)>
         <<<num_batch, 32, 0, stream>>>(td_qy, tma_qy, (const Tin *)q_ptr, (const Tout *)y_ptr,
                                        (const int *)cu_seqlens_q_ptr, num_batch, max_seq_q,
                                        num_dim_qk, num_dim_v, num_head_q, ldQ, ldY);
