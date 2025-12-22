@@ -557,3 +557,197 @@ def test_rope_norm_blocked_decode(num_req, num_q_head_head_dim, num_kv_heads, us
     assert allclose(torch_out_q, my_out_q, atol=5e-2)
     assert allclose(torch_kcache, kcache, atol=5e-2)
     assert allclose(torch_vcache, vcache, atol=5e-2)
+
+
+@pytest.mark.parametrize("num_req", [7])
+@pytest.mark.parametrize("num_q_head_head_dim", [(4, 128)])
+@pytest.mark.parametrize("num_kv_heads", [1])
+@pytest.mark.parametrize("use_qknorm", [True])
+def test_rope_norm_blocked_prefill_fp8(num_req, num_q_head_head_dim, num_kv_heads, use_qknorm):
+    req_length = torch.randint(20, 200, (num_req,)).tolist()
+    num_q_heads = num_q_head_head_dim[0]
+    qk_head_dim = num_q_head_head_dim[1]
+    v_head_dim = num_q_head_head_dim[1]
+    kv_block_size = 64
+    max_num_kv_blocks = 1024
+    max_rope_position = 2048
+    dtype = torch.bfloat16
+    (
+        qkv,
+        num_seqlen_per_req,
+        cos_sin,
+        kcache,
+        vcache,
+        kv_indices,
+        q_norm_weight,
+        k_norm_weight,
+    ) = prepare_prefill_input(
+        num_req,
+        req_length,
+        num_q_heads,
+        num_kv_heads,
+        qk_head_dim,
+        v_head_dim,
+        kv_block_size,
+        max_num_kv_blocks,
+        max_rope_position,
+        dtype,
+    )
+    q_index, qkv_new = sample_and_extract_qkv(req_length, qkv)
+
+    # clone input for torch ref, incase inplace update
+    qkv_ref = qkv_new.clone()
+    kcache_ref = kcache.clone()
+    vcache_ref = vcache.clone()
+
+    k_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv_new.device)
+    v_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv_new.device)
+    kcache_fp8 = kcache.to(torch.float8_e4m3fn)
+    vcache_fp8 = vcache.to(torch.float8_e4m3fn)
+
+    seqlens = q_index[1:] - q_index[:-1]
+    max_seqlens = seqlens.max().item()
+
+    q_fp8, k_fp8, qk_scale, split_k_flag, out_attention, tma_tensor = (
+        hpc.rope_norm_blocked_kvcache_w8c8_dqskv(
+            key_cache=kcache_fp8,
+            value_cache=vcache_fp8,
+            qkv=qkv_new,
+            cos_sin=cos_sin,
+            num_seqlen_per_req=num_seqlen_per_req,
+            q_index=q_index,
+            kvcache_indices=kv_indices,
+            is_prefill=True,  # is_refill
+            use_qk_norm=use_qknorm,
+            max_seqlens=max_seqlens,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            q_norm_weight=q_norm_weight,
+            k_norm_weight=k_norm_weight,
+        )
+    )
+
+    # convert q_scale to original format
+    num_seq = seqlens.shape[0]
+    mask = torch.arange(qk_scale.shape[2]).expand(
+        qk_scale.shape[0], qk_scale.shape[2]
+    ).cuda() < seqlens.unsqueeze(1)
+    qk_scale_normal = qk_scale.permute(0, 2, 1)[mask].cuda()
+
+    q_bf16 = (q_fp8.to(torch.bfloat16) * qk_scale_normal[:, :, None]).to(torch.bfloat16) * (
+        1 / k_scale.to(torch.bfloat16)
+    )
+    k_bf16 = k_fp8.to(torch.bfloat16) * k_scale.to(torch.bfloat16)
+
+    torch_out_q, torch_out_k, torch_kcache, torch_vcache = torch_rope_norm_blocked_prefill(
+        kcache_ref,
+        vcache_ref,
+        qkv_ref,
+        cos_sin,
+        num_seqlen_per_req,
+        q_index,
+        kv_indices,
+        is_prefill=True,
+        use_qknorm=use_qknorm,
+        q_norm_weight=q_norm_weight,
+        k_norm_weight=k_norm_weight,
+    )
+
+    my_kcache = kcache_fp8.float()
+    my_vcache = vcache_fp8.float()
+    torch_kcache = torch_kcache.float()
+    torch_vcache = torch_vcache.float()
+
+    assert allclose(torch_out_q, q_bf16, atol=0.5)
+    assert allclose(torch_out_k, k_bf16, atol=0.5)
+
+
+@pytest.mark.parametrize("num_req", [7])
+@pytest.mark.parametrize("num_q_head_head_dim", [(4, 128)])
+@pytest.mark.parametrize("num_kv_heads", [1])
+@pytest.mark.parametrize("use_qknorm", [True])
+def test_rope_norm_blocked_decode_fp8(num_req, num_q_head_head_dim, num_kv_heads, use_qknorm):
+    req_length = torch.randint(20, 200, (num_req,)).tolist()
+    num_q_heads = num_q_head_head_dim[0]
+    qk_head_dim = num_q_head_head_dim[1]
+    v_head_dim = num_q_head_head_dim[1]
+    kv_block_size = 64
+    max_num_kv_blocks = 1024
+    max_rope_position = 2048
+    dtype = torch.bfloat16
+    (
+        qkv,
+        num_seqlen_per_req,
+        cos_sin,
+        kcache,
+        vcache,
+        kv_indices,
+        q_norm_weight,
+        k_norm_weight,
+    ) = prepare_decode_input(
+        num_req,
+        req_length,
+        num_q_heads,
+        num_kv_heads,
+        qk_head_dim,
+        v_head_dim,
+        kv_block_size,
+        max_num_kv_blocks,
+        max_rope_position,
+        dtype,
+    )
+
+    # clone input for torch ref, incase inplace update
+    qkv_ref = qkv.clone()
+    kcache_ref = kcache.clone()
+    vcache_ref = vcache.clone()
+
+    k_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv.device)
+    v_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv.device)
+    kcache_fp8 = kcache.to(torch.float8_e4m3fn)
+    vcache_fp8 = vcache.to(torch.float8_e4m3fn)
+
+    q_fp8, k_fp8, qk_scale, split_k_flag, out_attention, tma_tensor = (
+        hpc.rope_norm_blocked_kvcache_w8c8_dqskv(
+            key_cache=kcache_fp8,
+            value_cache=vcache_fp8,
+            qkv=qkv,
+            cos_sin=cos_sin,
+            num_seqlen_per_req=num_seqlen_per_req,
+            q_index=num_seqlen_per_req,
+            kvcache_indices=kv_indices,
+            is_prefill=False,  # is_prefill
+            use_qk_norm=use_qknorm,
+            max_seqlens=1,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            q_norm_weight=q_norm_weight,
+            k_norm_weight=k_norm_weight,
+        )
+    )
+
+    q_bf16 = (q_fp8.to(torch.bfloat16) * qk_scale[:, :, None]).to(
+        torch.bfloat16
+    )  # no k_scale in decode
+    k_bf16 = k_fp8.to(torch.bfloat16) * k_scale.to(torch.bfloat16)
+
+    torch_out_q, torch_out_k, torch_kcache, torch_vcache = torch_rope_norm_blocked_decode(
+        kcache_ref,
+        vcache_ref,
+        qkv_ref,
+        cos_sin,
+        num_seqlen_per_req,
+        num_seqlen_per_req,
+        kv_indices,
+        is_prefill=False,
+        use_qknorm=use_qknorm,
+        q_norm_weight=q_norm_weight,
+        k_norm_weight=k_norm_weight,
+    )
+
+    my_kcache = kcache_fp8.float()
+    my_vcache = vcache_fp8.float()
+    torch_kcache = torch_kcache.float()
+    torch_vcache = torch_vcache.float()
+
+    assert allclose(torch_out_q, q_bf16, atol=0.5)

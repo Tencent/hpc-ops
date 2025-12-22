@@ -353,6 +353,15 @@ __device__ __forceinline__ float warp_reduce_sum_xor(float x) {
   return x;
 }
 
+__device__ __forceinline__ float warp_reduce_max_xor(float x) {
+#pragma unroll
+  for (int ioffset = 16; ioffset >= 1; ioffset /= 2) {
+    x = fmaxf(__shfl_xor_sync(0xFFFFFFFF, x, ioffset), x);
+  }
+
+  return x;
+}
+
 __device__ __forceinline__ float warp_4lane_reduce_max_xor(float x) {
   x = fmaxf(__shfl_xor_sync(0xFFFFFFFF, x, 1), x);
   x = fmaxf(__shfl_xor_sync(0xFFFFFFFF, x, 2), x);
