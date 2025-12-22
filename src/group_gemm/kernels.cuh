@@ -178,6 +178,11 @@ __global__ void __launch_bounds__(384, 1)
   TmaA tma_a;
   TmaD tma_d;
 
+  int num_total_warps = blockDim.x / 32;
+  for (int i = iwarp; i < num_group * 2; i += num_total_warps) {
+    tma_descriptor_fence_acquire(td_xy + i);
+  }
+
   auto sA = make_tensor(make_smem_ptr(shm_a), SLayoutA{});
   auto sB = make_tensor(make_smem_ptr(shm_b), SLayoutB{});
 
@@ -466,6 +471,11 @@ __global__ void __launch_bounds__(384, 1)
 
   TmaA tma_a;
   TmaC tma_c;
+
+  int num_total_warps = blockDim.x / 32;
+  for (int i = iwarp; i < num_group * 2; i += num_total_warps) {
+    tma_descriptor_fence_acquire(td_xy + i);
+  }
 
   auto sA = make_tensor(make_smem_ptr(shm_a), SLayoutA{});
   auto sB = make_tensor(make_smem_ptr(shm_b), SLayoutB{});
