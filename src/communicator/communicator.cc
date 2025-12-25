@@ -14,8 +14,7 @@
 namespace hpc {
 namespace communicator {
 
-Communicator::Communicator(int rank, int world_size, const std::string &comm_name)
-    : kRegistery_(comm_name) {
+Communicator::Communicator(int rank, int world_size, const std::string &url) : kUrl_(url) {
   rank_ = rank;
   world_size_ = world_size;
 
@@ -24,7 +23,7 @@ Communicator::Communicator(int rank, int world_size, const std::string &comm_nam
   bool is_root = (rank_ == root_);
   if (is_root) {
     Listener listener;
-    listener.Listen(kRegistery_);
+    listener.Listen(kUrl_);
 
     std::vector<std::shared_ptr<Channel>> channels;
     for (int i = 0; i < world_size_ - 1; ++i) {
@@ -49,7 +48,7 @@ Communicator::Communicator(int rank, int world_size, const std::string &comm_nam
     }
 
   } else {
-    auto channel = Connector::Connect(kRegistery_);
+    auto channel = Connector::Connect(kUrl_);
 
     // 1. send meta to root
     {

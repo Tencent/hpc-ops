@@ -10,9 +10,13 @@
 int main() {
   hpc::communicator::Listener listener;
 
-  listener.Listen("test");
+  listener.Listen("tcp://0.0.0.0:10086");
 
   auto channel = listener.Accept();
+  if (!channel) {
+    printf("channel is none\n");
+    return 0;
+  }
 
   {
     bool ok = channel->Send("1234567890");

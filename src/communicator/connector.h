@@ -16,8 +16,7 @@ class Connector {
   Connector();
   ~Connector();
 
-  static std::shared_ptr<Channel> Connect(const std::string& file);
-  static std::shared_ptr<Channel> ConnectMayFail(const std::string& file);
+  static std::shared_ptr<Channel> Connect(const std::string& url);
 
  private:
 };

@@ -29,7 +29,8 @@ MulticastCommunicator::MulticastCommunicator(int rank, int world_size, int devic
     device_id_ = device_id;
   }
 
-  comm_ = std::make_unique<Communicator>(rank, world_size, comm_name);
+  const std::string url = std::string("unix://") + comm_name;
+  comm_ = std::make_unique<Communicator>(rank, world_size, url);
   multimgr_ = std::make_unique<MulticastObjectManager>(device_id_, world_size_);
 }
 

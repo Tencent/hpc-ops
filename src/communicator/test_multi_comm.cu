@@ -109,7 +109,8 @@ int main(int argc, char *argv[]) {
   int rank = std::stoi(argv[1]);
   int world_size = std::stoi(argv[2]);
 
-  auto comm = std::make_shared<hpc::communicator::MulticastCommunicator>(rank, world_size);
+  auto comm =
+      std::make_shared<hpc::communicator::MulticastCommunicator>(rank, world_size, rank, "test");
 
   cudaSetDevice(rank);
 

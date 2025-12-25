@@ -14,7 +14,7 @@ int main(int argc, char *argv[]) {
   int rank = std::stoi(argv[1]);
   int world_size = std::stoi(argv[2]);
 
-  hpc::communicator::Communicator comm(rank, world_size);
+  hpc::communicator::Communicator comm(rank, world_size, "tcp://0.0.0.0:10085");
 
   printf("\nTest Broadcast\n");
   {

@@ -8,7 +8,12 @@
 #include "src/communicator/connector.h"
 
 int main() {
-  auto channel = hpc::communicator::Connector::Connect("test");
+  auto channel = hpc::communicator::Connector::Connect("tcp://0.0.0.0:10086");
+
+  if (!channel) {
+    printf("channel is none\n");
+    return 0;
+  }
 
   {
     std::string data;

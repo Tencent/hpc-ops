@@ -25,7 +25,10 @@ Channel::Channel() { socket_ = -1; }
 
 Channel::Channel(int sock) { socket_ = sock; }
 
-Channel::~Channel() { socket_ = -1; }
+Channel::~Channel() {
+  ::close(socket_);
+  socket_ = -1;
+}
 
 bool Channel::Send(const std::string &data) {
   MessageHeader header;

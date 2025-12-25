@@ -16,7 +16,7 @@ class Listener {
   Listener();
   ~Listener();
 
-  bool Listen(const std::string &file);
+  bool Listen(const std::string &url);
   std::shared_ptr<Channel> Accept();
   void Close();
 

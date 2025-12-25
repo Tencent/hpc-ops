@@ -15,7 +15,8 @@ namespace communicator {
 
 class Communicator {
  public:
-  Communicator(int rank, int world_size, const std::string &comm_name);
+  // url should be tcp://1.1.1.1:8080 or unix://a/b/c form
+  Communicator(int rank, int world_size, const std::string &url);
   ~Communicator();
 
   bool Broadcast(const std::string &send_data, std::string *recv_data, int root = 0);
@@ -29,7 +30,7 @@ class Communicator {
   void Barrier();
 
  private:
-  const std::string kRegistery_;
+  const std::string kUrl_;
 
   int rank_;
   int world_size_;
