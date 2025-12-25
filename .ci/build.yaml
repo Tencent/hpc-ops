@@ -271,9 +271,6 @@ stages:
 finally:
   job_SCd:
     name: clean temp file
-    mutex:
-      label: singleton
-      queue-length: 5
     runs-on:
       pool-name: agentless
     steps:
