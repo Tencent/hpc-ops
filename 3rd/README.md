@@ -1,0 +1,1 @@
+We have copied the source code directly into our repository instead of using a Git submodule. This approach simplifies compilation (or: build dependencies) and keeps the project self-contained — a significant benefit in internal/restricted network environments where external dependencies are difficult or impossible to fetch. Unused portions of the code have been removed.
