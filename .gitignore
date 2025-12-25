@@ -11,3 +11,14 @@ __pycache__
 *.sqlite
 test
 version.py
+
+3rd/nvshmem/bin/
+3rd/nvshmem/include/
+3rd/nvshmem/lib/
+3rd/nvshmem/share/
+3rd/nvshmem/version.txt
+3rd/nvshmem/changelog
+3rd/nvshmem/git_commit.txt
+3rd/nvshmem/src/include/non_abi/nvshmem_build_options.h
+3rd/nvshmem/src/include/non_abi/nvshmem_version.h
+3rd/nvshmem/src/device/comm/transfer_device.cu

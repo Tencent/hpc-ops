@@ -1,0 +1,98 @@
+get_filename_component(PACKAGE_PREFIX_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../" ABSOLUTE)
+
+include(CMakeFindDependencyMacro)
+find_dependency(CUDAToolkit REQUIRED)
+if (CUDAToolkit_VERSION_MAJOR GREATER 12)
+  find_dependency(CCCL PATHS ${CUDAToolkit_LIBRARY_DIR}/cmake/cccl)
+else()
+
+endif()
+
+macro(set_and_check _var _file)
+  set(${_var} "${_file}")
+  if(NOT EXISTS "${_file}")
+    set(${_var} "")
+  endif()
+endmacro()
+
+macro(check_required_components _NAME)
+  foreach(comp ${${_NAME}_FIND_COMPONENTS})
+    if(NOT ${_NAME}_${comp}_FOUND)
+      if(${_NAME}_FIND_REQUIRED_${comp})
+        set(${_NAME}_FOUND FALSE)
+      endif()
+    endif()
+  endforeach()
+endmacro()
+
+set(NVSHMEM_VERSION @PACKAGE_VERSION@)
+
+get_filename_component(NVSHMEM_RHEL_INCL_BIN_BASE "${CMAKE_CURRENT_LIST_DIR}/../../../../../" ABSOLUTE)
+get_filename_component(NVSHMEM_DEB_INCL_BIN_BASE "${CMAKE_CURRENT_LIST_DIR}/../../../../../.." ABSOLUTE)
+get_filename_component(NVSHMEM_RHEL_BACKUP_INCL_BIN_BASE "${CMAKE_CURRENT_LIST_DIR}/../../../../" ABSOLUTE)
+set(NVSHMEM_INCLUDE_FINAL "include/nvshmem_@CUDAToolkit_VERSION_MAJOR@")
+set(NVSHMEM_BIN_FINAL "bin/nvshmem_@CUDAToolkit_VERSION_MAJOR@")
+
+set(INCLUDE_DIRS
+  ${PACKAGE_PREFIX_DIR}/include
+  ${NVSHMEM_DEB_INCL_BIN_BASE}/${NVSHMEM_INCLUDE_FINAL}
+  ${NVSHMEM_RHEL_INCL_BIN_BASE}/${NVSHMEM_INCLUDE_FINAL}
+  ${NVSHMEM_RHEL_BACKUP_INCL_BIN_BASE}/${NVSHMEM_INCLUDE_FINAL}
+)
+
+set(BIN_DIRS
+  ${PACKAGE_PREFIX_DIR}/bin
+  ${NVSHMEM_DEB_INCL_BIN_BASE}/${NVSHMEM_BIN_FINAL}
+  ${NVSHMEM_RHEL_INCL_BIN_BASE}/${NVSHMEM_BIN_FINAL}
+  ${NVSHMEM_RHEL_BACKUP_INCL_BIN_BASE}/${NVSHMEM_BIN_FINAL}
+)
+
+set(LIB_DIRS
+${PACKAGE_PREFIX_DIR}/lib
+${CMAKE_CURRENT_LIST_DIR}/../..
+)
+
+
+foreach(INCLUDE_PATH IN LISTS INCLUDE_DIRS)
+  set_and_check(NVSHMEM_INCLUDE_DIR "${INCLUDE_PATH}")
+  if (NVSHMEM_INCLUDE_DIR)
+    break()
+  endif ()
+endforeach()
+
+foreach(BIN_PATH IN LISTS BIN_DIRS)
+  set_and_check(NVSHMEM_BIN_DIR "${BIN_PATH}")
+  if (NVSHMEM_BIN_DIR)
+    break()
+  endif ()
+endforeach()
+
+foreach(LIB_PATH IN LISTS LIB_DIRS)
+  set_and_check(NVSHMEM_LIB_DIR "${LIB_PATH}")
+  if (NVSHMEM_LIB_DIR)
+    break()
+  endif ()
+endforeach()
+
+if (NOT NVSHMEM_INCLUDE_DIR)
+  message(FATAL_ERROR "Unable to find NVSHMEM Include directory!")
+endif ()
+
+if (NOT NVSHMEM_BIN_DIR)
+  message(FATAL_ERROR "Unable to find NVSHMEM Binary directory!")
+endif ()
+
+if (NOT NVSHMEM_LIB_DIR)
+  message(FATAL_ERROR "Unable to find NVSHMEM Library directory!")
+endif ()
+
+include(CMakeFindDependencyMacro)
+
+check_required_components(NVSHMEM)
+
+# Capturing values from configure (optional)
+set(my-config-var @my-config-var@)
+
+# Add the targets file
+include(${CMAKE_CURRENT_LIST_DIR}/NVSHMEMTargets.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/NVSHMEMDeviceTargets.cmake)

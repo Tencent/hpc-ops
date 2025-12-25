@@ -1,0 +1,17 @@
+set(SOURCE_LIST bootstrap_shmem.c)
+
+nvshmem_add_bootstrap(nvshmem_bootstrap_shmem ${SOURCE_LIST})
+
+find_library(
+SHMEM_LIB
+NAMES oshmem
+HINTS ${SHMEM_HOME}
+PATH_SUFFIXES lib lib64)
+find_path(SHMEM_INCLUDE NAME shmem.h HINTS ${SHMEM_HOME}
+          PATH_SUFFIXES include
+)
+add_library(shmem IMPORTED INTERFACE)
+target_link_libraries(shmem INTERFACE ${SHMEM_LIB})
+target_include_directories(shmem INTERFACE ${SHMEM_INCLUDE})
+
+target_link_libraries(nvshmem_bootstrap_shmem PRIVATE shmem)

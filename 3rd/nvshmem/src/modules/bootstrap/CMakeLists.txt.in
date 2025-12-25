@@ -1,0 +1,89 @@
+cmake_minimum_required(VERSION 3.19)
+
+set(CUSTOM_BOOTSTRAP_VERSION_MAJOR @BOOTSTRAP_VERSION_MAJOR@)
+set(CUSTOM_BOOTSTRAP_VERSION_MINOR @BOOTSTRAP_VERSION_MINOR@)
+set(CUSTOM_BOOTSTRAP_VERSION_PATCH @BOOTSTRAP_VERSION_PATCH@)
+
+if (DEFINED ENV{MPI_HOME})
+  set(MPI_HOME_DEFAULT $ENV{MPI_HOME})
+else()
+  set(MPI_HOME_DEFAULT "/usr/local/ompi")
+endif()
+
+if (DEFINED ENV{PMI_HOME})
+  set(PMI_HOME_DEFAULT $ENV{PMIX_HOME})
+else()
+  set(PMI_HOME_DEFAULT "/usr")
+endif()
+
+if (DEFINED ENV{PMIX_HOME})
+  set(PMIX_HOME_DEFAULT $ENV{PMIX_HOME})
+else()
+  set(PMIX_HOME_DEFAULT "/usr")
+endif()
+
+if (DEFINED ENV{PMI2_HOME})
+  set(PMI2_HOME_DEFAULT $ENV{PMI2_HOME})
+else()
+  set(PMI2_HOME_DEFAULT "/usr")
+endif()
+
+option(NVSHMEM_BUILD_MPI_BOOTSTRAP "Enable compilation of the MPI bootstrap" OFF)
+option(NVSHMEM_BUILD_PMI_BOOTSTRAP "Enable compilation of the PMI bootstrap" OFF)
+option(NVSHMEM_BUILD_PMI2_BOOTSTRAP "Enable compilation of the PMI2 bootstrap" OFF)
+option(NVSHMEM_BUILD_PMIX_BOOTSTRAP "Enable compilation of the PMIX bootstrap" OFF)
+option(NVSHMEM_BUILD_SHMEM_BOOTSTRAP "Enable compilation of the SHMEM bootstrap" OFF)
+
+set(PMIX_HOME ${PMIX_HOME_DEFAULT} CACHE PATH "path to PMIX installation")
+set(PMI_HOME ${PMI_HOME_DEFAULT} CACHE PATH "path to PMI installation")
+set(PMI2_HOME ${PMI2_HOME_DEFAULT} CACHE PATH "path to PMI2 installation")
+set(MPI_HOME ${MPI_HOME_DEFAULT} CACHE PATH "path to MPI installation")
+set(SHMEM_HOME ${MPI_HOME} CACHE PATH "path to SHMEM installation")
+
+project(
+  NVSHMEM_BOOTSTRAPS
+  LANGUAGES CXX C
+  VERSION ${CUSTOM_BOOTSTRAP_VERSION_MAJOR}.${CUSTOM_BOOTSTRAP_VERSION_MINOR}.${CUSTOM_BOOTSTRAP_VERSION_PATCH}
+)
+
+add_subdirectory(common)
+
+macro(nvshmem_add_bootstrap BOOTSTRAP_NAME SOURCE_LIST)
+  add_library(${BOOTSTRAP_NAME} SHARED)
+  target_sources(${BOOTSTRAP_NAME} PRIVATE ${SOURCE_LIST})
+  target_include_directories(${BOOTSTRAP_NAME} PRIVATE
+                             ${CMAKE_SOURCE_DIR}/common
+                             ${CMAKE_SOURCE_DIR}/include
+  )
+
+  target_link_libraries(${BOOTSTRAP_NAME} PRIVATE nvshmem_bootstrap_common)
+
+  set_target_properties(${BOOTSTRAP_NAME}
+    PROPERTIES PREFIX ""
+    VERSION ${CUSTOM_BOOTSTRAP_VERSION_MAJOR}.${CUSTOM_BOOTSTRAP_VERSION_MINOR}.${CUSTOM_BOOTSTRAP_VERSION_PATCH}
+    SOVERSION ${CUSTOM_BOOTSTRAP_VERSION_MAJOR}
+  )
+
+  target_link_options(${BOOTSTRAP_NAME} PRIVATE
+                      "-Wl,--version-script=${CMAKE_SOURCE_DIR}/nvshmem_bootstrap.sym")
+
+  install(TARGETS ${BOOTSTRAP_NAME}
+    LIBRARY DESTINATION lib
+  )
+endmacro()
+
+if(NVSHMEM_BUILD_MPI_BOOTSTRAP)
+  add_subdirectory(mpi)
+endif()
+
+if(NVSHMEM_BUILD_PMI_BOOTSTRAP OR NVSHMEM_BUILD_PMI2_BOOTSTRAP)
+  add_subdirectory(pmi)
+endif()
+
+if(NVSHMEM_BUILD_PMIX_BOOTSTRAP)
+  add_subdirectory(pmix)
+endif()
+
+if(NVSHMEM_BUILD_SHMEM_BOOTSTRAP)
+  add_subdirectory(shmem)
+endif()

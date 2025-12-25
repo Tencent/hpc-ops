@@ -19,6 +19,30 @@ cmake:
 wheel:
 	python3 setup.py bdist_wheel
 
+nvshmem:
+	cmake -S 3rd/nvshmem -B 3rd/nvshmem-build / \
+		-DMLX5_lib=/usr/lib64/libmlx5.so\
+		-DCMAKE_CUDA_ARCHITECTURES=90a\
+		-DNVSHMEM_IBGDA_SUPPORT=ON \
+		-DCUDA_HOME=/usr/local/cuda \
+		-DCMAKE_INSTALL_PREFIX=./3rd/nvshmem \
+		-DNVSHMEM_SHMEM_SUPPORT=OFF \
+		-DNVSHMEM_MPI_SUPPORT=OFF \
+		-DNVSHMEM_PMI_SUPPORT=OFF \
+		-DNVSHMEM_PMIX_SUPPORT=OFF \
+		-DNVSHMEM_PMI2_SUPPORT=OFF \
+		-DNVSHMEM_UCX_SUPPORT=OFF \
+		-DNVSHMEM_USE_NCCL=OFF \
+		-DNVSHMEM_BUILD_HYDRA_LAUNCHER=OFF \
+		-DNVSHMEM_BUILD_PYTHON_LIB=OFF \
+		-DNVSHMEM_BUILD_TXZ_PACKAGE=OFF \
+		-DNVSHMEM_TIMEOUT_DEVICE_POLLING=OFF \
+		-DNVSHMEM_USE_GDRCOPY=OFF \
+		-DNVSHMEM_BUILD_EXAMPLES=OFF \
+		-DNVSHMEM_BUILD_TESTS=OFF
+	make -C 3rd/nvshmem-build -j
+	make install -C 3rd/nvshmem-build
+	rm -rf 3rd/nvshmem-build
 doc:
 	python3 tools/generate_docs.py
 	python3 -m mkdocs build

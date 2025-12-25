@@ -1,0 +1,18 @@
+add_library(nvshmem_bootstrap_common STATIC bootstrap_util.cpp)
+
+set_target_properties(nvshmem_bootstrap_common PROPERTIES
+  POSITION_INDEPENDENT_CODE ON
+  CXX_STANDARD_REQUIRED ON
+  CUDA_STANDARD_REQUIRED ON
+  CXX_STANDARD 11
+  CUDA_STANDARD 11
+  CUDA_SEPARABLE_COMPILATION ON
+)
+
+target_include_directories(nvshmem_bootstrap_common INTERFACE
+                           ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_include_directories(nvshmem_bootstrap_common PRIVATE
+                           ${CMAKE_SOURCE_DIR}/include
+)
