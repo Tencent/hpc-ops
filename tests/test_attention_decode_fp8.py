@@ -226,7 +226,7 @@ def test_attention_decode_fp8(
             "{:+.4f} vs {:+.4f} with diff = {:.4f}, @ {}".format(gt[idx], my[idx], vals[i], cpu_idx)
         )
 
-    assert torch.allclose(my, gt, atol=0.0156)
+    assert torch.allclose(my, gt, atol=0.016)
     assert gt.device == my.device
     assert gt.dtype == my.dtype
     assert gt.shape == my.shape

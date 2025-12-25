@@ -177,11 +177,13 @@ def allclose(ref_tensor, real_tensor, atol=1e-8, rtol=1e-5):
     assert ref_tensor.dtype == real_tensor.dtype
     assert ref_tensor.device == real_tensor.device
     assert ref_tensor.shape == real_tensor.shape
-    is_true = torch.allclose(ref_tensor, real_tensor, atol=atol, rtol=rtol)
+    is_true = torch.allclose(
+        ref_tensor.to(torch.float32), real_tensor.to(torch.float32), atol=atol, rtol=rtol
+    )
     if not is_true:
         print(
             errors_to_string(
-                calculate_errors(ref_tensor.to(torch.float32), real_tensor.to(torch.float16))
+                calculate_errors(ref_tensor.to(torch.float32), real_tensor.to(torch.float32))
             )
         )
     return is_true

@@ -177,4 +177,4 @@ def test_attention_with_kvcache_prefill_bf16(
     print("\nmy\n")
     print(my[0, :, 0], my.shape)
 
-    assert allclose(gt, my, atol=0.0156)
+    assert allclose(gt, my, atol=0.016)

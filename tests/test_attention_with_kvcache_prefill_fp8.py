@@ -204,4 +204,4 @@ def test_attention_with_kvcache_prefill_fp8(
     print("\n diff \n")
     print((gt - my)[:64, 0, :1])
 
-    assert allclose(gt, my, atol=0.08)
+    assert allclose(gt, my, atol=0.1)

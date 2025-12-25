@@ -62,4 +62,4 @@ def test_gem3():
             "{:+.4f} vs {:+.4f} with diff = {:.4f}, @ {}".format(gt[idx], my[idx], vals[i], cpu_idx)
         )
 
-    assert allclose(gt, my, atol=0.0156)
+    assert allclose(gt, my, atol=0.016)

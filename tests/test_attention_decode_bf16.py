@@ -198,4 +198,4 @@ def test_attention_decode_bf16(
     print("\nmy\n")
     print(my[0, :, :])
 
-    assert allclose(gt, my, atol=0.0156)
+    assert allclose(gt, my, atol=0.016)

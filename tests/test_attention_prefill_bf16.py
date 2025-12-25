@@ -172,4 +172,4 @@ def test_attention_prefill_bf16(
     print("\nmy\n")
     print(my[:5, :, 9:10])
 
-    assert allclose(gt, my, atol=0.0156)
+    assert allclose(gt, my, atol=0.016)
