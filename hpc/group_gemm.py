@@ -86,7 +86,7 @@ def group_gemm_blockwise_fp8(
             Shape: [hidden_size // 128, total_seq_pad]
             Dtype: float32
         w_scale: Scaling factor for weight FP8 quantization
-            Shape: [num_group, output_dim // 128, 64]
+            Shape: [num_group, output_dim // 128, (hidden_size // 128 + 3) // 4 * 4]
             Dtype: float32
 
     Returns:
@@ -101,7 +101,7 @@ def group_gemm_blockwise_fp8(
     Note:
         - All input tensors must be on CUDA device
         - The length of x_scale for each group must be aligned to multiple of 16/32/64 according to num_seq_per_group_avg
-        - Only support hidden_size <= 8192
+        - The size of w_scale must be multiple of 4
 
     """
     return torch.ops.hpc.group_gemm_blockwise_fp8(

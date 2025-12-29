@@ -431,7 +431,8 @@ __global__ void __launch_bounds__(384, 1)
                                     cute::TmaDescriptor *td_xy, int *seqlens_ptr, float *xscale_ptr,
                                     float *wscale_ptr, int *tiles_ptr, int *cu_tiles_ptr,
                                     int num_group, int m, int n, int k, int m_pad, int num_block_n,
-                                    int num_block_k, cutlass::FastDivmod flat_divider) {
+                                    int num_block_k, int num_block_k_pad4,
+                                    cutlass::FastDivmod flat_divider) {
   using namespace cute;  // NOLINT
 
   using Tin = typename Config::Tin;
@@ -488,7 +489,7 @@ __global__ void __launch_bounds__(384, 1)
       make_tensor(make_gmem_ptr(static_cast<Tout *>(nullptr)),
                   make_shape(Int<kTileN>{}, Int<kTileM>{}), make_stride(Int<kTileM>{}, Int<1>{}));
   auto gAS = tma_as.get_tma_tensor(make_shape(num_block_k, m_pad));
-  auto gBS = tma_bs.get_tma_tensor(make_shape(num_block_n, kTileS, num_group));
+  auto gBS = tma_bs.get_tma_tensor(make_shape(num_block_n, num_block_k_pad4, num_group));
 
   auto btma_a = tma_a.get_slice(0);
   auto btma_b = tma_b.get_slice(0);
@@ -505,7 +506,7 @@ __global__ void __launch_bounds__(384, 1)
   auto tASs = btma_as.partition_D(sAS);  // (TMA, kStage, _1)
 
   auto tBSg = btma_bs.partition_S(gBS);  // (TMA, TMA_N, TMA_K, num_group)
-  auto tBSs = btma_bs.partition_D(sBS);  // (TMA, kStage, _1)
+  auto tBSs = btma_bs.partition_D(sBS);  // (TMA, kStage, TMA_K)
 
   int num_tile_n = size<1>(tBg);
 
@@ -549,7 +550,7 @@ __global__ void __launch_bounds__(384, 1)
     cutlass::arch::warpgroup_reg_dealloc<32>();
     idx -= kNumThreads;
     constexpr int kTransactionBytes =
-        sizeof(Tin) * (kTileM + kTileN) * kTileK + (kTileM + kTileS) * sizeof(float);
+        sizeof(Tin) * (kTileM + kTileN) * kTileK + (kTileM + 4) * sizeof(float);
     // sizeof(Tin) * cosize(SLayoutA{}(_, _, 0)) + sizeof(Tin) * cosize(SLayoutB{}(_, _, 0));
 
     int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
@@ -595,7 +596,7 @@ __global__ void __launch_bounds__(384, 1)
 
           cute::copy(tma_as.with(readable[ismem_write]),
                      tASg(_, itile_k, cu_tiles_ptr[igroup] + itile_m), tASs(_, ismem_write, 0));
-          cute::copy(tma_bs.with(readable[ismem_write]), tBSg(_, itile_n, 0, igroup),
+          cute::copy(tma_bs.with(readable[ismem_write]), tBSg(_, itile_n, itile_k / 4, igroup),
                      tBSs(_, ismem_write, 0));
 
           set_barrier_transaction_bytes(readable[ismem_write], kTransactionBytes);
@@ -669,7 +670,7 @@ __global__ void __launch_bounds__(384, 1)
 
         float tCS[kN];
 
-        float wscale = sBS(ismem_read, itile_k);  // gBS(itile_n, itile_k, igroup);
+        float wscale = sBS(ismem_read, itile_k % 4);  // gBS(itile_n, itile_k, igroup);
 #pragma unroll
         for (int in = 0; in < kN; in++) {
           tCS[in] = sAS(ismem_read, get<1>(tI_mn(0, in))) * wscale;

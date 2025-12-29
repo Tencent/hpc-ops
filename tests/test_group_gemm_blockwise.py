@@ -60,7 +60,7 @@ def test_group_gemm1(num_group, actual_m, m, n, k):
     x = (torch.randn((total_seq, k), dtype=torch.float, device="cuda") / 10).to(dtype)
     w = (torch.randn((num_group, n, k), dtype=torch.float, device="cuda") / 10).to(dtype)
     xscale = torch.randn((k // 128, total_seq_pad), dtype=torch.float, device="cuda")
-    wscale = torch.randn((num_group, n // 128, 64), dtype=torch.float, device="cuda")
+    wscale = torch.randn((num_group, n // 128, k // 128), dtype=torch.float, device="cuda")
 
     cu_seqlens = torch.cumsum(
         torch.cat([torch.tensor([0], dtype=torch.int32, device="cuda"), seqlens]), dim=0

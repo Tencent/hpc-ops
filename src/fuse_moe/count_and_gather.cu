@@ -319,6 +319,14 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gate_up_output_ptr, v
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
         cu_tiles_ptr, num_seq, hidden_size, intermediate_size, num_topk, num_expert, eprank,
         num_seq_per_group_avg, stream);
+  } else if (num_seq_per_group_avg <= 48) {
+    constexpr int kTileM = 48;
+    constexpr int kStage = 8;
+    launch_count_and_gather<kTileM, kTileN, kTileK, kStage>(
+        gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
+        topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, num_seq, hidden_size, intermediate_size, num_topk, num_expert, eprank,
+        num_seq_per_group_avg, stream);
   } else {
     constexpr int kTileM = 64;
     constexpr int kStage = 8;

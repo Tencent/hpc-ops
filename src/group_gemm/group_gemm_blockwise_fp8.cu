@@ -19,7 +19,7 @@ void launch_group_gemm_blockwise_fp8(void *y_ptr, const void *x_ptr, const void 
                                      const void *seqlens_ptr, const void *cu_seqlens_ptr,
                                      const void *xscale_ptr, const void *wscale_ptr, void *tmas_ptr,
                                      void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m,
-                                     int n, int k, int m_pad, bool update_tma,
+                                     int n, int k, int m_pad, int num_block_k_pad4, bool update_tma,
                                      cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
@@ -39,8 +39,8 @@ void launch_group_gemm_blockwise_fp8(void *y_ptr, const void *x_ptr, const void 
   auto XS = make_tensor(make_gmem_ptr(reinterpret_cast<const TS *>(xscale_ptr)),
                         make_shape(num_block_k, m_pad), make_stride(m_pad, Int<1>{}));
   auto WS = make_tensor(make_gmem_ptr(reinterpret_cast<const TS *>(wscale_ptr)),
-                        make_shape(num_block_n, kTileS, num_group),
-                        make_stride(kTileS, Int<1>{}, num_block_n * kTileS));
+                        make_shape(num_block_n, num_block_k_pad4, num_group),
+                        make_stride(num_block_k_pad4, Int<1>{}, num_block_n * num_block_k_pad4));
 
   using Config =
       GroupGEMMBlockWiseFp8Config<Tin, Tout, TS, kTileM, kTileN, kTileK, kTileS, kStage,
@@ -89,7 +89,7 @@ void launch_group_gemm_blockwise_fp8(void *y_ptr, const void *x_ptr, const void 
       kernel<<<grid, block, shm_size, stream>>>(
           tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
           (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k, m_pad,
-          num_block_n, num_block_k, flat_divider);
+          num_block_n, num_block_k, num_block_k_pad4, flat_divider);
     } else {
       constexpr bool IsLoopH = false;
       auto kernel =
@@ -101,7 +101,7 @@ void launch_group_gemm_blockwise_fp8(void *y_ptr, const void *x_ptr, const void 
       kernel<<<grid, block, shm_size, stream>>>(
           tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
           (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k, m_pad,
-          num_block_n, num_block_k, flat_divider);
+          num_block_n, num_block_k, num_block_k_pad4, flat_divider);
     }
   }
 }
@@ -110,8 +110,9 @@ void group_gemm_blockwise_fp8_async(void *y_ptr, const void *x_ptr, const void *
                                     const void *seqlens_ptr, const void *cu_seqlens_ptr,
                                     const void *xscale_ptr, const void *wscale_ptr, void *tmas_ptr,
                                     void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m,
-                                    int n, int k, int m_pad, int num_seq_per_group_avg,
-                                    bool update_tma, cudaStream_t stream) {
+                                    int n, int k, int m_pad, int num_block_k_pad4,
+                                    int num_seq_per_group_avg, bool update_tma,
+                                    cudaStream_t stream) {
   constexpr int kTileN = 128;
   constexpr int kTileK = 128;
   constexpr int kTileS = 64;
@@ -127,21 +128,21 @@ void group_gemm_blockwise_fp8_async(void *y_ptr, const void *x_ptr, const void *
     launch_group_gemm_blockwise_fp8<kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
                                     kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
         y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
-        tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, update_tma, stream);
+        tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4, update_tma, stream);
   } else if (num_seq_per_group_avg <= 32) {
     constexpr int kTileM = 32;
     constexpr int kStage = 8;
     launch_group_gemm_blockwise_fp8<kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
                                     kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
         y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
-        tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, update_tma, stream);
+        tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4, update_tma, stream);
   } else {
     constexpr int kTileM = 64;
     constexpr int kStage = 8;
     launch_group_gemm_blockwise_fp8<kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
                                     kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
         y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
-        tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, update_tma, stream);
+        tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4, update_tma, stream);
   }
 }
 

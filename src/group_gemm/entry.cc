@@ -87,12 +87,13 @@ torch::Tensor group_gemm_blockwise_fp8_entry(
   TORCH_CHECK(seqlens.size(0) == weight.size(0),
               "seqlens and weight must share the same num_group");
   TORCH_CHECK(x.size(1) == weight.size(2), "x and weight must share the same k");
-  TORCH_CHECK(w_scale.size(2) == 64, "w_scale must be 64");
+  TORCH_CHECK(w_scale.size(2) % 4 == 0, "w_scale must be multiple of 4");
 
   int m = x.size(0);
   int k = x.size(1);
   int n = weight.size(1);
   int m_pad = x_scale.size(1);
+  int num_block_k_pad4 = w_scale.size(2);
   int num_group = seqlens.size(0);
 
   auto options = x.options();
@@ -129,7 +130,8 @@ torch::Tensor group_gemm_blockwise_fp8_entry(
 
   group_gemm_blockwise_fp8_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr,
                                  wscale_ptr, tmas_ptr, tiles_ptr, cu_tiles_ptr, num_group, m, n, k,
-                                 m_pad, num_seq_per_group_avg, update_tma, stream);
+                                 m_pad, num_block_k_pad4, num_seq_per_group_avg, update_tma,
+                                 stream);
 
   return y;
 }

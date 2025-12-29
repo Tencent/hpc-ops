@@ -115,6 +115,13 @@ void group_gemm_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                           kSwizzleW, kSwizzleY>(y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr,
                                                 y_scale, tmas_ptr, tiles_ptr, cu_tiles_ptr,
                                                 num_group, m, n, k, update_tma, stream);
+  } else if (num_seq_per_group_avg <= 48) {
+    constexpr int kTileM = 48;
+    constexpr int kStage = 8;
+    launch_group_gemm_fp8<kTileM, kTileN, kTileK, kStage, kWarpgroupM, kWarpgroupN, kSwizzleX,
+                          kSwizzleW, kSwizzleY>(y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr,
+                                                y_scale, tmas_ptr, tiles_ptr, cu_tiles_ptr,
+                                                num_group, m, n, k, update_tma, stream);
   } else {
     constexpr int kTileM = 64;
     constexpr int kStage = 8;
