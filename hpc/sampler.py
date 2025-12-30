@@ -8,7 +8,7 @@ def _to_tensor_scalar_tuple(x) -> Tuple[Optional[Tensor], Union[int, float]]:
     if isinstance(x, torch.Tensor):
         if x.dtype == torch.float:
             return (x, 0.0)
-        elif x.dtype == torch.int32:
+        elif x.dtype == torch.int32 or x.dtype == torch.int64:
             return (x, 0)
     else:
         return (None, x)

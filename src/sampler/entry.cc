@@ -86,9 +86,16 @@ torch::Tensor topk_mask_logits_entry(const torch::Tensor& logits, std::optional<
   TORCH_CHECK(logits.dtype() == torch::kFloat32,
               "logits must be float32 for current implementation");
 
+  int int_bytes = 0;
   if (topk.has_value()) {
     TORCH_CHECK(topk->is_contiguous(), "topk tensor must be contiguous");
-    TORCH_CHECK(topk->scalar_type() == torch::kInt32, "topk dtype must be int32");
+    if (topk->scalar_type() == torch::kInt32) {
+      int_bytes = sizeof(int);
+    } else if (topk->scalar_type() == torch::kInt64) {
+      int_bytes = sizeof(int64_t);
+    } else {
+      TORCH_CHECK(false, "topk dtype must be int32 or int64");
+    }
   }
   if (reject_threshold.has_value()) {
     TORCH_CHECK(reject_threshold->is_contiguous(), "reject_threshold tensor must be contiguous");
@@ -96,7 +103,7 @@ torch::Tensor topk_mask_logits_entry(const torch::Tensor& logits, std::optional<
 
   int batch_size = logits.size(0);
   int vocab_size = logits.size(1);
-  TORCH_CHECK(vocab_size % 8 == 0, "hpc sample only support vocab_size % 8 == 0");
+  int vocab_size_padded = logits.stride(0);
 
   // Used for temp storage of topk tokens and logits of first stage topk
   // Fixed size for current implementation
@@ -129,7 +136,7 @@ torch::Tensor topk_mask_logits_entry(const torch::Tensor& logits, std::optional<
 
   topk_mask_logits_async(output_logits_ptr, sample_tokens_ptr, middle_logits_ptr, middle_tokens_ptr,
                          logits_ptr, topk_ptr, topk_val, reject_threshold_ptr, reject_threshold_val,
-                         batch_size, vocab_size, stream);
+                         batch_size, vocab_size, vocab_size_padded, int_bytes, stream);
 
   return output_logits;
 }

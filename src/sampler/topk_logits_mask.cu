@@ -13,21 +13,22 @@ namespace hpc {
 namespace sampler {
 namespace kernels {
 
-template <int kThreadsPerBlock, int kBlockPerBatch, int kItemsPerThread, int kSortItemsPerThread,
-          int kMaxTopK>
+template <typename KType, int kThreadsPerBlock, int kBlockPerBatch, int kItemsPerThread,
+          int kSortItemsPerThread, int kMaxTopK, bool kUseVec16B>
 __global__ void topk_stage1(float* output_logits, float* mid_logits, int* mid_tokens,
-                            const float* logits, int* topk, float* reject_threshold,
-                            float reject_threshold_val, int vocab_size) {
+                            const float* logits, KType* topk, float* reject_threshold,
+                            float reject_threshold_val, int vocab_size, int vocab_size_padded) {
   constexpr int kWarpSize = 32;
   constexpr int kWarpCount = kThreadsPerBlock / kWarpSize;
   constexpr int kKeepTopKTheads = kMaxTopK / kSortItemsPerThread;
   constexpr int kLoadDataTheads = kWarpSize - kKeepTopKTheads;
+  constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 
   int ibatch = blockIdx.y;
   int iwarp = threadIdx.x / 32;
   int ilane = threadIdx.x % 32;
 
-  auto* logits_batch = logits + ibatch * vocab_size;
+  auto* logits_batch = logits + ibatch * vocab_size_padded;
   auto* output_logits_batch = output_logits + ibatch * vocab_size;
   auto* mid_logits_batch = mid_logits + ibatch * kBlockPerBatch * kMaxTopK;
   auto* mid_tokens_batch = mid_tokens + ibatch * kBlockPerBatch * kMaxTopK;
@@ -66,10 +67,28 @@ __global__ void topk_stage1(float* output_logits, float* mid_logits, int* mid_to
                     (kLoadDataTheads * kItemsPerThread) * kLoadDataTheads * kItemsPerThread;
        icol += kBlockPerBatch * kLoadDataTheads * kWarpCount * kItemsPerThread) {
     if (is_load_thread && icol < vocab_size) {
-      logits_load_vec[load_idx] = load<float, kItemsPerThread>(logits_batch + icol);
+      if constexpr (kUseVec16B && kItemsPerThread == 4) {
+        logits_load_vec[load_idx] = load<float, kItemsPerThread>(logits_batch + icol);
+#pragma unroll
+        for (int i = 0; i < kItemsPerThread; i++) {
+          if (icol + i >= vocab_size) {
+            logits_load_vec[load_idx][i] = kNegInf;
+          }
+        }
+        store(output_logits_batch + icol, kNegInf, kNegInf, kNegInf, kNegInf);
+      } else {
+#pragma unroll
+        for (int i = 0; i < kItemsPerThread; i++) {
+          int idata = icol + i;
+          logits_load_vec[load_idx][i] = idata >= vocab_size ? kNegInf : logits_batch[icol + i];
+          if (idata < vocab_size_padded) {
+            output_logits_batch[icol + i] = kNegInf;
+          }
+        }
+      }
+
       // set output to float -inf first, we will update it later in stage2
-      constexpr float kNegInf = -std::numeric_limits<float>::infinity();
-      store(output_logits_batch + icol, kNegInf, kNegInf, kNegInf, kNegInf);
+
       float warp_local_max_logits = 0;
 #pragma unroll
       for (int i = 0; i < kItemsPerThread; i++) {
@@ -195,10 +214,10 @@ __global__ void topk_stage1(float* output_logits, float* mid_logits, int* mid_to
   }
 }
 
-template <int kThreadsPerBlock, int kBlockPerBatch, int kItemsPerThread, int kSortItemsPerThread,
-          int kMaxTopK>
+template <typename KType, int kThreadsPerBlock, int kBlockPerBatch, int kItemsPerThread,
+          int kSortItemsPerThread, int kMaxTopK>
 __global__ void topk_stage2(float* output_logits, int* out, float* middle_logits,
-                            int* middle_tokens, int* topk, int topk_val) {
+                            int* middle_tokens, KType* topk, int topk_val, int vocab_size) {
   constexpr int kWarpSize = 32;
   constexpr int kKeepTopKTheads = kMaxTopK / kSortItemsPerThread;
   using BlockRadixSort = cub::BlockRadixSort<float, kThreadsPerBlock, kSortItemsPerThread, int>;
@@ -211,7 +230,7 @@ __global__ void topk_stage2(float* output_logits, int* out, float* middle_logits
 
   auto* middle_logits_batch = middle_logits + ibatch * kBlockPerBatch * kMaxTopK;
   auto* middle_tokens_batch = middle_tokens + ibatch * kBlockPerBatch * kMaxTopK;
-  int topk_batch = topk ? topk[ibatch] : topk_val;
+  int topk_batch = topk ? int(topk[ibatch]) : topk_val;
 
   vec_t<float, kSortItemsPerThread> logits_local;
   vec_t<int, kSortItemsPerThread> tokens_local;
@@ -227,7 +246,7 @@ __global__ void topk_stage2(float* output_logits, int* out, float* middle_logits
       for (int ik = 0; ik < kSortItemsPerThread; ik++) {
         int real_idx = ilane * kSortItemsPerThread + ik;
         if (real_idx < topk_batch) {
-          output_logits[tokens_local[ik]] = logits_local[ik];
+          output_logits[ibatch * vocab_size + tokens_local[ik]] = logits_local[ik];
         }
       }
     }
@@ -238,7 +257,8 @@ __global__ void topk_stage2(float* output_logits, int* out, float* middle_logits
 void topk_mask_logits_async(void* output_logits, void* out, void* middle_logits,
                             void* middle_tokens, void* logits, void* topk, int topk_val,
                             void* reject_threshold, float reject_threshold_val, int batch_size,
-                            int vocab_size, cudaStream_t stream) {
+                            int vocab_size, int vocab_size_padded, int int_bytes,
+                            cudaStream_t stream) {
   // Fixed size for current implementation
   constexpr int kThreadsPerBlock = 1024;
   constexpr int kItemsPerThread = 4;
@@ -252,25 +272,77 @@ void topk_mask_logits_async(void* output_logits, void* out, void* middle_logits,
 
   constexpr int topk_stage1_smem_size = kThreadsPerBlock / kWarpSize * kMaxTopK * 2 * sizeof(float);
 
-  // stage 1 will load and sort topk logits in every warp, and do block-level topk and store final
-  // 32 floats per block for each batch
-  kernels::topk_stage1<kThreadsPerBlock, kBlockPerBatch, kItemsPerThread, kSortItemsPerThread,
-                       kMaxTopK><<<grid1, block1, topk_stage1_smem_size, stream>>>(
-      reinterpret_cast<float*>(output_logits), reinterpret_cast<float*>(middle_logits),
-      reinterpret_cast<int*>(middle_tokens), reinterpret_cast<float*>(logits),
-      reinterpret_cast<int*>(topk), reinterpret_cast<float*>(reject_threshold),
-      reject_threshold_val, vocab_size);
+  if (int_bytes == 4) {
+    using KType = int;
+    // stage 1 will load and sort topk logits in every warp, and do block-level topk and store final
+    // 32 floats per block for each batch
+    if (vocab_size_padded % 4 == 0) {
+      constexpr bool kUseVec16B = true;
+      kernels::topk_stage1<KType, kThreadsPerBlock, kBlockPerBatch, kItemsPerThread,
+                           kSortItemsPerThread, kMaxTopK, kUseVec16B>
+          <<<grid1, block1, topk_stage1_smem_size, stream>>>(
+              reinterpret_cast<float*>(output_logits), reinterpret_cast<float*>(middle_logits),
+              reinterpret_cast<int*>(middle_tokens), reinterpret_cast<float*>(logits),
+              reinterpret_cast<KType*>(topk), reinterpret_cast<float*>(reject_threshold),
+              reject_threshold_val, vocab_size, vocab_size_padded);
+    } else {
+      constexpr bool kUseVec16B = false;
+      kernels::topk_stage1<KType, kThreadsPerBlock, kBlockPerBatch, kItemsPerThread,
+                           kSortItemsPerThread, kMaxTopK, kUseVec16B>
+          <<<grid1, block1, topk_stage1_smem_size, stream>>>(
+              reinterpret_cast<float*>(output_logits), reinterpret_cast<float*>(middle_logits),
+              reinterpret_cast<int*>(middle_tokens), reinterpret_cast<float*>(logits),
+              reinterpret_cast<KType*>(topk), reinterpret_cast<float*>(reject_threshold),
+              reject_threshold_val, vocab_size, vocab_size_padded);
+    }
 
-  // stage 2 will load 32*num_block floats and do topk again, and store final k value for each batch
-  constexpr int kSortItemsPerThread2 = 4;
-  constexpr int kThreadsPerBlock2 = kBlockPerBatch * kMaxTopK / kSortItemsPerThread2;
-  dim3 block2(kThreadsPerBlock2);
-  dim3 grid2(batch_size);
-  kernels::topk_stage2<kThreadsPerBlock2, kBlockPerBatch, kItemsPerThread, kSortItemsPerThread2,
-                       kMaxTopK><<<grid2, block2, 0, stream>>>(
-      reinterpret_cast<float*>(output_logits), reinterpret_cast<int*>(out),
-      reinterpret_cast<float*>(middle_logits), reinterpret_cast<int*>(middle_tokens),
-      reinterpret_cast<int*>(topk), topk_val);
+    // stage 2 will load 32*num_block floats and do topk again, and store final k value for each
+    // batch
+    constexpr int kSortItemsPerThread2 = 4;
+    constexpr int kThreadsPerBlock2 = kBlockPerBatch * kMaxTopK / kSortItemsPerThread2;
+    dim3 block2(kThreadsPerBlock2);
+    dim3 grid2(batch_size);
+    kernels::topk_stage2<KType, kThreadsPerBlock2, kBlockPerBatch, kItemsPerThread,
+                         kSortItemsPerThread2, kMaxTopK><<<grid2, block2, 0, stream>>>(
+        reinterpret_cast<float*>(output_logits), reinterpret_cast<int*>(out),
+        reinterpret_cast<float*>(middle_logits), reinterpret_cast<int*>(middle_tokens),
+        reinterpret_cast<KType*>(topk), topk_val, vocab_size);
+  } else if (int_bytes == 8) {
+    using KType = int64_t;
+    // stage 1 will load and sort topk logits in every warp, and do block-level topk and store final
+    // 32 floats per block for each batch
+    if (vocab_size_padded % 4 == 0) {
+      constexpr bool kUseVec16B = true;
+      kernels::topk_stage1<KType, kThreadsPerBlock, kBlockPerBatch, kItemsPerThread,
+                           kSortItemsPerThread, kMaxTopK, kUseVec16B>
+          <<<grid1, block1, topk_stage1_smem_size, stream>>>(
+              reinterpret_cast<float*>(output_logits), reinterpret_cast<float*>(middle_logits),
+              reinterpret_cast<int*>(middle_tokens), reinterpret_cast<float*>(logits),
+              reinterpret_cast<KType*>(topk), reinterpret_cast<float*>(reject_threshold),
+              reject_threshold_val, vocab_size, vocab_size_padded);
+    } else {
+      constexpr bool kUseVec16B = false;
+      kernels::topk_stage1<KType, kThreadsPerBlock, kBlockPerBatch, kItemsPerThread,
+                           kSortItemsPerThread, kMaxTopK, kUseVec16B>
+          <<<grid1, block1, topk_stage1_smem_size, stream>>>(
+              reinterpret_cast<float*>(output_logits), reinterpret_cast<float*>(middle_logits),
+              reinterpret_cast<int*>(middle_tokens), reinterpret_cast<float*>(logits),
+              reinterpret_cast<KType*>(topk), reinterpret_cast<float*>(reject_threshold),
+              reject_threshold_val, vocab_size, vocab_size_padded);
+    }
+
+    // stage 2 will load 32*num_block floats and do topk again, and store final k value for each
+    // batch
+    constexpr int kSortItemsPerThread2 = 4;
+    constexpr int kThreadsPerBlock2 = kBlockPerBatch * kMaxTopK / kSortItemsPerThread2;
+    dim3 block2(kThreadsPerBlock2);
+    dim3 grid2(batch_size);
+    kernels::topk_stage2<KType, kThreadsPerBlock2, kBlockPerBatch, kItemsPerThread,
+                         kSortItemsPerThread2, kMaxTopK><<<grid2, block2, 0, stream>>>(
+        reinterpret_cast<float*>(output_logits), reinterpret_cast<int*>(out),
+        reinterpret_cast<float*>(middle_logits), reinterpret_cast<int*>(middle_tokens),
+        reinterpret_cast<KType*>(topk), topk_val, vocab_size);
+  }
 }
 
 }  // namespace sampler
