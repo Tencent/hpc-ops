@@ -219,9 +219,11 @@ void masked_act_mul_and_quant_async(__nv_fp8_e4m3 *output_ptr, const __nv_bfloat
       num_tokens_per_expert, Block2YX, Row2EandT, num_block_row);
 }
 
-void act_mul_and_blockwise_quant_async(__nv_fp8_e4m3 *output_ptr, float *output_scale_ptr,
-                                       const __nv_bfloat16 *input_ptr, const int num_row,
-                                       const int num_col, cudaStream_t stream) {
+void act_mul_and_blockwise_quant_async(void *output_ptr, void *output_scale_ptr,
+                                       const void *input_ptr, const int num_row, const int num_col,
+                                       cudaStream_t stream) {
+  using Tin = __nv_bfloat16;
+  using Tout = __nv_fp8_e4m3;
   int intermediate_size = num_col / 2;
 
   dim3 block(128);
@@ -230,7 +232,8 @@ void act_mul_and_blockwise_quant_async(__nv_fp8_e4m3 *output_ptr, float *output_
   dim3 grid(num_row * num_block_per_row);
 
   kernels::act_mul_and_blockwise_quant_kernel<<<grid, block, 0, stream>>>(
-      input_ptr, output_ptr, output_scale_ptr, num_row, intermediate_size, block1D22D);
+      (Tin *)input_ptr, (Tout *)output_ptr, (float *)output_scale_ptr, num_row, intermediate_size,
+      block1D22D);
 }
 
 }  // namespace activation

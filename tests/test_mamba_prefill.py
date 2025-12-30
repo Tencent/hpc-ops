@@ -856,6 +856,7 @@ def chun_scan_torch_ref(B, C, x, pre_y, z, xs, ys, D, split_metadata, chunk_size
 @pytest.mark.parametrize("dstate", [128])
 @pytest.mark.parametrize("d_conv", [4])
 def test_mamba_prefill_by_step(batch_size, max_seqlen, nheads, ngroups, head_dim, dstate, d_conv):
+    torch.manual_seed(0)
     num_max_batch = 256
     chunk_size = 256
     torch.random.manual_seed(0)
@@ -1116,6 +1117,7 @@ def test_mamba_prefill_by_step(batch_size, max_seqlen, nheads, ngroups, head_dim
 @pytest.mark.parametrize("dstate", [128])
 @pytest.mark.parametrize("d_conv", [4])
 def test_mamba_prefill(batch_size, max_seqlen, nheads, ngroups, head_dim, dstate, d_conv):
+    torch.manual_seed(0)
     num_max_batch = 256
     chunk_size = 256
     torch.random.manual_seed(0)

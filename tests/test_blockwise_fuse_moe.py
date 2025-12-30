@@ -1,0 +1,341 @@
+import sys
+import os
+from pathlib import Path
+
+sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
+
+import hpc
+import torch
+import math
+import pytest
+from pathlib import Path
+from utils import allclose
+from typing import Tuple
+import torch.nn.functional as F
+
+
+def naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert):
+    num_tokens, num_topk = topk_ids.shape
+    num_tokens, hidden_size = x.shape
+    total_num_tokens = num_tokens * num_topk
+    num_tokens_per_group_avg = total_num_tokens / num_expert
+    align_size = 16
+    if num_tokens_per_group_avg <= 16:
+        align_size = 16
+    elif num_tokens_per_group_avg <= 32:
+        align_size = 32
+    else:
+        align_size = 64
+
+    def __align_to_multiple(tensor, multiple):
+        return torch.where(tensor == 0, tensor, ((tensor + multiple - 1) // multiple) * multiple)
+
+    unique_values, num_tokens_per_expert_partial = torch.unique(
+        topk_ids.flatten(), return_counts=True, sorted=True
+    )
+    num_tokens_per_expert = torch.full([num_expert], 0, dtype=torch.int32, device="cuda")
+    for i in range(unique_values.numel()):
+        num_tokens_per_expert[unique_values[i]] = num_tokens_per_expert_partial[i]
+
+    cu_num_tokens_per_expert = torch.cumsum(
+        torch.cat([torch.tensor([0], dtype=torch.int32, device="cuda"), num_tokens_per_expert]),
+        dim=0,
+    ).to(torch.int32)
+
+    num_tokens_per_expert_paded = __align_to_multiple(num_tokens_per_expert, align_size)
+
+    cu_num_tokens_per_expert_paded = torch.cumsum(
+        torch.cat(
+            [torch.tensor([0], dtype=torch.int32, device="cuda"), num_tokens_per_expert_paded]
+        ),
+        dim=0,
+    ).to(torch.int32)
+
+    num_tokens_paded = (
+        (num_tokens * num_topk + num_expert * align_size + align_size - 1)
+        // align_size
+        * align_size
+    )
+
+    y = torch.zeros((num_tokens_paded, hidden_size), dtype=x.dtype, device=x.device)
+    y_scale = torch.zeros(
+        (num_tokens_paded, x_scale.size(1)), dtype=torch.float32, device=x_scale.device
+    )
+    token_pos = torch.zeros((num_tokens, num_topk), dtype=torch.int32, device=x.device)
+
+    # reset
+    num_tokens_per_expert.fill_(0)
+
+    for idx, iexpert in enumerate(topk_ids.flatten()):
+        itoken = idx // num_topk
+        icol = idx % num_topk
+        pos = cu_num_tokens_per_expert_paded[iexpert] + num_tokens_per_expert[iexpert]
+        y[pos] = x[itoken]
+        y_scale[pos] = x_scale[itoken]
+        token_pos[itoken, icol] = pos.item()
+        num_tokens_per_expert[iexpert] += 1
+
+    return (
+        y,
+        y_scale,
+        token_pos,
+        num_tokens_per_expert,
+        cu_num_tokens_per_expert_paded,
+        unique_values,
+    )
+
+
+def naive_group_gemm(x, w, num_tokens_per_expert, cu_num_tokens_per_expert, xscale, wscale):
+
+    m, k = x.shape
+    num_group, n, _ = w.shape
+
+    m_pergroup = m // num_group
+
+    y = torch.zeros((m, n), dtype=torch.bfloat16, device=x.device)
+
+    for i in range(num_group):
+        start_idx = int(cu_num_tokens_per_expert[i].item())
+        end_idx = int(
+            start_idx + num_tokens_per_expert[i].item()
+        )  # cu_num_tokens_per_expert[i + 1].item()
+        if num_tokens_per_expert[i].item() == 0:
+            continue
+
+        x_group = x[start_idx:end_idx]  # (m, k)
+        w_group = w[i]  # (n, k)
+
+        m = x_group.size(0)
+        n = w_group.size(0)
+        k = x_group.size(1)
+
+        x_scale_group = xscale[start_idx:end_idx]  # (m, k / 128)
+        w_scale_group = wscale[i]  # (n/128, 64)
+        w_scale_group = w_scale_group[:, : k // 128]
+
+        assert x_group.size(1) == w_group.size(1)
+        assert w_scale_group.size(0) == w_group.size(0) // 128
+        assert w_scale_group.size(1) == w_group.size(1) // 128
+
+        output = torch.zeros((m, n), dtype=torch.float32, device=x_group.device)
+
+        num_tile_n = n // 128
+        num_tile_k = k // 128
+
+        x_chunks = torch.chunk(x_group, num_tile_k, dim=1)
+        w_chunks = torch.chunk(w_group, num_tile_k, dim=1)
+
+        for n in range(num_tile_n):
+            tmp = torch.zeros((m, 128), dtype=torch.float32, device=x_group.device)
+            for k in range(num_tile_k):
+                x_i = x_chunks[k]  # （m, 128)
+                x_scale_i = x_scale_group[:, k]  # (m, 1)
+                w_scale_i = w_scale_group[n, k]  # (1)
+                assert x_scale_i.size(0) == x_i.size(0)
+                assert w_scale_i.numel() == 1
+
+                w_chunk = w_chunks[k]  # (n, 128)
+                w_i = w_chunk[n * 128 : (n + 1) * 128].t()  # (128, 128)
+
+                scale_a = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+                scale_b = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+
+                gemm_output = torch._scaled_mm(x_i, w_i, scale_a, scale_b, out_dtype=torch.float32)
+                tmp += gemm_output * x_scale_i.unsqueeze(1) * w_scale_i
+            output[:, n * 128 : (n + 1) * 128] = tmp
+
+        y[start_idx:end_idx] = output.to(torch.bfloat16)
+    return y
+
+
+def naive_act_mul_and_blockwise_quant(gate_up_out):
+
+    def _quantize_blockwise_fp8(
+        tensor: torch.Tensor,
+        block_size: int = 128,
+        fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+        compute_dtype: torch.dtype = torch.float32,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert tensor.dim() == 2, "Tensor must be 2D"
+
+        batch_size, num_features = tensor.shape
+        num_blocks = (num_features + block_size - 1) // block_size
+
+        fp8_max = 448.0
+
+        quantized = torch.empty(batch_size, num_features, device=tensor.device, dtype=fp8_dtype)
+
+        scales = torch.empty(batch_size, num_blocks, device=tensor.device, dtype=compute_dtype)
+
+        for block_idx in range(num_blocks):
+            start = block_idx * block_size
+            end = min(start + block_size, num_features)
+
+            if start >= end:
+                continue
+
+            block = tensor[:, start:end]  # (batch, block_features)
+
+            block_abs_max = block.abs().amax(dim=1, keepdim=True)  # (batch, 1)
+
+            scale = block_abs_max / fp8_max
+            inv_scale = 1.0 / (scale + 1e-8)
+
+            # save scale
+            scales[:, block_idx] = scale.squeeze(1)
+
+            # quant
+            quantized_block = (block * inv_scale).to(fp8_dtype)
+            quantized[:, start:end] = quantized_block
+
+        return quantized, scales
+
+    def silu(x):
+        return x / (1 + (-x).exp())
+
+    # silu and mul
+    gate_up = gate_up_out.float()
+    gate, up = torch.chunk(gate_up.float(), 2, dim=1)
+    out = silu(gate) * up
+
+    # block wise quant
+    outfp8, out_scale = _quantize_blockwise_fp8(out)
+    return outfp8, out_scale
+
+
+def naive_reduce(x_bf16, topk_pos, topk_scale, shared_output=None):
+    num_tokens, num_topk = topk_pos.shape
+    _, hidden_size = x_bf16.shape
+
+    y_bf16 = torch.zeros((num_tokens, hidden_size), dtype=torch.bfloat16, device=x_bf16.device)
+    for i in range(num_tokens):
+        y_bf16[i] = torch.sum(x_bf16[topk_pos[i]] * topk_scale[i].unsqueeze(1), dim=0)
+        if shared_output is not None:
+            y_bf16[i] += shared_output[i]
+
+    return y_bf16
+
+
+def naive_fuse_moe_blockwise(
+    x,
+    x_scale,
+    gate_up_weight,
+    gate_up_weight_scale,
+    down_weight,
+    down_weight_scale,
+    topk_ids,
+    topk_scale,
+    rank_ep,
+    num_expert,
+    shared_output=None,
+):
+    # count_and_gather
+    (
+        gate_up_input,
+        gate_up_input_scale,
+        topk_pos,
+        num_tokens_per_expert,
+        cu_num_tokens_per_expert_paded,
+        expert_ids,
+    ) = naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert)
+
+    # gate_up_proj
+    gate_up_output = naive_group_gemm(
+        gate_up_input,
+        gate_up_weight,
+        num_tokens_per_expert,
+        cu_num_tokens_per_expert_paded,
+        gate_up_input_scale,
+        gate_up_weight_scale,
+    )
+
+    # act_and_mul
+    down_input, down_input_scale = naive_act_mul_and_blockwise_quant(gate_up_output)
+
+    # down_proj
+    down_output = naive_group_gemm(
+        down_input,
+        down_weight,
+        num_tokens_per_expert,
+        cu_num_tokens_per_expert_paded,
+        down_input_scale,
+        down_weight_scale,
+    )
+
+    # reduce
+    y = naive_reduce(down_output, topk_pos, topk_scale, shared_output)
+
+    return y
+
+
+@pytest.mark.parametrize("num_tokens", [8])
+@pytest.mark.parametrize("num_topk", [8])
+@pytest.mark.parametrize("hidden_size", [512])
+@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("num_expert", [128])
+@pytest.mark.parametrize("rank_ep", [0])
+@pytest.mark.parametrize("has_shared_output", [False, True])
+def test_fuse_moe(
+    num_tokens, num_topk, hidden_size, intermediate_size, num_expert, rank_ep, has_shared_output
+):
+    torch.manual_seed(0)
+    dtype = torch.float8_e4m3fn
+
+    topk_ids = torch.randint(
+        0, num_expert, (num_tokens, num_topk), dtype=torch.int32, device="cuda"
+    )
+    topk_ids, _ = torch.sort(topk_ids, dim=1)
+    topk_scale = torch.randn((num_tokens, num_topk), dtype=torch.float, device="cuda") / num_topk
+
+    x = (torch.randn((num_tokens, hidden_size), dtype=torch.float, device="cuda") / 100).to(dtype)
+    x_scale = torch.randn((num_tokens, hidden_size // 128), dtype=torch.float, device="cuda")
+    gate_up_weight = torch.randn(
+        (num_expert, intermediate_size * 2, hidden_size), dtype=torch.float, device="cuda"
+    ).to(dtype)
+    gate_up_weight_scale = torch.randn(
+        (num_expert, intermediate_size * 2 // 128, hidden_size // 128),
+        dtype=torch.float,
+        device="cuda",
+    )
+    down_weight = torch.randn(
+        (num_expert, hidden_size, intermediate_size),
+        dtype=torch.float,
+        device="cuda",
+    ).to(dtype)
+    down_weight_scale = torch.randn(
+        (num_expert, hidden_size // 128, intermediate_size // 128), dtype=torch.float, device="cuda"
+    )
+    if has_shared_output:
+        shared_output = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
+    else:
+        shared_output = None
+
+    for _ in range(1):
+        my = hpc.fuse_moe_blockwise(
+            x,
+            x_scale,
+            gate_up_weight,
+            gate_up_weight_scale,
+            down_weight,
+            down_weight_scale,
+            topk_ids,
+            topk_scale,
+            rank_ep,
+            num_expert,
+        )
+        gt = naive_fuse_moe_blockwise(
+            x,
+            x_scale,
+            gate_up_weight,
+            gate_up_weight_scale,
+            down_weight,
+            down_weight_scale,
+            topk_ids,
+            topk_scale,
+            rank_ep,
+            num_expert,
+        )
+
+        torch.cuda.synchronize()
+
+    assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.08, atol=0.1)

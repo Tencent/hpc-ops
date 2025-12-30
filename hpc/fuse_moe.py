@@ -215,6 +215,82 @@ def fuse_moe(
     )
 
 
+def fuse_moe_blockwise(
+    x: Tensor,
+    x_scale: Tensor,
+    gate_up_weight: Tensor,
+    gate_up_weight_scale: Tensor,
+    down_weight: Tensor,
+    down_weight_scale: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    rank_ep: int,
+    num_expert_total: int,
+    shared_output: Tensor = None,
+) -> Tensor:
+    """Performs Mixture of Experts (MoE) forward operation with FP8 precision.
+
+    It only supports blockwise quantization of weights and inputs, with a block
+    size of 128.
+
+    This function executes the MoE computation with all matrix multiplications
+    performed in FP8 precision for improved performance and memory efficiency.
+    The gate and up projections are fused into a single matrix multiplication.
+
+    Args:
+        x: Input activation tensor
+            Shape: [num_tokens, hidden_size]
+            Dtype: fp8
+        x_scale: Scaling factors for input activation
+            Shape: [num_tokens, hidden_size / 128]
+            Dtype: fp32
+        gate_up_weight: Combined weight tensor for gate and up projections
+            Shape: [num_expert_local, intermediate_size * 2, hidden_size]
+            Dtype: fp8
+        gate_up_weight_scale: Scaling factors for gate_up_weight, should pad the last dim to 64,
+                              so hidden_size must be smaller than 64*128
+            Shape: [num_expert_local, intermediate_size * 2 / 128, 64]
+            Dtype: fp32
+        down_weight: Weight tensor for down projection
+            Shape: [num_expert_local, hidden_size, intermediate_size]
+            Dtype: fp8
+        down_weight_scale: Scaling factors for down_weight, should pad the last dim to 64,
+                           so intermediate_size must be smaller than 64*128
+            Shape: [num_expert_local, hidden_size / 128, 64]
+            Dtype: float32
+        topk_ids: Token indices assigned to each expert
+            Shape: [num_tokens, num_topk]
+            Dtype: int32
+        topk_scale: Weighting factors for each token-expert assignment
+            Shape: [num_tokens, num_topk]
+            Dtype: float32
+        rank_ep: Expert parallel rank (for distributed training)
+            Dtype: int32
+        num_expert_total: the total number of expert
+            Dtype: int32
+        shared_output: output for shared experts, default is None
+            Shape: [num_seq, hidden_size]
+            Dtype: bfloat16
+    Returns:
+        torch.Tensor: Output tensor after MoE computation
+            Shape: [num_tokens, hidden_size]
+            Dtype: bfloat16
+    """
+    return torch.ops.hpc.fuse_moe_blockwise(
+        x,
+        x_scale,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids,
+        topk_scale,
+        shared_output,
+        rank_ep,
+        num_expert_total,
+    )
+
+
 @torch.library.register_fake("hpc::count_and_gather")
 def count_and_gather_fake(
     x, topk_ids, num_expert, rank_ep, intermediate_size, num_seq_per_group_avg
@@ -251,5 +327,22 @@ def fuse_moe_fake(
     rank_ep,
     num_expert_total,
     use_bf16_mul,
+):
+    return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+
+
+@torch.library.register_fake("hpc::fuse_moe_blockwise")
+def fuse_moe_blockwise_fake(
+    x: Tensor,
+    x_scale: Tensor,
+    gate_up_weight: Tensor,
+    gate_up_weight_scale: Tensor,
+    down_weight: Tensor,
+    down_weight_scale: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    rank_ep: int,
+    num_expert_total: int,
+    use_bf16_mul: bool = True,
 ):
     return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)

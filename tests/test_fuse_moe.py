@@ -13,7 +13,7 @@ from utils import allclose
 
 
 def naive_gather_expert_inputs(x, topk_ids):
-    num_expert, num_topk = topk_ids.shape
+    num_tokens, num_topk = topk_ids.shape
     num_seq, hidden_size = x.shape
 
     unique_values, seqlens = torch.unique(topk_ids.flatten(), return_counts=True, sorted=True)
@@ -27,7 +27,7 @@ def naive_gather_expert_inputs(x, topk_ids):
 
     sort_token_indices = sort_indices // num_topk
     token_pos, _ = torch.sort(
-        torch.argsort(sort_token_indices).reshape(num_expert, num_topk), dim=1
+        torch.argsort(sort_token_indices).reshape(num_tokens, num_topk), dim=1
     )
 
     y = x[sort_token_indices]
@@ -133,6 +133,7 @@ def naive_fuse_moe(
 def test_fuse_moe(
     num_seq, num_topk, hidden_size, intermediate_size, num_expert, rank_ep, has_shared_output
 ):
+    torch.manual_seed(0)
     dtype = torch.float8_e4m3fn
 
     topk_ids = torch.randint(0, num_expert, (num_seq, num_topk), dtype=torch.int32, device="cuda")
