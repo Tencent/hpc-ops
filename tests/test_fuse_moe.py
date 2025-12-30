@@ -76,13 +76,15 @@ def naive_act_mul_and_quant(gate_up, scale):
     return outfp8
 
 
-def naive_reduce(x_bf16, topk_pos, topk_scale):
+def naive_reduce(x_bf16, topk_pos, topk_scale, shared_output=None):
     num_seq, num_topk = topk_pos.shape
     total_num_seq, hidden_size = x_bf16.shape
 
     y_bf16 = torch.zeros((num_seq, hidden_size), dtype=torch.bfloat16, device=x_bf16.device)
     for i in range(num_seq):
         y_bf16[i] = torch.sum(x_bf16[topk_pos[i]] * topk_scale[i].unsqueeze(1), dim=0)
+        if shared_output is not None:
+            y_bf16[i] += shared_output[i]
 
     return y_bf16
 
@@ -97,6 +99,7 @@ def naive_fuse_moe(
     topk_ids,
     topk_scale,
     rank_ep,
+    shared_output=None,
 ):
     # count_and_gather
     gate_up_input, topk_pos, seqlens, cu_seqlens, expert_ids = naive_gather_expert_inputs(
@@ -115,7 +118,7 @@ def naive_fuse_moe(
     down_output = naive_group_gemm(down_input, down_weight, cu_seqlens, down_scale, expert_ids)
 
     # reduce
-    y = naive_reduce(down_output, topk_pos, topk_scale)
+    y = naive_reduce(down_output, topk_pos, topk_scale, shared_output)
 
     return y
 
@@ -126,7 +129,10 @@ def naive_fuse_moe(
 @pytest.mark.parametrize("intermediate_size", [4096, 512, 1024])
 @pytest.mark.parametrize("num_expert", [128])
 @pytest.mark.parametrize("rank_ep", [0])
-def test_fuse_moe(num_seq, num_topk, hidden_size, intermediate_size, num_expert, rank_ep):
+@pytest.mark.parametrize("has_shared_output", [False, True])
+def test_fuse_moe(
+    num_seq, num_topk, hidden_size, intermediate_size, num_expert, rank_ep, has_shared_output
+):
     dtype = torch.float8_e4m3fn
 
     topk_ids = torch.randint(0, num_expert, (num_seq, num_topk), dtype=torch.int32, device="cuda")
@@ -146,7 +152,10 @@ def test_fuse_moe(num_seq, num_topk, hidden_size, intermediate_size, num_expert,
     down_scale = torch.randn((num_expert), dtype=torch.float, device="cuda")
     act_and_mul_scale = torch.randn((1), dtype=torch.float, device="cuda")
     topk_scale = torch.randn((num_seq, num_topk), dtype=torch.float, device="cuda") / num_topk
-
+    if has_shared_output:
+        shared_output = torch.randn((num_seq, hidden_size), dtype=torch.bfloat16, device="cuda")
+    else:
+        shared_output = None
     for _ in range(1):
         my = hpc.fuse_moe(
             x,
@@ -159,6 +168,7 @@ def test_fuse_moe(num_seq, num_topk, hidden_size, intermediate_size, num_expert,
             topk_scale,
             rank_ep,
             num_expert,
+            shared_output=shared_output,
         )
         gt = naive_fuse_moe(
             x,
@@ -170,9 +180,10 @@ def test_fuse_moe(num_seq, num_topk, hidden_size, intermediate_size, num_expert,
             topk_ids,
             topk_scale,
             rank_ep,
+            shared_output,
         )
 
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
 
     print("gt")
     print(gt)

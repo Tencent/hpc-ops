@@ -70,7 +70,8 @@ count_and_gather_entry(const torch::Tensor &x, const torch::Tensor &topk_ids,
 }
 
 torch::Tensor reduce_entry(const torch::Tensor &x, const torch::Tensor &topk_pos,
-                           const torch::Tensor &topk_scale) {
+                           const torch::Tensor &topk_scale,
+                           const std::optional<torch::Tensor> &shared_output) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
   TORCH_CHECK(topk_pos.device().is_cuda(), "topk_pos tensor must be cuda");
@@ -82,6 +83,19 @@ torch::Tensor reduce_entry(const torch::Tensor &x, const torch::Tensor &topk_pos
               "topk_pos and topk_scale must share the same num_seq");
   TORCH_CHECK(topk_pos.size(1) == topk_scale.size(1),
               "topk_pos and topk_scale must share the same num_topk");
+
+  const void *shared_output_ptr = nullptr;
+  if (shared_output.has_value()) {
+    const auto shared_output_tensor = shared_output.value();
+    TORCH_CHECK(shared_output_tensor.device().is_cuda(), "shared_output tensor must be cuda");
+    TORCH_CHECK(shared_output_tensor.is_contiguous(), "shared_output tensor must be contiguous");
+    TORCH_CHECK(shared_output_tensor.dtype() == torch::kBFloat16,
+                "shared_output tensor dtype must be bfloat16");
+    TORCH_CHECK(
+        shared_output_tensor.size(0) == x.size(0) && shared_output_tensor.size(1) == x.size(1),
+        "shared_output tensor shape must be same as x tensor");
+    shared_output_ptr = shared_output_tensor.const_data_ptr();
+  }
 
   int total_num_seq = x.size(0);
   int hidden_size = x.size(1);
@@ -97,8 +111,8 @@ torch::Tensor reduce_entry(const torch::Tensor &x, const torch::Tensor &topk_pos
 
   auto *y_ptr = y.mutable_data_ptr();
 
-  reduce_async(y_ptr, x_ptr, topk_pos_ptr, topk_scale_ptr, total_num_seq, num_seq, hidden_size,
-               num_topk, stream);
+  reduce_async(y_ptr, x_ptr, topk_pos_ptr, topk_scale_ptr, shared_output_ptr, total_num_seq,
+               num_seq, hidden_size, num_topk, stream);
 
   return y;
 }
@@ -107,7 +121,8 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
                              const torch::Tensor &down_weight, const torch::Tensor &gate_up_scale,
                              const torch::Tensor &down_scale,
                              const torch::Tensor &act_and_mul_scale, const torch::Tensor &topk_ids,
-                             const torch::Tensor &topk_scale, int64_t rank_ep,
+                             const torch::Tensor &topk_scale,
+                             const std::optional<torch::Tensor> &shared_output, int64_t rank_ep,
                              int64_t num_expert_total, bool use_bf16_mul) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
@@ -135,6 +150,19 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   TORCH_CHECK(x.size(1) == gate_up_weight.size(2), "x and weight must share the same k");
   TORCH_CHECK(gate_up_weight.size(0) == down_weight.size(0),
               "gate_up_weight and down_weight must share the same num_expert");
+
+  const void *shared_output_ptr = nullptr;
+  if (shared_output.has_value()) {
+    const auto shared_output_tensor = shared_output.value();
+    TORCH_CHECK(shared_output_tensor.device().is_cuda(), "shared_output tensor must be cuda");
+    TORCH_CHECK(shared_output_tensor.is_contiguous(), "shared_output tensor must be contiguous");
+    TORCH_CHECK(shared_output_tensor.dtype() == torch::kBFloat16,
+                "shared_output tensor dtype must be bfloat16");
+    TORCH_CHECK(
+        shared_output_tensor.size(0) == x.size(0) && shared_output_tensor.size(1) == x.size(1),
+        "shared_output tensor shape must be same as x tensor");
+    shared_output_ptr = shared_output_tensor.const_data_ptr();
+  }
 
   int num_seq = x.size(0);
   int hidden_size = x.size(1);
@@ -186,8 +214,8 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
                  gate_up_scale_ptr, gate_up_tmas_ptr, act_and_mul_scale_ptr, down_input_ptr,
                  down_output_ptr, down_weight_ptr, down_scale_ptr, down_tmas_ptr, topk_ids_ptr,
                  topk_scale_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr,
-                 num_seq, hidden_size, intermediate_size, num_topk, num_expert_total, num_expert,
-                 rank_ep, use_bf16_mul, stream);
+                 shared_output_ptr, num_seq, hidden_size, intermediate_size, num_topk,
+                 num_expert_total, num_expert, rank_ep, use_bf16_mul, stream);
 
   return y;
 }
@@ -203,13 +231,14 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.impl("count_and_gather", torch::kCUDA, &hpc::fuse_moe::count_and_gather_entry);
 
   m.def(
-      "reduce(Tensor x, Tensor topk_pos, Tensor topk_scale"
+      "reduce(Tensor x, Tensor topk_pos, Tensor topk_scale, Tensor ? shared_output"
       ") -> (Tensor)");
   m.impl("reduce", torch::kCUDA, &hpc::fuse_moe::reduce_entry);
 
   m.def(
       "fuse_moe(Tensor x, Tensor gate_up_weight, Tensor down_weight, Tensor gate_up_scale, "
-      "Tensor down_scale, Tensor act_and_mul_scale, Tensor topk_ids, Tensor topk_scale,"
+      "Tensor down_scale, Tensor act_and_mul_scale, Tensor topk_ids, Tensor topk_scale, Tensor ? "
+      "shared_output, "
       "int rank_ep, int num_expert_total, bool use_bf16_mul) -> (Tensor)");
   m.impl("fuse_moe", torch::kCUDA, &hpc::fuse_moe::fuse_moe_entry);
 }

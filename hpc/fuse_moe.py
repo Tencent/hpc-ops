@@ -85,6 +85,7 @@ def reduce(
     x: Tensor,
     topk_pos: Tensor,
     topk_scale: Tensor,
+    shared_output: Tensor = None,
 ) -> Tensor:
     """reduce token based on expert assignments for MoE layers.
 
@@ -102,6 +103,9 @@ def reduce(
         topk_scale: Scaling factors for expert outputs (typically gating scores)
             Shape: [num_seq, num_topk]
             Dtype: float32
+        shared_output: output for shared experts, default is None
+            Shape: [num_seq, hidden_size]
+            Dtype: bfloat16
 
     Returns:
         Tensor: Reduced output tensor containing aggregated expert contributions
@@ -119,7 +123,7 @@ def reduce(
         - For best performance, hidden_size should be a multiple of 32
         - topk_pos values must be in range [0, total_num_seq-1]
     """
-    return torch.ops.hpc.reduce(x, topk_pos, topk_scale)
+    return torch.ops.hpc.reduce(x, topk_pos, topk_scale, shared_output)
 
 
 def fuse_moe(
@@ -134,6 +138,7 @@ def fuse_moe(
     rank_ep: int,
     num_expert_total: int,
     use_bf16_mul: bool = True,
+    shared_output: Tensor = None,
 ) -> Tensor:
     """Performs Mixture of Experts (MoE) forward operation with FP8 precision.
 
@@ -171,6 +176,9 @@ def fuse_moe(
         num_expert_total: the total number of expert
             Dtype: int32
         use_bf16_mul: use bf16 for silu mul or not.
+        shared_output: output for shared experts, default is None
+            Shape: [num_seq, hidden_size]
+            Dtype: bfloat16
 
     Returns:
         torch.Tensor: Output tensor after MoE computation
@@ -200,6 +208,7 @@ def fuse_moe(
         act_and_mul_scale,
         topk_ids,
         topk_scale,
+        shared_output,
         rank_ep,
         num_expert_total,
         use_bf16_mul,
