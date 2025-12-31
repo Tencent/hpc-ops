@@ -1,8 +1,38 @@
-from setuptools import setup
-from torch.utils.cpp_extension import CppExtension, BuildExtension, CUDAExtension
-import os
-from glob import glob
-import subprocess
+from setuptools import setup, Extension
+from setuptools.command.build_ext import build_ext
+import subprocess, os, sys
+import shutil
+
+
+class CMakeExtension(Extension):
+    def __init__(self, name, version_macros=[], sourcedir=""):
+        Extension.__init__(self, name, sources=[])
+        self.version_macros = version_macros
+        self.sourcedir = os.path.abspath(sourcedir)
+
+
+class CMakeBuild(build_ext):
+    def run(self):
+        for ext in self.extensions:
+            self.build_extension(ext)
+
+    def build_extension(self, ext):
+        build_lib_dir = os.path.dirname(self.get_ext_fullpath(ext.name))
+        build_temp_dir = os.path.join(self.build_temp, ext.name)
+
+        os.makedirs(build_lib_dir, exist_ok=True)
+        os.makedirs(build_temp_dir, exist_ok=True)
+
+        cmake_args = [f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={build_lib_dir}", *ext.version_macros]
+
+        subprocess.check_call(["cmake", ext.sourcedir] + cmake_args, cwd=build_temp_dir)
+        subprocess.check_call(
+            ["cmake", "--build", ".", "--config", "Release", "-j4"], cwd=build_temp_dir
+        )
+
+        so_src_path = os.path.join(build_temp_dir, "_C.abi3.so")
+        so_dst_path = os.path.join(build_lib_dir, "hpc/_C.abi3.so")
+        shutil.copy(so_src_path, so_dst_path)
 
 
 def get_version():
@@ -37,43 +67,10 @@ def get_version():
 
 
 version, git_hash = get_version()
-
-include_flags = "-I" + os.path.dirname(__file__)
-cute_include = "-I" + os.path.dirname(__file__) + "/3rd/cutlass/include"
-cxx_flags = ['-DHPC_VERSION_STR="{}"'.format(version), '-DHPC_GIT_HASH_STR="{}"'.format(git_hash)]
-
-extra_compile_args = {
-    "cxx": ["-O2", "-std=c++17", include_flags, cute_include, *cxx_flags],
-    "nvcc": [
-        "-arch=sm_90a",
-        "-O2",
-        "-lineinfo",
-        "-Xptxas=-warn-double-usage,-warn-spills,-Werror,-v",
-        "-std=c++17",
-        "--expt-relaxed-constexpr",
-        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
-        "-DNDEBUG",
-        include_flags,
-        cute_include,
-        *cxx_flags,
-    ],
-}
-
-extra_link_args = ["-L/usr/local/cuda/targets/x86_64-linux/lib/stubs", "-lcuda"]
-
-cc_files = glob("src/**/*.cc", recursive=True)
-cu_files = glob("src/**/*.cu", recursive=True)
-
-sources = cc_files + cu_files
-sources = [f for f in sources if not ("test" in f)]
-
-cuda_extension = CUDAExtension(
-    name="hpc._C",
-    sources=sources,
-    extra_compile_args=extra_compile_args,
-    extra_link_args=extra_link_args,
-    py_limited_api=True,
-)
+version_macros = [
+    '-DHPC_VERSION_STR="{}"'.format(version),
+    '-DHPC_GIT_HASH_STR="{}"'.format(git_hash),
+]
 
 with open("hpc/version.py", "w") as fp:
     fp.write('version = "{}"\n'.format(version))
@@ -88,9 +85,9 @@ setup(
     url="https://mirrors.tencent.com/#/private/pypi/detail?repo_id=155&project_name=hpc-ops",
     license="Copyright 2025",
     packages=["hpc"],
-    ext_modules=[cuda_extension],
-    install_requires=["torch"],
-    cmdclass={"build_ext": BuildExtension},
-    package_data={"hpc": ["*.so"]},
+    ext_modules=[CMakeExtension("hpc", version_macros)],
+    cmdclass={"build_ext": CMakeBuild},
+    package_data={"_C": ["*.so"]},
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
+    install_requires=["torch"],
 )

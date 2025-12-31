@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "src/communicator/multicast_communicator.h"
+#include "src/communicator/multinode_communicator.h"
 
 namespace hpc {
 namespace communicator {
@@ -73,6 +74,33 @@ class IMulticastCommunicator : public torch::CustomClassHolder {
   std::unique_ptr<MulticastCommunicator> multicomm_;
 };
 
+class IMultinodeCommunicator : public torch::CustomClassHolder {
+ public:
+  IMultinodeCommunicator(int64_t rank, int64_t world_size, int64_t device_id,
+                         const std::string &comm_name) {
+    multinode_comm_ =
+        std::make_unique<MultinodeCommunicator>(rank, world_size, device_id, comm_name);
+  }
+
+  ~IMultinodeCommunicator() { multinode_comm_.reset(); }
+
+  auto CreateTensorSync(int64_t bytes) {
+    c10::Dict<int64_t, torch::Tensor> tensors;
+    return tensors;
+  }
+
+  void Barrier() { multinode_comm_->Barrier(); }
+
+  int64_t GetRank() { return multinode_comm_->GetRank(); }
+
+  int64_t GetWorldSize() { return multinode_comm_->GetWorldSize(); }
+
+  int64_t GetDeviceId() { return multinode_comm_->GetDeviceId(); }
+
+ private:
+  std::unique_ptr<MultinodeCommunicator> multinode_comm_;
+};
+
 }  // namespace communicator
 }  // namespace hpc
 
@@ -87,4 +115,14 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       .def("GetRank", &hpc::communicator::IMulticastCommunicator::GetRank)
       .def("GetWorldSize", &hpc::communicator::IMulticastCommunicator::GetWorldSize)
       .def("GetDeviceId", &hpc::communicator::IMulticastCommunicator::GetDeviceId);
+  m.class_<hpc::communicator::IMultinodeCommunicator>("MultinodeCommunicator")
+      .def(torch::init<int64_t, int64_t, int64_t, const std::string &>(),
+           "initialize multicast communcommunicator",
+           {torch::arg("rank"), torch::arg("world_size"), torch::arg("device_id"),
+            torch::arg("comm_name")})
+      .def("CreateTensorSync", &hpc::communicator::IMultinodeCommunicator::CreateTensorSync)
+      .def("Barrier", &hpc::communicator::IMultinodeCommunicator::Barrier)
+      .def("GetRank", &hpc::communicator::IMultinodeCommunicator::GetRank)
+      .def("GetWorldSize", &hpc::communicator::IMultinodeCommunicator::GetWorldSize)
+      .def("GetDeviceId", &hpc::communicator::IMultinodeCommunicator::GetDeviceId);
 }

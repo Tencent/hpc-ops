@@ -7,17 +7,18 @@ CUH_FILES=$(shell find src -name "*.cuh")
 
 CSRC_FILES=$(CC_FILES) $(CU_FILES) $(CUH_FILES) $(H_FILES)
 
-TORCH_PATH=$(shell python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')
 
 all:
 	python3 setup.py build
 
 cmake:
-	cmake -S . -B build -DCMAKE_PREFIX_PATH=$(TORCH_PATH) ..
-	cmake --build build --parallel
+	cmake -S . -B build
+	cmake --build build --parallel -v
 
 wheel:
+	find . -type d -name "__pycache__" -exec rm -rf {} +
 	python3 setup.py bdist_wheel
+	# python3 -m build --wheel
 
 nvshmem:
 	cmake -S 3rd/nvshmem -B 3rd/nvshmem-build / \
