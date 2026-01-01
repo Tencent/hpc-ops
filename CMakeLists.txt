@@ -10,30 +10,35 @@ if(NOT EXISTS "${NVSHMEM_INSTALL_DIR}/include")
     file(MAKE_DIRECTORY "${NVSHMEM_INSTALL_DIR}/include")
 endif()
 
+find_library(MLX5_LIBRARY
+  NAMES mlx5
+  HINTS /lib/x86_64-linux-gnu /usr/lib64 /lib64
+)
+
 ExternalProject_Add(nvshmem_external
-    SOURCE_DIR "${NVSHMEM_SRC_DIR}"
-    BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build"
-    CMAKE_ARGS
-        -DMLX5_lib=/usr/lib64/libmlx5.so
-        -DCMAKE_CUDA_ARCHITECTURES=90a
-        -DNVSHMEM_IBGDA_SUPPORT=ON
-        -DCUDA_HOME=/usr/local/cuda
-        -DCMAKE_INSTALL_PREFIX=${NVSHMEM_INSTALL_DIR}
-        -DNVSHMEM_SHMEM_SUPPORT=OFF
-        -DNVSHMEM_MPI_SUPPORT=OFF
-        -DNVSHMEM_PMI_SUPPORT=OFF
-        -DNVSHMEM_PMIX_SUPPORT=OFF
-        -DNVSHMEM_PMI2_SUPPORT=OFF
-        -DNVSHMEM_UCX_SUPPORT=OFF
-        -DNVSHMEM_USE_NCCL=OFF
-        -DNVSHMEM_BUILD_HYDRA_LAUNCHER=OFF
-        -DNVSHMEM_BUILD_PYTHON_LIB=OFF
-        -DNVSHMEM_BUILD_TXZ_PACKAGE=OFF
-        -DNVSHMEM_TIMEOUT_DEVICE_POLLING=OFF
-        -DNVSHMEM_USE_GDRCOPY=OFF
-        -DNVSHMEM_BUILD_EXAMPLES=OFF
-        -DNVSHMEM_BUILD_TESTS=OFF
-    INSTALL_COMMAND make install
+  SOURCE_DIR "${NVSHMEM_SRC_DIR}"
+  BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build"
+  CMAKE_ARGS
+   -DMLX5_lib=${MLX5_LIBRARY}
+   -DCMAKE_CUDA_ARCHITECTURES=90a
+   -DNVSHMEM_IBGDA_SUPPORT=ON
+   -DCUDA_HOME=/usr/local/cuda
+   -DCMAKE_INSTALL_PREFIX=${NVSHMEM_INSTALL_DIR}
+   -DNVSHMEM_SHMEM_SUPPORT=OFF
+   -DNVSHMEM_MPI_SUPPORT=OFF
+   -DNVSHMEM_PMI_SUPPORT=OFF
+   -DNVSHMEM_PMIX_SUPPORT=OFF
+   -DNVSHMEM_PMI2_SUPPORT=OFF
+   -DNVSHMEM_UCX_SUPPORT=OFF
+   -DNVSHMEM_USE_NCCL=OFF
+   -DNVSHMEM_BUILD_HYDRA_LAUNCHER=OFF
+   -DNVSHMEM_BUILD_PYTHON_LIB=OFF
+   -DNVSHMEM_BUILD_TXZ_PACKAGE=OFF
+   -DNVSHMEM_TIMEOUT_DEVICE_POLLING=OFF
+   -DNVSHMEM_USE_GDRCOPY=OFF
+   -DNVSHMEM_BUILD_EXAMPLES=OFF
+   -DNVSHMEM_BUILD_TESTS=OFF
+   INSTALL_COMMAND make install -j4
 )
 
 add_library(nvshmem STATIC IMPORTED GLOBAL)
@@ -94,13 +99,6 @@ target_compile_definitions(
   HPC_VERSION_STR=${HPC_VERSION_STR}
 )
 
-message(STATUS "=========================================================== reed debug ====================")
-message(STATUS ${HPC_GIT_HASH_STR})
-message(STATUS ${HPC_VERSION_STR})
-message(STATUS ${Python3_SITELIB})
-message(STATUS ${CUDAToolkit_INCLUDE_DIRS})
-message(STATUS "=========================================================== reed end ====================")
-
 target_include_directories(
   _C PRIVATE
   ./
@@ -135,6 +133,7 @@ target_compile_options(
     -std=c++17
     -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
     -DNDEBUG
+    -Xptxas=-warn-double-usage,-warn-spills,-Werror,-v
   >
   $<$<COMPILE_LANGUAGE:CXX>:
     -Wno-unused-result

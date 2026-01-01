@@ -17,8 +17,7 @@ cmake:
 
 wheel:
 	find . -type d -name "__pycache__" -exec rm -rf {} +
-	python3 setup.py bdist_wheel
-	# python3 -m build --wheel
+	python3 -m build --wheel --no-isolation
 
 nvshmem:
 	cmake -S 3rd/nvshmem -B 3rd/nvshmem-build / \

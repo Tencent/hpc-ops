@@ -27,7 +27,7 @@ class CMakeBuild(build_ext):
 
         subprocess.check_call(["cmake", ext.sourcedir] + cmake_args, cwd=build_temp_dir)
         subprocess.check_call(
-            ["cmake", "--build", ".", "--config", "Release", "-j4"], cwd=build_temp_dir
+            ["cmake", "--build", ".", "--config", "Release", "-j8"], cwd=build_temp_dir
         )
 
         so_src_path = os.path.join(build_temp_dir, "_C.abi3.so")
