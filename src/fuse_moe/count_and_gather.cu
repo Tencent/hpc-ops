@@ -16,21 +16,76 @@ namespace fuse_moe {
 
 namespace kernels {
 
-__global__ void count_kernel(const int *topk_ids_ptr, int *seqlens_ptr, int total_num_topk,
-                             int start_expert, int end_expert) {
+__global__ void count_seq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, int *seqlens_ptr,
+                                 int total_num_topk, int start_expert, int end_expert) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
-  int iexpert = topk_ids_ptr[idx];
-  if ((idx < total_num_topk) && (iexpert >= start_expert) && (iexpert < end_expert)) {
-    atomicAdd(&seqlens_ptr[iexpert - start_expert], 1);
+  if ((idx < total_num_topk)) {
+    int iexpert = topk_ids_ptr[idx];
+    if ((iexpert >= start_expert) && (iexpert < end_expert)) {
+      atomicAdd(&seqlens_ptr[iexpert - start_expert], 1);
+    }
+    topk_pos_ptr[idx] = -1;
   }
 }
 
 template <int kThreadPerBlock, int kGroupPerThread, int kTileM>
-__global__ void count_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, int *seqlens_ptr,
-                             int *cu_seqlens_ptr, int *tiles_ptr, int *cu_tiles_ptr, int num_seq,
-                             int num_topk, int total_num_topk, int num_expert, int start_expert,
-                             int end_expert) {
+__global__ void count_cuseq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, int *seqlens_ptr,
+                                   int *cu_seqlens_ptr, int *tiles_ptr, int *cu_tiles_ptr,
+                                   int num_seq, int num_topk, int total_num_topk, int num_expert,
+                                   int start_expert, int end_expert) {
+  int idx = threadIdx.x + blockDim.x * blockIdx.x;
+
+  // cusum
+  int thread_seqs[kGroupPerThread];
+  int thread_tiles[kGroupPerThread];
+#pragma unroll
+  for (int i = 0; i < kGroupPerThread; i++) {
+    int igroup = idx * kGroupPerThread + i;
+    if (igroup < num_expert) {
+      int iseq = seqlens_ptr[igroup];
+      int itile_num = (iseq + kTileM - 1) / kTileM;
+      thread_seqs[i] = iseq;
+      thread_tiles[i] = itile_num;
+      tiles_ptr[igroup] = itile_num;
+    } else {
+      thread_seqs[i] = 0;
+      thread_tiles[i] = 0;
+    }
+  }
+  using BlockScan = cub::BlockScan<int, kThreadPerBlock>;
+  __shared__ typename BlockScan::TempStorage temp_storage1;
+  __shared__ typename BlockScan::TempStorage temp_storage2;
+  int seqs_aggregate, tiles_aggregate;
+  BlockScan(temp_storage1).ExclusiveSum(thread_seqs, thread_seqs, seqs_aggregate);
+  BlockScan(temp_storage2).ExclusiveSum(thread_tiles, thread_tiles, tiles_aggregate);
+
+  // store
+  // fill seqlens with zero
+  for (int i = idx; i < num_expert; i += blockDim.x) {
+    seqlens_ptr[i] = 0;  // seqlens_shm[i];
+  }
+
+#pragma unroll
+  for (int i = 0; i < kGroupPerThread; i++) {
+    int igroup = idx * kGroupPerThread + i;
+    if (igroup < num_expert) {
+      cu_seqlens_ptr[igroup] = thread_seqs[i];
+      cu_tiles_ptr[igroup] = thread_tiles[i];
+    }
+  }
+  if (idx == 0) {
+    cu_seqlens_ptr[num_expert] = seqs_aggregate;
+    cu_tiles_ptr[num_expert] = tiles_aggregate;
+  }
+}
+
+template <int kThreadPerBlock, int kGroupPerThread, int kTileM>
+__global__ void count_seq_and_cuseq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr,
+                                           int *seqlens_ptr, int *cu_seqlens_ptr, int *tiles_ptr,
+                                           int *cu_tiles_ptr, int num_seq, int num_topk,
+                                           int total_num_topk, int num_expert, int start_expert,
+                                           int end_expert) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
   extern __shared__ int seqlens_shm[];
@@ -256,13 +311,34 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
     constexpr int kThreadPerBlock = 256;
     constexpr int kGroupPerThread = 2;
 
-    dim3 block(kThreadPerBlock);
-    dim3 grid(1);
-    kernels::count_kernel<kThreadPerBlock, kGroupPerThread, kTileM>
-        <<<grid, block, num_expert * 4, stream>>>(
-            (const int *)topk_ids_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
-            (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_seq, num_topk,
-            total_num_topk, num_expert, start_expert, end_expert);
+    if (num_seq <= 128) {
+      dim3 block(kThreadPerBlock);
+      dim3 grid(1);
+      kernels::count_seq_and_cuseq_kernel<kThreadPerBlock, kGroupPerThread, kTileM>
+          <<<grid, block, num_expert * 4, stream>>>(
+              (const int *)topk_ids_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
+              (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_seq, num_topk,
+              total_num_topk, num_expert, start_expert, end_expert);
+    } else {
+      // 0.1 count seqlens
+      {
+        dim3 block(kThreadPerBlock);
+        dim3 grid((total_num_topk + kThreadPerBlock - 1) / kThreadPerBlock);
+        kernels::count_seq_kernel<<<grid, block, 0, stream>>>(
+            (const int *)topk_ids_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr, total_num_topk,
+            start_expert, end_expert);
+      }
+      // 0.2 count cu_seqlens
+      {
+        dim3 block(kThreadPerBlock);
+        dim3 grid(1);
+        kernels::count_cuseq_kernel<kThreadPerBlock, kGroupPerThread, kTileM>
+            <<<grid, block, num_expert * 4, stream>>>(
+                (const int *)topk_ids_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
+                (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_seq, num_topk,
+                total_num_topk, num_expert, start_expert, end_expert);
+      }
+    }
   }
 
   // 1. gather token and update tmas

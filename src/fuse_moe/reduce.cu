@@ -34,8 +34,8 @@ __global__ void reduce_kernel(T *y_ptr, const T *x_ptr, const int *topk_pos_ptr,
   auto *scale_shm = (float *)(shm_data + num_topk);
 
   for (int i = idx; i < num_topk; i += blockDim.x) {
-    pos_shm[idx] = topk_pos_ptr[irow * num_topk + i];
-    scale_shm[idx] = topk_scale_ptr[irow * num_topk + i];
+    pos_shm[i] = topk_pos_ptr[irow * num_topk + i];
+    scale_shm[i] = topk_scale_ptr[irow * num_topk + i];
   }
   __syncthreads();
 

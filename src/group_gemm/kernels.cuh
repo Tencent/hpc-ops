@@ -448,7 +448,6 @@ __global__ void __launch_bounds__(384, 1)
   constexpr int kTileM = Config::kTileM;
   constexpr int kTileN = Config::kTileN;
   constexpr int kTileK = Config::kTileK;
-  constexpr int kTileS = Config::kTileS;
   constexpr int kStage = Config::kStage;
 
   int idx = threadIdx.x;
@@ -460,7 +459,6 @@ __global__ void __launch_bounds__(384, 1)
 
   __shared__ uint64_t writable[kStage];
   __shared__ uint64_t readable[kStage];
-  __shared__ float wscale_shm[64];
 
   extern __shared__ uint8_t shm_data[] alignas(128);
   auto *shm_a = reinterpret_cast<Tin *>(shm_data);

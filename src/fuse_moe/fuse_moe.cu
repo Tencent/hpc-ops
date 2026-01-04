@@ -73,9 +73,10 @@ void fuse_moe_blockwise_async(
   // 0. call count_and_gather_async
   blockwise_count_and_gather_async(
       input_ptr, input_scale_ptr, gate_up_input_ptr, gate_up_output_ptr, gate_up_input_scale_ptr,
-      topk_ids_ptr, topk_pos_ptr, num_tokens_per_group_ptr, cu_num_tokens_per_group_ptr,
-      gate_up_tmas_ptr, tiles_ptr, cu_tiles_ptr, num_tokens, num_padded_tokens, hidden_size,
-      intermediate_size, num_topk, num_expert_local, rank_ep, num_tokens_per_group_avg, stream);
+      down_input_ptr, down_output_ptr, topk_ids_ptr, topk_pos_ptr, num_tokens_per_group_ptr,
+      cu_num_tokens_per_group_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr, cu_tiles_ptr,
+      num_tokens, num_padded_tokens, hidden_size, intermediate_size, num_topk, num_expert_local,
+      rank_ep, num_tokens_per_group_avg, stream);
 
   // 1. gate_up gemm
   group_gemm::group_gemm_blockwise_fp8_async(
@@ -96,7 +97,7 @@ void fuse_moe_blockwise_async(
       cu_num_tokens_per_group_ptr, down_input_scale_ptr, down_weight_scale_ptr, down_tmas_ptr,
       tiles_ptr, cu_tiles_ptr, num_expert_local, total_num_tokens, hidden_size,
       intermediate_size / 2, num_padded_tokens, intermediate_size / 2 / 128,
-      num_tokens_per_group_avg, true, stream);
+      num_tokens_per_group_avg, false, stream);
 
   // 4. call reduce //delete total_num_seq
   reduce_async(output_ptr, down_output_ptr, topk_pos_ptr, topk_scale_ptr, shared_output_ptr,
