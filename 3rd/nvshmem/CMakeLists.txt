@@ -47,15 +47,6 @@ endif()
 
 
 set(PROJECT_VERSION_NUM "3.4.5")
-set(PROJECT_VERSION_SUFFIX "R02C02")
-set(PROJECT_VERSION_FULL "${PROJECT_VERSION_NUM}${PROJECT_VERSION_SUFFIX}")
-
-string(TIMESTAMP BUILD_TIMESTAMP "%Y-%m-%dT%H:%M:%S.%f")
-file(WRITE "/dockerdata/.trmt/shmem.config.json" 
-"{
-    \"TIMESTAMP\": \"${BUILD_TIMESTAMP}\",
-    \"NVSHMEM_VERSION\": \"${PROJECT_VERSION_FULL}\"
-}")
 
 project(
   NVSHMEM

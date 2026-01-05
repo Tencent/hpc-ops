@@ -38,7 +38,7 @@ ExternalProject_Add(nvshmem_external
    -DNVSHMEM_USE_GDRCOPY=OFF
    -DNVSHMEM_BUILD_EXAMPLES=OFF
    -DNVSHMEM_BUILD_TESTS=OFF
-   INSTALL_COMMAND make install -j4
+   INSTALL_COMMAND $(MAKE) install
 )
 
 add_library(nvshmem STATIC IMPORTED GLOBAL)
@@ -128,6 +128,7 @@ target_link_libraries(
 target_compile_options(
   _C PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:
+    -Werror=all-warnings
     -lineinfo
     --expt-relaxed-constexpr
     -std=c++17

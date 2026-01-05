@@ -923,10 +923,12 @@ install(
   FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
                    GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
 )
-install(
-  DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/share/src/
-  DESTINATION share/src/
-)
+if(NVSHMEM_BUILD_TESTS)
+  install(
+    DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/share/src/
+    DESTINATION share/src/
+  )
+endif()
 install(
   DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/
   DESTINATION include/
@@ -953,19 +955,21 @@ if(NVSHMEM_BUILD_TESTS)
 )
 endif()
 
-install(
-  FILES ${CMAKE_CURRENT_SOURCE_DIR}/../changelog
-  DESTINATION ./
-)
-install(
-  FILES ${CMAKE_CURRENT_SOURCE_DIR}/../License.txt
-  DESTINATION ./
-)
-install(
-  FILES ${CMAKE_CURRENT_SOURCE_DIR}/../version.txt
-  FILES ${CMAKE_CURRENT_SOURCE_DIR}/../git_commit.txt
-  DESTINATION ./
-)
+if(NVSHMEM_BUILD_TESTS)
+  install(
+    FILES ${CMAKE_CURRENT_SOURCE_DIR}/../changelog
+    DESTINATION ./
+  )
+  install(
+    FILES ${CMAKE_CURRENT_SOURCE_DIR}/../License.txt
+    DESTINATION ./
+  )
+  install(
+    FILES ${CMAKE_CURRENT_SOURCE_DIR}/../version.txt
+    FILES ${CMAKE_CURRENT_SOURCE_DIR}/../git_commit.txt
+    DESTINATION ./
+  )
+endif()
 
 include(CMakePackageConfigHelpers)
 
