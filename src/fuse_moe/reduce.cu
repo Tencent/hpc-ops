@@ -14,10 +14,10 @@ namespace fuse_moe {
 
 namespace kernels {
 
-template <typename T, int kThreadPerBlock, int kNumItemPer16B>
+template <typename T, int kThreadPerBlock, int kNumItemPer16B, int kNumTopkMax = 128>
 __global__ void reduce_kernel(T *y_ptr, const T *x_ptr, const int *topk_pos_ptr,
-                              float *topk_scale_ptr, const T *shared_output_ptr, int total_num_seq,
-                              int num_seq, int hidden_size, int num_topk,
+                              const float *topk_scale_ptr, const T *shared_output_ptr,
+                              int total_num_seq, int num_seq, int hidden_size, int num_topk,
                               cutlass::FastDivmod block_divider) {
   int idx = threadIdx.x;
   int iblock = blockIdx.x;
@@ -27,12 +27,12 @@ __global__ void reduce_kernel(T *y_ptr, const T *x_ptr, const int *topk_pos_ptr,
 
   block_divider(iblocky, iblockx, iblock);
   int irow = iblocky;
-  int icol = (threadIdx.x + iblockx * blockDim.x) * kNumItemPer16B;
+  int icol = (threadIdx.x + iblockx * kThreadPerBlock) * kNumItemPer16B;
 
-  extern __shared__ int shm_data[];
-  auto *pos_shm = (int *)shm_data;
-  auto *scale_shm = (float *)(shm_data + num_topk);
+  __shared__ int pos_shm[kNumTopkMax];
+  __shared__ float scale_shm[kNumTopkMax];
 
+#pragma unroll 1
   for (int i = idx; i < num_topk; i += blockDim.x) {
     pos_shm[i] = topk_pos_ptr[irow * num_topk + i];
     scale_shm[i] = topk_scale_ptr[irow * num_topk + i];
@@ -79,7 +79,7 @@ void reduce_async(void *y_ptr, const void *x_ptr, const void *topk_pos_ptr,
                   int num_seq, int hidden_size, int num_topk, cudaStream_t stream) {
   using T = __nv_bfloat16;
 
-  // 0. reduce tokens
+  // reduce tokens
   {
     constexpr int kThreadPerBlock = 256;
     constexpr int kNumItemPer16B = 16 / sizeof(T);
@@ -90,11 +90,9 @@ void reduce_async(void *y_ptr, const void *x_ptr, const void *topk_pos_ptr,
 
     dim3 block(kThreadPerBlock);
     dim3 grid(num_block_total);
-    kernels::reduce_kernel<T, kThreadPerBlock, kNumItemPer16B>
-        <<<grid, block, num_topk * 8, stream>>>((T *)y_ptr, (const T *)x_ptr,
-                                                (const int *)topk_pos_ptr, (float *)topk_scale_ptr,
-                                                (const T *)shared_output_ptr, total_num_seq,
-                                                num_seq, hidden_size, num_topk, block_divider);
+    kernels::reduce_kernel<T, kThreadPerBlock, kNumItemPer16B><<<grid, block, 0, stream>>>(
+        (T *)y_ptr, (const T *)x_ptr, (const int *)topk_pos_ptr, (const float *)topk_scale_ptr,
+        (const T *)shared_output_ptr, total_num_seq, num_seq, hidden_size, num_topk, block_divider);
   }
 }
 

@@ -101,6 +101,7 @@ torch::Tensor reduce_entry(const torch::Tensor &x, const torch::Tensor &topk_pos
   int hidden_size = x.size(1);
   int num_seq = topk_pos.size(0);
   int num_topk = topk_pos.size(1);
+  TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
   auto options = x.options();
   torch::Tensor y = torch::empty({num_seq, hidden_size}, options.dtype(torch::kBFloat16));
@@ -169,6 +170,7 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   int num_expert = gate_up_weight.size(0);
   int intermediate_size = gate_up_weight.size(1);
   int num_topk = topk_ids.size(1);
+  TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
   auto options = x.options();
   torch::Tensor y = torch::empty({num_seq, hidden_size}, options.dtype(torch::kBFloat16));
@@ -290,6 +292,8 @@ torch::Tensor fuse_moe_blockwise_entry(
   int num_topk = topk_ids.size(1);
   int num_tokens_per_group_avg = num_tokens * num_topk / num_expert_total;
   int aligned_size = 0;
+
+  TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
   if (num_tokens_per_group_avg <= 16) {
     aligned_size = 16;
