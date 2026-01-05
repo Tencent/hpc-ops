@@ -136,6 +136,13 @@ void group_gemm_blockwise_fp8_async(void *y_ptr, const void *x_ptr, const void *
                                     kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
         y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
         tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4, update_tma, stream);
+  } else if (num_seq_per_group_avg <= 48) {
+    constexpr int kTileM = 48;
+    constexpr int kStage = 8;
+    launch_group_gemm_blockwise_fp8<kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
+                                    kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
+        y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
+        tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4, update_tma, stream);
   } else {
     constexpr int kTileM = 64;
     constexpr int kStage = 8;
