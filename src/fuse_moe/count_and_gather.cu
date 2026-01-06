@@ -177,7 +177,7 @@ __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
 
         pos_in_expert = __shfl_sync(0xFFFFFFFF, pos_in_expert, 0);
 
-        int irow = cu_seqlens_ptr[iexpert - start_expert] + pos_in_expert;
+        uint64_t irow = cu_seqlens_ptr[iexpert - start_expert] + pos_in_expert;
         int iseq, res;
         topk_divider(iseq, res, itopk);
 
@@ -203,7 +203,7 @@ __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
       __shared__ cute::TmaDescriptor smem_tma_desc[4];
 
       int num_seq = cu_seqlens_ptr[igroup + 1] - cu_seqlens_ptr[igroup];
-      int cu_seqlen = cu_seqlens_ptr[igroup];
+      uint64_t cu_seqlen = cu_seqlens_ptr[igroup];
       auto *x_gate_up_ibatch_ptr = gate_up_input_ptr + cu_seqlen * hidden_size;
       auto *y_gate_up_ibatch_ptr = gate_up_output_ptr + cu_seqlen * intermediate_size;
       auto *x_down_ibatch_ptr = down_input_ptr + cu_seqlen * intermediate_size / 2;
@@ -231,7 +231,7 @@ __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
         update_tma_gtensor<GateUpTmaY>(smem_tma_desc[idx], gY);
       }
 
-      // // X_down
+      // X_down
       if (idx == 2) {
         auto gX = make_tensor(make_gmem_ptr(x_down_ibatch_ptr), make_shape(num_seq, n / 2),
                               make_stride(n / 2, Int<1>{}));

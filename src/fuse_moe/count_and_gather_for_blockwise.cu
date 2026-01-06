@@ -187,8 +187,8 @@ __global__ void blockwise_gather_kernel(
         int itoken, res;
         topk_divider(itoken, res, itopk);
 
-        auto gate_up_input_irow_ptr = gate_up_input_ptr + irow * hidden_size;
-        auto input_ptr_irow_ptr = input_ptr + itoken * hidden_size;
+        auto gate_up_input_irow_ptr = gate_up_input_ptr + static_cast<uint64_t>(irow) * hidden_size;
+        auto input_ptr_irow_ptr = input_ptr + static_cast<uint64_t>(itoken) * hidden_size;
 
         constexpr int kNumItemPer16B = 16 / sizeof(T1);
         int total_items = hidden_size / kNumItemPer16B;
@@ -202,7 +202,8 @@ __global__ void blockwise_gather_kernel(
 
         irow = cu_tiles_ptr[iexpert - start_expert] * kTileM + pos_in_expert;
         auto gate_up_input_scale_irow_ptr = gate_up_input_scale_ptr + irow;
-        auto input_scale_irow_ptr = input_scale_ptr + itoken * input_scale_size;
+        auto input_scale_irow_ptr =
+            input_scale_ptr + static_cast<uint64_t>(itoken) * input_scale_size;
 
         for (int i = ilane; i < input_scale_size; i += kThreadPerWarp) {
           auto src_addr = input_scale_irow_ptr + i;
@@ -221,7 +222,7 @@ __global__ void blockwise_gather_kernel(
 
       int num_tokens =
           cu_num_tokens_per_group_ptr[igroup + 1] - cu_num_tokens_per_group_ptr[igroup];
-      int cu_num_tokens = cu_num_tokens_per_group_ptr[igroup];
+      uint64_t cu_num_tokens = cu_num_tokens_per_group_ptr[igroup];
       auto *gate_up_input_ibatch_ptr = gate_up_input_ptr + cu_num_tokens * hidden_size;
       auto *gate_up_output_ibatch_ptr = gate_up_output_ptr + cu_num_tokens * intermediate_size;
       auto *down_input_ibatch_ptr = down_input_ptr + cu_num_tokens * intermediate_size / 2;
