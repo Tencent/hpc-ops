@@ -1,4 +1,4 @@
-PY_FILES=$(shell find hpc -name "*.py") $(shell find tests -name "*.py") setup.py
+PY_FILES=$(shell find hpc -name "*.py") $(shell find tests -name "*.py") $(shell find ./ -maxdepth 1 -name "*.py")
 PY_TEST=$(shell find tests -name "test_*.py")
 CC_FILES=$(shell find src -name "*.cc")
 CU_FILES=$(shell find src -name "*.cu")
@@ -19,30 +19,6 @@ wheel:
 	find . -type d -name "__pycache__" -exec rm -rf {} +
 	python3 -m build --wheel --no-isolation
 
-nvshmem:
-	cmake -S 3rd/nvshmem -B 3rd/nvshmem-build / \
-		-DMLX5_lib=/usr/lib64/libmlx5.so\
-		-DCMAKE_CUDA_ARCHITECTURES=90a\
-		-DNVSHMEM_IBGDA_SUPPORT=ON \
-		-DCUDA_HOME=/usr/local/cuda \
-		-DCMAKE_INSTALL_PREFIX=./3rd/nvshmem \
-		-DNVSHMEM_SHMEM_SUPPORT=OFF \
-		-DNVSHMEM_MPI_SUPPORT=OFF \
-		-DNVSHMEM_PMI_SUPPORT=OFF \
-		-DNVSHMEM_PMIX_SUPPORT=OFF \
-		-DNVSHMEM_PMI2_SUPPORT=OFF \
-		-DNVSHMEM_UCX_SUPPORT=OFF \
-		-DNVSHMEM_USE_NCCL=OFF \
-		-DNVSHMEM_BUILD_HYDRA_LAUNCHER=OFF \
-		-DNVSHMEM_BUILD_PYTHON_LIB=OFF \
-		-DNVSHMEM_BUILD_TXZ_PACKAGE=OFF \
-		-DNVSHMEM_TIMEOUT_DEVICE_POLLING=OFF \
-		-DNVSHMEM_USE_GDRCOPY=OFF \
-		-DNVSHMEM_BUILD_EXAMPLES=OFF \
-		-DNVSHMEM_BUILD_TESTS=OFF
-	make -C 3rd/nvshmem-build -j
-	make install -C 3rd/nvshmem-build
-	rm -rf 3rd/nvshmem-build
 doc:
 	python3 tools/generate_docs.py
 	python3 -m mkdocs build
@@ -62,27 +38,10 @@ test:$(PY_TEST)
 	  python3 -m pytest -v --no-header --disable-warnings $$test || exit 1; \
 	done
 
-sanitizer:sanitizer-memcheck sanitizer-synccheck sanitizer-racecheck sanitizer-initcheck
-	echo "do all sanitizer check"
-
-sanitizer-memcheck:$(PY_TEST)
+sanitizer:$(PY_TEST)
+	@rm -rf /dev/shm/tmp_hpc_*
 	@for test in $^; do \
-	  PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer --tool=memcheck --require-cuda-init=no --kernel-name regex="hpc.+" python3 -m pytest -v --no-header --disable-warnings $$test || exit 1; \
-	done
-
-sanitizer-synccheck:$(PY_TEST)
-	@for test in $^; do \
-	  PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer --tool=synccheck --require-cuda-init=no --kernel-name regex="hpc.+" python3 -m pytest -v --no-header --disable-warnings $$test || exit 1; \
-	done
-
-sanitizer-racecheck:$(PY_TEST)
-	@for test in $^; do \
-	  PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer --tool=racecheck --require-cuda-init=no --kernel-name regex="hpc.+" python3 -m pytest -v --no-header --disable-warnings $$test 2>&1 | python3 tools/racecheck-has-error.py || exit 1;\
-	done
-
-sanitizer-initcheck:$(PY_TEST)
-	@for test in $^; do \
-	   true || PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer --tool=initcheck --require-cuda-init=no --check-api-memory-access=no --print-limit=2 --force-blocking-launches python3 -m pytest -v --no-header --disable-warnings $$test || exit 1; \
+	  PYTORCH_NO_CUDA_MEMORY_CACHING=1 SANITIZER_CHECK=synccheck,memcheck,racecheck NV_SANITIZER_INJECTION_PORT_BASE=1111 python3 -m pytest -v --no-header --disable-warnings $$test || exit 1; \
 	done
 
 clean:

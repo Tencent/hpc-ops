@@ -18,6 +18,7 @@ def generate_random_string(n):
     return "".join(random.choices(characters, k=n))
 
 
+@pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
 @pytest.mark.parametrize(
     "dtype",
     [

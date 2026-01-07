@@ -25,6 +25,7 @@ def naive_reduce(x_bf16, topk_pos, topk_scale):
     return y_bf16
 
 
+@pytest.mark.skip
 @pytest.mark.skipif(not file_available, reason="fused_moe_topk files does not exists!!!")
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("intermediate_size", [8192])

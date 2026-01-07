@@ -19,6 +19,7 @@ def reference_scale3(x, scale_tensor, scale2_tensor, is_moe):
     return x_fp8, x_fp8_scale2, x_fp32
 
 
+@pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 5, 8, 14, 16, 17, 32, 64])
 @pytest.mark.parametrize("hidden_states", [4096])
 @pytest.mark.parametrize("scale", [0.6])

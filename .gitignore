@@ -9,6 +9,7 @@ __pycache__
 *.ncu-rep
 *.nsys-rep
 *.sqlite
+*.log
 test
 version.py
 

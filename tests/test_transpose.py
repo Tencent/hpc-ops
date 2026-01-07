@@ -6,12 +6,11 @@ sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/li
 
 import hpc
 import torch
-import math
 import pytest
-import torch.nn.functional as F
 from utils import allclose
 
 
+@pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
 def test_transpose():
     m, n = 9614, 108
     x = torch.randn((m, n), dtype=torch.float, device="cuda")

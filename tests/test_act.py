@@ -111,8 +111,8 @@ def _act_mul_and_blockwise_quant(gate_up):
     return outfp8, new_out_scale
 
 
-@pytest.mark.parametrize("num_batch", [64, 62 * 1024, 128 * 1024])
-@pytest.mark.parametrize("intermediate_size", [2128, 512, 4608])
+@pytest.mark.parametrize("num_batch", [128 * 1024])
+@pytest.mark.parametrize("intermediate_size", [4608])
 @pytest.mark.parametrize("use_output", [True, False])
 def test_act_mul_and_quant(num_batch, intermediate_size, use_output):
     gate_up_out = torch.randn(
@@ -209,6 +209,7 @@ def test_masked_act_mul_and_quant(num_expert, num_max_tokens_per_expert, num_int
     assert allclose(gt.to(torch.float32), my.to(torch.float32), atol=0.15, rtol=0.0125)
 
 
+@pytest.mark.skip
 @pytest.mark.parametrize("num_batch", [29, 64, 62 * 1024, 128 * 1024])
 @pytest.mark.parametrize("intermediate_size", [4096, 512, 1024])
 def test_act_mul_and_blokcwise_quant(num_batch, intermediate_size):

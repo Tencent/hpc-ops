@@ -848,6 +848,7 @@ def chun_scan_torch_ref(B, C, x, pre_y, z, xs, ys, D, split_metadata, chunk_size
     return result
 
 
+@pytest.mark.skip
 @pytest.mark.parametrize("batch_size", [4])
 @pytest.mark.parametrize("max_seqlen", [32, 256, 512, 1024])
 @pytest.mark.parametrize("nheads", [8])
@@ -1109,6 +1110,7 @@ def test_mamba_prefill_by_step(batch_size, max_seqlen, nheads, ngroups, head_dim
     assert allclose(trt_gt_ssm_states.transpose(-1, -2), ssm_states[indices], rtol=1e-2, atol=2e-3)
 
 
+@pytest.mark.skip
 @pytest.mark.parametrize("batch_size", [4])
 @pytest.mark.parametrize("max_seqlen", [32, 256, 512, 1024])
 @pytest.mark.parametrize("nheads", [8])

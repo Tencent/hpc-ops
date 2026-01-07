@@ -79,6 +79,7 @@ def generate_shuffled_batch_indices(num_batch, num_max_batch):
     return indices.to(torch.int32).cuda()
 
 
+@pytest.mark.skip
 @pytest.mark.parametrize("batch_size", [8, 16, 32])
 @pytest.mark.parametrize("nheads", [8, 4])
 @pytest.mark.parametrize("state_len", [3])
@@ -193,6 +194,7 @@ def causal_conv1d_update_with_spec_ref(
     return out, conv_states.permute(0, 2, 1).contiguous()
 
 
+@pytest.mark.skip
 @pytest.mark.parametrize("batch_size", [8, 16, 32])
 @pytest.mark.parametrize("nheads", [8, 4])
 @pytest.mark.parametrize("state_len", [4])

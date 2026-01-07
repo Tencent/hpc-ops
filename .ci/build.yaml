@@ -182,7 +182,7 @@ stages:
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
             sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make test"
 
-      - name: compute-sanitizer::memcheck
+      - name: compute-sanitizer
         id: rL0
         uses: JobScriptExecutionA@1.*
         with:
@@ -193,7 +193,6 @@ stages:
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
-
             set -xe
 
             echo ${{BK_CI_PROJECT_NAME}}
@@ -203,71 +202,7 @@ stages:
             echo ${{BK_CI_BUILD_TASK_ID}}
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-
-            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make sanitizer-memcheck"
-
-      - name: compute-sanitizer::initcheck
-        id: F2Q
-        uses: JobScriptExecutionA@1.*
-        with:
-          envType: ENV
-          envId:
-          - dpzbvgzp
-          account: reedlauliu
-          shellScriptContent: |-
-            #!/bin/bash
-            set -xe
-
-            echo ${{BK_CI_PROJECT_NAME}}
-            echo ${{BK_CI_PIPELINE_ID}}
-            echo ${{BK_CI_BUILD_ID}}
-            echo ${{BK_CI_BUILD_NUM}}
-            echo ${{BK_CI_BUILD_TASK_ID}}
-
-            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make sanitizer-initcheck"
-
-      - name: compute-sanitizer::synccheck
-        id: BTt
-        uses: JobScriptExecutionA@1.*
-        with:
-          envType: ENV
-          envId:
-          - dpzbvgzp
-          account: reedlauliu
-          shellScriptContent: |-
-            #!/bin/bash
-            set -xe
-
-            echo ${{BK_CI_PROJECT_NAME}}
-            echo ${{BK_CI_PIPELINE_ID}}
-            echo ${{BK_CI_BUILD_ID}}
-            echo ${{BK_CI_BUILD_NUM}}
-            echo ${{BK_CI_BUILD_TASK_ID}}
-
-            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make sanitizer-synccheck"
-
-      - name: compute-sanitizer::racecheck
-        id: ywt
-        uses: JobScriptExecutionA@1.*
-        with:
-          envType: ENV
-          envId:
-          - dpzbvgzp
-          account: reedlauliu
-          shellScriptContent: |-
-            #!/bin/bash
-            set -xe
-
-            echo ${{BK_CI_PROJECT_NAME}}
-            echo ${{BK_CI_PIPELINE_ID}}
-            echo ${{BK_CI_BUILD_ID}}
-            echo ${{BK_CI_BUILD_NUM}}
-            echo ${{BK_CI_BUILD_TASK_ID}}
-
-            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make sanitizer-racecheck"
+            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make sanitizer"
 
 finally:
   job_SCd:

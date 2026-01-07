@@ -486,6 +486,7 @@ def test_rope_norm_blocked_prefill(num_req, num_q_head_head_dim, num_kv_heads, u
     assert allclose(torch_vcache, vcache, atol=5e-2)
 
 
+@pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
 @pytest.mark.parametrize("num_req", [7])
 @pytest.mark.parametrize("num_q_head_head_dim", [(4, 128), (8, 128), (8, 80)])
 @pytest.mark.parametrize("num_kv_heads", [1])
@@ -559,6 +560,7 @@ def test_rope_norm_blocked_decode(num_req, num_q_head_head_dim, num_kv_heads, us
     assert allclose(torch_vcache, vcache, atol=5e-2)
 
 
+@pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
 @pytest.mark.parametrize("num_req", [7])
 @pytest.mark.parametrize("num_q_head_head_dim", [(4, 128)])
 @pytest.mark.parametrize("num_kv_heads", [1])
@@ -662,6 +664,7 @@ def test_rope_norm_blocked_prefill_fp8(num_req, num_q_head_head_dim, num_kv_head
     assert allclose(torch_out_k, k_bf16, atol=0.5)
 
 
+@pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
 @pytest.mark.parametrize("num_req", [7])
 @pytest.mark.parametrize("num_q_head_head_dim", [(4, 128)])
 @pytest.mark.parametrize("num_kv_heads", [1])

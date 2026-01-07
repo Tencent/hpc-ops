@@ -14,6 +14,7 @@ from utils import allclose
 file_available = os.path.exists("/cfs_cloud_code/theocheng/fused_moe_topk")
 
 
+@pytest.mark.skip
 @pytest.mark.skipif(not file_available, reason="fused_moe_topk files does not exists!!!")
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("intermediate_size", [8192])

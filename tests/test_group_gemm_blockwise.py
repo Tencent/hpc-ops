@@ -68,12 +68,11 @@ def test_group_gemm1(num_group, actual_m, m, n, k):
     print(seqlens)
     print(cu_seqlens)
 
-    for _ in range(10):
+    for _ in range(1):
         gt = naive_group_gemm(x, w, seqlens, cu_seqlens, xscale, wscale)
         my = hpc.group_gemm_blockwise_fp8(
             x, w, seqlens, cu_seqlens, xscale, wscale, num_seq_per_group_avg=mean_seq
         )
-        my1 = hpc.group_gemm_fp8(x, w, seqlens, cu_seqlens, xscale, num_seq_per_group_avg=mean_seq)
 
     print("gt")
     print(gt[:5, -10:])

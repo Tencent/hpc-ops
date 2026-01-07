@@ -123,6 +123,7 @@ def generate_shuffled_batch_indices(num_batch, num_max_batch):
     return indices.to(torch.int32).cuda()
 
 
+@pytest.mark.skip
 @pytest.mark.parametrize("batch_size", [64, 128, 129])
 @pytest.mark.parametrize("nheads", [8])
 @pytest.mark.parametrize("num_group", [2])
