@@ -1,6 +1,49 @@
 import torch
 from torch import Tensor
-from typing import Tuple
+from typing import Tuple, Optional
+
+
+def reformat_x_scale(
+    x_scale: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    num_seq_per_group_avg: int,
+    output: Optional[Tensor] = None,
+) -> Tensor:
+    """Performs transpose, pad to aligned to tile m and compact arrangement
+    just for deepep format input when use fp8 blockwise group gemm
+    Args:
+        x_scale: Scaling factor for x FP8 quantization
+            Shape: [total_seq_pad, hidden_size // 128]
+            Dtype: float32
+
+        seqlens: Sequence lengths for each group
+            Shape: [num_group]
+            Dtype: int32
+
+        cu_seqlens: Cumulative sequence lengths indicating start indices in input tensor
+            Shape: [num_group + 1]
+            Dtype: int32
+
+        num_seq_per_group_avg: average number seqs per group, use for get tile m
+
+    Returns:
+        Tensor: Output x scale tensor after reformat
+            Shape: [hidden_size // 128, compact_total_seq_pad]
+            Dtype: float32
+
+    Raises:
+        RuntimeError: If the input tensors have incompatible shapes or types,
+            or if the CUDA kernel execution fails.
+
+    Note:
+        - All input tensors must be on CUDA device
+        - The length of x_scale for each group must be aligned to multiple of 16/32/64 according to num_seq_per_group_avg
+
+    """
+    return torch.ops.hpc.reformat_x_scale(
+        x_scale, seqlens, cu_seqlens, output, num_seq_per_group_avg
+    )
 
 
 def group_gemm_fp8(

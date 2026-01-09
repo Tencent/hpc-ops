@@ -136,6 +136,55 @@ torch::Tensor group_gemm_blockwise_fp8_entry(
   return y;
 }
 
+torch::Tensor reformat_x_scale_entry(const torch::Tensor &x_scale, const torch::Tensor &seqlens,
+                                     const torch::Tensor &cu_seqlens,
+                                     std::optional<torch::Tensor> out_x_scale,
+                                     const int64_t num_seq_per_group_avg) {
+  auto stream = at::cuda::getCurrentCUDAStream(x_scale.get_device());
+  TORCH_CHECK(x_scale.device().is_cuda(), "x_scale tensor must be cuda");
+  TORCH_CHECK(seqlens.device().is_cuda(), "seqlens tensor must be cuda");
+  TORCH_CHECK(cu_seqlens.device().is_cuda(), "cu_seqlens tensor must be cuda");
+  TORCH_CHECK(x_scale.is_contiguous(), "x_scale tensor a must be contiguous");
+  TORCH_CHECK(seqlens.is_contiguous(), "seqlens tensor a must be contiguous");
+  TORCH_CHECK(cu_seqlens.is_contiguous(), "cu_seqlens tensor a must be contiguous");
+
+  int m = x_scale.size(0);
+  int n = x_scale.size(1);
+  TORCH_CHECK(n == 16 || n == 32, "n must be 16 or 32(for dsv4 group gemm k=2048 or 4096)");
+
+  int num_group = seqlens.size(0);
+  int tilem = 0;
+  // careful!!! here logit must be corresponds with group_gemm_blockwise_fp8_async
+  if (num_seq_per_group_avg <= 16) {
+    tilem = 16;
+  } else if (num_seq_per_group_avg <= 32) {
+    tilem = 32;
+  } else {
+    tilem = 64;
+  }
+  int num_seq_pad_per_group = m / num_group;
+  TORCH_CHECK(num_seq_pad_per_group % tilem == 0,
+              "The sparse pad length of x_scale for each group must be aligned to multiple of "
+              "16/32/64 according to num_seq_per_group_avg");
+
+  torch::Tensor output;
+  if (out_x_scale.has_value()) {
+    output = out_x_scale.value();
+  } else {
+    output = torch::empty({n, m}, x_scale.options());
+  }
+
+  const auto *xscale_ptr = x_scale.const_data_ptr();
+  const auto *seqlens_ptr = seqlens.const_data_ptr();
+  const auto *cu_seqlens_ptr = cu_seqlens.const_data_ptr();
+  auto *output_ptr = output.mutable_data_ptr();
+
+  reformat_x_scale_async(output_ptr, xscale_ptr, seqlens_ptr, cu_seqlens_ptr, num_group, m, n,
+                         tilem, stream);
+
+  return output;
+}
+
 }  // namespace group_gemm
 }  // namespace hpc
 
@@ -151,4 +200,9 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "int num_seq_per_group_avg, Tensor? output, Tensor? tma_desc) -> (Tensor)");
   m.impl("group_gemm_blockwise_fp8", torch::kCUDA,
          &hpc::group_gemm::group_gemm_blockwise_fp8_entry);
+
+  m.def(
+      "reformat_x_scale(Tensor x_scale, Tensor seqlens, Tensor cu_seqlens, "
+      "Tensor? out_x_scale, int num_seq_per_group_avg) -> (Tensor)");
+  m.impl("reformat_x_scale", torch::kCUDA, &hpc::group_gemm::reformat_x_scale_entry);
 }

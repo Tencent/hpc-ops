@@ -23,6 +23,10 @@ void group_gemm_blockwise_fp8_async(void *y_ptr, const void *x_ptr, const void *
                                     int num_seq_per_group_avg, bool update_tma,
                                     cudaStream_t stream);
 
+void reformat_x_scale_async(void *output_ptr, const void *xscale_ptr, const void *seqlens_ptr,
+                            const void *cu_seqlens_ptr, int num_group, int m, int n, int tilem,
+                            cudaStream_t stream);
+
 }  // namespace group_gemm
 }  // namespace hpc
 
