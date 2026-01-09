@@ -303,6 +303,9 @@ __device__ __forceinline__ float rcpf_ftz(float x) {
   return r;
 }
 
+// y = max(0, x)
+__device__ __forceinline__ float relu(float x) { return fmaxf(0, x); }
+
 // y = x / (1 + e^(-x))
 __device__ __forceinline__ float silu(float x) { return x * rcpf_ftz(1.f + expf_ftz(-x)); }
 

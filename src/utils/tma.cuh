@@ -56,6 +56,16 @@ __device__ __forceinline__ void update_tma_gtensor(cute::TmaDescriptor &smem_tma
   }
 }
 
+__device__ __forceinline__ void cp_async_g2s(void *smem_ptr, const void *gmem_ptr, int bytes,
+                                             const uint64_t *bar_ptr) {
+  int smem_int = cute::cast_smem_ptr_to_uint(smem_ptr);
+  int bar_int = cute::cast_smem_ptr_to_uint(bar_ptr);
+  asm volatile(
+      "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" ::"r"(
+          smem_int),
+      "l"(gmem_ptr), "r"(bytes), "r"(bar_int));
+}
+
 }  // namespace hpc
 
 #endif  // SRC_UTILS_TMA_CUH_
