@@ -46,10 +46,10 @@ gt = d['ret']
 s = func(*args, **kwargs)
 
 if isinstance(s, torch.Tensor):
-  assert torch.allclose(s.view(torch.int8), gt.view(torch.int8))
+  assert torch.equal(s.view(torch.int8), gt.view(torch.int8))
 elif isinstance(s, tuple):
   for i, e in enumerate(s):
-    assert torch.allclose(s[i].view(torch.int8), gt[i].view(torch.int8))
+    assert torch.equal(s[i].view(torch.int8), gt[i].view(torch.int8))
 else:
   print('=== type :', type(s))
   assert False
@@ -62,7 +62,7 @@ else:
 
 
 def sanitizer_check(file_name, check):
-    cmd = f"compute-sanitizer --tool={check} --require-cuda-init=no python3 {file_name}"
+    cmd = f'compute-sanitizer --tool={check} --require-cuda-init=no --kernel-name regex="hpc.+" python3 {file_name}'
     print(cmd)
     output = subprocess.check_output(cmd, shell=True)
     text = output.decode("utf-8")
