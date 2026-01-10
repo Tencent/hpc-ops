@@ -261,16 +261,12 @@ torch::Tensor fuse_moe_blockwise_entry(
   TORCH_CHECK(x_scale.size(1) == x.size(1) / 128, "x_scale must be per 128 blockwise quant");
   TORCH_CHECK(gate_up_weight_scale.size(1) == gate_up_weight.size(1) / 128,
               "gate_up_weight must be per 128 blockwise quant");
-  TORCH_CHECK(gate_up_weight_scale.size(2) == gate_up_weight.size(2) / 128,
-              "gate_up_weight must be per 128 blockwise quant");
-  TORCH_CHECK(gate_up_weight_scale.size(2) % 4 == 0,
-              "gate_up_weight_scale last dim must be multiple of 4");
+  TORCH_CHECK(gate_up_weight_scale.size(2) == (gate_up_weight.size(2) / 128 + 3) / 4 * 4,
+              "gate_up_weight must be per 128 blockwise quant and must be aligned to 4");
   TORCH_CHECK(down_weight_scale.size(1) == down_weight.size(1) / 128,
               "down_weight must be per 128 blockwise quant");
-  TORCH_CHECK(down_weight_scale.size(2) == down_weight.size(2) / 128,
-              "down_weight must be per 128 blockwise quant");
-  TORCH_CHECK(down_weight_scale.size(2) % 4 == 0,
-              "down_weight_scale last dim must be multiple of 4");
+  TORCH_CHECK(down_weight_scale.size(2) == (down_weight.size(2) / 128 + 3) / 4 * 4,
+              "down_weight must be per 128 blockwise quant and must be aligned to 4");
 
   const void *shared_output_ptr = nullptr;
   if (shared_output.has_value()) {
@@ -292,6 +288,8 @@ torch::Tensor fuse_moe_blockwise_entry(
   int num_topk = topk_ids.size(1);
   int num_tokens_per_group_avg = num_tokens * num_topk / num_expert_total;
   int aligned_size = 0;
+  int gate_up_weight_scale_lastdim_pad4 = gate_up_weight_scale.size(-1);
+  int down_weight_scale_lastdim_pad4 = down_weight_scale.size(-1);
 
   TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
@@ -355,14 +353,14 @@ torch::Tensor fuse_moe_blockwise_entry(
   auto *down_output_ptr = down_output.mutable_data_ptr();
   auto *down_tmas_ptr = down_tmas.mutable_data_ptr();
 
-  fuse_moe_blockwise_async(y_ptr, x_ptr, x_scale_ptr, gate_up_input_ptr, gate_up_input_scale_ptr,
-                           gate_up_output_ptr, gate_up_weight_ptr, gate_up_weight_scale_ptr,
-                           gate_up_tmas_ptr, down_input_ptr, down_input_scale_ptr, down_output_ptr,
-                           down_weight_ptr, down_weight_scale_ptr, down_tmas_ptr, topk_ids_ptr,
-                           topk_scale_ptr, topk_pos_ptr, num_tokens_per_group_ptr,
-                           cu_num_tokens_per_group_ptr, tiles_ptr, cu_tiles_ptr, shared_output_ptr,
-                           num_tokens, num_padded_tokens, hidden_size, intermediate_size, num_topk,
-                           num_expert_total, num_experts, rank_ep, stream);
+  fuse_moe_blockwise_async(
+      y_ptr, x_ptr, x_scale_ptr, gate_up_input_ptr, gate_up_input_scale_ptr, gate_up_output_ptr,
+      gate_up_weight_ptr, gate_up_weight_scale_ptr, gate_up_tmas_ptr, down_input_ptr,
+      down_input_scale_ptr, down_output_ptr, down_weight_ptr, down_weight_scale_ptr, down_tmas_ptr,
+      topk_ids_ptr, topk_scale_ptr, topk_pos_ptr, num_tokens_per_group_ptr,
+      cu_num_tokens_per_group_ptr, tiles_ptr, cu_tiles_ptr, shared_output_ptr, num_tokens,
+      num_padded_tokens, hidden_size, intermediate_size, num_topk, num_expert_total, num_experts,
+      gate_up_weight_scale_lastdim_pad4, down_weight_scale_lastdim_pad4, rank_ep, stream);
   return y;
 }
 

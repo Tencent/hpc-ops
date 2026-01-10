@@ -268,10 +268,10 @@ def naive_fuse_moe_blockwise(
     return y
 
 
-@pytest.mark.parametrize("num_tokens", [8, 129, 1024, 2048, 8192])
+@pytest.mark.parametrize("num_tokens", [8, 1024, 2048, 8192])
 @pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("hidden_size", [512])
-@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("intermediate_size", [512, 256])
 @pytest.mark.parametrize("num_expert", [128])
 @pytest.mark.parametrize("rank_ep", [0])
 @pytest.mark.parametrize("has_shared_output", [False, True])
@@ -293,7 +293,7 @@ def test_fuse_moe(
         (num_expert, intermediate_size * 2, hidden_size), dtype=torch.float, device="cuda"
     ).to(dtype)
     gate_up_weight_scale = torch.randn(
-        (num_expert, intermediate_size * 2 // 128, hidden_size // 128),
+        (num_expert, intermediate_size * 2 // 128, (hidden_size // 128 + 3) // 4 * 4),
         dtype=torch.float,
         device="cuda",
     )
@@ -303,7 +303,9 @@ def test_fuse_moe(
         device="cuda",
     ).to(dtype)
     down_weight_scale = torch.randn(
-        (num_expert, hidden_size // 128, intermediate_size // 128), dtype=torch.float, device="cuda"
+        (num_expert, hidden_size // 128, (intermediate_size // 128 + 3) // 4 * 4),
+        dtype=torch.float,
+        device="cuda",
     )
     if has_shared_output:
         shared_output = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")

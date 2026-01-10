@@ -53,7 +53,8 @@ void fuse_moe_blockwise_async(
     const void *topk_scale_ptr, void *topk_pos_ptr, void *num_tokens_per_group_ptr,
     void *cu_num_tokens_per_group_ptr, void *tiles_ptr, void *cu_tiles_ptr,
     const void *shared_output_ptr, int num_tokens, int num_padded_tokens, int hidden_size,
-    int intermediate_size, int num_topk, int num_expert_total, int num_expert_local, int rank_ep,
+    int intermediate_size, int num_topk, int num_expert_total, int num_expert_local,
+    int gate_up_weight_scale_lastdim_pad4, int down_weight_scale_lastdim_pad4, int rank_ep,
     cudaStream_t stream);
 
 }  // namespace fuse_moe
