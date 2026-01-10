@@ -321,10 +321,6 @@ __global__ void gemm_blockwise(
           tDr_mn(im, in) += bias;
         }
       }
-      if (elected_idx_in_warpgroup) {
-        arrive_barrier(bias_writable);
-      }
-      phase_bias ^= 1;
 
       // float32 -> bfloat16
       auto tCrh = make_tensor_like<cute::bfloat16_t>(tCr);
@@ -345,6 +341,12 @@ __global__ void gemm_blockwise(
 
       cute::tma_store_wait<0>();
       syncwarpgroup(iwarpgroup);
+
+      // bias arrive must wait all thread in warp have handled bias
+      if (elected_idx_in_warpgroup) {
+        arrive_barrier(bias_writable);
+      }
+      phase_bias ^= 1;
 
       cute::copy(tiled_copy_c, tCr4s, tCs4r);
       syncwarpgroup(iwarpgroup);

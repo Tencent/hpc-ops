@@ -73,7 +73,7 @@ def test_gemm_blockwise_with_transpose(m, n, k):
     w = torch.randn((n, k), dtype=torch.float, device="cuda").to(dtype)
     x_scale = torch.ones((m, k // 128), dtype=torch.float, device="cuda")
     w_scale = torch.ones((n // 128, k // 128), dtype=torch.float, device="cuda")
-    bias = torch.randn((n), dtype=torch.float, device="cuda") * 0
+    bias = torch.randn((n), dtype=torch.float, device="cuda")
 
     m_pad = (m + 3) // 4 * 4
     x_scale_t = x_scale.clone()
@@ -83,7 +83,7 @@ def test_gemm_blockwise_with_transpose(m, n, k):
 
     my = hpc.gemm_blockwise(x, w, x_scale, w_scale, bias)
     gt = hpc.gemm_blockwise(x, w, x_scale_t, w_scale, bias)
-    assert allclose(gt, my, atol=32, rtol=0.01)
+    assert allclose(gt, my)
 
 
 @pytest.mark.parametrize("m", [4, 8, 9614])
@@ -97,7 +97,7 @@ def test_gemm_blockwise(m, n, k):
     w = torch.randn((n, k), dtype=torch.float, device="cuda").to(dtype)
     x_scale = torch.rand((m, k // 128), dtype=torch.float, device="cuda")
     w_scale = torch.rand((n // 128, k // 128), dtype=torch.float, device="cuda")
-    bias = torch.randn((n), dtype=torch.float, device="cuda") * 0
+    bias = torch.randn((n), dtype=torch.float, device="cuda")
 
     my = hpc.gemm_blockwise(x, w, x_scale, w_scale, bias)
     gt = simple_naive_blockwise_gemm(x, w, x_scale, w_scale, bias)
