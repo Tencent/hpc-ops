@@ -39,9 +39,11 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
       gate_up_scale_ptr, gate_up_tmas_ptr, tiles_ptr, cu_tiles_ptr, num_expert_local, total_num_seq,
       intermediate_size, hidden_size, num_seq_per_group_avg, false, stream);
   // 2. call act and mul ??? EP seq_len
+  const int *valid_row_range_ptr =
+      (int *)cu_seqlens_ptr + num_expert_local;  // get last number as valid row
   activation::act_mul_and_quant_async((T2 *)down_input_ptr, (const T1 *)gate_up_output_ptr,
-                                      (const float *)act_and_mul_scale_ptr, total_num_seq,
-                                      intermediate_size, use_bf16_mul, stream);
+                                      (const float *)act_and_mul_scale_ptr, valid_row_range_ptr,
+                                      total_num_seq, intermediate_size, use_bf16_mul, stream);
 
   // 3. call down linear
   group_gemm::group_gemm_fp8_async(down_output_ptr, down_input_ptr, down_weight_ptr, seqlens_ptr,

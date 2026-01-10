@@ -14,8 +14,9 @@ namespace kernels {
 
 template <bool kUseBFloat16PrecisionMultiply = true>
 __global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_up_ptr,
-                                         const float *scale_ptr, const int num_row,
-                                         const int num_col, cutlass::FastDivmod block1D22D) {
+                                         const float *scale_ptr, const int *valid_row_range,
+                                         const int num_row, const int num_col,
+                                         cutlass::FastDivmod block1D22D) {
   int iblockx;
   int iblocky;
 
@@ -23,6 +24,10 @@ __global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr, const __nv_bflo
   int it = threadIdx.x + iblockx * blockDim.x;
 
   int irow = iblocky;
+  int my_valid_row_end_exclusive = valid_row_range ? valid_row_range[0] : num_row;
+  if (irow >= my_valid_row_end_exclusive) {
+    return;
+  }
 
   using T = __nv_bfloat162;
 
@@ -259,6 +264,13 @@ __global__ void masked_act_mul_and_blockwise_quant_kernel(
 void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_up_ptr,
                              const float *scale_ptr, const int num_row, const int num_col,
                              bool use_bf16_mul, cudaStream_t stream) {
+  act_mul_and_quant_async(out_ptr, gate_up_ptr, scale_ptr, nullptr, num_row, num_col, use_bf16_mul,
+                          stream);
+}
+
+void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_up_ptr,
+                             const float *scale_ptr, const int *valid_row_range, const int num_row,
+                             const int num_col, bool use_bf16_mul, cudaStream_t stream) {
   // num_col == 2128 x 2
   // gate + up
 
@@ -271,10 +283,10 @@ void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_u
 
   if (use_bf16_mul) {
     kernels::act_mul_and_quant_kernel<true><<<grid, block, 0, stream>>>(
-        out_ptr, gate_up_ptr, scale_ptr, num_row, intermediate_size, block1D22D);
+        out_ptr, gate_up_ptr, scale_ptr, valid_row_range, num_row, intermediate_size, block1D22D);
   } else {
     kernels::act_mul_and_quant_kernel<false><<<grid, block, 0, stream>>>(
-        out_ptr, gate_up_ptr, scale_ptr, num_row, intermediate_size, block1D22D);
+        out_ptr, gate_up_ptr, scale_ptr, valid_row_range, num_row, intermediate_size, block1D22D);
   }
 }
 

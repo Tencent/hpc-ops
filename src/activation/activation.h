@@ -15,6 +15,10 @@ void act_mul_and_quant_async(__nv_fp8_e4m3 *y_ptr, const __nv_bfloat16 *x_ptr,
                              const float *scale_ptr, const int num_row, const int num_col,
                              bool use_bf16_mul, cudaStream_t stream);
 
+void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_up_ptr,
+                             const float *scale_ptr, const int *valid_row_range, const int num_row,
+                             const int num_col, bool use_bf16_mul, cudaStream_t stream);
+
 void masked_act_mul_and_quant_async(__nv_fp8_e4m3 *output_ptr, const __nv_bfloat16 *input_ptr,
                                     const float *scale_ptr, const int *num_per_expert_ptr,
                                     int num_total_tokens, int num_intermediate_size,
