@@ -99,18 +99,34 @@ target_compile_definitions(
   HPC_VERSION_STR=${HPC_VERSION_STR}
 )
 
+execute_process(
+  COMMAND python3 -c "
+from torch.utils.cpp_extension import include_paths
+print(';'.join(include_paths()), end='')
+"
+  OUTPUT_VARIABLE TORCH_INCLUDE_PATHS
+)
+
+execute_process(
+  COMMAND python3 -c "
+from torch.utils.cpp_extension import library_paths
+print(';'.join(library_paths()), end='')
+"
+  OUTPUT_VARIABLE TORCH_LIBRARY_PATHS
+)
+
+
 target_include_directories(
   _C PRIVATE
   ./
   3rd/cutlass/include
-  ${Python3_SITELIB}/torch/include
-  ${Python3_SITELIB}/torch/include/torch/csrc/api/include
   ${CUDAToolkit_INCLUDE_DIRS}
+  ${TORCH_INCLUDE_PATHS}
 )
 
 target_link_directories(
   _C PRIVATE
-  ${Python3_SITELIB}/torch/lib
+  ${TORCH_LIBRARY_PATHS}
 )
 
 target_link_libraries(

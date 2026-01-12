@@ -180,6 +180,7 @@ stages:
             echo ${{BK_CI_BUILD_TASK_ID}}
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
+            sudo docker exec -t hpc-ops-cicd bash -c "pkill -9 python3 || true"
             sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make test"
 
       - name: compute-sanitizer
@@ -202,6 +203,7 @@ stages:
             echo ${{BK_CI_BUILD_TASK_ID}}
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
+            sudo docker exec -t hpc-ops-cicd bash -c "pkill -9 python3 || true"
             sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make sanitizer"
 
 finally:
