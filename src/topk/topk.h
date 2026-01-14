@@ -12,6 +12,10 @@ namespace topk {
 bool topk_per_row_async(int *topk_indices, const float *logits, const int *seqlens, int topk,
                         int num_sp_tokens, int num_rows, int row_stride, cudaStream_t stream);
 
+bool topk_per_row_varlen_async(int *topk_indices, const float *logits_ptr,
+                               const int *cu_seqlens_q_ptr, const int *seqlens_kv_ptr, int topk,
+                               int compress_ratio, int num_batch, int num_rows, int row_stride,
+                               bool deterministic, cudaStream_t stream);
 }  // namespace topk
 }  // namespace hpc
 
