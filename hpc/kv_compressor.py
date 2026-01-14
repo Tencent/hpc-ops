@@ -73,22 +73,38 @@ def kv_compressor(
             Dtype: float32
 
     """
-    return torch.ops.hpc.kv_compressor(
-        kv,
-        score,
-        cu_seqlens,
-        cu_compressed_seqlens,
-        total_compressed_seqlen,
-        kv_states,
-        score_states,
-        state_index,
-        start_pos,
-        ape,
-        ratio,
-        overlap,
-        head_dim,
-        is_prefill,
-    )
+    if is_prefill:
+        return torch.ops.hpc.kv_compressor(
+            kv,
+            score,
+            cu_seqlens,
+            cu_compressed_seqlens,
+            total_compressed_seqlen,
+            kv_states,
+            score_states,
+            state_index,
+            start_pos,
+            ape,
+            ratio,
+            overlap,
+            head_dim,
+            is_prefill,
+        )
+    else:
+        return torch.ops.hpc.kv_compressor_decode(
+            kv,
+            score,
+            ape,
+            kv_states,
+            score_states,
+            state_index,
+            start_pos,
+            cu_compressed_seqlens,
+            head_dim,
+            ratio,
+            overlap,
+            None,
+        )
 
 
 @torch.library.register_fake("hpc::kv_compressor")
