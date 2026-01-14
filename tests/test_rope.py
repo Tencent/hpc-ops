@@ -452,7 +452,7 @@ def test_rope_norm_blocked_prefill(num_req, num_q_head_head_dim, num_kv_heads, u
     kcache_ref = kcache.clone()
     vcache_ref = vcache.clone()
 
-    my_out_q, my_out_k = hpc.rope_norm_blocked_kvcache(
+    my_out_q, _ = hpc.rope_norm_blocked_kvcache(
         kcache,
         vcache,
         qkv_new,
@@ -481,12 +481,10 @@ def test_rope_norm_blocked_prefill(num_req, num_q_head_head_dim, num_kv_heads, u
     )
 
     assert allclose(torch_out_q, my_out_q, atol=5e-2)
-    assert allclose(torch_out_k, my_out_k, atol=5e-2)
     assert allclose(torch_kcache, kcache, atol=5e-2)
     assert allclose(torch_vcache, vcache, atol=5e-2)
 
 
-@pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
 @pytest.mark.parametrize("num_req", [7])
 @pytest.mark.parametrize("num_q_head_head_dim", [(4, 128), (8, 128), (8, 80)])
 @pytest.mark.parametrize("num_kv_heads", [1])
@@ -527,7 +525,7 @@ def test_rope_norm_blocked_decode(num_req, num_q_head_head_dim, num_kv_heads, us
     kcache_ref = kcache.clone()
     vcache_ref = vcache.clone()
 
-    my_out_q, my_out_k = hpc.rope_norm_blocked_kvcache(
+    my_out_q, _ = hpc.rope_norm_blocked_kvcache(
         kcache,
         vcache,
         qkv,
@@ -639,7 +637,6 @@ def test_rope_norm_blocked_prefill_fp8(num_req, num_q_head_head_dim, num_kv_head
     q_bf16 = (q_fp8.to(torch.bfloat16) * qk_scale_normal[:, :, None]).to(torch.bfloat16) * (
         1 / k_scale.to(torch.bfloat16)
     )
-    k_bf16 = k_fp8.to(torch.bfloat16) * k_scale.to(torch.bfloat16)
 
     torch_out_q, torch_out_k, torch_kcache, torch_vcache = torch_rope_norm_blocked_prefill(
         kcache_ref,
@@ -661,10 +658,8 @@ def test_rope_norm_blocked_prefill_fp8(num_req, num_q_head_head_dim, num_kv_head
     torch_vcache = torch_vcache.float()
 
     assert allclose(torch_out_q, q_bf16, atol=0.5)
-    assert allclose(torch_out_k, k_bf16, atol=0.5)
 
 
-@pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
 @pytest.mark.parametrize("num_req", [7])
 @pytest.mark.parametrize("num_q_head_head_dim", [(4, 128)])
 @pytest.mark.parametrize("num_kv_heads", [1])
@@ -732,7 +727,6 @@ def test_rope_norm_blocked_decode_fp8(num_req, num_q_head_head_dim, num_kv_heads
     q_bf16 = (q_fp8.to(torch.bfloat16) * qk_scale[:, :, None]).to(
         torch.bfloat16
     )  # no k_scale in decode
-    k_bf16 = k_fp8.to(torch.bfloat16) * k_scale.to(torch.bfloat16)
 
     torch_out_q, torch_out_k, torch_kcache, torch_vcache = torch_rope_norm_blocked_decode(
         kcache_ref,

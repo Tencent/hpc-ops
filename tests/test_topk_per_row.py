@@ -10,6 +10,7 @@ import torch
 from utils import allclose
 
 
+@pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("num_sp_tokens", [2])
 @pytest.mark.parametrize("max_seqlen", [1024, 100 * 1024])

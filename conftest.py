@@ -24,7 +24,7 @@ def save_data(file_name, module_name, func_name, ret, args, kwargs):
     torch.save(data, file_name)
 
 
-def dump_test_py(file_name, test_data_file, pypath):
+def dump_test_py(file_name, test_before_file, test_after_file, pypath):
 
     text = """ 
 import sys
@@ -36,25 +36,35 @@ sys.path.insert(0, "{}")
 import torch
 import hpc
 
-d = torch.load("{}")
+din = torch.load("{}")
+dout = torch.load("{}")
 
-func = getattr(hpc, d['func_name'])
-args = d['args']
-kwargs = d['kwargs']
-gt = d['ret']
+func = getattr(hpc, din['func_name'])
+args = din['args']
+kwargs = din['kwargs']
+gt = dout['ret']
 
 s = func(*args, **kwargs)
 
-if isinstance(s, torch.Tensor):
-  assert torch.equal(s.view(torch.int8), gt.view(torch.int8))
-elif isinstance(s, tuple):
-  for i, e in enumerate(s):
-    assert torch.equal(s[i].view(torch.int8), gt[i].view(torch.int8))
-else:
-  print('=== type :', type(s))
-  assert False
+# test output
+def assert_equal(my, gt):
+  if isinstance(my, torch.Tensor):
+    assert torch.equal(my.byte(), gt.byte())
+  elif isinstance(my, tuple):
+    for i, e in enumerate(my):
+      assert_equal(my[i], gt[i])
+  elif isinstance(my, dict):
+    for k in my.keys():
+      assert_equal(my[k], gt[k])
+  else:
+    assert my == gt
+
+assert_equal(s, gt)
+assert_equal(args, dout['args'])
+assert_equal(kwargs, dout['kwargs'])
+
 """.format(
-        pypath, test_data_file
+        pypath, test_before_file, test_after_file
     )
 
     with open(file_name, "w") as fp:
@@ -64,9 +74,12 @@ else:
 def sanitizer_check(file_name, check):
     cmd = f'compute-sanitizer --tool={check} --require-cuda-init=no --kernel-name regex="hpc.+" python3 {file_name}'
     print(cmd)
-    output = subprocess.check_output(cmd, shell=True)
-    text = output.decode("utf-8")
-    print(text)
+    try:
+        output = subprocess.check_output(cmd, shell=True)
+        text = output.decode("utf-8")
+        print(text)
+    except subprocess.CalledProcessError as e:
+        raise e
 
 
 class TraceHook(object):
@@ -81,21 +94,24 @@ class TraceHook(object):
         org_func = getattr(module, func_name)
 
         def wrapped(*args, **kwargs):
+            tmp_py_file = tempfile.mktemp(prefix="tmp_hpc_" + func_name + "_", suffix=".py")
+            tmp_before_invoke_file = tmp_py_file.replace(".py", "_before_invoke.pth")
+            tmp_after_invoke_file = tmp_py_file.replace(".py", "_after_invoke.pth")
+
+            save_data(tmp_before_invoke_file, "hpc", func_name, None, args, kwargs)
             ret = org_func(*args, **kwargs)
+            save_data(tmp_after_invoke_file, "hpc", func_name, ret, args, kwargs)
 
-            # save data
-            tmp_data_file = tempfile.mktemp(prefix="tmp_hpc_" + func_name + "_", suffix=".pth")
-            tmp_py_file = tmp_data_file.replace(".pth", ".py")
             pypath = os.path.realpath(list(Path(__file__).parent.glob("./build/lib.*/"))[0])
-
-            save_data(tmp_data_file, "hpc", func_name, ret, args, kwargs)
-            dump_test_py(tmp_py_file, tmp_data_file, pypath)
+            dump_test_py(tmp_py_file, tmp_before_invoke_file, tmp_after_invoke_file, pypath)
+            print(tmp_py_file)
 
             for check in self.checks_:
                 print(f"{check}...")
                 sanitizer_check(tmp_py_file, check)
 
-            os.unlink(tmp_data_file)
+            os.unlink(tmp_before_invoke_file)
+            os.unlink(tmp_after_invoke_file)
             os.unlink(tmp_py_file)
 
             return ret

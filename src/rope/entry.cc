@@ -63,15 +63,11 @@ std::tuple<torch::Tensor, torch::Tensor> rope_norm_blocked_kvcache_entry(
         out_k.size(0) == num_rows && out_k.size(1) == num_kv_heads && out_k.size(2) == qk_head_dim,
         "out_k tensor shape mismatch");
     TORCH_CHECK(out_k.is_contiguous(), "out_k tensor must be contiguous");
-  } else {
-    out_k = torch::empty({num_rows, num_kv_heads, qk_head_dim},
-                         torch::dtype(qkv.dtype()).device(qkv.device()));
   }
 
   // Prepare pointers
   using DType = __nv_bfloat16;
   auto *out_q_ptr = reinterpret_cast<DType *>(out_q.mutable_data_ptr());
-  auto *out_k_ptr = reinterpret_cast<DType *>(out_k.mutable_data_ptr());
   auto *kcache_ptr = reinterpret_cast<DType *>(kcache.mutable_data_ptr());
   auto *vcache_ptr = reinterpret_cast<DType *>(vcache.mutable_data_ptr());
   const auto *qkv_ptr = reinterpret_cast<const DType *>(qkv.const_data_ptr());
@@ -95,7 +91,7 @@ std::tuple<torch::Tensor, torch::Tensor> rope_norm_blocked_kvcache_entry(
 
   // Launch kernel
   apply_rotary_pos_emb_blocked_kvcache_bf16_async(
-      out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+      out_q_ptr, kcache_ptr, vcache_ptr, qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
       q_index_ptr, kvcache_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
       vcache_block_offset, num_req, max_num_kv_block_per_batch, kv_block_size, num_rows,
       num_q_heads, num_kv_heads, qk_head_dim, v_head_dim, is_prefill, use_qk_norm, stream);
@@ -204,9 +200,6 @@ rope_norm_blocked_kvcache_w8c8_dqskv_entry(
     TORCH_CHECK(out_k.is_contiguous(), "out_k tensor must be contiguous");
     TORCH_CHECK(out_k.scalar_type() == torch::kFloat8_e4m3fn,
                 "out_k tensor data type must be float8_e4m3fn");
-  } else {
-    out_k = torch::empty({num_rows, num_kv_heads, qk_head_dim},
-                         torch::dtype(torch::kFloat8_e4m3fn).device(qkv.device()));
   }
 
   if (out_attention_opt.has_value()) {
@@ -219,15 +212,10 @@ rope_norm_blocked_kvcache_w8c8_dqskv_entry(
     TORCH_CHECK(out_attention.is_contiguous(), "out_attention tensor must be contiguous");
     TORCH_CHECK(out_attention.scalar_type() == torch::kBFloat16,
                 "out_attention tensor data type must be bfloat16");
-  } else {
-    out_attention = torch::empty({num_rows, num_q_heads, v_head_dim},
-                                 torch::dtype(torch::kBFloat16).device(qkv.device()));
   }
 
   // Prepare pointers
-
   auto *out_q_ptr = reinterpret_cast<QType *>(out_q.mutable_data_ptr());
-  auto *out_k_ptr = reinterpret_cast<QType *>(out_k.mutable_data_ptr());
   auto *kcache_ptr = reinterpret_cast<QType *>(kcache.mutable_data_ptr());
   auto *vcache_ptr = reinterpret_cast<QType *>(vcache.mutable_data_ptr());
   const auto *qkv_ptr = reinterpret_cast<const DType *>(qkv.const_data_ptr());
@@ -256,7 +244,7 @@ rope_norm_blocked_kvcache_w8c8_dqskv_entry(
 
   // Launch kernel
   apply_rotary_pos_emb_blocked_kvcache_bf16_to_fp8_async(
-      out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+      out_q_ptr, kcache_ptr, vcache_ptr, qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
       q_index_ptr, kvcache_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr, q_scale_ptr,
       k_scale_ptr, v_scale_ptr, split_k_flag_ptr, upper_max, kcache_block_offset,
       vcache_block_offset, num_req, max_num_kv_block_per_batch, kv_block_size, num_rows,

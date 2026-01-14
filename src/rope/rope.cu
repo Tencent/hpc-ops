@@ -59,11 +59,11 @@ __device__ __forceinline__ void compute_rms_norm(float *thread_data, const float
 template <typename DType = __nv_bfloat16, int kNumWarpsPerBlock = 4, int kNumQHeads = 8,
           int kNumKVHeads = 1, int kQKHeadDim = 80, int kVHeadDim = 80, bool kUseQKNorm = false>
 __global__ void apply_rotary_pos_emb_prefill_kernel(
-    DType *out_q_ptr, DType *out_k_ptr, DType *kcache_ptr, DType *vcache_ptr,
-    const DType *in_qkv_ptr, const float *cos_sin_ptr, const int *num_tokens_per_batch_ptr,
-    const int *q_index_ptr, const int *kv_block_indices_ptr, const float *q_norm_weight_ptr,
-    const float *k_norm_weight_ptr, int kcache_block_offset, int vcache_block_offset, int num_batch,
-    int max_num_kv_block_per_batch, cutlass::FastDivmod kv_block_size_divider, int num_rows) {
+    DType *out_q_ptr, DType *kcache_ptr, DType *vcache_ptr, const DType *in_qkv_ptr,
+    const float *cos_sin_ptr, const int *num_tokens_per_batch_ptr, const int *q_index_ptr,
+    const int *kv_block_indices_ptr, const float *q_norm_weight_ptr, const float *k_norm_weight_ptr,
+    int kcache_block_offset, int vcache_block_offset, int num_batch, int max_num_kv_block_per_batch,
+    cutlass::FastDivmod kv_block_size_divider, int num_rows) {
   constexpr int kNumElemPerRow =
       kNumQHeads * kQKHeadDim + kNumKVHeads * kQKHeadDim + kNumKVHeads * kVHeadDim;
 
@@ -230,7 +230,6 @@ __global__ void apply_rotary_pos_emb_prefill_kernel(
 #pragma unroll
   for (int kv_head = 0; kv_head < kNumKVHeads; ++kv_head) {
     DType *k_head_data = row_data + kNumQHeads * kQKHeadDim + kv_head * kQKHeadDim;
-    DType *out_k_head_ptr = out_k_ptr + irow * kNumKVHeads * kQKHeadDim + kv_head * kQKHeadDim;
 
     // Apply RoPE transformation (neox version)
     constexpr int kNumRoundsHalf = (kQKHeadDim / 2 + kWarpSize - 1) / kWarpSize;
@@ -262,10 +261,6 @@ __global__ void apply_rotary_pos_emb_prefill_kernel(
       if (i < kQKHeadDim / 2) {
         DType k_out_1 = __float2bfloat16(k_float_buffer_reg[iround * 2]);
         DType k_out_2 = __float2bfloat16(k_float_buffer_reg[iround * 2 + 1]);
-
-        // Write K to output
-        out_k_head_ptr[i] = k_out_1;
-        out_k_head_ptr[i + kQKHeadDim / 2] = k_out_2;
 
         // Write K to KV cache
         DType *kvcache_k_ptr = k_cache_row_start + kv_head * kQKHeadDim;
@@ -578,13 +573,13 @@ __global__ void apply_rotary_pos_emb_decoding_kernel(
 }  // namespace kernels
 
 void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
-    __nv_bfloat16 *out_q_ptr, __nv_bfloat16 *out_k_ptr, __nv_bfloat16 *kcache_ptr,
-    __nv_bfloat16 *vcache_ptr, const __nv_bfloat16 *in_qkv_ptr, const float *cos_sin_ptr,
-    const int *num_tokens_per_batch_ptr, const int *q_index_ptr, const int *kv_block_indices_ptr,
-    const float *q_norm_weight_ptr, const float *k_norm_weight_ptr, int kcache_block_offset,
-    int vcache_block_offset, int num_batch, int max_num_kv_block_per_batch, int kv_block_size,
-    int num_rows, int num_q_heads, int num_kv_heads, int qk_head_dim, int v_head_dim,
-    bool is_prefill, bool use_qk_norm, cudaStream_t stream) {
+    __nv_bfloat16 *out_q_ptr, __nv_bfloat16 *kcache_ptr, __nv_bfloat16 *vcache_ptr,
+    const __nv_bfloat16 *in_qkv_ptr, const float *cos_sin_ptr, const int *num_tokens_per_batch_ptr,
+    const int *q_index_ptr, const int *kv_block_indices_ptr, const float *q_norm_weight_ptr,
+    const float *k_norm_weight_ptr, int kcache_block_offset, int vcache_block_offset, int num_batch,
+    int max_num_kv_block_per_batch, int kv_block_size, int num_rows, int num_q_heads,
+    int num_kv_heads, int qk_head_dim, int v_head_dim, bool is_prefill, bool use_qk_norm,
+    cudaStream_t stream) {
   cutlass::FastDivmod kv_block_size_divider(kv_block_size);
 
   // Dispatch based on head configuration and mode
@@ -603,7 +598,7 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
         kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, true>
             <<<grid, block, 0, stream>>>(
-                out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
+                out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
                 num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
                 k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
                 max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
@@ -611,7 +606,7 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
         kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, false>
             <<<grid, block, 0, stream>>>(
-                out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
+                out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
                 num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
                 k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
                 max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
@@ -658,7 +653,7 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
         kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, true>
             <<<grid, block, 0, stream>>>(
-                out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
+                out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
                 num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
                 k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
                 max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
@@ -666,7 +661,7 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
         kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, false>
             <<<grid, block, 0, stream>>>(
-                out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
+                out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
                 num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
                 k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
                 max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
@@ -713,7 +708,7 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
         kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, true>
             <<<grid, block, 0, stream>>>(
-                out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
+                out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
                 num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
                 k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
                 max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
@@ -721,7 +716,7 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
         kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, false>
             <<<grid, block, 0, stream>>>(
-                out_q_ptr, out_k_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
+                out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
                 num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
                 k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
                 max_num_kv_block_per_batch, kv_block_size_divider, num_rows);

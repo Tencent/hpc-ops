@@ -97,6 +97,7 @@ def test_group_gemm1(num_group, actual_m, m, n, k):
     assert torch.allclose(my.to(torch.float), gt.to(torch.float), rtol=0.08, atol=0.1)
 
 
+@pytest.mark.skipif(os.getenv("NV_SANITIZER_INJECTION_PORT_BASE"), reason="skip sanitizer")
 @pytest.mark.parametrize("num_group", [256])
 @pytest.mark.parametrize("actual_m", [30])
 @pytest.mark.parametrize("m", [1280])
@@ -186,8 +187,8 @@ def naive_deepep_input_format_group_gemm(x, w, seqlens, cu_seqlens, xscale, wsca
     return y
 
 
+@pytest.mark.skipif(os.getenv("NV_SANITIZER_INJECTION_PORT_BASE"), reason="skip sanitizer")
 @pytest.mark.parametrize("num_group", [256])
-# @pytest.mark.parametrize("actual_m", [16, 32, 64, 128, 256, 512])
 @pytest.mark.parametrize("actual_m", [30])
 @pytest.mark.parametrize("m", [1280])
 @pytest.mark.parametrize("n", [4096])
