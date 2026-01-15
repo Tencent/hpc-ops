@@ -2,6 +2,7 @@ from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
 import subprocess, os, sys
 import shutil
+import torch
 
 
 class CMakeExtension(Extension):
@@ -48,6 +49,8 @@ def get_version():
         .strip()
         .lstrip("v")
     )
+    torch_version = "torch" + torch.__version__.split("+")[0].replace(".", "")
+
     newest_tag_hash = subprocess.check_output(
         ["git", "rev-list", "--tags", "--max-count=1"], stderr=subprocess.DEVNULL, text=True
     ).strip()[:7]
@@ -63,7 +66,7 @@ def get_version():
         except subprocess.CalledProcessError:
             commit_count = "0"
 
-        return f"{newest_tag}.dev{commit_count}+g{git_hash}", git_hash
+        return f"{newest_tag}.dev{commit_count}+g{git_hash}.{torch_version}", git_hash
 
 
 version, git_hash = get_version()
