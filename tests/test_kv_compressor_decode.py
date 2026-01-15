@@ -315,7 +315,7 @@ def test_c128_kv_compressor_decode(batch, dim, ratio):
 
 
 @pytest.mark.parametrize("batch", [128])
-@pytest.mark.parametrize("dim", [128])
+@pytest.mark.parametrize("dim", [128, 512])
 @pytest.mark.parametrize("ratio", [4])
 def test_c4_kv_compressor_decode(batch, dim, ratio):
     kv_state = torch.randn((batch, 2 * ratio, 2 * dim), dtype=torch.float, device="cuda")
@@ -444,7 +444,7 @@ def test_c128_kv_compressor_decode_mtp(batch, dim, ratio, mtp):
 
 
 @pytest.mark.parametrize("batch", [4])
-@pytest.mark.parametrize("dim", [128])
+@pytest.mark.parametrize("dim", [128, 512])
 @pytest.mark.parametrize("ratio", [4])
 @pytest.mark.parametrize("mtp", [1])
 def test_c4_kv_compressor_decode_mtp(batch, dim, ratio, mtp):

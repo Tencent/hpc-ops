@@ -246,16 +246,27 @@ void kv_compressor_decode_async(void* y_ptr, const void* kv_ptr, const void* sco
   if (mtp == 1) {
     // mtp decode
     if (ratio == 4) {
-      // head_dim == 128, overlap is true
-      dim3 grid(batch_size);
-      dim3 block(32);
-      auto decode_kernel = kernels::c4_kv_compressor_decode_kernel<4, 128, 2>;
-      decode_kernel<<<grid, block, 0, stream>>>(
-          (float*)y_ptr, (const float*)kv_ptr, (const float*)score_ptr, (const float*)ape_ptr,
-          (float*)kv_states_ptr, (float*)score_states_ptr, (const int*)state_idx_ptr,
-          (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr);
+      if (head_dim == 128) {
+        // head_dim == 128,
+        dim3 grid(batch_size);
+        dim3 block(32);
+        auto decode_kernel = kernels::c4_kv_compressor_decode_kernel<4, 128, 2>;
+        decode_kernel<<<grid, block, 0, stream>>>(
+            (float*)y_ptr, (const float*)kv_ptr, (const float*)score_ptr, (const float*)ape_ptr,
+            (float*)kv_states_ptr, (float*)score_states_ptr, (const int*)state_idx_ptr,
+            (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr);
+      } else {
+        // head_dim == 512
+        dim3 grid(batch_size);
+        dim3 block(128);
+        auto decode_kernel = kernels::c4_kv_compressor_decode_kernel<4, 512, 2>;
+        decode_kernel<<<grid, block, 0, stream>>>(
+            (float*)y_ptr, (const float*)kv_ptr, (const float*)score_ptr, (const float*)ape_ptr,
+            (float*)kv_states_ptr, (float*)score_states_ptr, (const int*)state_idx_ptr,
+            (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr);
+      }
     } else {
-      // head_dim == 512, overlap is false
+      // ratio = 128, head_dim == 512
       dim3 grid(batch_size);
       dim3 block(128);
       auto decode_kernel = kernels::c128_kv_compressor_decode_kernel<128, 512, 2>;
@@ -267,16 +278,27 @@ void kv_compressor_decode_async(void* y_ptr, const void* kv_ptr, const void* sco
   } else {
     // normal decode
     if (ratio == 4) {
-      // head_dim == 128, overlap is true
-      dim3 grid(batch_size);
-      dim3 block(32);
-      auto decode_kernel = kernels::c4_kv_compressor_decode_kernel<4, 128, 1>;
-      decode_kernel<<<grid, block, 0, stream>>>(
-          (float*)y_ptr, (const float*)kv_ptr, (const float*)score_ptr, (const float*)ape_ptr,
-          (float*)kv_states_ptr, (float*)score_states_ptr, (const int*)state_idx_ptr,
-          (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr);
+      if (head_dim == 128) {
+        // head_dim == 128
+        dim3 grid(batch_size);
+        dim3 block(32);
+        auto decode_kernel = kernels::c4_kv_compressor_decode_kernel<4, 128, 1>;
+        decode_kernel<<<grid, block, 0, stream>>>(
+            (float*)y_ptr, (const float*)kv_ptr, (const float*)score_ptr, (const float*)ape_ptr,
+            (float*)kv_states_ptr, (float*)score_states_ptr, (const int*)state_idx_ptr,
+            (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr);
+      } else {
+        // head_dim == 512
+        dim3 grid(batch_size);
+        dim3 block(128);
+        auto decode_kernel = kernels::c4_kv_compressor_decode_kernel<4, 512, 1>;
+        decode_kernel<<<grid, block, 0, stream>>>(
+            (float*)y_ptr, (const float*)kv_ptr, (const float*)score_ptr, (const float*)ape_ptr,
+            (float*)kv_states_ptr, (float*)score_states_ptr, (const int*)state_idx_ptr,
+            (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr);
+      }
     } else {
-      // head_dim == 512, overlap is false
+      // ratio = 128, head_dim == 512
       dim3 grid(batch_size);
       dim3 block(128);
       auto decode_kernel = kernels::c128_kv_compressor_decode_kernel<128, 512, 1>;

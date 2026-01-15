@@ -56,7 +56,7 @@ torch::Tensor kv_compressor_decode(const torch::Tensor& kv, const torch::Tensor&
   int coff = 1;
   if (overlap) {
     TORCH_CHECK(ratio == 4, "ratio must be 4 when overlap is true");
-    TORCH_CHECK(head_dim == 128, "head_dim must be 128 when ratio is 4");
+    TORCH_CHECK(head_dim == 128 || head_dim == 512, "head_dim must be 128 or 512 when ratio is 4");
     coff = 2;
   } else {
     TORCH_CHECK(ratio == 128, "ratio must be 128 when overlap is false");
