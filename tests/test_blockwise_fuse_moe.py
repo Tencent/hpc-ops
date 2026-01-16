@@ -14,7 +14,7 @@ from typing import Tuple
 import torch.nn.functional as F
 
 
-def naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert):
+def naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert, rank_ep):
     num_tokens, num_topk = topk_ids.shape
     num_tokens, hidden_size = x.shape
     total_num_tokens = num_tokens * num_topk
@@ -33,9 +33,15 @@ def naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert):
     unique_values, num_tokens_per_expert_partial = torch.unique(
         topk_ids.flatten(), return_counts=True, sorted=True
     )
+    start_expert = rank_ep * num_expert
+    end_expert = (rank_ep + 1) * num_expert
+    mask = (unique_values >= start_expert) & (unique_values < end_expert)
+    unique_values = unique_values[mask]
+    num_tokens_per_expert_partial = num_tokens_per_expert_partial[mask]
     num_tokens_per_expert = torch.full([num_expert], 0, dtype=torch.int32, device="cuda")
+
     for i in range(unique_values.numel()):
-        num_tokens_per_expert[unique_values[i]] = num_tokens_per_expert_partial[i]
+        num_tokens_per_expert[unique_values[i] - start_expert] = num_tokens_per_expert_partial[i]
 
     cu_num_tokens_per_expert = torch.cumsum(
         torch.cat([torch.tensor([0], dtype=torch.int32, device="cuda"), num_tokens_per_expert]),
@@ -62,6 +68,7 @@ def naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert):
         (num_tokens_paded, x_scale.size(1)), dtype=torch.float32, device=x_scale.device
     )
     token_pos = torch.zeros((num_tokens, num_topk), dtype=torch.int32, device=x.device)
+    token_pos.fill_(-1)
 
     # reset
     num_tokens_per_expert.fill_(0)
@@ -69,11 +76,15 @@ def naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert):
     for idx, iexpert in enumerate(topk_ids.flatten()):
         itoken = idx // num_topk
         icol = idx % num_topk
-        pos = cu_num_tokens_per_expert_paded[iexpert] + num_tokens_per_expert[iexpert]
-        y[pos] = x[itoken]
-        y_scale[pos] = x_scale[itoken]
-        token_pos[itoken, icol] = pos.item()
-        num_tokens_per_expert[iexpert] += 1
+        if iexpert >= start_expert and iexpert < end_expert:
+            pos = (
+                cu_num_tokens_per_expert_paded[iexpert - start_expert]
+                + num_tokens_per_expert[iexpert - start_expert]
+            )
+            y[pos] = x[itoken]
+            y_scale[pos] = x_scale[itoken]
+            token_pos[itoken, icol] = pos.item()
+            num_tokens_per_expert[iexpert - start_expert] += 1
 
     return (
         y,
@@ -205,14 +216,19 @@ def naive_act_mul_and_blockwise_quant(gate_up_out):
 
 def naive_reduce(x_bf16, topk_pos, topk_scale, shared_output=None):
     num_tokens, num_topk = topk_pos.shape
-    _, hidden_size = x_bf16.shape
+    total_num_tokens, hidden_size = x_bf16.shape
 
     y_bf16 = torch.zeros((num_tokens, hidden_size), dtype=torch.bfloat16, device=x_bf16.device)
     for i in range(num_tokens):
-        y_bf16[i] = torch.sum(x_bf16[topk_pos[i]] * topk_scale[i].unsqueeze(1), dim=0)
+        acc = torch.zeros((1, hidden_size), dtype=torch.float, device="cuda")
+        cur_topk_pos = topk_pos[i]
+        cur_topk_scale = topk_scale[i]
+        for j, pos in enumerate(cur_topk_pos):
+            if pos >= 0:
+                acc += x_bf16[pos].float() * cur_topk_scale[j].float()
         if shared_output is not None:
-            y_bf16[i] += shared_output[i]
-
+            acc += shared_output[i].float()
+        y_bf16[i] = acc.to(torch.bfloat16)
     return y_bf16
 
 
@@ -237,7 +253,7 @@ def naive_fuse_moe_blockwise(
         num_tokens_per_expert,
         cu_num_tokens_per_expert_paded,
         expert_ids,
-    ) = naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert)
+    ) = naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert, rank_ep)
 
     # gate_up_proj
     gate_up_output = naive_group_gemm(
@@ -268,15 +284,23 @@ def naive_fuse_moe_blockwise(
     return y
 
 
-@pytest.mark.parametrize("num_tokens", [8, 1024, 2048, 8192])
+@pytest.mark.parametrize("num_tokens", [128])
 @pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512, 256])
 @pytest.mark.parametrize("num_expert", [128])
-@pytest.mark.parametrize("rank_ep", [0])
+@pytest.mark.parametrize("rank_ep", [0, 1])
+@pytest.mark.parametrize("size_ep", [1, 4, 8])
 @pytest.mark.parametrize("has_shared_output", [False, True])
 def test_fuse_moe(
-    num_tokens, num_topk, hidden_size, intermediate_size, num_expert, rank_ep, has_shared_output
+    num_tokens,
+    num_topk,
+    hidden_size,
+    intermediate_size,
+    num_expert,
+    rank_ep,
+    size_ep,
+    has_shared_output,
 ):
     torch.manual_seed(0)
     dtype = torch.float8_e4m3fn
@@ -290,20 +314,22 @@ def test_fuse_moe(
     x = (torch.randn((num_tokens, hidden_size), dtype=torch.float, device="cuda") / 100).to(dtype)
     x_scale = torch.randn((num_tokens, hidden_size // 128), dtype=torch.float, device="cuda")
     gate_up_weight = torch.randn(
-        (num_expert, intermediate_size * 2, hidden_size), dtype=torch.float, device="cuda"
+        (num_expert // size_ep, intermediate_size * 2, hidden_size),
+        dtype=torch.float,
+        device="cuda",
     ).to(dtype)
     gate_up_weight_scale = torch.randn(
-        (num_expert, intermediate_size * 2 // 128, (hidden_size // 128 + 3) // 4 * 4),
+        (num_expert // size_ep, intermediate_size * 2 // 128, (hidden_size // 128 + 3) // 4 * 4),
         dtype=torch.float,
         device="cuda",
     )
     down_weight = torch.randn(
-        (num_expert, hidden_size, intermediate_size),
+        (num_expert // size_ep, hidden_size, intermediate_size),
         dtype=torch.float,
         device="cuda",
     ).to(dtype)
     down_weight_scale = torch.randn(
-        (num_expert, hidden_size // 128, (intermediate_size // 128 + 3) // 4 * 4),
+        (num_expert // size_ep, hidden_size // 128, (intermediate_size // 128 + 3) // 4 * 4),
         dtype=torch.float,
         device="cuda",
     )
@@ -312,32 +338,31 @@ def test_fuse_moe(
     else:
         shared_output = None
 
-    for _ in range(1):
-        my = hpc.fuse_moe_blockwise(
-            x,
-            x_scale,
-            gate_up_weight,
-            gate_up_weight_scale,
-            down_weight,
-            down_weight_scale,
-            topk_ids,
-            topk_scale,
-            rank_ep,
-            num_expert,
-        )
-        gt = naive_fuse_moe_blockwise(
-            x,
-            x_scale,
-            gate_up_weight,
-            gate_up_weight_scale,
-            down_weight,
-            down_weight_scale,
-            topk_ids,
-            topk_scale,
-            rank_ep,
-            num_expert,
-        )
+    my = hpc.fuse_moe_blockwise(
+        x,
+        x_scale,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids,
+        topk_scale,
+        rank_ep,
+        num_expert // size_ep,
+    )
+    gt = naive_fuse_moe_blockwise(
+        x,
+        x_scale,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids,
+        topk_scale,
+        rank_ep,
+        num_expert // size_ep,
+    )
 
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
 
     assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.08, atol=0.1)

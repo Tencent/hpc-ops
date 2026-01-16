@@ -177,8 +177,7 @@ __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
 
         pos_in_expert = __shfl_sync(0xFFFFFFFF, pos_in_expert, 0);
 
-        int irow = cu_seqlens_ptr[iexpert] + pos_in_expert;
-
+        int irow = cu_seqlens_ptr[iexpert - start_expert] + pos_in_expert;
         int iseq, res;
         topk_divider(iseq, res, itopk);
 

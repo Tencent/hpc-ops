@@ -183,7 +183,7 @@ __global__ void blockwise_gather_kernel(
 
         pos_in_expert = __shfl_sync(0xFFFFFFFF, pos_in_expert, 0);
 
-        int irow = cu_num_tokens_per_group_ptr[iexpert] + pos_in_expert;
+        int irow = cu_num_tokens_per_group_ptr[iexpert - start_expert] + pos_in_expert;
 
         int itoken, res;
         topk_divider(itoken, res, itopk);
