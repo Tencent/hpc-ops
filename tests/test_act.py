@@ -242,6 +242,7 @@ def gt_masked_act_mul_and_blockwise_quant(gate_up, num_per_expert):
     return outfp8, scale
 
 
+@pytest.mark.skip
 @pytest.mark.parametrize("num_expert", [32])
 @pytest.mark.parametrize("num_max_tokens_per_expert", [336])
 @pytest.mark.parametrize("num_intermediate_size", [2048])

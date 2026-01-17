@@ -303,6 +303,12 @@ __device__ __forceinline__ float rcpf_ftz(float x) {
   return r;
 }
 
+__device__ __forceinline__ float sqrt_ftz(float x) {
+  float r;
+  asm volatile("sqrt.approx.ftz.f32 %0, %1;\n" : "=f"(r) : "f"(x));
+  return r;
+}
+
 // y = max(0, x)
 __device__ __forceinline__ float relu(float x) { return fmaxf(0, x); }
 
