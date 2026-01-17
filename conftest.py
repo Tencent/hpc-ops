@@ -94,7 +94,8 @@ class TraceHook(object):
         org_func = getattr(module, func_name)
 
         def wrapped(*args, **kwargs):
-            tmp_py_file = tempfile.mktemp(prefix="tmp_hpc_" + func_name + "_", suffix=".py")
+            fd, tmp_py_file = tempfile.mkstemp(prefix="tmp_hpc_" + func_name + "_", suffix=".py")
+            os.close(fd)
             tmp_before_invoke_file = tmp_py_file.replace(".py", "_before_invoke.pth")
             tmp_after_invoke_file = tmp_py_file.replace(".py", "_after_invoke.pth")
 
