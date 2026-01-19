@@ -48,8 +48,7 @@ __global__ void blockwise_count_cutokens_kernel(const int *topk_ids_ptr, int *to
     if (igroup < num_experts) {
       int inum_tokens = num_tokens_per_group_ptr[igroup];
       int itile_num = (inum_tokens + kTileM - 1) / kTileM;
-      int inum_padded_tokens = itile_num * kTileM;
-      thread_num_tokens[i] = inum_padded_tokens;
+      thread_num_tokens[i] = inum_tokens;
       thread_tiles[i] = itile_num;
       tiles_ptr[igroup] = itile_num;
     } else {
@@ -119,8 +118,7 @@ __global__ void blockwise_count_kernel(const int *topk_ids_ptr, int *topk_pos_pt
     if (igroup < num_experts) {
       int inum_tokens = s_num_tokens_per_group[igroup];
       int itile_num = (inum_tokens + kTileM - 1) / kTileM;
-      int inum_padded_tokens = itile_num * kTileM;
-      thread_num_tokens[i] = inum_padded_tokens;
+      thread_num_tokens[i] = inum_tokens;
       thread_tiles[i] = itile_num;
       tiles_ptr[igroup] = itile_num;
     } else {
@@ -156,15 +154,16 @@ __global__ void blockwise_count_kernel(const int *topk_ids_ptr, int *topk_pos_pt
 }
 
 template <typename T1, typename T2, typename GateUpTmaX, typename GateUpTmaY, typename DownTmaX,
-          typename DownTmaY, int kWarpPerBlock>
+          typename DownTmaY, int kWarpPerBlock, int kTileM>
 __global__ void blockwise_gather_kernel(
     const vec_t<cute::TmaDescriptor, 4> td_xy, cute::TmaDescriptor *gate_up_tma_xy,
     cute::TmaDescriptor *down_tma_xy, const T1 *input_ptr, const float *input_scale_ptr,
     T1 *gate_up_input_ptr, T2 *gate_up_output_ptr, float *gate_up_input_scale_ptr,
     T1 *down_input_ptr, T2 *down_output_ptr, const int *topk_ids_ptr, int *topk_pos_ptr,
-    int *num_tokens_per_group_ptr, int *cu_num_tokens_per_group_ptr, int total_num_topk,
-    int hidden_size, int intermediate_size, int input_scale_size, int num_padded_tokens,
-    int start_expert, int end_expert, int num_block_for_copy, cutlass::FastDivmod topk_divider) {
+    int *num_tokens_per_group_ptr, int *cu_num_tokens_per_group_ptr, int *cu_tiles_ptr,
+    int total_num_topk, int hidden_size, int intermediate_size, int input_scale_size,
+    int num_padded_tokens, int start_expert, int end_expert, int num_block_for_copy,
+    cutlass::FastDivmod topk_divider) {
   constexpr int kThreadPerWarp = 32;
   int idx = threadIdx.x;
   int iblock = blockIdx.x;
@@ -201,6 +200,7 @@ __global__ void blockwise_gather_kernel(
         }
         topk_pos_ptr[itopk] = irow;
 
+        irow = cu_tiles_ptr[iexpert - start_expert] * kTileM + pos_in_expert;
         auto gate_up_input_scale_irow_ptr = gate_up_input_scale_ptr + irow;
         auto input_scale_irow_ptr = input_scale_ptr + itoken * input_scale_size;
 
@@ -297,18 +297,18 @@ void launch_blockwise_count_and_gather(
   int start_expert = eprank * num_experts;
   int end_expert = (eprank + 1) * num_experts;
 
-  int m = num_padded_tokens;
+  int m = num_tokens;
   int n = intermediate_size;
   int k = hidden_size;
 
   auto X_gate_up = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(gate_up_input_ptr)),
-                               make_shape(m, k), make_stride(k, Int<1>{}));
+                               make_shape(m * num_topk, k), make_stride(k, Int<1>{}));
   auto Y_gate_up = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(gate_up_output_ptr)),
-                               make_shape(n, m), make_stride(Int<1>{}, n));
+                               make_shape(n, m * num_topk), make_stride(Int<1>{}, n));
   auto X_down = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(down_input_ptr)),
-                            make_shape(m, n / 2), make_stride(n / 2, Int<1>{}));
+                            make_shape(m * num_topk, n / 2), make_stride(n / 2, Int<1>{}));
   auto Y_down = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(down_output_ptr)),
-                            make_shape(k, m), make_stride(Int<1>{}, k));
+                            make_shape(k, m * num_topk), make_stride(Int<1>{}, k));
 
   auto slayout_x = tile_to_shape(GMMA::Layout_K_SW128_Atom<Tin>{},
                                  make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{}));
@@ -378,15 +378,14 @@ void launch_blockwise_count_and_gather(
 
     int input_scale_size = hidden_size / 128;
     kernels::blockwise_gather_kernel<Tin, Tout, decltype(gata_up_tma_x), decltype(gata_up_tma_y),
-                                     decltype(down_tma_x), decltype(down_tma_y), kWarpPerBlock>
-        <<<grid, block, 0, stream>>>(
-            td_xy, gate_up_tma_xy, down_tma_xy, (const Tin *)input_ptr, (float *)input_scale_ptr,
-            (Tin *)gate_up_input_ptr, (Tout *)gate_up_output_ptr, (float *)gate_up_input_scale_ptr,
-            (Tin *)down_input_ptr, (Tout *)down_output_ptr, (const int *)topk_ids_ptr,
-            (int *)topk_pos_ptr, (int *)num_tokens_per_group_ptr,
-            (int *)cu_num_tokens_per_group_ptr, total_num_topk, hidden_size, intermediate_size,
-            input_scale_size, num_padded_tokens, start_expert, end_expert, num_block_for_copy,
-            topk_divider);
+                                     decltype(down_tma_x), decltype(down_tma_y), kWarpPerBlock,
+                                     kTileM><<<grid, block, 0, stream>>>(
+        td_xy, gate_up_tma_xy, down_tma_xy, (const Tin *)input_ptr, (float *)input_scale_ptr,
+        (Tin *)gate_up_input_ptr, (Tout *)gate_up_output_ptr, (float *)gate_up_input_scale_ptr,
+        (Tin *)down_input_ptr, (Tout *)down_output_ptr, (const int *)topk_ids_ptr,
+        (int *)topk_pos_ptr, (int *)num_tokens_per_group_ptr, (int *)cu_num_tokens_per_group_ptr,
+        (int *)cu_tiles_ptr, total_num_topk, hidden_size, intermediate_size, input_scale_size,
+        num_padded_tokens, start_expert, end_expert, num_block_for_copy, topk_divider);
   }
 }
 

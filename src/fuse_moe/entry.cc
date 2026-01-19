@@ -309,18 +309,18 @@ torch::Tensor fuse_moe_blockwise_entry(
   auto options = x.options();
   torch::Tensor y = torch::empty({num_tokens, hidden_size}, options.dtype(torch::kBFloat16));
   torch::Tensor gate_up_input =
-      torch::empty({num_padded_tokens, hidden_size}, options.dtype(torch::kFloat8_e4m3fn));
+      torch::empty({num_tokens * num_topk, hidden_size}, options.dtype(torch::kFloat8_e4m3fn));
   torch::Tensor gate_up_input_scale =
       torch::empty({x_scale.size(1), num_padded_tokens}, options.dtype(torch::kFloat32));
   torch::Tensor gate_up_output =
-      torch::empty({num_padded_tokens, intermediate_size}, options.dtype(torch::kBFloat16));
+      torch::empty({num_tokens * num_topk, intermediate_size}, options.dtype(torch::kBFloat16));
   torch::Tensor gate_up_tmas = torch::empty({num_experts * 2, 128}, options.dtype(torch::kInt8));
-  torch::Tensor down_input = torch::empty({num_padded_tokens, intermediate_size / 2},
+  torch::Tensor down_input = torch::empty({num_tokens * num_topk, intermediate_size / 2},
                                           options.dtype(torch::kFloat8_e4m3fn));
   torch::Tensor down_input_scale = torch::empty({intermediate_size / 2 / 128, num_padded_tokens},
                                                 options.dtype(torch::kFloat32));
   torch::Tensor down_output =
-      torch::empty({num_padded_tokens, hidden_size}, options.dtype(torch::kBFloat16));
+      torch::empty({num_tokens * num_topk, hidden_size}, options.dtype(torch::kBFloat16));
   torch::Tensor down_tmas = torch::empty({num_experts * 2, 128}, options.dtype(torch::kInt8));
   torch::Tensor topk_pos = torch::empty({num_tokens, num_topk}, options.dtype(torch::kInt32));
   torch::Tensor num_tokens_per_group = torch::zeros({num_experts}, options.dtype(torch::kInt32));

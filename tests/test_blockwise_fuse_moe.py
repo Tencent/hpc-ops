@@ -19,16 +19,6 @@ def naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert, rank_ep):
     num_tokens, hidden_size = x.shape
     total_num_tokens = num_tokens * num_topk
     num_tokens_per_group_avg = total_num_tokens / num_expert
-    align_size = 16
-    if num_tokens_per_group_avg <= 16:
-        align_size = 16
-    elif num_tokens_per_group_avg <= 32:
-        align_size = 32
-    else:
-        align_size = 64
-
-    def __align_to_multiple(tensor, multiple):
-        return torch.where(tensor == 0, tensor, ((tensor + multiple - 1) // multiple) * multiple)
 
     unique_values, num_tokens_per_expert_partial = torch.unique(
         topk_ids.flatten(), return_counts=True, sorted=True
@@ -48,24 +38,9 @@ def naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert, rank_ep):
         dim=0,
     ).to(torch.int32)
 
-    num_tokens_per_expert_paded = __align_to_multiple(num_tokens_per_expert, align_size)
-
-    cu_num_tokens_per_expert_paded = torch.cumsum(
-        torch.cat(
-            [torch.tensor([0], dtype=torch.int32, device="cuda"), num_tokens_per_expert_paded]
-        ),
-        dim=0,
-    ).to(torch.int32)
-
-    num_tokens_paded = (
-        (num_tokens * num_topk + num_expert * align_size + align_size - 1)
-        // align_size
-        * align_size
-    )
-
-    y = torch.zeros((num_tokens_paded, hidden_size), dtype=x.dtype, device=x.device)
+    y = torch.zeros((num_tokens * num_topk, hidden_size), dtype=x.dtype, device=x.device)
     y_scale = torch.zeros(
-        (num_tokens_paded, x_scale.size(1)), dtype=torch.float32, device=x_scale.device
+        (num_tokens * num_topk, x_scale.size(1)), dtype=torch.float32, device=x_scale.device
     )
     token_pos = torch.zeros((num_tokens, num_topk), dtype=torch.int32, device=x.device)
     token_pos.fill_(-1)
@@ -78,7 +53,7 @@ def naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert, rank_ep):
         icol = idx % num_topk
         if iexpert >= start_expert and iexpert < end_expert:
             pos = (
-                cu_num_tokens_per_expert_paded[iexpert - start_expert]
+                cu_num_tokens_per_expert[iexpert - start_expert]
                 + num_tokens_per_expert[iexpert - start_expert]
             )
             y[pos] = x[itoken]
@@ -91,7 +66,7 @@ def naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert, rank_ep):
         y_scale,
         token_pos,
         num_tokens_per_expert,
-        cu_num_tokens_per_expert_paded,
+        cu_num_tokens_per_expert,
         unique_values,
     )
 
@@ -251,7 +226,7 @@ def naive_fuse_moe_blockwise(
         gate_up_input_scale,
         topk_pos,
         num_tokens_per_expert,
-        cu_num_tokens_per_expert_paded,
+        cu_num_tokens_per_expert,
         expert_ids,
     ) = naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert, rank_ep)
 
@@ -260,7 +235,7 @@ def naive_fuse_moe_blockwise(
         gate_up_input,
         gate_up_weight,
         num_tokens_per_expert,
-        cu_num_tokens_per_expert_paded,
+        cu_num_tokens_per_expert,
         gate_up_input_scale,
         gate_up_weight_scale,
     )
@@ -273,7 +248,7 @@ def naive_fuse_moe_blockwise(
         down_input,
         down_weight,
         num_tokens_per_expert,
-        cu_num_tokens_per_expert_paded,
+        cu_num_tokens_per_expert,
         down_input_scale,
         down_weight_scale,
     )
@@ -364,5 +339,4 @@ def test_fuse_moe(
     )
 
     torch.cuda.synchronize()
-
-    assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.08, atol=0.1)
+    assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.01, atol=0.01)

@@ -119,17 +119,36 @@ __global__ void masked_act_mul_and_quant_kernel(
   }  // irow0
 }
 
-__global__ void act_mul_and_blockwise_quant_kernel(const __nv_bfloat16 *gate_up_output_ptr,
-                                                   __nv_fp8_e4m3 *output_ptr,
-                                                   float *output_scale_ptr, const int num_row,
-                                                   const int num_col,
-                                                   cutlass::FastDivmod block1D22D) {
+__device__ __forceinline__ void get_group_id(int irow, const int *cu_num_tokens_per_group_ptr,
+                                             int num_group, int &igroup, int &offset) {
+  int left = 0;
+  int right = num_group;
+  while (left <= right) {
+    int mid = left + (right - left) / 2;
+    if (cu_num_tokens_per_group_ptr[mid] > irow) {
+      right = mid - 1;
+    } else {
+      left = mid + 1;
+    }
+  }
+  offset = irow - cu_num_tokens_per_group_ptr[right];
+  igroup = right;
+}
+
+__global__ void act_mul_and_blockwise_quant_kernel(
+    const __nv_bfloat16 *gate_up_output_ptr, __nv_fp8_e4m3 *output_ptr, float *output_scale_ptr,
+    const int *cu_num_tokens_per_group_ptr, const int *cu_tiles_ptr, const int num_row,
+    const int num_row_padded_size, const int num_col, const int num_group, const int ktile_m,
+    cutlass::FastDivmod block1D22D) {
   int iblockx;
   int iblocky;
 
   block1D22D(iblocky, iblockx, blockIdx.x);
   int it = threadIdx.x + iblockx * blockDim.x;
   int irow = iblocky;
+  if (irow >= cu_num_tokens_per_group_ptr[num_group]) {
+    return;
+  }
   int lane_id = threadIdx.x % 32;
 
   using T = __nv_bfloat162;
@@ -174,8 +193,14 @@ __global__ void act_mul_and_blockwise_quant_kernel(const __nv_bfloat16 *gate_up_
 
     // store scale
     if (lane_id == 0 || lane_id == 16) {
-      auto *scale_addr = output_scale_ptr + irow * 1 + icol / 128 * num_row;
-      store(scale_addr, scale);
+      int igroup = -1;
+      int offset = -1;
+      get_group_id(irow, cu_num_tokens_per_group_ptr, num_group, igroup, offset);
+      if (igroup >= 0 && offset >= 0) {
+        auto *scale_addr = output_scale_ptr + cu_tiles_ptr[igroup] * ktile_m + offset +
+                           icol / 128 * num_row_padded_size;
+        store(scale_addr, scale);
+      }
     }
   }
 }
@@ -313,7 +338,11 @@ void masked_act_mul_and_quant_async(__nv_fp8_e4m3 *output_ptr, const __nv_bfloat
 }
 
 void act_mul_and_blockwise_quant_async(void *output_ptr, void *output_scale_ptr,
-                                       const void *input_ptr, const int num_row, const int num_col,
+                                       const void *input_ptr,
+                                       const void *cu_num_tokens_per_group_ptr,
+                                       const void *cu_tiles_ptr, const int num_row,
+                                       const int num_row_padded_size, const int num_col,
+                                       const int num_group, const int num_tokens_per_group_avg,
                                        cudaStream_t stream) {
   using Tin = __nv_bfloat16;
   using Tout = __nv_fp8_e4m3;
@@ -323,10 +352,20 @@ void act_mul_and_blockwise_quant_async(void *output_ptr, void *output_scale_ptr,
   int num_block_per_row = (intermediate_size / 8 + block.x - 1) / block.x;
   cutlass::FastDivmod block1D22D(num_block_per_row);
   dim3 grid(num_row * num_block_per_row);
-
+  int ktile_m = 0;
+  if (num_tokens_per_group_avg <= 16) {
+    ktile_m = 16;
+  } else if (num_tokens_per_group_avg <= 32) {
+    ktile_m = 32;
+  } else if (num_tokens_per_group_avg <= 48) {
+    ktile_m = 48;
+  } else {
+    ktile_m = 64;
+  }
   kernels::act_mul_and_blockwise_quant_kernel<<<grid, block, 0, stream>>>(
-      (Tin *)input_ptr, (Tout *)output_ptr, (float *)output_scale_ptr, num_row, intermediate_size,
-      block1D22D);
+      (Tin *)input_ptr, (Tout *)output_ptr, (float *)output_scale_ptr,
+      (int *)cu_num_tokens_per_group_ptr, (int *)cu_tiles_ptr, num_row, num_row_padded_size,
+      intermediate_size, num_group, ktile_m, block1D22D);
 }
 
 void masked_act_mul_and_blockwise_quant_async(__nv_fp8_e4m3 *output_ptr, float *output_scale_ptr,
