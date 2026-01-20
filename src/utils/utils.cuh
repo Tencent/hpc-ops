@@ -303,6 +303,8 @@ __device__ __forceinline__ float rcpf_ftz(float x) {
   return r;
 }
 
+// y = 1 / (1 + e^(-x))
+__device__ __forceinline__ float sigmoid(float x) { return rcpf_ftz(1.f + expf_ftz(-x)); }
 __device__ __forceinline__ float sqrt_ftz(float x) {
   float r;
   asm volatile("sqrt.approx.ftz.f32 %0, %1;\n" : "=f"(r) : "f"(x));
