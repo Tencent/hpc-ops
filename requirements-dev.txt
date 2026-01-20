@@ -1,0 +1,12 @@
+numpy==2.3.1
+torch==2.7.0
+pytest==8.4.1
+setuptools==68.0.0
+wheel==0.45.1
+black==25.1.0
+twine==6.1.0
+clang-format==20.1.8
+cpplint==2.0.2
+mkdocs==1.6.1
+mkdocstrings-python==1.16.12
+mkdocs-material==9.6.14

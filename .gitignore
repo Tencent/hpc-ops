@@ -1,0 +1,14 @@
+build/
+dist/
+site/
+docs/
+.vscode/
+*.egg-info/
+_C.*.so
+__pycache__
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+*.log
+test
+version.py
