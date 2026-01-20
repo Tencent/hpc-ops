@@ -348,6 +348,142 @@ def attention_decode_fp8(
     )
 
 
+def attention_mla_with_kvcache_bf16(
+    q: Tensor,
+    kvcache: Tensor,
+    block_ids: Tensor,
+    cu_seqlens_q: Tensor,
+    num_seq_kv: Tensor,
+    output: Tensor = None,
+) -> Tensor:
+    """Computes attention prefill using bfloat16 precision.
+
+    This function performs the attention prefill computation using custom hardware
+    operations optimized for bfloat16 data type. The prefill stage processes all
+    input tokens simultaneously to generate the initial attention context, which
+    is typically used during the first forward pass of autoregressive models.
+
+    Args:
+        q: Query tensor for attention computation
+            Shape: [total_seq, num_head_q, num_dim_qk]
+            Dtype: bfloat16
+        k: Key tensor for attention computation
+            Shape: [total_seq, num_head_kv, num_dim_qk]
+            Dtype: bfloat16
+        v: Value tensor for attention computation
+            Shape: [total_seq, num_head_kv, num_dim_v]
+            Dtype: bfloat16
+        seqlens_q: num_seq_q for each batch
+            Shape: [num_batch]
+            Dtype: int32
+        cu_seqlens_q: start_seq_q for each batch
+            Shape: [num_batch + 1]
+            Dtype: int32
+        max_seqlens_q: max seqlens amang all batchs
+            Shape: scalar
+            Dtype: int
+
+    Returns:
+        Tensor: Attention output tensor in bfloat16 format on CUDA device
+            Shape: [total_seq, num_head_q, num_dim_v]
+            Dtype: bfloat16
+
+    Raises:
+        RuntimeError: If the shapes or dtypes do not satisfy the constraints above.
+
+    Note:
+        - All input tensors must be on CUDA device and in bfloat16 format
+        - The query and key tensors must have the same embedding dimension (num_dim_qk)
+        - total_seq = sum(seqlens_q[ibatch] for ibatch in range(num_batch))
+    """
+
+    return torch.ops.hpc.attention_mla_with_kvcache_bf16(
+        q, kvcache, block_ids, cu_seqlens_q, num_seq_kv, output
+    )
+
+
+def sparse_mla_with_kvcache_bf16(
+    q: Tensor,
+    win_kvcache: Tensor,
+    win_block_ids: Tensor,
+    win_topk_ids: Tensor,
+    compress_kvcache: Tensor,
+    compress_block_ids: Tensor,
+    compress_topk_ids: Tensor,
+    cu_seqlens_q: Tensor,
+    sink_weight: Tensor,
+    softmax_scale: float,
+    output: Tensor = None,
+) -> Tensor:
+    """Computes index attention prefill using bfloat16 precision.
+
+    This function performs the index attention computation using custom hardware
+    operations optimized for bfloat16 data type. The prefill stage processes all
+    input tokens simultaneously to generate the initial attention context, which
+    is typically used during the first forward pass of autoregressive models.
+
+    Args:
+        q: Query tensor for attention computation
+            Shape: [num_total_tokens_q, num_head_q, num_dim]
+            Dtype: bfloat16
+        win_kvcache: Sliding window kvcache tensor for attention computation in paged format.
+                 Constrainst the unused slots in last block of vcache for each request to be set zeros.
+            Shape: [num_win_blocks, block_size, num_head_kv, num_dim]
+            Dtype: bfloat16
+        win_block_ids: Sliding window paged kvcache block index tensor for get paged kvcache.
+            Shape: [num_batch, num_max_win_blocks]
+            Dtype: int32
+        win_topk_ids: Sliding window topk index for select kvcache
+            Shape: [num_total_tokens, num_win_topk]
+            Dtype: int32
+        compress_kvcache: Compress 4/128 kvcache tensor for attention computation in paged format.
+                 Constrainst the unused slots in last block of vcache for each request to be set zeros.
+            Shape: [num_compress_blocks, block_size, num_head_kv, num_dim]
+            Dtype: bfloat16
+        compress_block_ids: Compress 4/128 paged kvcache block index tensor for get paged kvcache.
+            Shape: [num_batch, num_max_compress_blocks]
+            Dtype: int32
+        compress_topk_ids: Compress 4/128 topk index for select kvcache
+            Shape: [num_total_tokens_q, num_compress_topk]
+            Dtype: int32
+        cu_seqlens_q: start_seq_q for each batch
+            Shape: [num_batch + 1]
+            Dtype: int32
+        sink_weight:
+            Shape: [num_head_q]
+            Dtype: float32
+        softmax_scale:
+            Shape: scalar
+            Dtype: float32
+
+    Returns:
+        Tensor: Attention output tensor in bfloat16 format on CUDA device
+            Shape: [num_total_tokens_q, num_head_q, num_dim]
+            Dtype: bfloat16
+
+    Raises:
+        RuntimeError: If the shapes or dtypes do not satisfy the constraints above.
+
+    Note:
+        - All input tensors must be on CUDA device and in bfloat16 format
+        - num_total_tokens_q = cu_seqlens_q[num_batch + 1]
+    """
+
+    return torch.ops.hpc.attention_sparse_mla_with_kvcache_bf16(
+        q,
+        win_kvcache,
+        win_block_ids,
+        win_topk_ids,
+        compress_kvcache,
+        compress_block_ids,
+        compress_topk_ids,
+        cu_seqlens_q,
+        sink_weight,
+        softmax_scale,
+        output,
+    )
+
+
 @torch.library.register_fake("hpc::attention_prefill_bf16")
 def attention_prefill_bf16_fake(q, k, v, seqlens_q, cu_seqlens_q, max_seqlens_q, output):
     return torch.empty_like(q)
@@ -396,6 +532,35 @@ def attention_decode_fp8_fake(
     new_kv_included,
     splitk,
     split_flag,
+    output,
+):
+    return torch.empty_like(q)
+
+
+@torch.library.register_fake("hpc::attention_mla_with_kvcache_bf16")
+def attention_mla_with_kvcache_bf16_fake(
+    q: Tensor,
+    kvcache: Tensor,
+    block_ids: Tensor,
+    cu_seqlens_q: Tensor,
+    num_seq_kv: Tensor,
+    output: Tensor = None,
+):
+    return torch.empty_like(q)
+
+
+@torch.library.register_fake("hpc::attention_sparse_mla_with_kvcache_bf16")
+def sparse_mla_with_kvcache_bf16_fake(
+    q,
+    win_kvcache,
+    win_block_ids,
+    win_topk_ids,
+    compress_kvcache,
+    compress_block_ids,
+    compress_topk_ids,
+    cu_seqlens_q,
+    sink_weight,
+    softmax_scale,
     output,
 ):
     return torch.empty_like(q)

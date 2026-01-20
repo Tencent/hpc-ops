@@ -581,6 +581,17 @@ template <int N>
 __device__ __forceinline__ void bar_sync(int barrier_id) {
   asm volatile("barrier.cta.sync %0, %1;\n" ::"r"(barrier_id), "n"(N) : "memory");
 }
+
+__forceinline__ __device__ void cpasync_barrier_arrive_noinc(uint64_t const *smem_ptr) {
+  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+  asm volatile(
+      "{\n\t"
+      "  cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n\t"
+      "}"
+      :
+      : "r"(smem_addr));
+}
+
 }  // namespace hpc
 
 #endif  // SRC_UTILS_UTILS_CUH_

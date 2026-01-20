@@ -6,6 +6,7 @@
 #include <torch/library.h>
 
 #include "src/attention/decode/decode.h"
+#include "src/attention/mla/mla.h"
 #include "src/attention/prefill/prefill.h"
 
 namespace hpc {
@@ -401,6 +402,137 @@ torch::Tensor attention_decode_fp8_entry(const torch::Tensor &q, torch::Tensor &
   return y;
 }
 
+torch::Tensor attention_mla_with_kvcache_bf16_entry(const torch::Tensor &q,
+                                                    const torch::Tensor &kvcache,
+                                                    const torch::Tensor &block_ids,
+                                                    const torch::Tensor &cu_seqlens_q,
+                                                    const torch::Tensor &num_seq_kv,
+                                                    std::optional<torch::Tensor> output) {
+  auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+  TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
+  TORCH_CHECK(kvcache.device().is_cuda(), "kvcache tensor must be cuda");
+  TORCH_CHECK(block_ids.device().is_cuda(), "kvcache tensor must be cuda");
+  TORCH_CHECK(cu_seqlens_q.device().is_cuda(), "kvcache tensor must be cuda");
+  TORCH_CHECK(num_seq_kv.device().is_cuda(), "kvcache tensor must be cuda");
+
+  int num_batch = num_seq_kv.size(0);
+  int total_seq_q = q.size(0);
+  int num_head_q = q.size(1);
+  int head_dim = q.size(2);
+
+  int num_kvcache_blocks = kvcache.size(0);
+  int block_size = kvcache.size(1);
+
+  int num_seq_max_blocks = block_ids.size(1);
+
+  const auto *q_ptr = q.const_data_ptr();
+  auto *kvcache_ptr = kvcache.mutable_data_ptr();
+  const int *block_ids_ptr = block_ids.const_data_ptr<int>();
+
+  const int *cu_seqlens_q_ptr = cu_seqlens_q.const_data_ptr<int>();
+  const int *num_seq_kv_ptr = num_seq_kv.const_data_ptr<int>();
+
+  auto options = q.options().dtype(torch::kBFloat16);
+  torch::Tensor y;
+  if (output.has_value()) {
+    y = output.value();
+  } else {
+    y = torch::empty({total_seq_q, num_head_q, head_dim}, options);
+  }
+  auto *y_ptr = y.data_ptr();
+
+  int ldQ = q.stride(0);  // num_head_q * num_dim_qk;
+  int ldKV = kvcache.stride(0);
+  int ldY = y.stride(0);  // num_head_q * num_dim_v;
+
+  bool running = attention_mla_with_kvcache_bf16_async(
+      y_ptr, q_ptr, kvcache_ptr, block_ids_ptr, cu_seqlens_q_ptr, num_seq_kv_ptr, num_batch,
+      total_seq_q, num_head_q, head_dim, num_kvcache_blocks, num_seq_max_blocks, ldY, ldQ, ldKV,
+      stream);
+
+  TORCH_CHECK(running, "attn decode kernel launch failed!");
+
+  return y;
+}
+
+torch::Tensor attention_sparse_mla_with_kvcache_bf16_entry(
+    const torch::Tensor &q, const torch::Tensor &win_kvcache, const torch::Tensor &win_block_ids,
+    const torch::Tensor &win_topk_ids, const torch::Tensor &compress_kvcache,
+    const torch::Tensor &compress_block_ids, const torch::Tensor &compress_topk_ids,
+    const torch::Tensor &cu_seqlens_q, const torch::Tensor &sink_weight, double softmax_scale,
+    std::optional<torch::Tensor> output) {
+  auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+  TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
+  TORCH_CHECK(win_kvcache.device().is_cuda(), "win_kvcache tensor must be cuda");
+  TORCH_CHECK(win_block_ids.device().is_cuda(), "win_block_ids tensor must be cuda");
+  TORCH_CHECK(win_topk_ids.device().is_cuda(), "win_topk_ids tensor must be cuda");
+
+  TORCH_CHECK(compress_kvcache.device().is_cuda(), "compress_kvcache tensor must be cuda");
+  TORCH_CHECK(compress_block_ids.device().is_cuda(), "compress_block_ids tensor must be cuda");
+  TORCH_CHECK(compress_topk_ids.device().is_cuda(), "compress_topk_ids tensor must be cuda");
+
+  TORCH_CHECK(cu_seqlens_q.device().is_cuda(), "cu_seqlens_q tensor must be cuda");
+  TORCH_CHECK(sink_weight.device().is_cuda(), "sink_weight tensor must be cuda");
+
+  int num_batch = cu_seqlens_q.size(0) - 1;
+  int total_seq_q = q.size(0);
+  int num_head_q = q.size(1);
+  int head_dim = q.size(2);
+
+  int num_win_kvcache_blocks = win_kvcache.size(0);
+  int win_block_size = win_kvcache.size(1);
+
+  int num_compress_kvcache_blocks = compress_kvcache.size(0);
+  int compress_block_size = compress_kvcache.size(1);
+
+  int num_win_seq_max_blocks = win_block_ids.size(1);
+  int num_compress_seq_max_blocks = compress_block_ids.size(1);
+
+  int num_win_max_topk = win_topk_ids.size(1);
+  int num_compress_max_topk = compress_topk_ids.size(1);
+
+  TORCH_CHECK(win_block_size == compress_block_size,
+              "compress_block_size should equal win_block_size");
+
+  const auto *q_ptr = q.const_data_ptr();
+  auto *win_kvcache_ptr = win_kvcache.mutable_data_ptr();
+  const int *win_block_ids_ptr = win_block_ids.const_data_ptr<int>();
+  const int *win_topk_ids_ptr = win_topk_ids.const_data_ptr<int>();
+
+  auto *compress_kvcache_ptr = compress_kvcache.mutable_data_ptr();
+  const int *compress_block_ids_ptr = compress_block_ids.const_data_ptr<int>();
+  const int *compress_topk_ids_ptr = compress_topk_ids.const_data_ptr<int>();
+
+  const int *cu_seqlens_q_ptr = cu_seqlens_q.const_data_ptr<int>();
+  const auto *sink_weight_ptr = sink_weight.const_data_ptr();
+
+  auto options = q.options().dtype(torch::kBFloat16);
+  torch::Tensor y;
+  if (output.has_value()) {
+    y = output.value();
+  } else {
+    y = torch::empty({total_seq_q, num_head_q, head_dim}, options);
+  }
+  auto *y_ptr = y.data_ptr();
+
+  int ldQ = q.stride(0);  // num_head_q * num_dim_qk;
+  int ldWinKV = win_kvcache.stride(0);
+  int ldCompressKV = compress_kvcache.stride(0);
+  int ldY = y.stride(0);  // num_head_q * num_dim_v;
+
+  bool running = attention_sparse_mla_with_kvcache_bf16_async(
+      y_ptr, q_ptr, win_kvcache_ptr, win_block_ids_ptr, win_topk_ids_ptr, compress_kvcache_ptr,
+      compress_block_ids_ptr, compress_topk_ids_ptr, cu_seqlens_q_ptr, sink_weight_ptr,
+      softmax_scale, num_batch, total_seq_q, num_head_q, head_dim, num_win_kvcache_blocks,
+      num_compress_kvcache_blocks, num_win_seq_max_blocks, num_compress_seq_max_blocks,
+      win_block_size, num_win_max_topk, num_compress_max_topk, ldY, ldQ, ldWinKV, ldCompressKV,
+      stream);
+
+  TORCH_CHECK(running, "sparse_mla_with_kvcache_bf16 kernel launch failed!");
+
+  return y;
+}
+
 }  // namespace attention
 }  // namespace hpc
 
@@ -434,4 +566,19 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "num_seq_kvcache, Tensor qscale, Tensor kscale, Tensor vscale, bool new_kv_included, bool "
       "use_splitk, Tensor? split_flag, Tensor? output) -> (Tensor)");
   m.impl("attention_decode_fp8", torch::kCUDA, &hpc::attention::attention_decode_fp8_entry);
+
+  m.def(
+      "attention_mla_with_kvcache_bf16(Tensor q, Tensor kvcache, Tensor block_ids, Tensor "
+      "cu_seqlens_q, Tensor "
+      "num_seq_kv, Tensor? output) -> (Tensor)");
+  m.impl("attention_mla_with_kvcache_bf16", torch::kCUDA,
+         &hpc::attention::attention_mla_with_kvcache_bf16_entry);
+
+  m.def(
+      "attention_sparse_mla_with_kvcache_bf16("
+      " Tensor q, Tensor win_kvcache, Tensor win_block_ids, Tensor win_topk_ids,"
+      " Tensor compress_kvcache, Tensor compress_block_ids, Tensor compress_topk_ids,"
+      " Tensor cu_seqlens_q, Tensor sink_weight, float softmax_scale, Tensor? output) -> (Tensor)");
+  m.impl("attention_sparse_mla_with_kvcache_bf16", torch::kCUDA,
+         &hpc::attention::attention_sparse_mla_with_kvcache_bf16_entry);
 }
