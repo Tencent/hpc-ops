@@ -233,6 +233,16 @@ def rope_norm_blocked_kvcache_w8c8_dqskv(
     )
 
 
+def rope_interleave(
+    input: Tensor,
+    cos_sin_cache: Tensor,
+    cu_seqlen: Tensor,
+    seqlen_kv: Tensor,
+    output: Optional[Tensor] = None,
+):
+    return torch.ops.hpc.rope_interleave(input, cos_sin_cache, cu_seqlen, seqlen_kv, output)
+
+
 @torch.library.register_fake("hpc::rope_norm_blocked_kvcache")
 def rope_norm_blocked_kvcache_fake(
     key_cache,
@@ -390,3 +400,14 @@ def rope_norm_blocked_kvcache_w8c8_dqskv_fake(
                 device=qkv.device,
             ),
         )
+
+
+@torch.library.register_fake("hpc::rope_interleave")
+def rope_interleave_fake(
+    input: Tensor,
+    cos_sin_cache: Tensor,
+    cu_seqlen: Tensor,
+    seqlen_kv: Tensor,
+    output: Optional[Tensor] = None,
+):
+    return torch.empty_like(input)

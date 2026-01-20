@@ -32,6 +32,10 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_to_fp8_async(
     int num_rows, int num_q_heads, int num_kv_heads, int qk_head_dim, int v_head_dim,
     bool is_prefill, bool use_qk_norm, int max_seqlens_pad128, cudaStream_t stream);
 
+bool rope_interleave_bf16_async(void *y_ptr, void *x_ptr, const void *cos_sin_cache_ptr,
+                                const void *cu_seqlens_q_ptr, const void *seqlen_kv_ptr,
+                                int num_batch, int num_tokens, int dim, int ldX, int ldCache,
+                                int ldY, cudaStream_t stream);
 }  // namespace rope
 }  // namespace hpc
 
