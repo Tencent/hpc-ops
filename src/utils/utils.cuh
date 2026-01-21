@@ -142,6 +142,8 @@ __device__ __forceinline__ constexpr auto to(const vec_t<T, N> &v) {
       o[i] = __float22bfloat162_rn(*reinterpret_cast<const float2 *>(&v[2 * i]));
     }
     return o;
+  } else if constexpr (std::is_same_v<T, U>) {
+    return v;
   }
 }
 

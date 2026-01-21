@@ -14,6 +14,7 @@
 #include "cutlass/float8.h"
 #include "src/normalization/fused_layer_norm_with_scale_quant.h"
 #include "src/normalization/fused_rms_norm_with_scale.h"
+#include "src/normalization/fused_rmsnorm_blockwise_quant.h"
 
 namespace hpc {
 namespace normalization {
@@ -134,6 +135,45 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fused_layer_norm_with_sc
   return std::make_tuple(output, quant_scale, output_x);
 }
 
+std::tuple<torch::Tensor, std::optional<torch::Tensor>> fused_rmsnorm_blockwise_quant_entry(
+    const torch::Tensor &input, const torch::Tensor &weight, double eps,
+    const bool with_blockwise_quant, const int64_t quant_size) {
+  auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+  TORCH_CHECK(input.dim() == 2, "input dim must be 2");
+  TORCH_CHECK(input.size(-1) == 128 || input.size(-1) == 512 || input.size(-1) == 1024 ||
+                  input.size(-1) == 4096,
+              "now only support dim 128/512/1024/4096");
+  TORCH_CHECK(input.dtype() == torch::kBFloat16, "input dtype must be bfloat16");
+  TORCH_CHECK(weight.dtype() == torch::kBFloat16, "weight dtype must be bfloat16");
+  TORCH_CHECK(weight.size(-1) == input.size(-1), "weight.size(-1) == input.size(-1) must be true");
+
+  const auto *input_ptr = input.const_data_ptr();
+  const auto *weight_ptr = weight.const_data_ptr();
+
+  int m = input.size(0);
+  int hidden_size = input.size(1);
+  TORCH_CHECK(hidden_size % 128 == 0, "hidden_size % 128 == 0 must be true");
+
+  auto options = input.options();
+
+  if (with_blockwise_quant) {
+    auto y = torch::empty({m, hidden_size}, options.dtype(torch::kFloat8_e4m3fn));
+    auto y_scale = torch::empty({m, hidden_size / 128}, options.dtype(torch::kFloat32));
+    auto *y_ptr = y.mutable_data_ptr();
+    auto *y_scale_ptr = y_scale.mutable_data_ptr();
+    fused_rmsnorm_blockwise_quant_async(y_ptr, y_scale_ptr, input_ptr, weight_ptr, m, hidden_size,
+                                        eps, with_blockwise_quant, stream);
+    return std::make_tuple(y, y_scale);
+  } else {
+    auto y = torch::empty({m, hidden_size}, options);
+    auto *y_ptr = y.mutable_data_ptr();
+    fused_rmsnorm_blockwise_quant_async(y_ptr, nullptr, input_ptr, weight_ptr, m, hidden_size, eps,
+                                        with_blockwise_quant, stream);
+    return std::make_tuple(y, std::nullopt);
+  }
+}
+
 }  // namespace normalization
 }  // namespace hpc
 
@@ -152,4 +192,10 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "Tensor, Tensor)");
   m.impl("fused_layer_norm_with_scale_quant", torch::kCUDA,
          &hpc::normalization::fused_layer_norm_with_scale_quant_entry);
+
+  m.def(
+      "fused_rmsnorm_blockwise_quant(Tensor input, Tensor weight,"
+      "float eps, bool with_blockwise_quant, int block_size) -> (Tensor, Tensor ?)");
+  m.impl("fused_rmsnorm_blockwise_quant", torch::kCUDA,
+         &hpc::normalization::fused_rmsnorm_blockwise_quant_entry);
 }

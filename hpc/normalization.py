@@ -1,6 +1,6 @@
 import torch
 from torch import Tensor
-from typing import Union, Tuple
+from typing import Union, Tuple, Optional
 
 
 def fused_rms_norm_with_scale(
@@ -162,6 +162,19 @@ def fused_layer_norm_with_scale_quant(
         use_post_norm_scale,
     )
     return output_fp8, quant_scale, output_x
+
+
+def fused_rmsnorm_blockwise_quant(
+    x: Tensor,
+    weight: Tensor,
+    eps: float = torch.finfo(torch.float32).eps,
+    with_blockwise_quant: bool = False,
+    block_size: int = 128,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    assert block_size == 128, "now only support blockwise == 128"
+    return torch.ops.hpc.fused_rmsnorm_blockwise_quant(
+        x, weight, eps, with_blockwise_quant, block_size
+    )
 
 
 @torch.library.register_fake("hpc::fused_rms_norm_with_scale")
