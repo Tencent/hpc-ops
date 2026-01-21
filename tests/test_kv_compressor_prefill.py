@@ -51,9 +51,6 @@ def compressor_torch(
     assert cu_seqlens.shape[0] == start_pos.shape[0] + 1
     assert start_pos.shape[0] == state_index.shape[0]
     assert kv.shape[0] == cu_seqlens[-1].item()
-    assert (is_prefill and torch.all(start_pos == 0).item()) or (
-        not is_prefill
-    )  # this will decide how many output tokens
 
     if overlap:
         assert kv.shape[-1] == head_dim * 2
@@ -113,7 +110,7 @@ def compressor_torch(
         cur_seqlen = seqlens[ibatch]
         start_pos_this_batch = start_pos[ibatch]
 
-        if start_pos_this_batch == 0 and is_prefill:  # prefill
+        if is_prefill:  # prefill
             remainder = cur_seqlen % ratio
             cutoff = cur_seqlen - remainder
             if overlap:
@@ -250,6 +247,138 @@ def compressor_torch(
     return compressed_kv
 
 
+@pytest.mark.parametrize("batch", [1, 8, 11])
+@pytest.mark.parametrize("max_seqlen", [1233])
+@pytest.mark.parametrize("head_dim, ratio", [(512, 4)])
+def test_compress_kv_chunk_prefill(batch, max_seqlen, head_dim, ratio):
+    # torch.manual_seed(41)
+    # torch.cuda.manual_seed(41)
+    overlap = ratio == 4
+    overlap_copy = 1 + int(overlap)
+    kv_state = torch.randn(
+        (batch, ratio * overlap_copy, head_dim * overlap_copy), dtype=torch.float, device="cuda"
+    )
+    score_state = torch.randn(
+        (batch, ratio * overlap_copy, head_dim * overlap_copy), dtype=torch.float, device="cuda"
+    )
+    state_index = torch.arange(batch, dtype=torch.int, device="cuda")
+    ape = torch.randn((ratio, head_dim * overlap_copy), dtype=torch.float, device="cuda")
+
+    seqlens = (
+        torch.randint(1, max_seqlen, (batch,), dtype=torch.int, device="cuda") * 0 + max_seqlen
+    )
+
+    cu_seqlens = torch.cumsum(seqlens, dim=0)
+    cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.int, device="cuda"), cu_seqlens], dim=0).to(
+        torch.int32
+    )
+    compressed_seqlens = seqlens // ratio
+    cu_compressed_seqlens = torch.cumsum(compressed_seqlens, dim=0)
+    total_compressed_seqlen = cu_compressed_seqlens[-1].item()
+    cu_compressed_seqlens = torch.cat(
+        [torch.zeros(1, dtype=torch.int, device="cuda"), cu_compressed_seqlens], dim=0
+    ).to(torch.int32)
+
+    start_pos = torch.zeros(batch, dtype=torch.int, device="cuda")
+
+    kv = torch.randn(
+        (cu_seqlens[-1].item(), head_dim * overlap_copy), dtype=torch.float, device="cuda"
+    )
+    score = torch.randn(
+        (cu_seqlens[-1].item(), head_dim * overlap_copy), dtype=torch.float, device="cuda"
+    )
+
+    kv_state_for_torch = kv_state.clone()
+    score_state_for_torch = score_state.clone()
+
+    cu_compressed_seqlens_torch = cu_compressed_seqlens.clone()
+
+    compressed_torch = compressor_torch(
+        kv,
+        score,
+        cu_seqlens,
+        cu_compressed_seqlens,
+        kv_state_for_torch,
+        score_state_for_torch,
+        state_index,
+        start_pos,
+        ape,
+        ratio,
+        overlap=overlap,
+        head_dim=head_dim,
+        is_prefill=True,
+    )
+
+    # imitate chunk prefill
+    chunk_offset = 2 * ratio
+    start_pos = torch.zeros(batch, dtype=torch.int, device="cuda") + chunk_offset
+
+    # slice original into chunk
+    chunked_kv = []
+    chunked_score = []
+    for ibatch in range(batch):
+        chunked_kv.append(kv[cu_seqlens[ibatch] + start_pos[ibatch] : cu_seqlens[ibatch + 1]])
+        chunked_score.append(score[cu_seqlens[ibatch] + start_pos[ibatch] : cu_seqlens[ibatch + 1]])
+        kv_state[ibatch, :ratio] = kv[
+            cu_seqlens[ibatch] + start_pos[ibatch] - ratio : cu_seqlens[ibatch] + start_pos[ibatch]
+        ]
+        score_state[ibatch, :ratio] = (
+            score[
+                cu_seqlens[ibatch]
+                + start_pos[ibatch]
+                - ratio : cu_seqlens[ibatch]
+                + start_pos[ibatch]
+            ]
+            + ape
+        )
+
+    chunked_kv = torch.cat(chunked_kv, dim=0)
+    chunked_score = torch.cat(chunked_score, dim=0)
+
+    # real args for chunked prefill
+    seqlens = seqlens - chunk_offset
+    cu_seqlens = torch.cumsum(seqlens, dim=0)
+    cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.int, device="cuda"), cu_seqlens], dim=0).to(
+        torch.int32
+    )
+    compressed_seqlens = seqlens // ratio
+    cu_compressed_seqlens = torch.cumsum(compressed_seqlens, dim=0)
+    total_compressed_seqlen = cu_compressed_seqlens[-1].item()
+    cu_compressed_seqlens = torch.cat(
+        [torch.zeros(1, dtype=torch.int, device="cuda"), cu_compressed_seqlens], dim=0
+    ).to(torch.int32)
+
+    torch.cuda.synchronize()
+    compressed_kv = hpc.kv_compressor(
+        chunked_kv.contiguous(),
+        chunked_score.contiguous(),
+        cu_seqlens.contiguous(),
+        cu_compressed_seqlens.contiguous(),
+        total_compressed_seqlen,
+        kv_state,
+        score_state,
+        state_index,
+        start_pos,
+        ape,
+        ratio,
+        overlap=overlap,
+        head_dim=head_dim,
+        is_prefill=True,
+    )
+    torch.cuda.synchronize()
+
+    chunked_compressed_kv_torch = []
+    for ibatch in range(batch):
+        chunked_compressed_kv_torch.append(
+            compressed_torch[
+                cu_compressed_seqlens_torch[ibatch]
+                + (chunk_offset // ratio) : cu_compressed_seqlens_torch[ibatch + 1]
+            ]
+        )
+    chunked_compressed_kv_torch = torch.cat(chunked_compressed_kv_torch, dim=0).contiguous()
+    assert allclose(chunked_compressed_kv_torch, compressed_kv, atol=1e-6)
+
+
 @pytest.mark.parametrize("batch", [1, 3, 7, 32])
 @pytest.mark.parametrize("max_seqlen", [222, 1233])
 @pytest.mark.parametrize("head_dim, ratio", [(512, 128), (512, 4), (128, 4)])
@@ -293,9 +422,6 @@ def test_compress_kv_prefill(batch, max_seqlen, head_dim, ratio):
 
     kv_state_for_torch = kv_state.clone()
     score_state_for_torch = score_state.clone()
-
-    kv_state_before = kv_state.clone()
-    score_state_before = score_state.clone()
 
     compressed_kv = hpc.kv_compressor(
         kv,
