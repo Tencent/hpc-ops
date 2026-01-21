@@ -84,12 +84,12 @@ template <typename TiledMma, typename TmaA, typename TmaB, typename TmaAS, typen
           typename TmaBIAS, typename TmaD, int kTileM, int kTileN, int kStage, int kTileS,
           typename Tin, typename Tout, typename SLayoutA, typename SLayoutB, typename SLayoutAS,
           typename SLayoutBS, typename SLayoutBIAS, typename SLayoutC, int kBlockSwizzle>
-__global__ void gemm_blockwise(
-    const __grid_constant__ TmaA tma_a, const __grid_constant__ TmaB tma_b,
-    const __grid_constant__ TmaAS tma_as, const __grid_constant__ TmaBS tma_bs,
-    const __grid_constant__ TmaBIAS tma_bias, const __grid_constant__ TmaD tma_d, int m, int n,
-    int k, int m_pad, int num_block_n, int num_block_k, cutlass::FastDivmod swizzle_divider,
-    cutlass::FastDivmod flat_divider) {
+__global__ void __launch_bounds__(384, 1)
+    gemm_blockwise(const __grid_constant__ TmaA tma_a, const __grid_constant__ TmaB tma_b,
+                   const __grid_constant__ TmaAS tma_as, const __grid_constant__ TmaBS tma_bs,
+                   const __grid_constant__ TmaBIAS tma_bias, const __grid_constant__ TmaD tma_d,
+                   int m, int n, int k, int m_pad, int num_block_n, int num_block_k,
+                   cutlass::FastDivmod swizzle_divider, cutlass::FastDivmod flat_divider) {
   using namespace cute;  // NOLINT
 
   int idx = threadIdx.x;
