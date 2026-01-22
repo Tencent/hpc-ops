@@ -236,8 +236,7 @@ def rope_norm_blocked_kvcache_w8c8_dqskv(
 def rope_interleave(
     input: Tensor,
     cos_sin_cache: Tensor,
-    cu_seqlen: Tensor,
-    seqlen_kv: Tensor,
+    position: Tensor,
     output: Optional[Tensor] = None,
 ):
     """Applies Rotary Position Embedding (RoPE) with blocked KV cache. Supports QK normalization.
@@ -250,18 +249,15 @@ def rope_interleave(
         cos_sin_cache: cos_sin_cache.
             Shape: [max_seqlen, dim]
             Dtype: float32
-        cu_seqlens_q: start_seq_q for each batch
-            Shape: [num_batch + 1]
-            Dtype: int32
-        seqlens_kv: number tokens in kvcache contain the cur query.
-            Shape: [num_batch]
-            Dtype: int32
+        position: position in request
+            Shape: [num_token]
+            Dtype: int64
     Returns:
         Tensor: Attention output tensor in bfloat16
             Shape: [num_tokens, num_heads, dim]
             Dtype: bfloat16
     """
-    return torch.ops.hpc.rope_interleave(input, cos_sin_cache, cu_seqlen, seqlen_kv, output)
+    return torch.ops.hpc.rope_interleave(input, cos_sin_cache, position, output)
 
 
 @torch.library.register_fake("hpc::rope_norm_blocked_kvcache")
@@ -427,8 +423,7 @@ def rope_norm_blocked_kvcache_w8c8_dqskv_fake(
 def rope_interleave_fake(
     input: Tensor,
     cos_sin_cache: Tensor,
-    cu_seqlen: Tensor,
-    seqlen_kv: Tensor,
+    position: Tensor,
     output: Optional[Tensor] = None,
 ):
     return torch.empty_like(input)

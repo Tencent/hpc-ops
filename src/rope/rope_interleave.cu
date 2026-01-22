@@ -17,27 +17,12 @@ namespace kernels {
 
 template <typename T, int kRowsPerBlock, int kThreadsPerRow, int kItemsPerThread>
 __global__ void rope_interleave_kernels(T* y_ptr, T* x_ptr, const float* cos_sin_cache_ptr,
-                                        const int* cu_seqlens_q_ptr, const int* seqlen_kv_ptr,
-                                        int num_batch, int num_tokens, int ldX, int ldCache,
-                                        int ldY, int ldXHead, int ldYHead) {
+                                        const int64_t* position_ptr, int num_tokens, int ldX,
+                                        int ldCache, int ldY, int ldXHead, int ldYHead) {
   int ihead = blockIdx.y;
   int itoken = blockIdx.x * kRowsPerBlock + threadIdx.x / kThreadsPerRow;
 
-  int ibatch = 0;
-  int itoken_in_batch = itoken;
-  int seqlenq = 0;
-
-  for (int i = 1; i < num_batch + 1; i++) {
-    int cu_seqlenq = cu_seqlens_q_ptr[i];
-    if (itoken < cu_seqlenq) {
-      ibatch = i - 1;
-      itoken_in_batch = itoken - cu_seqlens_q_ptr[ibatch];
-      seqlenq = cu_seqlenq - cu_seqlens_q_ptr[ibatch];
-      break;
-    }
-  }
-
-  int ipos = (seqlen_kv_ptr[ibatch] - seqlenq) + itoken_in_batch;
+  int ipos = position_ptr[itoken];
   int icol = (threadIdx.x % kThreadsPerRow) * kItemsPerThread;
 
   if (itoken >= num_tokens) {
@@ -68,9 +53,8 @@ __global__ void rope_interleave_kernels(T* y_ptr, T* x_ptr, const float* cos_sin
 }  // namespace kernels
 
 bool rope_interleave_bf16_async(void* y_ptr, void* x_ptr, const void* cos_sin_cache_ptr,
-                                const void* cu_seqlens_q_ptr, const void* seqlen_kv_ptr,
-                                int num_batch, int num_tokens, int num_heads, int dim, int ldX,
-                                int ldCache, int ldY, int ldXHead, int ldYHead,
+                                const int64_t* position_ptr, int num_tokens, int num_heads, int dim,
+                                int ldX, int ldCache, int ldY, int ldXHead, int ldYHead,
                                 cudaStream_t stream) {
   constexpr int kDim = 64;
   constexpr int kItemsPerThread = 4;
@@ -86,9 +70,8 @@ bool rope_interleave_bf16_async(void* y_ptr, void* x_ptr, const void* cos_sin_ca
   kernels::rope_interleave_kernels<T, kRowsPerBlock, kThreadsPerRow, kItemsPerThread>
       <<<grid, block, 0, stream>>>(reinterpret_cast<T*>(y_ptr), reinterpret_cast<T*>(x_ptr),
                                    reinterpret_cast<const float*>(cos_sin_cache_ptr),
-                                   reinterpret_cast<const int*>(cu_seqlens_q_ptr),
-                                   reinterpret_cast<const int*>(seqlen_kv_ptr), num_batch,
-                                   num_tokens, ldX, ldCache, ldY, ldXHead, ldYHead);
+                                   reinterpret_cast<const int64_t*>(position_ptr), num_tokens, ldX,
+                                   ldCache, ldY, ldXHead, ldYHead);
 
   return true;
 }

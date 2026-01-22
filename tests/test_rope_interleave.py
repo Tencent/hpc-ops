@@ -55,21 +55,13 @@ def precompute_freqs_cis(
     return freqs_cis
 
 
-def rope_interleave_ref(input, freq_cis, cu_seqlenq, num_seq_kv, output):
-
-    num_batch = num_seq_kv.shape[0]
-    seqlenq = cu_seqlenq[1:] - cu_seqlenq[:-1]
+def rope_interleave_ref(input, freq_cis, position, output):
 
     y = torch.empty_like(input)
-
-    for bi in range(num_batch):
-        x = input[cu_seqlenq[bi] : cu_seqlenq[bi] + seqlenq[bi]]
-        pos = torch.arange(seqlenq[bi], device="cuda") + num_seq_kv[bi] - seqlenq[bi]
-        freq = freq_cis[pos].unsqueeze(1)
-        x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
-        x = torch.view_as_real(x * freq).flatten(-2)
-        y[cu_seqlenq[bi] : cu_seqlenq[bi] + seqlenq[bi]] = x
-
+    freq = freq_cis[position].unsqueeze(1)
+    x = input
+    x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+    y = torch.view_as_real(x * freq).flatten(-2)
     output.copy_(y)
 
     return output
@@ -112,19 +104,22 @@ def test_rope_interleave(
     input = input[:, :, -dim:]
     input_clone = input_clone[:, :, -dim:]
 
+    positions = []
+    for i in range(num_batch):
+        positions.append(torch.arange(num_seq_q[i], device="cuda") + num_seq_kvcache[i])
+
+    positions = torch.concat(positions, dim=0).to(torch.int64)
     my = hpc.rope_interleave(
         input,
         torch.view_as_real(freq_cis),
-        cu_seqlenq,
-        num_seq_kv,
+        positions,
         output=input,
     )
 
     gt = rope_interleave_ref(
         input_clone,
         freq_cis,
-        cu_seqlenq,
-        num_seq_kv,
+        positions,
         output=input_clone,
     )
 

@@ -256,8 +256,7 @@ rope_norm_blocked_kvcache_w8c8_dqskv_entry(
 }
 
 torch::Tensor rope_interleave_entry(torch::Tensor &input, const torch::Tensor &cos_sin_cache,
-                                    const torch::Tensor &cu_seqlen_q,
-                                    const torch::Tensor &seqlen_kv,
+                                    const torch::Tensor &position,
                                     std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
@@ -269,7 +268,6 @@ torch::Tensor rope_interleave_entry(torch::Tensor &input, const torch::Tensor &c
   }
 
   int num_tokens = input.size(0);
-  int num_batch = seqlen_kv.size(0);
   int num_heads = input.size(1);
   int dim = input.size(2);
   int ldX = input.stride(0);
@@ -285,13 +283,12 @@ torch::Tensor rope_interleave_entry(torch::Tensor &input, const torch::Tensor &c
 
   auto *x_ptr = input.mutable_data_ptr();
   const auto *cos_sin_cache_ptr = cos_sin_cache.data_ptr();
-  const auto *cu_seqlen_q_ptr = cu_seqlen_q.data_ptr<int>();
-  const auto *seqlen_kv_ptr = seqlen_kv.data_ptr<int>();
+  const auto *position_ptr = position.data_ptr<int64_t>();
   auto *y_ptr = y.mutable_data_ptr();
 
-  bool running = rope_interleave_bf16_async(y_ptr, x_ptr, cos_sin_cache_ptr, cu_seqlen_q_ptr,
-                                            seqlen_kv_ptr, num_batch, num_tokens, num_heads, dim,
-                                            ldX, ldCache, ldY, ldXHead, ldYHead, stream);
+  bool running =
+      rope_interleave_bf16_async(y_ptr, x_ptr, cos_sin_cache_ptr, position_ptr, num_tokens,
+                                 num_heads, dim, ldX, ldCache, ldY, ldXHead, ldYHead, stream);
 
   TORCH_CHECK(running, "rope_interleave_async running failed");
 
@@ -323,7 +320,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
          &hpc::rope::rope_norm_blocked_kvcache_w8c8_dqskv_entry);
 
   m.def(
-      "rope_interleave(Tensor! input, Tensor cos_sin_cache, Tensor cu_seqlen_q, Tensor seqlen_kv, "
+      "rope_interleave(Tensor! input, Tensor cos_sin_cache, Tensor position, "
       " Tensor? output) -> (Tensor)");
   m.impl("rope_interleave", torch::kCUDA, &hpc::rope::rope_interleave_entry);
 }
