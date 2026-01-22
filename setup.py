@@ -55,7 +55,7 @@ def get_version():
         ["git", "rev-list", "--tags", "--max-count=1"], stderr=subprocess.DEVNULL, text=True
     ).strip()[:7]
     if newest_tag_hash == git_hash:
-        return f"{newest_tag}-{torch_version}", git_hash
+        return f"{newest_tag}+{torch_version}", git_hash
     else:
         try:
             commit_count = subprocess.check_output(
