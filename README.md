@@ -11,12 +11,12 @@ HPC-Ops is a **production-grade, high-performance, and easy-to-use** operator li
 
 ### Maximum observed speedup per operator
 
-| Operator         | Baseline        | Prefill      | Decode |
-|:----------------:|:---------------:|:------------:|:------:|
-| Attention (bf16) | FlashInfer, FA2 | 1.33x        | 2.22x  |
-| Attention (fp8)  | FlashInfer, FA2 | 1.12x        | 2.0x  |
-| FusedMoE (fp8)   | TensorRT-LLM    | 1.49x        | 1.14x  |
-| GroupGEMM (fp8)  | DeepGEMM        | 1.1x         | 1.88x  |
+| Operator         | Baseline                           | Prefill      | Decode |
+|:----------------:|:----------------------------------:|:------------:|:------:|
+| Attention (bf16) | FlashInfer, FA2, FA3, TensorRT-LLM | 1.33x        | 2.22x  |
+| Attention (fp8)  | FlashInfer, FA3, TensorRT-LLM      | 1.12x        | 2.0x   |
+| FusedMoE (fp8)   | TensorRT-LLM, vLLM                 | 1.49x        | 1.14x  |
+| GroupGEMM (fp8)  | DeepGEMM                           | 1.1x         | 1.88x  |
 
 *We focus on maximum speedup to highlight the optimization potential, as performance varies substantially across cases.*
 
@@ -76,7 +76,7 @@ output = hpc.group_gemm_pertensor_fp8(
 ## Roadmap
 
 - **Sparse Attention Kernels**: Optimized for long-context LLMs, these kernels boost throughput for memory-bound workloads.
-- **Extended Quantization Support**: Flexible strategies (INT4/INT8 mixed-precision included)  kernel optimizations for quantized attention and GEMM which balance speed and accuracy.
+- **Extended Quantization Support**: Flexible strategies (4bit/8bit mixed-precision included)  kernel optimizations for quantized attention and GEMM which balance speed and accuracy.
 - **Compute-Communication Boundary-Breaking Kernels**: Overlapped computation and inter-GPU communication logic to  minimizes overhead in multi-node/multi-GPU distributed inference.
 
 We welcome targeted, high-impact contributions—whether it’s fixing edge-case kernel bugs, or submitting optimizations for niche LLM inference scenarios, your PRs will help refine this toolkit for production use.
