@@ -20,7 +20,7 @@ stages:
   - Build
   jobs:
     job_Cty:
-      name: Compile
+      name: Compile-Torch270
       runs-on:
         pool-name: docker
         container:
@@ -71,5 +71,58 @@ stages:
           - verbose
           distribution: dist/hpc*.whl
         retry-times: 2
+    job_N46:
+      name: Compile-Torch290
+      runs-on:
+        pool-name: docker
+        container:
+          image: mirrors.tencent.com/hunyuan_infer/text2text_infer:H-6.2.1.dev32
+      steps:
+      - checkout:
+          repo-id: rxOYK
+        name: git clone and checkout
+        with:
+          refName: "${BK_CI_HOOK_SOURCE_BRANCH}"
+      - name: code style check
+        id: ""
+        uses: linuxScript@1.*
+        with:
+          script: |-
+            set -xe
+
+            cd ${{ci.workspace}}
+            make format-check
+
+      - name: character check
+        id: N_0
+        uses: linuxScript@1.*
+        with:
+          script: |-
+            set -xe
+
+            cd ${{ci.workspace}}
+            python3 tools/check-no-chinese.py
+
+      - name: complile whl
+        uses: linuxScript@1.*
+        with:
+          script: |-
+            set -xe
+
+            cd ${{ci.workspace}}
+            make wheel
+
+      - name: upload to pypi
+        uses: DistributionToGeneric@1.*
+        with:
+          username: reedlauliu
+          token: e0b4892c66d411f086b85254009bad14
+          repo_category: pypi
+          pypi_upload_arguments:
+          - skip_existing
+          - verbose
+          distribution: dist/hpc*.whl
+        retry-times: 2
+
 concurrency: {}
 syntax-dialect: INHERIT
