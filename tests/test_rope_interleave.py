@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+
 import hpc
 from utils import allclose
 
@@ -64,9 +65,8 @@ def rope_interleave_ref(input, freq_cis, cu_seqlenq, num_seq_kv, output):
     for bi in range(num_batch):
         x = input[cu_seqlenq[bi] : cu_seqlenq[bi] + seqlenq[bi]]
         pos = torch.arange(seqlenq[bi], device="cuda") + num_seq_kv[bi] - seqlenq[bi]
-        freq = freq_cis[pos]
+        freq = freq_cis[pos].unsqueeze(1)
         x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
-        # import pdb;pdb.set_trace()
         x = torch.view_as_real(x * freq).flatten(-2)
         y[cu_seqlenq[bi] : cu_seqlenq[bi] + seqlenq[bi]] = x
 
@@ -78,17 +78,19 @@ def rope_interleave_ref(input, freq_cis, cu_seqlenq, num_seq_kv, output):
 @pytest.mark.parametrize("num_batch", [1, 10, 20, 40, 60, 80])
 @pytest.mark.parametrize("max_seq_q", [1, 2, 2 * 1024])
 @pytest.mark.parametrize("max_seq_kv", [2 * 1024])
+@pytest.mark.parametrize("num_heads", [64])
 @pytest.mark.parametrize("dim", [64])
 @pytest.mark.parametrize("max_seqlen", [8 * 1024])
 def test_rope_interleave(
     num_batch,
     max_seq_q,
     max_seq_kv,
+    num_heads,
     dim,
     max_seqlen,
 ):
-    # torch.manual_seed(41)
-    # torch.cuda.manual_seed(41)
+    torch.manual_seed(41)
+    torch.cuda.manual_seed(41)
 
     freq_cis = precompute_freqs_cis(dim, max_seqlen, max_seqlen, 40000, 40, 32, 1).cuda()
 
@@ -105,12 +107,11 @@ def test_rope_interleave(
         [torch.tensor([0], dtype=torch.int32, device="cuda"), cu_seqlenq], dim=0
     )
 
-    input = torch.randn(total_seq_q, 512, device="cuda", dtype=torch.bfloat16)
+    input = torch.randn(total_seq_q, num_heads, 128, device="cuda", dtype=torch.bfloat16)
     input_clone = input.clone()
-    input = input[:, -dim:]
-    input_clone = input_clone[:, -dim:]
+    input = input[:, :, -dim:]
+    input_clone = input_clone[:, :, -dim:]
 
-    # import pdb;pdb.set_trace()
     my = hpc.rope_interleave(
         input,
         torch.view_as_real(freq_cis),
@@ -126,7 +127,5 @@ def test_rope_interleave(
         num_seq_kv,
         output=input_clone,
     )
-
-    # import pdb;pdb.set_trace()
 
     assert allclose(gt, my, atol=1e-3, rtol=1e-2)

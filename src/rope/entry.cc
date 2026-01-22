@@ -270,8 +270,11 @@ torch::Tensor rope_interleave_entry(torch::Tensor &input, const torch::Tensor &c
 
   int num_tokens = input.size(0);
   int num_batch = seqlen_kv.size(0);
-  int dim = input.size(1);
+  int num_heads = input.size(1);
+  int dim = input.size(2);
   int ldX = input.stride(0);
+  int ldXHead = input.stride(1);
+  int ldYHead = y.stride(1);
   int ldCache = cos_sin_cache.stride(0);
   int ldY = y.stride(0);
 
@@ -286,9 +289,9 @@ torch::Tensor rope_interleave_entry(torch::Tensor &input, const torch::Tensor &c
   const auto *seqlen_kv_ptr = seqlen_kv.data_ptr<int>();
   auto *y_ptr = y.mutable_data_ptr();
 
-  bool running =
-      rope_interleave_bf16_async(y_ptr, x_ptr, cos_sin_cache_ptr, cu_seqlen_q_ptr, seqlen_kv_ptr,
-                                 num_batch, num_tokens, dim, ldX, ldCache, ldY, stream);
+  bool running = rope_interleave_bf16_async(y_ptr, x_ptr, cos_sin_cache_ptr, cu_seqlen_q_ptr,
+                                            seqlen_kv_ptr, num_batch, num_tokens, num_heads, dim,
+                                            ldX, ldCache, ldY, ldXHead, ldYHead, stream);
 
   TORCH_CHECK(running, "rope_interleave_async running failed");
 

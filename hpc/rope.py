@@ -240,6 +240,27 @@ def rope_interleave(
     seqlen_kv: Tensor,
     output: Optional[Tensor] = None,
 ):
+    """Applies Rotary Position Embedding (RoPE) with blocked KV cache. Supports QK normalization.
+
+    This function applies RoPE transformation.
+    Args:
+        input: Input tensor for apply rope.
+            Shape: [num_tokens, num_heads, dim]
+            Dtype: bfloat16
+        cos_sin_cache: cos_sin_cache.
+            Shape: [max_seqlen, dim]
+            Dtype: float32
+        cu_seqlens_q: start_seq_q for each batch
+            Shape: [num_batch + 1]
+            Dtype: int32
+        seqlens_kv: number tokens in kvcache contain the cur query.
+            Shape: [num_batch]
+            Dtype: int32
+    Returns:
+        Tensor: Attention output tensor in bfloat16
+            Shape: [num_tokens, num_heads, dim]
+            Dtype: bfloat16
+    """
     return torch.ops.hpc.rope_interleave(input, cos_sin_cache, cu_seqlen, seqlen_kv, output)
 
 

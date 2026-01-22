@@ -19,7 +19,8 @@ template <typename T, int kRowsPerBlock, int kThreadsPerRow, int kItemsPerThread
 __global__ void rope_interleave_kernels(T* y_ptr, T* x_ptr, const float* cos_sin_cache_ptr,
                                         const int* cu_seqlens_q_ptr, const int* seqlen_kv_ptr,
                                         int num_batch, int num_tokens, int ldX, int ldCache,
-                                        int ldY) {
+                                        int ldY, int ldXHead, int ldYHead) {
+  int ihead = blockIdx.y;
   int itoken = blockIdx.x * kRowsPerBlock + threadIdx.x / kThreadsPerRow;
 
   int ibatch = 0;
@@ -43,8 +44,8 @@ __global__ void rope_interleave_kernels(T* y_ptr, T* x_ptr, const float* cos_sin
     return;
   }
 
-  T* y_row = y_ptr + itoken * ldY;
-  T* x_row = x_ptr + itoken * ldX;
+  T* y_row = y_ptr + itoken * ldY + ihead * ldYHead;
+  T* x_row = x_ptr + itoken * ldX + ihead * ldXHead;
   const float* cos_sin_cache_row = cos_sin_cache_ptr + ipos * ldCache;
 
   auto x = to<float>(load<T, kItemsPerThread>(x_row + icol));
@@ -68,8 +69,9 @@ __global__ void rope_interleave_kernels(T* y_ptr, T* x_ptr, const float* cos_sin
 
 bool rope_interleave_bf16_async(void* y_ptr, void* x_ptr, const void* cos_sin_cache_ptr,
                                 const void* cu_seqlens_q_ptr, const void* seqlen_kv_ptr,
-                                int num_batch, int num_tokens, int dim, int ldX, int ldCache,
-                                int ldY, cudaStream_t stream) {
+                                int num_batch, int num_tokens, int num_heads, int dim, int ldX,
+                                int ldCache, int ldY, int ldXHead, int ldYHead,
+                                cudaStream_t stream) {
   constexpr int kDim = 64;
   constexpr int kItemsPerThread = 4;
   constexpr int kThreadsPerRow = kDim / kItemsPerThread;
@@ -77,7 +79,7 @@ bool rope_interleave_bf16_async(void* y_ptr, void* x_ptr, const void* cos_sin_ca
   constexpr int kWarpCount = 4;
   constexpr int kRowsPerBlock = kRowsPerWarp * kWarpCount;
 
-  dim3 grid((num_tokens + kRowsPerBlock - 1) / kRowsPerBlock);
+  dim3 grid((num_tokens + kRowsPerBlock - 1) / kRowsPerBlock, num_heads);
   dim3 block(kWarpCount * 32);
 
   using T = __nv_bfloat16;
@@ -86,7 +88,7 @@ bool rope_interleave_bf16_async(void* y_ptr, void* x_ptr, const void* cos_sin_ca
                                    reinterpret_cast<const float*>(cos_sin_cache_ptr),
                                    reinterpret_cast<const int*>(cu_seqlens_q_ptr),
                                    reinterpret_cast<const int*>(seqlen_kv_ptr), num_batch,
-                                   num_tokens, ldX, ldCache, ldY);
+                                   num_tokens, ldX, ldCache, ldY, ldXHead, ldYHead);
 
   return true;
 }
