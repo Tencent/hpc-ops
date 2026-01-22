@@ -84,6 +84,7 @@ def gt_mqa_indexer_logits_func(
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("topk", [512])
 @pytest.mark.parametrize("ratio", [4])
+@pytest.mark.parametrize("skip_block_ids", [0, 2])
 @pytest.mark.parametrize("max_context_len", [32 * 1024])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_mqa_indexer_topk(
@@ -95,6 +96,7 @@ def test_mqa_indexer_topk(
     topk,
     head_dim,
     ratio,
+    skip_block_ids,
     max_context_len,
     dtype,
 ):
@@ -147,12 +149,13 @@ def test_mqa_indexer_topk(
         Q, KV, W, kvcache, block_ids, nblocks, num_seq_q, cu_seqlenq, num_seq_kv, ratio, topk
     )
     """
+    block_ids = F.pad(block_ids, (skip_block_ids, 0), "constant", 0)
     gt = gt_mqa_indexer_logits_func(
         Q,
         KV,
         W,
         kvcache,
-        block_ids,
+        block_ids[:, skip_block_ids:],
         nblocks,
         num_seq_q,
         cu_seqlenq,
@@ -174,7 +177,7 @@ def test_mqa_indexer_topk(
         Q,
         kvcache,
         W,
-        block_ids,
+        block_ids[:, skip_block_ids:],
         cu_seqlenq,
         num_seq_kv,
         ratio,

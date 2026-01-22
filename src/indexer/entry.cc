@@ -32,7 +32,7 @@ torch::Tensor mqa_indexer_logits_entry(const torch::Tensor &q, const torch::Tens
   int num_kvcache_blocks = kvcache.size(0);
   int block_size = kvcache.size(1);
 
-  int num_seq_max_blocks = block_ids.size(1);
+  int num_seq_max_blocks = block_ids.stride(0);
 
   auto options = q.options().dtype(torch::kFloat32);
   torch::Tensor y;
