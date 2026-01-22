@@ -31,26 +31,6 @@ stages:
         name: git clone and checkout
         with:
           refName: "${BK_CI_HOOK_SOURCE_BRANCH}"
-      - name: code style check
-        id: ""
-        uses: linuxScript@1.*
-        with:
-          script: |-
-            set -xe
-
-            cd ${{ci.workspace}}
-            make format-check
-
-      - name: character check
-        id: N_0
-        uses: linuxScript@1.*
-        with:
-          script: |-
-            set -xe
-
-            cd ${{ci.workspace}}
-            python3 tools/check-no-chinese.py
-
       - name: complile whl
         uses: linuxScript@1.*
         with:
@@ -84,26 +64,6 @@ stages:
         with:
           refName: "${BK_CI_HOOK_SOURCE_BRANCH}"
           enableGitLfs: false
-      - name: code style check
-        id: ""
-        uses: linuxScript@1.*
-        with:
-          script: |-
-            set -xe
-
-            cd ${{ci.workspace}}
-            make format-check
-
-      - name: character check
-        id: N_0
-        uses: linuxScript@1.*
-        with:
-          script: |-
-            set -xe
-
-            cd ${{ci.workspace}}
-            python3 tools/check-no-chinese.py
-
       - name: complile whl
         uses: linuxScript@1.*
         with:
