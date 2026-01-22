@@ -122,7 +122,7 @@ def naive_fuse_H_post_mapping_H_res_mapping_and_residual_add(x, residual, H_post
     x = x.float()
     y1 = H_post.unsqueeze(-1) * x.unsqueeze(-2)
     residual = residual.float()
-    y2 = torch.sum(H_res.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+    y2 = torch.sum(H_res.unsqueeze(-1) * residual.unsqueeze(-2), dim=1)
     y = (y1 + y2).to(dtype=torch.bfloat16)
     return y
 

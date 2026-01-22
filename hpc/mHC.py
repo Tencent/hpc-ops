@@ -137,7 +137,7 @@ def fuse_H_post_mapping_H_res_mapping_and_residual_add(
     1. x = x.float()
     2. y1 = post.unsqueeze(-1) * x.unsqueeze(-2)
     3. residual = residual.float()
-    4. y2 = torch.sum(res.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+    4. y2 = torch.sum(res.unsqueeze(-1) * residual.unsqueeze(-2), dim=1)
     5. y = (y1 + y2).to(dtype=torch.bfloat16)
 
     Executes via a custom high-performance GPU kernel.

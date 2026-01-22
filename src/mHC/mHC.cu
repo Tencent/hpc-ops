@@ -252,45 +252,56 @@ __global__ void fuse_hc_pre_mapping_kernel(__nv_bfloat16* output_ptr, const __nv
 }
 
 template <int kHCMult, int kHiddenDim, int kElementsPerThread>
-__global__ void fuse_H_post_mapping_H_res_mapping_and_residual_add_kernel(
-    __nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr, const __nv_bfloat16* residual_ptr,
-    const float* H_post_ptr, const float* H_res_ptr) {
+__global__ void __launch_bounds__(128, 1)
+    fuse_H_post_mapping_H_res_mapping_and_residual_add_kernel(__nv_bfloat16* output_ptr,
+                                                              const __nv_bfloat16* x_ptr,
+                                                              const __nv_bfloat16* residual_ptr,
+                                                              const float* H_post_ptr,
+                                                              const float* H_res_ptr) {
   const int irow = blockIdx.x;
   const float* H_post_row_ptr = H_post_ptr + irow * kHCMult;
   auto reg_H_post = load<float, kHCMult>(H_post_row_ptr);
 
-  const int icol = threadIdx.x * kElementsPerThread;
-  const __nv_bfloat16* x_row_ptr = x_ptr + irow * kHiddenDim + icol;
-  auto reg_x = to<float>(load<__nv_bfloat16, kElementsPerThread>(x_row_ptr));
-
   const float* H_res_row_ptr = H_res_ptr + irow * kHCMult * kHCMult;
+  vec_t<float, kHCMult> reg_H_res[kHCMult];
+#pragma unroll
+  for (int i = 0; i < kHCMult; ++i) {
+    reg_H_res[i] = load<float, kHCMult>(H_res_row_ptr + i * kHCMult);
+  }
+
+  const int icol = (blockIdx.y * blockDim.x + threadIdx.x) * kElementsPerThread;
+  const int icol_stride = gridDim.y * blockDim.x * kElementsPerThread;
+  const __nv_bfloat16* x_row_ptr = x_ptr + irow * kHiddenDim + icol;
   const __nv_bfloat16* residual_row_ptr = residual_ptr + irow * kHCMult * kHiddenDim + icol;
   __nv_bfloat16* output_row_ptr = output_ptr + irow * kHCMult * kHiddenDim + icol;
 
-#pragma unroll
-  for (int i = 0; i < kHCMult; ++i) {
-    vec_t<float, kElementsPerThread> reg_output;
+  vec_t<float, kElementsPerThread> reg_output[kHCMult];
+  vec_t<float, kElementsPerThread> reg_residual[kHCMult];
 
+  for (int iter = 0; icol + iter * icol_stride < kHiddenDim; ++iter) {
+    auto reg_x = to<float>(load<__nv_bfloat16, kElementsPerThread>(x_row_ptr + iter * icol_stride));
 #pragma unroll
-    for (int j = 0; j < kElementsPerThread; ++j) {
-      reg_output[j] = reg_H_post[i] * reg_x[j];
+    for (int i = 0; i < kHCMult; ++i) {
+      reg_residual[i] = to<float>(load<__nv_bfloat16, kElementsPerThread>(
+          residual_row_ptr + i * kHiddenDim + iter * icol_stride));
     }
-
-    auto reg_H_res = load<float, kHCMult>(H_res_row_ptr + i * kHCMult);
-    auto reg_residual =
-        to<float>(load<__nv_bfloat16, kElementsPerThread>(residual_row_ptr + i * kHiddenDim));
 #pragma unroll
-    for (int j = 0; j < kHCMult; ++j) {
+    for (int i = 0; i < kHCMult; ++i) {
 #pragma unroll
-      for (int k = 0; k < kElementsPerThread; ++k) {
-        reg_output[k] += reg_H_res[j] * reg_residual[k];
+      for (int j = 0; j < kElementsPerThread; ++j) {
+        reg_output[i][j] = reg_H_post[i] * reg_x[j];
       }
+#pragma unroll
+      for (int j = 0; j < kHCMult; ++j) {
+#pragma unroll
+        for (int k = 0; k < kElementsPerThread; ++k) {
+          reg_output[i][k] += reg_H_res[j][i] * reg_residual[j][k];
+        }
+      }
+      store(output_row_ptr + i * kHiddenDim + iter * icol_stride, to<__nv_bfloat16>(reg_output[i]));
     }
-
-    store(output_row_ptr + i * kHiddenDim, to<__nv_bfloat16>(reg_output));
   }
 }
-
 }  // namespace kernels
 
 void reciprocal_mean_square_root_norm_async(__nv_bfloat16* output_ptr,
@@ -340,11 +351,21 @@ void fuse_H_post_mapping_H_res_mapping_and_residual_add_async(
     cudaStream_t stream) {
   if (hc_mult == 4 && hidden_dim == 4096) {
     constexpr int kElementsPerThread = 8;
-    constexpr int kThreadsPerBlock = 4096 / kElementsPerThread;
+    constexpr int kThreadsPerBlock = 128;
 
+    int kBlockPerRow;
+    if (num_batch <= 16) {
+      // splitK = 4, four block per row
+      kBlockPerRow = 4096 / kThreadsPerBlock / kElementsPerThread;
+    } else {
+      // not splitK, one block per row
+      kBlockPerRow = 1;
+    }
+
+    dim3 block(kThreadsPerBlock);
+    dim3 grid(num_batch, kBlockPerRow, 1);
     kernels::fuse_H_post_mapping_H_res_mapping_and_residual_add_kernel<4, 4096, kElementsPerThread>
-        <<<num_batch, kThreadsPerBlock, 0, stream>>>(output_ptr, x_ptr, residual_ptr, H_post_ptr,
-                                                     H_res_ptr);
+        <<<grid, block, 0, stream>>>(output_ptr, x_ptr, residual_ptr, H_post_ptr, H_res_ptr);
   }
 }
 
