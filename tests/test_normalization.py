@@ -68,10 +68,14 @@ def test_fused_rms_norm_with_scale(batch_size, hidden_states, scale, is_moe):
 
 def torch_rmsnorm(x, weight, eps):
     dtype = x.dtype
-    x = x.float()
+    x = x.to(torch.float)
+    weight = weight.to(torch.float)
     var = x.square().mean(-1, keepdim=True)
     x = x * torch.rsqrt(var + eps)
-    return (weight * x).to(dtype)
+    if weight is not None:
+        return (weight * x).to(dtype)
+    else:
+        return x.to(dtype)
 
 
 def quantize_blockwise_fp8(tensor: torch.Tensor, block_size: int = 128, eps: float = 1e-6):
@@ -112,6 +116,35 @@ def torch_fused_rmsnorm_blockwise_quant(x, rmsnorm_weight, eps, with_blockwise_q
         return out, None
 
 
+def apply_rope(q: torch.Tensor, cos_sin_cache: torch.Tensor) -> torch.Tensor:
+    """
+    q: (num_tokens, nheads, dim)
+    cos_sin_cache: (num_tokens, dim)
+        format: [cos0, sin0, cos1, sin1, ...]
+    """
+    dtype = q.dtype
+    q = q.to(torch.float)
+    cos_sin_cache = cos_sin_cache.to(torch.float)
+
+    num_tokens, nheads, dim = q.shape
+
+    q_even = q[..., 0::2]
+    q_odd = q[..., 1::2]
+
+    cos = cos_sin_cache[..., 0::2]
+    sin = cos_sin_cache[..., 1::2]
+
+    # import pdb; pdb.set_trace()
+    q_even_rot = q_even * cos.unsqueeze(1) - q_odd * sin.unsqueeze(1)
+    q_odd_rot = q_even * sin.unsqueeze(1) + q_odd * cos.unsqueeze(1)
+
+    result = torch.zeros_like(q)
+    result[..., 0::2] = q_even_rot
+    result[..., 1::2] = q_odd_rot
+
+    return result.to(dtype)
+
+
 @pytest.mark.parametrize("batch_size", [128])
 @pytest.mark.parametrize("hidden_states", [128, 512, 1024, 4096])
 @pytest.mark.parametrize("with_blockwise_quant", [False, True])
@@ -124,16 +157,53 @@ def test_fused_rmsnorm_blockwise_quant(batch_size, hidden_states, with_blockwise
     gt, gt_scale = torch_fused_rmsnorm_blockwise_quant(
         x, rmsnorm_weight, eps=1e-6, with_blockwise_quant=with_blockwise_quant
     )
-
-    for _ in range(20):
-        my, my_scale = hpc.fused_rmsnorm_blockwise_quant(
-            x, rmsnorm_weight, eps=1e-6, with_blockwise_quant=with_blockwise_quant
-        )
+    my, my_scale = hpc.fused_rmsnorm_blockwise_quant(
+        x, rmsnorm_weight, eps=1e-6, with_blockwise_quant=with_blockwise_quant
+    )
     if with_blockwise_quant:
-        print(gt_scale)
-        print(my_scale)
         assert allclose(gt_scale, my_scale, atol=0.001, rtol=0.001)
         assert allclose(gt, my, atol=32, rtol=0.01)
     else:
         assert my_scale is None
         assert allclose(gt, my, atol=0.0001, rtol=0.01)
+
+
+@pytest.mark.parametrize("batch_size", [128])
+@pytest.mark.parametrize("dim", [128, 512])
+@pytest.mark.parametrize("rope_dim", [64])
+@pytest.mark.parametrize("q_heads", [8])
+@pytest.mark.parametrize("k_heads", [1])
+def test_fused_rmsnorm_rope(batch_size, dim, rope_dim, q_heads, k_heads):
+    torch.manual_seed(0)
+
+    q = torch.randn(batch_size, q_heads, dim, dtype=torch.bfloat16, device="cuda")
+    q_weight = torch.randn((1, dim), dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(batch_size, k_heads, dim, dtype=torch.bfloat16, device="cuda")
+    k_weight = torch.randn((1, dim), dtype=torch.bfloat16, device="cuda")
+
+    positions = torch.randint(
+        low=0, high=4096, size=(batch_size,), dtype=torch.int64, device="cuda"
+    )
+    cos_sin_cache = torch.rand((4096, rope_dim), dtype=torch.bfloat16, device="cuda")
+
+    my_q, my_k = hpc.fused_rmsnorm_rope(
+        positions, q, q_weight, k, k_weight, cos_sin_cache, 1e-6
+    )  # (batch, num_heads, dim)
+
+    gt_q = torch_rmsnorm(q.reshape(-1, q.size(-1)), q_weight, eps=1e-6).reshape(
+        batch_size, q_heads, dim
+    )
+    gt_k = torch_rmsnorm(k.reshape(-1, q.size(-1)), k_weight, eps=1e-6).reshape(
+        batch_size, k_heads, dim
+    )
+
+    gt_q[..., -rope_dim:] = apply_rope(
+        gt_q.reshape(batch_size, q_heads, -1)[..., -rope_dim:], cos_sin_cache[positions]
+    )
+
+    gt_k[..., -rope_dim:] = apply_rope(
+        gt_k.reshape(batch_size, k_heads, -1)[..., -rope_dim:], cos_sin_cache[positions]
+    )
+
+    assert allclose(gt_q, my_q, atol=0.01, rtol=0.01)
+    assert allclose(gt_k, my_k, atol=0.01, rtol=0.01)

@@ -15,6 +15,7 @@
 #include "src/normalization/fused_layer_norm_with_scale_quant.h"
 #include "src/normalization/fused_rms_norm_with_scale.h"
 #include "src/normalization/fused_rmsnorm_blockwise_quant.h"
+#include "src/normalization/fused_rmsnorm_rope.h"
 
 namespace hpc {
 namespace normalization {
@@ -174,6 +175,78 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> fused_rmsnorm_blockwise_
   }
 }
 
+std::tuple<torch::Tensor, std::optional<torch::Tensor>> fused_rmsnorm_rope_entry(
+    const torch::Tensor &positions, const torch::Tensor &q, std::optional<torch::Tensor> q_weight,
+    std::optional<torch::Tensor> k, std::optional<torch::Tensor> k_weight,
+    const torch::Tensor &cos_sin_cache, const double eps) {
+  auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+
+  int num_tokens = q.size(0);
+  int num_q_heads = q.size(1);
+  int dim = q.size(2);
+  int num_k_heads = 1;
+  TORCH_CHECK(positions.dim() == 1, "position.dim() must be true");
+  TORCH_CHECK(positions.size(0) == q.size(0), "positions.size(0) == q.size(0) must be true");
+  TORCH_CHECK(q.dim() == 3, "q.dim() == 3 must be true");
+  TORCH_CHECK(q.dtype() == torch::kBFloat16, "now only support bfloat16 for q")
+  TORCH_CHECK(positions.dtype() == torch::kInt64, "positions dtype must be int64");
+  if (q_weight.has_value()) {
+    TORCH_CHECK(q_weight.value().size(-1) == q.size(-1), "q_weight must has same dim with q");
+    TORCH_CHECK(q_weight.value().dtype() == q.dtype(), "q_weight must has same dtype with q");
+  }
+  if (k.has_value()) {
+    TORCH_CHECK(k.value().dtype() == torch::kBFloat16, "now only support bfloat16 for k")
+    TORCH_CHECK(k.value().dim() == 3, "k.dim() must be 3");
+    TORCH_CHECK(k.value().size(-1) == q.size(-1), "k must has same dim with q");
+    TORCH_CHECK(k.value().size(0) == q.size(0), "k.value().size(0) == q.size(0) must be true");
+    num_k_heads = k.value().size(1);
+    TORCH_CHECK(num_q_heads >= num_k_heads, "now only support num_q_heads >= num_k_heads");
+  }
+  if (k_weight.has_value()) {
+    TORCH_CHECK(k.has_value(), "when k_weight is given, k must be provided");
+    TORCH_CHECK(k_weight.value().size(-1) == k.value().size(-1), "k_weight must has dim with k");
+    TORCH_CHECK(k_weight.value().dtype() == k.value().dtype(),
+                "k_weight must has same dtype with k");
+  }
+
+  TORCH_CHECK(cos_sin_cache.dtype() == torch::kBFloat16,
+              "cos_sim_cache must has same dtype with q");
+
+  TORCH_CHECK(dim == 128 || dim == 512, "now only support dim 128/512");
+  int rope_dim = cos_sin_cache.size(-1);
+
+  auto options = q.options();
+  auto y_q = torch::empty({num_tokens, num_q_heads, dim}, options);
+
+  const auto *q_ptr = q.const_data_ptr();
+  const auto *pos_ptr = positions.const_data_ptr();
+  auto *y_q_ptr = y_q.mutable_data_ptr();
+  void *y_k_ptr = nullptr;
+  const void *q_weight_ptr = nullptr;
+  const void *k_ptr = nullptr;
+  const void *k_weight_ptr = nullptr;
+  const auto *cos_sin_ptr = cos_sin_cache.const_data_ptr();
+
+  if (q_weight.has_value()) {
+    q_weight_ptr = q_weight.value().const_data_ptr();
+  }
+  if (k.has_value()) {
+    if (k_weight.has_value()) {
+      k_weight_ptr = k_weight.value().const_data_ptr();
+    }
+    k_ptr = k.value().const_data_ptr();
+    auto y_k = torch::empty({num_tokens, num_k_heads, dim}, options);
+    auto *y_k_ptr = y_k.mutable_data_ptr();
+    fused_rmsnorm_rope_async(y_q_ptr, y_k_ptr, q_ptr, q_weight_ptr, k_ptr, k_weight_ptr, pos_ptr,
+                             cos_sin_ptr, num_tokens, dim, rope_dim, num_q_heads, num_k_heads, eps,
+                             stream);
+    return std::make_tuple(y_q, y_k);
+  }
+  fused_rmsnorm_rope_async(y_q_ptr, y_k_ptr, q_ptr, q_weight_ptr, k_ptr, k_weight_ptr, pos_ptr,
+                           cos_sin_ptr, num_tokens, dim, rope_dim, num_q_heads, num_k_heads, eps,
+                           stream);
+  return std::make_tuple(y_q, std::nullopt);
+}
 }  // namespace normalization
 }  // namespace hpc
 
@@ -198,4 +271,9 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "float eps, bool with_blockwise_quant, int block_size) -> (Tensor, Tensor ?)");
   m.impl("fused_rmsnorm_blockwise_quant", torch::kCUDA,
          &hpc::normalization::fused_rmsnorm_blockwise_quant_entry);
+
+  m.def(
+      "fused_rmsnorm_rope(Tensor positions, Tensor q, Tensor ? q_weight,"
+      "Tensor ? k, Tensor ? k_weight, Tensor cos_sin_cache, float eps) -> (Tensor, Tensor ?)");
+  m.impl("fused_rmsnorm_rope", torch::kCUDA, &hpc::normalization::fused_rmsnorm_rope_entry);
 }

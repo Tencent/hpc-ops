@@ -177,6 +177,45 @@ def fused_rmsnorm_blockwise_quant(
     )
 
 
+def fused_rmsnorm_rope(
+    positions: Tensor,
+    q: Tensor,
+    q_weight: Optional[Tensor],
+    k: Optional[Tensor],
+    k_weight: Optional[Tensor],
+    cos_sin_cache: Optional[Tensor],
+    eps: float = torch.finfo(torch.float32).eps,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """Perform RMSNorm and Rope.
+    Args:
+        positions: Position indices for each sequence element, used to lookup corresponding rotation angles from cos_sin_cache.
+            Shape: [batch]
+            Dtype: torch.int64
+        q: Input tensor
+            Shape: [batch, num_q_heads, dim]
+            Dtype: torch.bfloat16
+        q_weight: Weight for q in RMSNorm
+            Shape: [1, dim].
+            Dtype: torch.bfloat16
+        k: Input tensor
+            Shape: [batch, num_k_heads, dim] or [batch, dim]
+            Dtype: torch.bfloat16
+        k_weight: Weight for k in RMSNorm
+            Shape: [1, dim]
+            Dtype: torch.bfloat16
+        cos_sin_cache: cos and sin cache for rope, cos_sin_cache should be interleave
+            Shape: [1, rope_dim]
+            Dtype: torch.bfloat16
+        eps: a value added to the denominator for numerical stability.
+            Shape: scalar
+            Dtype: float
+
+    Returns:
+        New tensor with result Rope(RMSNorm(q)) and Rope(RMSNorm(k))
+    """
+    return torch.ops.hpc.fused_rmsnorm_rope(positions, q, q_weight, k, k_weight, cos_sin_cache, eps)
+
+
 @torch.library.register_fake("hpc::fused_rms_norm_with_scale")
 def fused_rms_norm_with_scale_fake(a, weight, eps, scale, is_moe):
     return (
