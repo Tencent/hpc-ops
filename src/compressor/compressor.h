@@ -23,7 +23,7 @@ void kv_compressor_decode_async(void* y_ptr, const void* kv_ptr, const void* sco
                                 const void* ape_ptr, void* kv_states_ptr, void* score_states_ptr,
                                 const void* state_idx_ptr, const void* start_pos_ptr,
                                 const void* cu_compress_seqlens_ptr, int batch_size, int head_dim,
-                                int ratio, int mtp, cudaStream_t stream);
+                                int stride, int ratio, int mtp, cudaStream_t stream);
 }  // namespace compressor
 }  // namespace hpc
 

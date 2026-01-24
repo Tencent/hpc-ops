@@ -96,7 +96,7 @@ torch::Tensor kv_compressor_decode_entry(const torch::Tensor &kv, const torch::T
   TORCH_CHECK(ape.dtype() == torch::kFloat32, "ape dtype must be float32");
   TORCH_CHECK(kv_states.dtype() == torch::kFloat32, "kv_states dtype must be float32");
   TORCH_CHECK(score_states.dtype() == torch::kFloat32, "score_states dtype must be float32");
-  TORCH_CHECK(state_idx.dtype() == torch::kInt32, "score_states dtype must be int32");
+  TORCH_CHECK(state_idx.dtype() == torch::kInt32, "state_idx dtype must be int32");
   TORCH_CHECK(start_pos.dtype() == torch::kInt32, "start_pos dtype must be int32");
   TORCH_CHECK(cu_compress_seqlens.dtype() == torch::kInt32,
               "cu_compress_seqlens dtype must be int32");
@@ -105,6 +105,7 @@ torch::Tensor kv_compressor_decode_entry(const torch::Tensor &kv, const torch::T
   TORCH_CHECK(score.dim() == kv.dim(), "score dim must be same as kv dim");
   TORCH_CHECK(kv.size(0) == score.size(0) && kv.size(1) == score.size(1),
               "score must have same shape with kv")
+  TORCH_CHECK(kv.stride(0) == score.stride(0), "kv.stride(0) == score.stride(0) must be true");
 
   TORCH_CHECK(kv_states.dim() == score_states.dim() && kv_states.dim() == 3,
               "kv_states and score_states dim must be  3");
@@ -154,11 +155,12 @@ torch::Tensor kv_compressor_decode_entry(const torch::Tensor &kv, const torch::T
   const auto *start_pos_ptr = start_pos.const_data_ptr();
   const auto *cu_compress_seqlens_ptr = cu_compress_seqlens.const_data_ptr();
 
+  int stride = kv.stride(0);
   if (output.has_value()) {
     auto *y_ptr = output.value().mutable_data_ptr();
     kv_compressor_decode_async(y_ptr, kv_ptr, score_ptr, ape_ptr, kv_states_ptr, score_states_ptr,
                                state_idx_ptr, start_pos_ptr, cu_compress_seqlens_ptr, batch_size,
-                               head_dim, ratio, mtp, stream);
+                               head_dim, stride, ratio, mtp, stream);
     return output.value();
   } else {
     auto options = kv.options();
@@ -167,7 +169,7 @@ torch::Tensor kv_compressor_decode_entry(const torch::Tensor &kv, const torch::T
     auto *y_ptr = y.mutable_data_ptr();
     kv_compressor_decode_async(y_ptr, kv_ptr, score_ptr, ape_ptr, kv_states_ptr, score_states_ptr,
                                state_idx_ptr, start_pos_ptr, cu_compress_seqlens_ptr, batch_size,
-                               head_dim, ratio, mtp, stream);
+                               head_dim, stride, ratio, mtp, stream);
     return y;
   }
 }

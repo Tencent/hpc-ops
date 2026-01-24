@@ -15,7 +15,7 @@ __global__ void c4_kv_compressor_kernel(float* y_ptr, const float* kv_ptr, const
                                         const float* ape_ptr, float* kv_states_ptr,
                                         float* score_state_ptr, const int* state_idx_ptr,
                                         const int* start_pos_ptr,
-                                        const int* cu_compress_seqlens_ptr) {
+                                        const int* cu_compress_seqlens_ptr, int stride) {
   constexpr int kN = 16 / sizeof(float);
   constexpr int kDoubleRatio = kRatio * 2;
   constexpr int kDoubleHeadDim = kHeadDim * 2;
@@ -28,8 +28,8 @@ __global__ void c4_kv_compressor_kernel(float* y_ptr, const float* kv_ptr, const
 
   auto cur_kv_state_ptr = kv_states_ptr + state_idx * kDoubleRatio * kDoubleHeadDim;
   auto cur_score_state_ptr = score_state_ptr + state_idx * kDoubleRatio * kDoubleHeadDim;
-  auto cur_kv_ptr = kv_ptr + (batch * kTokensPerBatch) * kDoubleHeadDim;
-  auto cur_score_ptr = score_ptr + (batch * kTokensPerBatch) * kDoubleHeadDim;
+  auto cur_kv_ptr = kv_ptr + (batch * kTokensPerBatch) * stride;
+  auto cur_score_ptr = score_ptr + (batch * kTokensPerBatch) * stride;
 
   int start_pos = start_pos_ptr[batch];
 
@@ -41,8 +41,8 @@ __global__ void c4_kv_compressor_kernel(float* y_ptr, const float* kv_ptr, const
     bool should_compress = (start_pos + 1) % kRatio == 0;
 
     for (int col = idx * kN; col < kDoubleHeadDim; col += blockDim.x * kN) {
-      auto kv = load<float, kN>(cur_kv_ptr + i * kDoubleHeadDim + col);
-      auto score = load<float, kN>(cur_score_ptr + i * kDoubleHeadDim + col);
+      auto kv = load<float, kN>(cur_kv_ptr + i * stride + col);
+      auto score = load<float, kN>(cur_score_ptr + i * stride + col);
       auto ape = load<float, kN>(ape_ptr + pos * kDoubleHeadDim + col);
 #pragma unroll
       for (int i = 0; i < kN; i++) {
@@ -128,7 +128,7 @@ __global__ void c128_kv_compressor_kernel(float* y_ptr, const float* kv_ptr, con
                                           const float* ape_ptr, float* kv_states_ptr,
                                           float* score_state_ptr, const int* state_idx_ptr,
                                           const int* start_pos_ptr,
-                                          const int* cu_compress_seqlens_ptr) {
+                                          const int* cu_compress_seqlens_ptr, int stride) {
   constexpr int kN = 16 / sizeof(float);
 
   int idx = threadIdx.x;
@@ -139,8 +139,8 @@ __global__ void c128_kv_compressor_kernel(float* y_ptr, const float* kv_ptr, con
 
   auto cur_kv_state_ptr = kv_states_ptr + state_idx * kRatio * kHeadDim;
   auto cur_score_state_ptr = score_state_ptr + state_idx * kRatio * kHeadDim;
-  auto cur_kv_ptr = kv_ptr + (batch * kTokensPerBatch) * kHeadDim;
-  auto cur_score_ptr = score_ptr + (batch * kTokensPerBatch) * kHeadDim;
+  auto cur_kv_ptr = kv_ptr + (batch * kTokensPerBatch) * stride;
+  auto cur_score_ptr = score_ptr + (batch * kTokensPerBatch) * stride;
 
   int col = idx * kN;
   int start_pos = start_pos_ptr[batch];
@@ -152,8 +152,8 @@ __global__ void c128_kv_compressor_kernel(float* y_ptr, const float* kv_ptr, con
     int pos = start_pos % kRatio;
     bool should_compress = (start_pos + 1) % kRatio == 0;
 
-    auto kv = load<float, kN>(cur_kv_ptr + i * kHeadDim + col);
-    auto score = load<float, kN>(cur_score_ptr + i * kHeadDim + col);
+    auto kv = load<float, kN>(cur_kv_ptr + i * stride + col);
+    auto score = load<float, kN>(cur_score_ptr + i * stride + col);
     auto ape = load<float, kN>(ape_ptr + pos * kHeadDim + col);
 #pragma unroll
     for (int k = 0; k < kN; k++) {
@@ -210,7 +210,7 @@ void kv_compressor_decode_async(void* y_ptr, const void* kv_ptr, const void* sco
                                 const void* ape_ptr, void* kv_states_ptr, void* score_state_ptr,
                                 const void* state_idx_ptr, const void* start_pos_ptr,
                                 const void* cu_compress_seqlens_ptr, int batch_size, int head_dim,
-                                int ratio, int mtp, cudaStream_t stream) {
+                                int stride, int ratio, int mtp, cudaStream_t stream) {
   if (mtp == 1) {
     // mtp decode
     if (ratio == 4) {
@@ -222,7 +222,7 @@ void kv_compressor_decode_async(void* y_ptr, const void* kv_ptr, const void* sco
         decode_kernel<<<grid, block, 0, stream>>>(
             (float*)y_ptr, (const float*)kv_ptr, (const float*)score_ptr, (const float*)ape_ptr,
             (float*)kv_states_ptr, (float*)score_state_ptr, (const int*)state_idx_ptr,
-            (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr);
+            (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr, stride);
       } else {
         // head_dim == 512
         dim3 grid(batch_size);
@@ -231,7 +231,7 @@ void kv_compressor_decode_async(void* y_ptr, const void* kv_ptr, const void* sco
         decode_kernel<<<grid, block, 0, stream>>>(
             (float*)y_ptr, (const float*)kv_ptr, (const float*)score_ptr, (const float*)ape_ptr,
             (float*)kv_states_ptr, (float*)score_state_ptr, (const int*)state_idx_ptr,
-            (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr);
+            (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr, stride);
       }
     } else {
       // ratio = 128, head_dim == 512
@@ -241,7 +241,7 @@ void kv_compressor_decode_async(void* y_ptr, const void* kv_ptr, const void* sco
       decode_kernel<<<grid, block, 0, stream>>>(
           (float*)y_ptr, (const float*)kv_ptr, (const float*)score_ptr, (const float*)ape_ptr,
           (float*)kv_states_ptr, (float*)score_state_ptr, (const int*)state_idx_ptr,
-          (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr);
+          (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr, stride);
     }
   } else {
     // normal decode
@@ -254,7 +254,7 @@ void kv_compressor_decode_async(void* y_ptr, const void* kv_ptr, const void* sco
         decode_kernel<<<grid, block, 0, stream>>>(
             (float*)y_ptr, (const float*)kv_ptr, (const float*)score_ptr, (const float*)ape_ptr,
             (float*)kv_states_ptr, (float*)score_state_ptr, (const int*)state_idx_ptr,
-            (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr);
+            (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr, stride);
       } else {
         // head_dim == 512
         dim3 grid(batch_size);
@@ -263,7 +263,7 @@ void kv_compressor_decode_async(void* y_ptr, const void* kv_ptr, const void* sco
         decode_kernel<<<grid, block, 0, stream>>>(
             (float*)y_ptr, (const float*)kv_ptr, (const float*)score_ptr, (const float*)ape_ptr,
             (float*)kv_states_ptr, (float*)score_state_ptr, (const int*)state_idx_ptr,
-            (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr);
+            (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr, stride);
       }
     } else {
       // ratio = 128, head_dim == 512
@@ -273,7 +273,7 @@ void kv_compressor_decode_async(void* y_ptr, const void* kv_ptr, const void* sco
       decode_kernel<<<grid, block, 0, stream>>>(
           (float*)y_ptr, (const float*)kv_ptr, (const float*)score_ptr, (const float*)ape_ptr,
           (float*)kv_states_ptr, (float*)score_state_ptr, (const int*)state_idx_ptr,
-          (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr);
+          (const int*)start_pos_ptr, (const int*)cu_compress_seqlens_ptr, stride);
     }
   }
 }

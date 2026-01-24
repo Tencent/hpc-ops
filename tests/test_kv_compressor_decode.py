@@ -269,8 +269,8 @@ def test_c128_kv_compressor_decode(batch, dim, ratio):
     kv_state_for_torch = kv_state.clone()
     score_state_for_torch = score_state.clone()
 
-    kv = torch.randn((batch, dim), dtype=torch.float, device="cuda")
-    score = torch.randn((batch, dim), dtype=torch.float, device="cuda")
+    kv_and_score = torch.randn((batch, 2 * dim), dtype=torch.float, device="cuda")
+    kv, score = kv_and_score.split((dim, dim), dim=-1)
 
     compressed_seqlens = ((start_pos + 1) % ratio == 0).to(torch.int32)
     cu_compressed_seqlens = torch.cumsum(compressed_seqlens, dim=0)
@@ -333,8 +333,8 @@ def test_c4_kv_compressor_decode(batch, dim, ratio):
     kv_state_for_torch = kv_state.clone()
     score_state_for_torch = score_state.clone()
 
-    kv = torch.randn((batch, 2 * dim), dtype=torch.float, device="cuda")
-    score = torch.randn((batch, 2 * dim), dtype=torch.float, device="cuda")
+    kv_and_score = torch.randn((batch, 2 * 2 * dim), dtype=torch.float, device="cuda")
+    kv, score = kv_and_score.split((2 * dim, 2 * dim), dim=-1)
 
     compressed_seqlens = ((start_pos + 1) % ratio == 0).to(torch.int32)
     cu_compressed_seqlens = torch.cumsum(compressed_seqlens, dim=0)
@@ -397,8 +397,8 @@ def test_c128_kv_compressor_decode_mtp(batch, dim, ratio, mtp):
     kv_state_for_torch = kv_state.clone()
     score_state_for_torch = score_state.clone()
 
-    kv = torch.randn((batch * 2, dim), dtype=torch.float, device="cuda")
-    score = torch.randn((batch * 2, dim), dtype=torch.float, device="cuda")
+    kv_and_score = torch.randn((batch * 2, 2 * dim), dtype=torch.float, device="cuda")
+    kv, score = kv_and_score.split((dim, dim), dim=-1)
 
     cond1 = (start_pos + 1) % ratio == 0
     cond2 = (start_pos + 2) % ratio == 0
@@ -443,7 +443,7 @@ def test_c128_kv_compressor_decode_mtp(batch, dim, ratio, mtp):
         assert allclose(compressed_kv, compressed_torch, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("batch", [4])
+@pytest.mark.parametrize("batch", [128])
 @pytest.mark.parametrize("dim", [128, 512])
 @pytest.mark.parametrize("ratio", [4])
 @pytest.mark.parametrize("mtp", [1])
@@ -466,8 +466,8 @@ def test_c4_kv_compressor_decode_mtp(batch, dim, ratio, mtp):
     kv_state_for_torch = kv_state.clone()
     score_state_for_torch = score_state.clone()
 
-    kv = torch.randn((batch * 2, 2 * dim), dtype=torch.float, device="cuda")
-    score = torch.randn((batch * 2, 2 * dim), dtype=torch.float, device="cuda")
+    kv_and_score = torch.randn((batch * 2, 2 * 2 * dim), dtype=torch.float, device="cuda")
+    kv, score = kv_and_score.split((2 * dim, 2 * dim), dim=-1)
 
     cond1 = (start_pos + 1) % ratio == 0
     cond2 = (start_pos + 2) % ratio == 0
