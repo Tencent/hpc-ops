@@ -67,15 +67,14 @@ def test_fused_rms_norm_with_scale(batch_size, hidden_states, scale, is_moe):
 
 
 def torch_rmsnorm(x, weight, eps):
-    dtype = x.dtype
     x = x.to(torch.float)
     weight = weight.to(torch.float)
     var = x.square().mean(-1, keepdim=True)
     x = x * torch.rsqrt(var + eps)
     if weight is not None:
-        return (weight * x).to(dtype)
+        return (weight * x).to(torch.bfloat16)
     else:
-        return x.to(dtype)
+        return x.to(torch.bfloat16)
 
 
 def quantize_blockwise_fp8(tensor: torch.Tensor, block_size: int = 128, eps: float = 1e-6):
@@ -122,7 +121,7 @@ def apply_rope(q: torch.Tensor, cos_sin_cache: torch.Tensor) -> torch.Tensor:
     cos_sin_cache: (num_tokens, dim)
         format: [cos0, sin0, cos1, sin1, ...]
     """
-    dtype = q.dtype
+    dtype = torch.bfloat16
     q = q.to(torch.float)
     cos_sin_cache = cos_sin_cache.to(torch.float)
 
@@ -173,13 +172,14 @@ def test_fused_rmsnorm_blockwise_quant(batch_size, hidden_states, with_blockwise
 @pytest.mark.parametrize("rope_dim", [64])
 @pytest.mark.parametrize("q_heads", [8])
 @pytest.mark.parametrize("k_heads", [1])
-def test_fused_rmsnorm_rope(batch_size, dim, rope_dim, q_heads, k_heads):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_fused_rmsnorm_rope(batch_size, dim, rope_dim, q_heads, k_heads, dtype):
     torch.manual_seed(0)
 
-    q = torch.randn(batch_size, q_heads, dim, dtype=torch.bfloat16, device="cuda")
-    q_weight = torch.randn((1, dim), dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(batch_size, k_heads, dim, dtype=torch.bfloat16, device="cuda")
-    k_weight = torch.randn((1, dim), dtype=torch.bfloat16, device="cuda")
+    q = torch.randn(batch_size, q_heads, dim, dtype=dtype, device="cuda")
+    q_weight = torch.randn((1, dim), dtype=dtype, device="cuda")
+    k = torch.randn(batch_size, k_heads, dim, dtype=dtype, device="cuda")
+    k_weight = torch.randn((1, dim), dtype=dtype, device="cuda")
 
     positions = torch.randint(
         low=0, high=4096, size=(batch_size,), dtype=torch.int64, device="cuda"
