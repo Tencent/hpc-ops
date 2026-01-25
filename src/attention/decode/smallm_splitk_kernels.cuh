@@ -256,7 +256,7 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
   int num_blocks = (num_seq_kv + kBlockSize - 1) / kBlockSize;
   int num_blocks_per_chunk = (num_seq_per_chunk + kBlockSize - 1) / kBlockSize;
 
-  float *lse_batch = lse_ptr + ibatch * kSplitK * num_head_q + ichunk * num_head_q;
+  float *lse_batch = lse_ptr + ibatch * kSplitK * num_head_q + ichunk * num_head_q + ihead_kv * heads_per_group;
 
   const int *block_ids =
       block_ids_ptr + ibatch * num_seq_max_blocks + ichunk * num_blocks_per_chunk;
