@@ -67,19 +67,21 @@ __global__ void c4_kv_compressor_kernel(float* y_ptr, const float* kv_ptr, const
         max[i] = -std::numeric_limits<float>::infinity();
       }
 
+      if (pos > 3) {  // for fist compression, overlap is non-existing
 #pragma unroll
-      // online softmax
-      for (int i = 0; i < kRatio; i++) {
-        auto kv = load<float, kN>(cur_kv_state_ptr + i * kDoubleHeadDim + col);
-        auto score = load<float, kN>(cur_score_state_ptr + i * kDoubleHeadDim + col);
+        // online softmax
+        for (int i = 0; i < kRatio; i++) {
+          auto kv = load<float, kN>(cur_kv_state_ptr + i * kDoubleHeadDim + col);
+          auto score = load<float, kN>(cur_score_state_ptr + i * kDoubleHeadDim + col);
 #pragma unroll
-        for (int i = 0; i < kN; i++) {
-          float new_max = fmaxf(max[i], score[i]);
-          float scale = expf_ftz(max[i] - new_max);
-          float w = expf_ftz(score[i] - new_max);
-          exp_sum[i] = exp_sum[i] * scale + w;
-          sum[i] = sum[i] * scale + kv[i] * w;
-          max[i] = new_max;
+          for (int i = 0; i < kN; i++) {
+            float new_max = fmaxf(max[i], score[i]);
+            float scale = expf_ftz(max[i] - new_max);
+            float w = expf_ftz(score[i] - new_max);
+            exp_sum[i] = exp_sum[i] * scale + w;
+            sum[i] = sum[i] * scale + kv[i] * w;
+            max[i] = new_max;
+          }
         }
       }
 #pragma unroll

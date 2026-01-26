@@ -99,9 +99,6 @@ def compressor_torch(
     else:
         compressed_kv = torch.zeros(num_batch, head_dim, dtype=kv.dtype, device=kv.device)
 
-    if overlap:
-        double_ape = torch.cat([ape, ape], dim=0)
-
     for ibatch in range(num_batch):
         cur_state_index = state_index[ibatch]
 
@@ -212,6 +209,11 @@ def compressor_torch(
                         upper_partial_score = score_state[
                             cur_state_index, :ratio, :head_dim
                         ]  # [ratio,head_dim]
+                        if (
+                            start_pos_this_batch == 3
+                        ):  # for fist compression, overlap is non-existing
+                            upper_partial_kv.fill_(0)
+                            upper_partial_score.fill_(float("-inf"))
                         tmp_one_token_kv_for_compress = torch.cat(
                             [upper_partial_kv, kv_state[cur_state_index, ratio:, head_dim:]], dim=0
                         )
