@@ -5,7 +5,7 @@ enable_language(CUDA)
 set(CMAKE_BUILD_TYPE "Release")
 
 find_package(CUDAToolkit REQUIRED)
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 
 file(GLOB_RECURSE SOURCES "src/*/*.cu" "src/*/*.cc")
 list(FILTER SOURCES EXCLUDE REGEX ".*test.*")
