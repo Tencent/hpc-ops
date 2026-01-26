@@ -70,8 +70,7 @@ def ref_attn_with_paged_kvcache_func(
 @pytest.mark.parametrize("num_seq_q", [1])
 @pytest.mark.parametrize("max_seq_kv", [1024, 4096])
 @pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("num_head_q", [4, 8])
-@pytest.mark.parametrize("num_head_kv", [1])
+@pytest.mark.parametrize("kv_head_q_head", [(1, 4), (1, 8), (2, 16), (4, 32)])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("new_kv_included", [True, False])
 @pytest.mark.parametrize("splitk", [True, False])
@@ -80,13 +79,13 @@ def test_attention_decode_bf16(
     num_seq_q,
     max_seq_kv,
     block_size,
-    num_head_q,
-    num_head_kv,
+    kv_head_q_head,
     head_dim,
     new_kv_included,
     splitk,
 ):
 
+    num_head_kv, num_head_q = kv_head_q_head
     num_dim_qk = head_dim
     num_dim_v = head_dim
     max_num_blocks = int(num_batch * max_seq_kv // block_size * 1.2)
