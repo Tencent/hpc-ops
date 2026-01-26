@@ -38,7 +38,7 @@ HPC-Ops is a **production-grade, high-performance, and easy-to-use** operator li
 - NVIDIA SM90 architecture GPU
 - Python 3.8 or higher
 - Compilers with C++17 support
-- CUDA Toolkit: CUDA 12.3 or higher
+- CUDA Toolkit: CUDA 12.8 or higher
 
 *You can set up the environment by installing the modules listed in requirements-dev.txt.*
 
