@@ -22,8 +22,8 @@ torch::Tensor kv_compressor_entry(const torch::Tensor &kv, const torch::Tensor &
                                   int64_t ratio, bool overlap, int64_t head_dim, bool is_prefill) {
   auto stream = at::cuda::getCurrentCUDAStream(kv.get_device());
   // kcache and vcache maybe not contiguous, we access them by stride
-  TORCH_CHECK(kv.is_contiguous(), "kv tensor must be contiguous");
-  TORCH_CHECK(score.is_contiguous(), "score tensor must be contiguous");
+  // TORCH_CHECK(kv.is_contiguous(), "kv tensor must be contiguous");
+  // TORCH_CHECK(score.is_contiguous(), "score tensor must be contiguous");
   TORCH_CHECK(cu_seqlens.is_contiguous(), "cu_seqlens tensor must be contiguous");
   TORCH_CHECK(cu_compressed_seqlens.is_contiguous(),
               "cu_compressed_seqlens tensor must be contiguous");
@@ -50,6 +50,7 @@ torch::Tensor kv_compressor_entry(const torch::Tensor &kv, const torch::Tensor &
   int num_batch = cu_seqlens.size(0) - 1;
   int total_seqlen = kv.size(0);
   int hidden_size = kv.size(1);
+  int kv_stride = kv.stride(0);
 
   if (overlap) {
     TORCH_CHECK(hidden_size == head_dim * 2, "if overlap, kv.size(1) must be head_dim*2");
@@ -76,7 +77,7 @@ torch::Tensor kv_compressor_entry(const torch::Tensor &kv, const torch::Tensor &
   bool running = kv_compressor_fp32_async(
       compressed_kv_ptr, kv_ptr, score_ptr, cu_seqlens_ptr, cu_compressed_seqlens_ptr,
       kv_states_ptr, score_states_ptr, state_index_ptr, start_pos_ptr, ape_ptr, num_batch,
-      total_seqlen, ratio, overlap, head_dim, is_prefill, stream);
+      total_seqlen, kv_stride, ratio, overlap, head_dim, is_prefill, stream);
   TORCH_CHECK(running, "kv compressor fp32 launch failed!");
   return compressed_kv;
 }

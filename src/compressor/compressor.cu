@@ -18,9 +18,9 @@ constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 namespace kernels {
 
 // copy one tile by for-loop
-template <typename DType, int kItemPerThread, int kValidRowDim, int kRowStride, int kMaxNumRow>
+template <typename DType, int kItemPerThread, int kValidRowDim, int kMaxNumRow>
 __forceinline__ __device__ void copy_tile_to_state(DType* dst, const DType* src, int valid_num_row,
-                                                   int tidx) {
+                                                   int dst_stride, int src_stride, int tidx) {
   static_assert(kValidRowDim % kItemPerThread == 0);
   if (tidx >= kValidRowDim / kItemPerThread) {
     return;
@@ -28,18 +28,19 @@ __forceinline__ __device__ void copy_tile_to_state(DType* dst, const DType* src,
 #pragma unroll
   for (int irow = 0; irow < kMaxNumRow; irow++) {
     if (irow < valid_num_row) {
-      auto* src_irow = src + irow * kRowStride;
-      auto* dst_irow = dst + irow * kRowStride;
+      auto* src_irow = src + irow * src_stride;
+      auto* dst_irow = dst + irow * dst_stride;
       auto src_load = load<DType, kItemPerThread>(src_irow + tidx * kItemPerThread);
       store(dst_irow + tidx * kItemPerThread, src_load);
     }
   }
 }
 // copy one tile by for-loop
-template <typename DType, int kItemPerThread, int kValidRowDim, int kRowStride, int kMaxNumRow>
+template <typename DType, int kItemPerThread, int kValidRowDim, int kMaxNumRow>
 __forceinline__ __device__ void add_copy_tile_to_state(DType* dst, const DType* src1,
                                                        const DType* src2, int valid_num_row,
-                                                       int tidx) {
+                                                       int dst_stride, int src1_stride,
+                                                       int src2_stride, int tidx) {
   static_assert(kValidRowDim % kItemPerThread == 0);
   if (tidx >= kValidRowDim / kItemPerThread) {
     return;
@@ -47,9 +48,9 @@ __forceinline__ __device__ void add_copy_tile_to_state(DType* dst, const DType* 
 #pragma unroll
   for (int irow = 0; irow < kMaxNumRow; irow++) {
     if (irow < valid_num_row) {
-      auto* src1_irow = src1 + irow * kRowStride;
-      auto* src2_irow = src2 + irow * kRowStride;
-      auto* dst_irow = dst + irow * kRowStride;
+      auto* src1_irow = src1 + irow * src1_stride;
+      auto* src2_irow = src2 + irow * src2_stride;
+      auto* dst_irow = dst + irow * dst_stride;
       auto src1_vec = load<DType, kItemPerThread>(src1_irow + tidx * kItemPerThread);
       auto src2_vec = load<DType, kItemPerThread>(src2_irow + tidx * kItemPerThread);
 #pragma unroll
@@ -61,13 +62,14 @@ __forceinline__ __device__ void add_copy_tile_to_state(DType* dst, const DType* 
   }
 }
 
-template <typename DType, int kItemPerThread, int kRatio = 128, int kHeadDim, int kRowStride,
+template <typename DType, int kItemPerThread, int kRatio = 128, int kHeadDim, int kWidth,
           bool kOverlap = false, bool kAddUpperApe = true>
 __forceinline__ __device__ void online_compress(DType* compressed_kv_ptr, const DType* kv_state_ptr,
                                                 const DType* score_state_ptr,
                                                 const DType* partial_kv_ptr,
                                                 const DType* partial_score_ptr,
-                                                const DType* ape_ptr, int tidx) {
+                                                const DType* ape_ptr, int state_stride,
+                                                int kv_stride, int tidx) {
   if (tidx >= kHeadDim / kItemPerThread) {
     return;
   }
@@ -92,9 +94,9 @@ __forceinline__ __device__ void online_compress(DType* compressed_kv_ptr, const 
 #pragma unroll
     for (int i = 0; i < kPreloadRow; i++) {
       int irow = iround * kPreloadRow + i;
-      auto* kv_irow = kv_state_ptr + irow * kRowStride;
-      auto* score_irow = score_state_ptr + irow * kRowStride;
-      auto* ape_irow = ape_ptr + irow * kRowStride;
+      auto* kv_irow = kv_state_ptr + irow * state_stride;
+      auto* score_irow = score_state_ptr + irow * state_stride;
+      auto* ape_irow = ape_ptr + irow * kWidth;
       kv_lvecs[i] = load<DType, kItemPerThread>(kv_irow + tidx * kItemPerThread);
       score_vecs[i] = load<DType, kItemPerThread>(score_irow + tidx * kItemPerThread);
       ape_vecs[i] = load<DType, kItemPerThread>(ape_irow + tidx * kItemPerThread);
@@ -120,12 +122,12 @@ __forceinline__ __device__ void online_compress(DType* compressed_kv_ptr, const 
     auto* right_ape_ptr = ape_ptr + kHeadDim;
 #pragma unroll
     for (int irow = 0; irow < kRatio; irow++) {
-      auto* kv_irow = partial_kv_ptr + irow * kRowStride;
-      auto* score_irow = partial_score_ptr + irow * kRowStride;
+      auto* kv_irow = partial_kv_ptr + irow * kv_stride;
+      auto* score_irow = partial_score_ptr + irow * kv_stride;
+      auto* ape_irow = right_ape_ptr + irow * kWidth;
       auto kv_lvecs = load<DType, kItemPerThread>(kv_irow + tidx * kItemPerThread);
       auto score_vecs = load<DType, kItemPerThread>(score_irow + tidx * kItemPerThread);
-      auto ape_vec =
-          load<DType, kItemPerThread>(right_ape_ptr + irow * kRowStride + tidx * kItemPerThread);
+      auto ape_vec = load<DType, kItemPerThread>(ape_irow + tidx * kItemPerThread);
 #pragma unroll
       for (int i = 0; i < size(max_score); i++) {
         score_vecs[i] += ape_vec[i];
@@ -148,14 +150,15 @@ __forceinline__ __device__ void online_compress(DType* compressed_kv_ptr, const 
   }
 }
 
-template <typename DType, int kItemPerThread, int kRatio = 128, int kHeadDim, int kRowStride,
+template <typename DType, int kItemPerThread, int kRatio = 128, int kHeadDim, int kWidth,
           bool kOverlap = false>
 __device__ void online_compress(DType* compressed_kv_ptr, const DType* partial_kv_ptr,
-                                const DType* partial_score_ptr, const DType* ape_ptr, int tidx) {
-  online_compress<DType, kItemPerThread, kRatio, kHeadDim, kRowStride, kOverlap, true>(
+                                const DType* partial_score_ptr, const DType* ape_ptr, int kv_stride,
+                                int tidx) {
+  online_compress<DType, kItemPerThread, kRatio, kHeadDim, kWidth, kOverlap, true>(
       compressed_kv_ptr, partial_kv_ptr, partial_score_ptr,
-      partial_kv_ptr + kRatio * kRowStride + kHeadDim,
-      partial_score_ptr + kRatio * kRowStride + kHeadDim, ape_ptr, tidx);
+      partial_kv_ptr + kRatio * kv_stride + kHeadDim,
+      partial_score_ptr + kRatio * kv_stride + kHeadDim, ape_ptr, kv_stride, kv_stride, tidx);
 }
 
 __forceinline__ __device__ void get_batch_id_of_this_block(const int* cu_compressed_seqlens_ptr,
@@ -185,8 +188,8 @@ __global__ void kv_compressor_prefill(float* compressed_kv_ptr, const float* kv_
                                       const float* score_ptr, const int* cu_seqlens_ptr,
                                       const int* cu_compressed_seqlens_ptr, float* kv_states_ptr,
                                       float* score_states_ptr, const int* state_index_ptr,
-                                      const int* start_pos_ptr, const float* ape_ptr, int num_batch,
-                                      int total_seqlen) {
+                                      const int* start_pos_ptr, const float* ape_ptr, int kv_stride,
+                                      int num_batch, int total_seqlen) {
   int tidx = threadIdx.x;
   int bidx = blockIdx.x;
 
@@ -204,51 +207,52 @@ __global__ void kv_compressor_prefill(float* compressed_kv_ptr, const float* kv_
     // this block is not used neither for cutoff nor for remainder
     return;
   }
-  constexpr int kKVStride = kHeadDim * (1 + int(kOverlap));  // elem-wise stride
-  auto* kv = kv_ptr + (cu_seqlens_ptr[batch_id] + icompress * kRatio) * kKVStride;
-  auto* score = score_ptr + (cu_seqlens_ptr[batch_id] + icompress * kRatio) * kKVStride;
+  constexpr int kWidth = kHeadDim * (1 + int(kOverlap));
+  auto* kv = kv_ptr + (cu_seqlens_ptr[batch_id] + icompress * kRatio) * kv_stride;
+  auto* score = score_ptr + (cu_seqlens_ptr[batch_id] + icompress * kRatio) * kv_stride;
 
   auto* kv_state =
-      kv_states_ptr + state_index_ptr[batch_id] * kKVStride * (1 + int(kOverlap)) * kRatio;
+      kv_states_ptr + state_index_ptr[batch_id] * kWidth * (1 + int(kOverlap)) * kRatio;
   auto* score_state =
-      score_states_ptr + state_index_ptr[batch_id] * kKVStride * (1 + int(kOverlap)) * kRatio;
+      score_states_ptr + state_index_ptr[batch_id] * kWidth * (1 + int(kOverlap)) * kRatio;
 
   if (should_compress) {
     auto* out_ptr = compressed_kv_ptr + (cu_compressed_seqlen + icompress) * kHeadDim;
-    if (kOverlap) {
+    if constexpr (kOverlap) {
       if (icompress == 0) {  // first compress block of this chunk
         if (start_pos_ptr[batch_id] == 0) {
           // first compress block of whole request, should not add upper block
-          online_compress<DType, kItemPerThread, kRatio, kHeadDim, kKVStride,
+          online_compress<DType, kItemPerThread, kRatio, kHeadDim, kWidth,
                           false>(  // act like not overlap
-              out_ptr, kv + kHeadDim, score + kHeadDim, ape_ptr + kHeadDim, tidx);
+              out_ptr, kv + kHeadDim, score + kHeadDim, ape_ptr + kHeadDim, kv_stride, tidx);
         } else {
           // compress with upper states
-          online_compress<DType, kItemPerThread, kRatio, kHeadDim, kKVStride, kOverlap, false>(
-              out_ptr, kv_state, score_state, kv + kHeadDim, score + kHeadDim, ape_ptr, tidx);
+          online_compress<DType, kItemPerThread, kRatio, kHeadDim, kWidth, kOverlap, false>(
+              out_ptr, kv_state, score_state, kv + kHeadDim, score + kHeadDim, ape_ptr, kWidth,
+              kv_stride, tidx);
         }
 
         // copy upper left state from the last compressed block
         int icompress_last = (cu_seqlens_ptr[batch_id + 1] - cu_seqlens_ptr[batch_id]) / kRatio;
         auto* kv_upper =
-            kv_ptr + (cu_seqlens_ptr[batch_id] + (icompress_last - 1) * kRatio) * kKVStride;
+            kv_ptr + (cu_seqlens_ptr[batch_id] + (icompress_last - 1) * kRatio) * kv_stride;
         auto* score_upper =
-            score_ptr + (cu_seqlens_ptr[batch_id] + (icompress_last - 1) * kRatio) * kKVStride;
-        copy_tile_to_state<DType, kItemPerThread, kHeadDim, kKVStride, kRatio>(kv_state, kv_upper,
-                                                                               kRatio, tidx);
-        add_copy_tile_to_state<DType, kItemPerThread, kHeadDim, kKVStride, kRatio>(
-            score_state, score_upper, ape_ptr, kRatio, tidx);
+            score_ptr + (cu_seqlens_ptr[batch_id] + (icompress_last - 1) * kRatio) * kv_stride;
+        copy_tile_to_state<DType, kItemPerThread, kHeadDim, kRatio>(kv_state, kv_upper, kRatio,
+                                                                    kWidth, kv_stride, tidx);
+        add_copy_tile_to_state<DType, kItemPerThread, kHeadDim, kRatio>(
+            score_state, score_upper, ape_ptr, kRatio, kWidth, kv_stride, kWidth, tidx);
 
       } else {  // not first compress block, give the upper block ptr
-        auto* kv_upper = kv_ptr + (cu_seqlens_ptr[batch_id] + (icompress - 1) * kRatio) * kKVStride;
+        auto* kv_upper = kv_ptr + (cu_seqlens_ptr[batch_id] + (icompress - 1) * kRatio) * kv_stride;
         auto* score_upper =
-            score_ptr + (cu_seqlens_ptr[batch_id] + (icompress - 1) * kRatio) * kKVStride;
-        online_compress<DType, kItemPerThread, kRatio, kHeadDim, kKVStride, kOverlap>(
-            out_ptr, kv_upper, score_upper, ape_ptr, tidx);
+            score_ptr + (cu_seqlens_ptr[batch_id] + (icompress - 1) * kRatio) * kv_stride;
+        online_compress<DType, kItemPerThread, kRatio, kHeadDim, kWidth, kOverlap>(
+            out_ptr, kv_upper, score_upper, ape_ptr, kv_stride, tidx);
       }
     } else {  // not overlap
-      online_compress<DType, kItemPerThread, kRatio, kHeadDim, kKVStride, kOverlap>(
-          out_ptr, kv, score, ape_ptr, tidx);
+      online_compress<DType, kItemPerThread, kRatio, kHeadDim, kWidth, kOverlap>(
+          out_ptr, kv, score, ape_ptr, kv_stride, tidx);
     }
   } else {
     int seqlen = cu_seqlens_ptr[batch_id + 1] - cu_seqlens_ptr[batch_id];
@@ -256,21 +260,22 @@ __global__ void kv_compressor_prefill(float* compressed_kv_ptr, const float* kv_
 
     if constexpr (kOverlap) {
       // copy down left state
-      copy_tile_to_state<DType, kItemPerThread, kHeadDim, kKVStride, kRatio>(
-          kv_state + kRatio * kKVStride, kv, remainder, tidx);
-      add_copy_tile_to_state<DType, kItemPerThread, kHeadDim, kKVStride, kRatio>(
-          score_state + kRatio * kKVStride, score, ape_ptr, remainder, tidx);
+      copy_tile_to_state<DType, kItemPerThread, kHeadDim, kRatio>(
+          kv_state + kRatio * kWidth, kv, remainder, kWidth, kv_stride, tidx);
+      add_copy_tile_to_state<DType, kItemPerThread, kHeadDim, kRatio>(
+          score_state + kRatio * kWidth, score, ape_ptr, remainder, kWidth, kv_stride, kWidth,
+          tidx);
       // copy down right state
-      copy_tile_to_state<DType, kItemPerThread, kHeadDim, kKVStride, kRatio>(
-          kv_state + kRatio * kKVStride + kHeadDim, kv + kHeadDim, remainder, tidx);
-      add_copy_tile_to_state<DType, kItemPerThread, kHeadDim, kKVStride, kRatio>(
-          score_state + kRatio * kKVStride + kHeadDim, score + kHeadDim, ape_ptr + kHeadDim,
-          remainder, tidx);
+      copy_tile_to_state<DType, kItemPerThread, kHeadDim, kRatio>(
+          kv_state + kRatio * kWidth + kHeadDim, kv + kHeadDim, remainder, kWidth, kv_stride, tidx);
+      add_copy_tile_to_state<DType, kItemPerThread, kHeadDim, kRatio>(
+          score_state + kRatio * kWidth + kHeadDim, score + kHeadDim, ape_ptr + kHeadDim, remainder,
+          kWidth, kv_stride, kWidth, tidx);
     } else {  // not overlap
-      copy_tile_to_state<DType, kItemPerThread, kHeadDim, kKVStride, kRatio>(kv_state, kv,
-                                                                             remainder, tidx);
-      add_copy_tile_to_state<DType, kItemPerThread, kHeadDim, kKVStride, kRatio>(
-          score_state, score, ape_ptr, remainder, tidx);
+      copy_tile_to_state<DType, kItemPerThread, kHeadDim, kRatio>(kv_state, kv, remainder, kWidth,
+                                                                  kv_stride, tidx);
+      add_copy_tile_to_state<DType, kItemPerThread, kHeadDim, kRatio>(
+          score_state, score, ape_ptr, remainder, kWidth, kv_stride, kWidth, tidx);
     }
   }
 }
@@ -281,8 +286,9 @@ bool kv_compressor_fp32_async(float* compressed_kv_ptr, const float* kv_ptr, con
                               const int* cu_seqlens_ptr, const int* cu_compressed_seqlens_ptr,
                               float* kv_states_ptr, float* score_states_ptr,
                               const int* state_index_ptr, const int* start_pos_ptr,
-                              const float* ape_ptr, int num_batch, int total_seqlen, int ratio,
-                              bool overlap, int head_dim, bool is_prefill, cudaStream_t stream) {
+                              const float* ape_ptr, int num_batch, int total_seqlen, int kv_stride,
+                              int ratio, bool overlap, int head_dim, bool is_prefill,
+                              cudaStream_t stream) {
   using DType = float;
   if (is_prefill) {
     if (ratio == 4) {
@@ -299,8 +305,8 @@ bool kv_compressor_fp32_async(float* compressed_kv_ptr, const float* kv_ptr, con
         kernels::kv_compressor_prefill<DType, kItemPerThread, kRatio, kHeadDim, kOverlap>
             <<<grid, block, 0, stream>>>(compressed_kv_ptr, kv_ptr, score_ptr, cu_seqlens_ptr,
                                          cu_compressed_seqlens_ptr, kv_states_ptr, score_states_ptr,
-                                         state_index_ptr, start_pos_ptr, ape_ptr, num_batch,
-                                         total_seqlen);
+                                         state_index_ptr, start_pos_ptr, ape_ptr, kv_stride,
+                                         num_batch, total_seqlen);
       } else if (head_dim == 512) {
         constexpr int kItemPerThread = 4;
         constexpr int kHeadDim = 512;
@@ -309,8 +315,8 @@ bool kv_compressor_fp32_async(float* compressed_kv_ptr, const float* kv_ptr, con
         kernels::kv_compressor_prefill<DType, kItemPerThread, kRatio, kHeadDim, kOverlap>
             <<<grid, block, 0, stream>>>(compressed_kv_ptr, kv_ptr, score_ptr, cu_seqlens_ptr,
                                          cu_compressed_seqlens_ptr, kv_states_ptr, score_states_ptr,
-                                         state_index_ptr, start_pos_ptr, ape_ptr, num_batch,
-                                         total_seqlen);
+                                         state_index_ptr, start_pos_ptr, ape_ptr, kv_stride,
+                                         num_batch, total_seqlen);
       }
 
     } else if (ratio == 128) {
@@ -323,8 +329,8 @@ bool kv_compressor_fp32_async(float* compressed_kv_ptr, const float* kv_ptr, con
       kernels::kv_compressor_prefill<DType, kItemPerThread, kRatio, kHeadDim, kOverlap>
           <<<grid, block, 0, stream>>>(compressed_kv_ptr, kv_ptr, score_ptr, cu_seqlens_ptr,
                                        cu_compressed_seqlens_ptr, kv_states_ptr, score_states_ptr,
-                                       state_index_ptr, start_pos_ptr, ape_ptr, num_batch,
-                                       total_seqlen);
+                                       state_index_ptr, start_pos_ptr, ape_ptr, kv_stride,
+                                       num_batch, total_seqlen);
     }
     return true;
   } else {

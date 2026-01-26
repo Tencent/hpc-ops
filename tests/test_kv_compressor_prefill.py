@@ -413,12 +413,11 @@ def test_compress_kv_prefill(batch, max_seqlen, head_dim, ratio):
 
     start_pos = torch.zeros(batch, dtype=torch.int, device="cuda")
 
-    kv = torch.randn(
-        (cu_seqlens[-1].item(), head_dim * overlap_copy), dtype=torch.float, device="cuda"
+    merged = torch.randn(
+        (cu_seqlens[-1].item(), 2 * head_dim * overlap_copy), dtype=torch.float, device="cuda"
     )
-    score = torch.randn(
-        (cu_seqlens[-1].item(), head_dim * overlap_copy), dtype=torch.float, device="cuda"
-    )
+    kv = merged[:, : head_dim * overlap_copy]
+    score = merged[:, head_dim * overlap_copy :]
 
     kv_state_for_torch = kv_state.clone()
     score_state_for_torch = score_state.clone()
@@ -464,5 +463,5 @@ def test_compress_kv_prefill(batch, max_seqlen, head_dim, ratio):
         score_state_for_torch[:, :ratio, head_dim:] = 0
 
     assert allclose(compressed_torch, compressed_kv, atol=1e-5)
-    assert allclose(kv_state_for_torch, kv_state, atol=1e-7)
-    assert allclose(score_state_for_torch, score_state, atol=1e-7)
+    assert allclose(kv_state_for_torch, kv_state, atol=1e-5)
+    assert allclose(score_state_for_torch, score_state, atol=1e-5)

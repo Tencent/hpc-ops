@@ -17,8 +17,9 @@ bool kv_compressor_fp32_async(float* compressed_kv_ptr, const float* kv_ptr, con
                               const int* cu_seqlens_ptr, const int* cu_compressed_seqlens_ptr,
                               float* kv_states_ptr, float* score_states_ptr,
                               const int* state_index_ptr, const int* start_pos_ptr,
-                              const float* ape_ptr, int num_batch, int total_seqlen, int ratio,
-                              bool overlap, int head_dim, bool is_prefill, cudaStream_t stream);
+                              const float* ape_ptr, int num_batch, int total_seqlen, int kv_stride,
+                              int ratio, bool overlap, int head_dim, bool is_prefill,
+                              cudaStream_t stream);
 void kv_compressor_decode_async(void* y_ptr, const void* kv_ptr, const void* score_ptr,
                                 const void* ape_ptr, void* kv_states_ptr, void* score_states_ptr,
                                 const void* state_idx_ptr, const void* start_pos_ptr,
