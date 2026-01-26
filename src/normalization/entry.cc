@@ -136,9 +136,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fused_layer_norm_with_sc
   return std::make_tuple(output, quant_scale, output_x);
 }
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>> fused_rmsnorm_blockwise_quant_entry(
-    const torch::Tensor &input, const torch::Tensor &weight, double eps,
-    const bool with_blockwise_quant, const int64_t quant_size) {
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>>
+fused_rmsnorm_blockwise_quant_entry(const torch::Tensor &input, const torch::Tensor &weight,
+                                    double eps, const bool with_blockwise_quant,
+                                    const int64_t quant_size, const bool dual_output) {
   auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
   TORCH_CHECK(input.dim() == 2, "input dim must be 2");
@@ -148,7 +149,10 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> fused_rmsnorm_blockwise_
   TORCH_CHECK(input.dtype() == torch::kBFloat16, "input dtype must be bfloat16");
   TORCH_CHECK(weight.dtype() == torch::kBFloat16, "weight dtype must be bfloat16");
   TORCH_CHECK(weight.size(-1) == input.size(-1), "weight.size(-1) == input.size(-1) must be true");
-
+  if (dual_output) {
+    TORCH_CHECK(with_blockwise_quant == true,
+                "when dual_output is set, with_blockwise_quant must be true");
+  }
   const auto *input_ptr = input.const_data_ptr();
   const auto *weight_ptr = weight.const_data_ptr();
 
@@ -159,19 +163,26 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> fused_rmsnorm_blockwise_
   auto options = input.options();
 
   if (with_blockwise_quant) {
-    auto y = torch::empty({m, hidden_size}, options.dtype(torch::kFloat8_e4m3fn));
+    auto y_fp8 = torch::empty({m, hidden_size}, options.dtype(torch::kFloat8_e4m3fn));
     auto y_scale = torch::empty({m, hidden_size / 128}, options.dtype(torch::kFloat32));
-    auto *y_ptr = y.mutable_data_ptr();
+    auto *y_fp8_ptr = y_fp8.mutable_data_ptr();
     auto *y_scale_ptr = y_scale.mutable_data_ptr();
-    fused_rmsnorm_blockwise_quant_async(y_ptr, y_scale_ptr, input_ptr, weight_ptr, m, hidden_size,
-                                        eps, with_blockwise_quant, stream);
-    return std::make_tuple(y, y_scale);
+    fused_rmsnorm_blockwise_quant_async(nullptr, y_fp8_ptr, y_scale_ptr, input_ptr, weight_ptr, m,
+                                        hidden_size, eps, with_blockwise_quant, stream);
+    if (dual_output) {
+      auto y_bf16 = torch::empty({m, hidden_size}, options.dtype(torch::kBFloat16));
+      auto y_bf16_ptr = y_bf16.mutable_data_ptr();
+      fused_rmsnorm_blockwise_quant_async(y_bf16_ptr, y_fp8_ptr, y_scale_ptr, input_ptr, weight_ptr,
+                                          m, hidden_size, eps, with_blockwise_quant, stream);
+      return std::make_tuple(y_bf16, y_fp8, y_scale);
+    }
+    return std::make_tuple(y_fp8, y_scale, std::nullopt);
   } else {
-    auto y = torch::empty({m, hidden_size}, options);
-    auto *y_ptr = y.mutable_data_ptr();
-    fused_rmsnorm_blockwise_quant_async(y_ptr, nullptr, input_ptr, weight_ptr, m, hidden_size, eps,
-                                        with_blockwise_quant, stream);
-    return std::make_tuple(y, std::nullopt);
+    auto y_bf16 = torch::empty({m, hidden_size}, options);
+    auto *y_bf16_ptr = y_bf16.mutable_data_ptr();
+    fused_rmsnorm_blockwise_quant_async(y_bf16_ptr, nullptr, nullptr, input_ptr, weight_ptr, m,
+                                        hidden_size, eps, with_blockwise_quant, stream);
+    return std::make_tuple(y_bf16, std::nullopt, std::nullopt);
   }
 }
 
@@ -274,7 +285,8 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 
   m.def(
       "fused_rmsnorm_blockwise_quant(Tensor input, Tensor weight,"
-      "float eps, bool with_blockwise_quant, int block_size) -> (Tensor, Tensor ?)");
+      "float eps, bool with_blockwise_quant, int block_size, bool dual_output) -> (Tensor, Tensor "
+      "?, Tensor ?)");
   m.impl("fused_rmsnorm_blockwise_quant", torch::kCUDA,
          &hpc::normalization::fused_rmsnorm_blockwise_quant_entry);
 

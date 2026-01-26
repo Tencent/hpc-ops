@@ -13,10 +13,10 @@
 
 namespace hpc {
 namespace normalization {
-void fused_rmsnorm_blockwise_quant_async(void* y_ptr, void* y_scale_ptr, const void* input_ptr,
-                                         const void* weight_ptr, const int m, const int hidden_size,
-                                         const float eps, bool with_blockwise_quant,
-                                         cudaStream_t stream);
+void fused_rmsnorm_blockwise_quant_async(void* y_fp8_ptr, void* y_bf16_ptr, void* y_scale_ptr,
+                                         const void* input_ptr, const void* weight_ptr, const int m,
+                                         const int hidden_size, const float eps,
+                                         bool with_blockwise_quant, cudaStream_t stream);
 }  // namespace normalization
 }  // namespace hpc
 

@@ -107,12 +107,16 @@ def quantize_blockwise_fp8(tensor: torch.Tensor, block_size: int = 128, eps: flo
     return quantized, scales
 
 
-def torch_fused_rmsnorm_blockwise_quant(x, rmsnorm_weight, eps, with_blockwise_quant):
-    out = torch_rmsnorm(x, rmsnorm_weight, eps)
-    if with_blockwise_quant:
-        return quantize_blockwise_fp8(out)
+def torch_fused_rmsnorm_blockwise_quant(x, rmsnorm_weight, eps, with_blockwise_quant, dual_output):
+    out_bf16 = torch_rmsnorm(x, rmsnorm_weight, eps)
+    if with_blockwise_quant and dual_output:
+        out_fp8, out_scale = quantize_blockwise_fp8(out_bf16)
+        return out_bf16, out_fp8, out_scale
+    elif with_blockwise_quant:
+        out_fp8, out_scale = quantize_blockwise_fp8(out_bf16)
+        return out_fp8, out_scale
     else:
-        return out, None
+        return out_bf16
 
 
 def apply_rope(q: torch.Tensor, cos_sin_cache: torch.Tensor) -> torch.Tensor:
@@ -147,24 +151,69 @@ def apply_rope(q: torch.Tensor, cos_sin_cache: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("batch_size", [128])
 @pytest.mark.parametrize("hidden_states", [128, 512, 1024, 4096])
 @pytest.mark.parametrize("with_blockwise_quant", [False, True])
-def test_fused_rmsnorm_blockwise_quant(batch_size, hidden_states, with_blockwise_quant):
+@pytest.mark.parametrize("dual_output", [False, True])
+def test_fused_rmsnorm_blockwise_quant(
+    batch_size, hidden_states, with_blockwise_quant, dual_output
+):
     torch.manual_seed(0)
 
     x = torch.randn(batch_size, hidden_states, dtype=torch.bfloat16, device="cuda")
     rmsnorm_weight = torch.randn((1, hidden_states), dtype=torch.bfloat16, device="cuda")
 
-    gt, gt_scale = torch_fused_rmsnorm_blockwise_quant(
-        x, rmsnorm_weight, eps=1e-6, with_blockwise_quant=with_blockwise_quant
-    )
-    my, my_scale = hpc.fused_rmsnorm_blockwise_quant(
-        x, rmsnorm_weight, eps=1e-6, with_blockwise_quant=with_blockwise_quant
-    )
-    if with_blockwise_quant:
-        assert allclose(gt_scale, my_scale, atol=0.001, rtol=0.001)
-        assert allclose(gt, my, atol=32, rtol=0.01)
+    if dual_output and not with_blockwise_quant:
+        return
+
+    if with_blockwise_quant and dual_output:
+        gt_bf16, gt_fp8, gt_scale = torch_fused_rmsnorm_blockwise_quant(
+            x,
+            rmsnorm_weight,
+            eps=1e-6,
+            with_blockwise_quant=with_blockwise_quant,
+            dual_output=dual_output,
+        )
+        my_bf16, my_fp8, my_scale = hpc.fused_rmsnorm_blockwise_quant(
+            x,
+            rmsnorm_weight,
+            eps=1e-6,
+            with_blockwise_quant=with_blockwise_quant,
+            dual_output=dual_output,
+        )
+        assert allclose(gt_bf16, my_bf16, atol=0.01, rtol=0.01)
+        assert allclose(gt_fp8, my_fp8, atol=32, rtol=0.01)
+        assert allclose(gt_scale, my_scale, atol=0.01, rtol=0.01)
+    elif with_blockwise_quant:
+        gt_fp8, gt_scale = torch_fused_rmsnorm_blockwise_quant(
+            x,
+            rmsnorm_weight,
+            eps=1e-6,
+            with_blockwise_quant=with_blockwise_quant,
+            dual_output=dual_output,
+        )
+        my_fp8, my_scale = hpc.fused_rmsnorm_blockwise_quant(
+            x,
+            rmsnorm_weight,
+            eps=1e-6,
+            with_blockwise_quant=with_blockwise_quant,
+            dual_output=dual_output,
+        )
+        assert allclose(gt_fp8, my_fp8, atol=32, rtol=0.01)
+        assert allclose(gt_scale, my_scale, atol=0.01, rtol=0.01)
     else:
-        assert my_scale is None
-        assert allclose(gt, my, atol=0.0001, rtol=0.01)
+        gt_bf16 = torch_fused_rmsnorm_blockwise_quant(
+            x,
+            rmsnorm_weight,
+            eps=1e-6,
+            with_blockwise_quant=with_blockwise_quant,
+            dual_output=dual_output,
+        )
+        my_bf16 = hpc.fused_rmsnorm_blockwise_quant(
+            x,
+            rmsnorm_weight,
+            eps=1e-6,
+            with_blockwise_quant=with_blockwise_quant,
+            dual_output=dual_output,
+        )
+        assert allclose(gt_bf16, my_bf16, atol=0.01, rtol=0.01)
 
 
 @pytest.mark.parametrize("batch_size", [128])

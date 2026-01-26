@@ -170,11 +170,47 @@ def fused_rmsnorm_blockwise_quant(
     eps: float = torch.finfo(torch.float32).eps,
     with_blockwise_quant: bool = False,
     block_size: int = 128,
-) -> Tuple[Tensor, Optional[Tensor]]:
+    dual_output: bool = False,
+) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+    """Perform RMSNorm and BlockWise Quant.
+    Args:
+        x: Input tensor
+            Shape: [num_tokens, dim]
+            Dtype: torch.bfloat16
+        weight: Weight for RMSNorm
+            Shape: [1, dim].
+            Dtype: torch.bfloat16
+        eps: a value added to the denominator for numerical stability.
+            Shape: scalar
+            Dtype: float
+        with_blockwise_quant: whether quantinize the output of rmsnorm
+        block_size: now only support 128
+        dual_output: if set to true, will return the output of rmsnorm and its quantinization
+    Returns:
+        when with_blockwise_quant is True and dual_output is True:
+            return [rmsnorm(x), quant(rmsnorm(x)), fp32_scale]
+        when only with_blockwise_quant is True:
+            return [quant(rmsnorm(x)), fp32_scale]
+        else:
+            return [rmsnorm(x)]
+    """
     assert block_size == 128, "now only support blockwise == 128"
-    return torch.ops.hpc.fused_rmsnorm_blockwise_quant(
-        x, weight, eps, with_blockwise_quant, block_size
-    )
+
+    if with_blockwise_quant and dual_output:
+        y_bf16, y_fp8, y_scale = torch.ops.hpc.fused_rmsnorm_blockwise_quant(
+            x, weight, eps, with_blockwise_quant, block_size, dual_output
+        )
+        return y_bf16, y_fp8, y_scale
+    elif with_blockwise_quant:
+        y_fp8, y_scale, _ = torch.ops.hpc.fused_rmsnorm_blockwise_quant(
+            x, weight, eps, with_blockwise_quant, block_size, dual_output
+        )
+        return y_fp8, y_scale
+    else:
+        y_bf16, _, _ = torch.ops.hpc.fused_rmsnorm_blockwise_quant(
+            x, weight, eps, with_blockwise_quant, block_size, dual_output
+        )
+        return y_bf16
 
 
 def fused_rmsnorm_rope(

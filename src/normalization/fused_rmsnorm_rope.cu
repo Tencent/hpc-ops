@@ -171,10 +171,8 @@ __global__ void fused_rmsnorm_rope_kernel(__nv_bfloat16* y_q_ptr, __nv_bfloat16*
         float b = k_in[2 * i + 1];
         float cos = cos_sin[2 * i];
         float sin = cos_sin[2 * i + 1];
-        k_in[2 * i] = a * cos - b * sin;  // a*cos - b*sin
-        k_in
-
-            [2 * i + 1] = a * sin + b * cos;  // a*sin + b*cos
+        k_in[2 * i] = a * cos - b * sin;      // a*cos - b*sin
+        k_in[2 * i + 1] = a * sin + b * cos;  // a*sin + b*cos
       }
       store(y_k_row_ptr + col, to<__nv_bfloat16>(k_in));
     }
