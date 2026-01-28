@@ -206,7 +206,7 @@ def test_fuse_moe_pertensor_fp8(
         topk_ids,
         topk_scale,
         rank_ep,
-        num_expert // size_ep,
+        num_expert,
         shared_output=shared_output,
     )
     gt = naive_fuse_moe_pertensor_fp8(
