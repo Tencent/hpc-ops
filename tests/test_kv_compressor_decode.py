@@ -331,7 +331,7 @@ def test_c4_kv_compressor_decode(batch, dim, ratio):
         torch.int32
     )
 
-    start_pos = torch.randint(low=0, high=4, size=(batch,), dtype=torch.int, device="cuda")
+    start_pos = torch.randint(low=0, high=111, size=(batch,), dtype=torch.int, device="cuda")
     kv_state_for_torch = kv_state.clone()
     score_state_for_torch = score_state.clone()
 
@@ -463,7 +463,7 @@ def test_c4_kv_compressor_decode_mtp(batch, dim, ratio, mtp):
         torch.int32
     )
 
-    start_pos = torch.randint(low=0, high=4, size=(batch,), dtype=torch.int, device="cuda")
+    start_pos = torch.randint(low=0, high=111, size=(batch,), dtype=torch.int, device="cuda")
     start_pos.fill_(0)
     kv_state_for_torch = kv_state.clone()
     score_state_for_torch = score_state.clone()

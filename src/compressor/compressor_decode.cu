@@ -67,7 +67,7 @@ __global__ void c4_kv_compressor_kernel(float* y_ptr, const float* kv_ptr, const
         max[i] = -std::numeric_limits<float>::infinity();
       }
 
-      if (pos > 3) {  // for fist compression, overlap is non-existing
+      if (start_pos > 3) {  // for fist compression, overlap is non-existing
 #pragma unroll
         // online softmax
         for (int i = 0; i < kRatio; i++) {
