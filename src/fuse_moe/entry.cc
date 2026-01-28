@@ -37,7 +37,7 @@ count_and_gather_entry(const torch::Tensor &x, const torch::Tensor &topk_ids,
       torch::empty({num_seq * num_topk, hidden_size}, options.dtype(torch::kBFloat16));
 
   torch::Tensor topk_pos = torch::empty({num_seq, num_topk}, options.dtype(torch::kInt32));
-  torch::Tensor seqlens = torch::zeros({num_expert}, options.dtype(torch::kInt32));
+  torch::Tensor seqlens = torch::empty({num_expert}, options.dtype(torch::kInt32));
   torch::Tensor cu_seqlens = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
   torch::Tensor tiles = torch::empty({num_expert}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
@@ -185,7 +185,7 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   torch::Tensor down_tmas = torch::empty({num_expert * 2, 128}, options.dtype(torch::kInt8));
 
   torch::Tensor topk_pos = torch::empty({num_seq, num_topk}, options.dtype(torch::kInt32));
-  torch::Tensor seqlens = torch::zeros({num_expert}, options.dtype(torch::kInt32));
+  torch::Tensor seqlens = torch::empty({num_expert}, options.dtype(torch::kInt32));
   torch::Tensor cu_seqlens = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
   torch::Tensor tiles = torch::empty({num_expert}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
@@ -323,7 +323,7 @@ torch::Tensor fuse_moe_blockwise_entry(
       torch::empty({num_tokens * num_topk, hidden_size}, options.dtype(torch::kBFloat16));
   torch::Tensor down_tmas = torch::empty({num_experts * 2, 128}, options.dtype(torch::kInt8));
   torch::Tensor topk_pos = torch::empty({num_tokens, num_topk}, options.dtype(torch::kInt32));
-  torch::Tensor num_tokens_per_group = torch::zeros({num_experts}, options.dtype(torch::kInt32));
+  torch::Tensor num_tokens_per_group = torch::empty({num_experts}, options.dtype(torch::kInt32));
   torch::Tensor cu_num_tokens_per_group =
       torch::empty({num_experts + 1}, options.dtype(torch::kInt32));
   torch::Tensor tiles = torch::empty({num_experts}, options.dtype(torch::kInt32));

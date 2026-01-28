@@ -39,7 +39,7 @@ torch::Tensor mqa_indexer_logits_entry(const torch::Tensor &q, const torch::Tens
   if (output.has_value()) {
     y = output.value();
   } else {
-    y = torch::zeros({total_seq_q, max_context_len}, options);
+    y = torch::empty({total_seq_q, max_context_len}, options);
   }
 
   int num_split = 1;

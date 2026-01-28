@@ -313,7 +313,9 @@ def test_c128_kv_compressor_decode(batch, dim, ratio):
     assert allclose(score_state, score_state_for_torch)
     valid_len = cu_compressed_seqlens[-1]
     if valid_len:
-        assert allclose(compressed_kv, compressed_torch, atol=1e-5, rtol=1e-5)
+        assert allclose(
+            compressed_kv[:valid_len], compressed_torch[:valid_len], atol=1e-5, rtol=1e-5
+        )
 
 
 @pytest.mark.parametrize("batch", [128])
@@ -374,7 +376,9 @@ def test_c4_kv_compressor_decode(batch, dim, ratio):
     )
     valid_len = cu_compressed_seqlens[-1]
     if valid_len:
-        assert allclose(compressed_kv, compressed_torch, atol=1e-5, rtol=1e-5)
+        assert allclose(
+            compressed_kv[:valid_len], compressed_torch[:valid_len], atol=1e-5, rtol=1e-5
+        )
 
 
 @pytest.mark.parametrize("batch", [128])
@@ -442,7 +446,9 @@ def test_c128_kv_compressor_decode_mtp(batch, dim, ratio, mtp):
     assert allclose(score_state, score_state_for_torch)
     valid_len = cu_compressed_seqlens[-1]
     if valid_len:
-        assert allclose(compressed_kv, compressed_torch, atol=1e-5, rtol=1e-5)
+        assert allclose(
+            compressed_kv[:valid_len], compressed_torch[:valid_len], atol=1e-5, rtol=1e-5
+        )
 
 
 @pytest.mark.parametrize("batch", [128])
@@ -509,4 +515,6 @@ def test_c4_kv_compressor_decode_mtp(batch, dim, ratio, mtp):
     )
     valid_len = cu_compressed_seqlens[-1]
     if valid_len:
-        assert allclose(compressed_kv, compressed_torch, atol=1e-5, rtol=1e-5)
+        assert allclose(
+            compressed_kv[:valid_len], compressed_torch[:valid_len], atol=1e-5, rtol=1e-5
+        )

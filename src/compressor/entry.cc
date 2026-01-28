@@ -166,7 +166,6 @@ torch::Tensor kv_compressor_decode_entry(const torch::Tensor &kv, const torch::T
   } else {
     auto options = kv.options();
     torch::Tensor y = torch::empty({batch_size, head_dim}, options);
-    y.fill_(0);
     auto *y_ptr = y.mutable_data_ptr();
     kv_compressor_decode_async(y_ptr, kv_ptr, score_ptr, ape_ptr, kv_states_ptr, score_states_ptr,
                                state_idx_ptr, start_pos_ptr, cu_compress_seqlens_ptr, batch_size,

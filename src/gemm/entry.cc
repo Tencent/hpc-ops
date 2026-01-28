@@ -19,7 +19,6 @@ torch::Tensor pad_and_transpose_entry(const torch::Tensor &x) {
 
   int m_pad = (m + 3) / 4 * 4;
   torch::Tensor y = torch::empty({n, m_pad}, options);
-  y.fill_(0);
   const auto *x_ptr = x.const_data_ptr();
   auto *y_ptr = y.mutable_data_ptr();
   pad_and_transpose_async(y_ptr, x_ptr, m, n, m_pad, stream);
