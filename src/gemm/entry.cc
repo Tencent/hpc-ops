@@ -31,10 +31,10 @@ torch::Tensor gemm_blockwise_entry(const torch::Tensor &x, const torch::Tensor &
                                    const torch::Tensor &bias) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   TORCH_CHECK(x.is_contiguous(), "x tensor must be contiguous");
-  TORCH_CHECK(weight.is_contiguous(), "x tensor must be contiguous");
-  TORCH_CHECK(x_scale.is_contiguous(), "x tensor must be contiguous");
-  TORCH_CHECK(weight_scale.is_contiguous(), "x tensor must be contiguous");
-  TORCH_CHECK(bias.is_contiguous(), "x tensor must be contiguous");
+  TORCH_CHECK(weight.is_contiguous(), "weight tensor must be contiguous");
+  TORCH_CHECK(x_scale.is_contiguous(), "x_scale tensor must be contiguous");
+  TORCH_CHECK(weight_scale.is_contiguous(), "weight_scale tensor must be contiguous");
+  TORCH_CHECK(bias.is_contiguous(), "bias tensor must be contiguous");
 
   TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn, "x dtype must be float8_e4m3");
   TORCH_CHECK(weight.dtype() == torch::kFloat8_e4m3fn, "weight dtype must be float8_e4m3");
@@ -85,8 +85,57 @@ torch::Tensor gemm_blockwise_entry(const torch::Tensor &x, const torch::Tensor &
   return y;
 }
 
+torch::Tensor gemm_bf16xfp32_entry(const torch::Tensor &x, const torch::Tensor &w_high,
+                                   const torch::Tensor &w_low, double scale, bool use_fp32_output) {
+  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
+  TORCH_CHECK(x.is_contiguous(), "x tensor must be contiguous");
+  TORCH_CHECK(w_high.is_contiguous(), "w_high tensor must be contiguous");
+  TORCH_CHECK(w_low.is_contiguous(), "w_low tensor must be contiguous");
+
+  TORCH_CHECK(x.dtype() == torch::kBFloat16, "x dtype must be bfloat16");
+  TORCH_CHECK(w_high.dtype() == torch::kBFloat16, "w_high dtype must be bfloat16");
+  TORCH_CHECK(w_low.dtype() == torch::kBFloat16, "w_low dtype must be bfloat16");
+
+  int m = x.size(0);
+  int k = x.size(1);
+  int n = w_high.size(0);
+
+  auto options = x.options();
+
+  auto out_dtype = torch::kBFloat16;
+  if (use_fp32_output) {
+    out_dtype = torch::kFloat32;
+  }
+
+  torch::Tensor y = torch::empty({m, n}, options.dtype(out_dtype));
+
+  const auto *x_ptr = x.const_data_ptr();
+  const auto *w_high_ptr = w_high.const_data_ptr();
+  const auto *w_low_ptr = w_low.const_data_ptr();
+  auto *y_ptr = y.mutable_data_ptr();
+
+  bool running = gemm_bf16xfp32_async(y_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
+                                      use_fp32_output, stream);
+
+  TORCH_CHECK(running, "gemm_bf16xfp32 launch failed!");
+
+  return y;
+}
+
 }  // namespace gemm
 }  // namespace hpc
 
-TORCH_LIBRARY_FRAGMENT(hpc, m) { m.def("gemm_blockwise", &hpc::gemm::gemm_blockwise_entry); }
-TORCH_LIBRARY_FRAGMENT(hpc, m) { m.def("pad_and_transpose", &hpc::gemm::pad_and_transpose_entry); }
+TORCH_LIBRARY_FRAGMENT(hpc, m) {
+  m.def(
+      "gemm_blockwise(Tensor x, Tensor weight, Tensor x_scale, Tensor weight_scale, Tensor bias) "
+      "-> (Tensor)");
+  m.impl("gemm_blockwise", torch::kCUDA, &hpc::gemm::gemm_blockwise_entry);
+
+  m.def("pad_and_transpose(Tensor x) -> (Tensor)");
+  m.impl("pad_and_transpose", torch::kCUDA, &hpc::gemm::pad_and_transpose_entry);
+
+  m.def(
+      "gemm_bf16xfp32(Tensor x, Tensor w_high, Tensor w_low, "
+      "float scale, bool use_fp32_output) -> (Tensor)");
+  m.impl("gemm_bf16xfp32", torch::kCUDA, &hpc::gemm::gemm_bf16xfp32_entry);
+}

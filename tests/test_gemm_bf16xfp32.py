@@ -1,0 +1,31 @@
+import sys
+import os
+from pathlib import Path
+
+sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
+
+import hpc
+import torch
+import pytest
+from utils import allclose
+
+
+@pytest.mark.parametrize("m", [16, 6, 12303])
+@pytest.mark.parametrize("n", [512, 1024, 2048])
+@pytest.mark.parametrize("k", [4096])
+@pytest.mark.parametrize("use_fp32_output", [True, False])
+def test_gemm_bf16xfp32(m, n, k, use_fp32_output):
+    dtype = torch.bfloat16
+
+    x = torch.randn((m, k), dtype=torch.float, device="cuda").to(dtype)
+    w = torch.randn((n, k), dtype=torch.float, device="cuda")
+
+    scale = 1 / 256
+    w_high = w.to(torch.bfloat16)
+    w_low = ((w - w_high.float()) / scale).to(torch.bfloat16)
+
+    gt = torch.matmul(x.float(), w.t())
+
+    my = hpc.gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output)
+
+    assert allclose(gt, my.float(), rtol=0.08, atol=0.01)
