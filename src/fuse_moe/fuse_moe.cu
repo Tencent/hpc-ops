@@ -92,7 +92,7 @@ void fuse_moe_blockwise_fp8_async(
   // 2. act_and_mul
   activation::act_mul_and_blockwise_quant_async(
       down_input_ptr, down_input_scale_ptr, gate_up_output_ptr, cu_num_tokens_per_group_ptr,
-      cu_tiles_ptr, total_num_tokens, num_padded_tokens, intermediate_size, num_expert_total,
+      cu_tiles_ptr, total_num_tokens, num_padded_tokens, intermediate_size, num_expert_local,
       num_tokens_per_group_avg, stream);
 
   // 3. call down linear

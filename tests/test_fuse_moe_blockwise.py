@@ -23,8 +23,6 @@ torch.cuda.manual_seed(41)
 def naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert, rank_ep):
     num_tokens, num_topk = topk_ids.shape
     num_tokens, hidden_size = x.shape
-    total_num_tokens = num_tokens * num_topk
-    num_tokens_per_group_avg = total_num_tokens / num_expert
 
     unique_values, num_tokens_per_expert_partial = torch.unique(
         topk_ids.flatten(), return_counts=True, sorted=True
@@ -224,6 +222,7 @@ def naive_fuse_moe_blockwise_fp8(
     num_expert,
     shared_output=None,
 ):
+    num_expert_local = gate_up_weight.size(0)
     # count_and_gather
     (
         gate_up_input,
@@ -232,7 +231,7 @@ def naive_fuse_moe_blockwise_fp8(
         num_tokens_per_expert,
         cu_num_tokens_per_expert,
         expert_ids,
-    ) = naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert, rank_ep)
+    ) = naive_gather_expert_inputs(x, x_scale, topk_ids, num_expert_local, rank_ep)
 
     # gate_up_proj
     gate_up_output = naive_group_gemm(
@@ -326,7 +325,8 @@ def test_fuse_moe_blockwise_fp8(
         topk_ids,
         topk_scale,
         rank_ep,
-        num_expert // size_ep,
+        num_expert,
+        shared_output,
     )
     gt = naive_fuse_moe_blockwise_fp8(
         x,
@@ -338,7 +338,8 @@ def test_fuse_moe_blockwise_fp8(
         topk_ids,
         topk_scale,
         rank_ep,
-        num_expert // size_ep,
+        num_expert,
+        shared_output,
     )
 
     torch.cuda.synchronize()
