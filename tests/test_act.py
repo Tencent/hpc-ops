@@ -240,3 +240,83 @@ def test_masked_act_mul_and_blockwise_quant(
 
     assert allclose(gt.to(torch.float32), my.to(torch.float32), atol=32, rtol=0.0125)
     assert allclose(gt_scale.to(torch.float32), my_scale.to(torch.float32), atol=0.15, rtol=0.0125)
+
+
+def _quantize_blockwise_fp8(
+    tensor: torch.Tensor,
+    block_size: int = 128,
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+    compute_dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert tensor.dim() == 2, "Tensor must be 2D"
+
+    batch_size, num_features = tensor.shape
+    num_blocks = (num_features + block_size - 1) // block_size
+
+    if fp8_dtype == torch.float8_e4m3fn:
+        fp8_max = 448.0
+    elif fp8_dtype == torch.float8_e5m2:
+        fp8_max = 57344.0
+    else:
+        fp8_max = 448.0
+
+    quantized = torch.empty(batch_size, num_features, device=tensor.device, dtype=fp8_dtype)
+
+    scales = torch.empty(batch_size, num_blocks, device=tensor.device, dtype=compute_dtype)
+
+    for block_idx in range(num_blocks):
+        start = block_idx * block_size
+        end = min(start + block_size, num_features)
+
+        if start >= end:
+            continue
+
+        block = tensor[:, start:end]  # (batch, block_features)
+
+        block_abs_max = block.abs().amax(dim=1, keepdim=True)  # (batch, 1)
+
+        scale = block_abs_max / fp8_max
+        inv_scale = 1.0 / (scale + 1e-8)
+
+        # save scale
+        scales[:, block_idx] = scale.squeeze(1)
+
+        # quant
+        quantized_block = (block * inv_scale).to(fp8_dtype)
+        quantized[:, start:end] = quantized_block
+
+    return quantized, scales
+
+
+def _act_mul_and_blockwise_quant(gate_up):
+
+    def silu(x):
+        return x / (1 + (-x).exp())
+
+    # silu and mul
+    gate_up = gate_up.float()
+    gate, up = torch.chunk(gate_up.float(), 2, dim=1)
+    out = silu(gate) * up
+
+    # block wise quant
+    outfp8, out_scale = _quantize_blockwise_fp8(out)
+
+    # m-major --> k-major
+    new_out_scale = out_scale.T.contiguous().T
+    return outfp8, new_out_scale
+
+
+@pytest.mark.parametrize("num_batch", [29, 64, 62 * 1024, 128 * 1024])
+@pytest.mark.parametrize("intermediate_size", [4096, 512, 1024])
+def test_act_mul_and_blokcwise_quant(num_batch, intermediate_size):
+    gate_up_out = torch.randn(
+        (num_batch, intermediate_size * 2), dtype=torch.bfloat16, device="cuda"
+    )
+
+    my, my_scale = hpc.act_mul_and_blockwise_quant(gate_up_out)
+
+    gt, gt_scale = _act_mul_and_blockwise_quant(gate_up_out)
+
+    assert my_scale.stride() == gt_scale.stride()
+    assert allclose(gt_scale, my_scale)
+    assert allclose(gt.to(torch.float32), my.to(torch.float32), atol=32, rtol=0.01)
