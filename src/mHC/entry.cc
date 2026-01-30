@@ -13,30 +13,22 @@ namespace hpc {
 namespace mHC {
 
 torch::Tensor fuse_cal_mixes_hat_hat_H_and_r_entry(const torch::Tensor &input,
-                                                   const torch::Tensor &weight_a,
-                                                   const torch::Tensor &weight_b, double norm_eps) {
+                                                   const torch::Tensor &weight, double norm_eps) {
   auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
   TORCH_CHECK(input.is_contiguous(), "input tensor must be contiguous");
-  TORCH_CHECK(weight_a.is_contiguous(), "weight_a tensor must be contiguous");
-  TORCH_CHECK(weight_b.is_contiguous(), "weight_b tensor must be contiguous");
+  TORCH_CHECK(weight.is_contiguous(), "weight tensor must be contiguous");
 
   TORCH_CHECK(input.device().is_cuda(), "input tensor's device must be cuda");
-  TORCH_CHECK(weight_a.device().is_cuda(), "weight_a tensor's device must be cuda");
-  TORCH_CHECK(weight_b.device().is_cuda(), "weight_b tensor's device must be cuda");
+  TORCH_CHECK(weight.device().is_cuda(), "weight tensor's device must be cuda");
 
   TORCH_CHECK(input.scalar_type() == torch::kBFloat16, "input tensor data type must be bfloat16");
-  TORCH_CHECK(weight_a.scalar_type() == torch::kBFloat16,
-              "weight_a tensor data type must be bfloat16");
-  TORCH_CHECK(weight_b.scalar_type() == torch::kBFloat16,
-              "weight_b tensor data type must be bfloat16");
+  TORCH_CHECK(weight.scalar_type() == torch::kBFloat16, "weight tensor data type must be bfloat16");
 
   TORCH_CHECK(input.dim() == 2, "input tensor's dim must be 2");
-  TORCH_CHECK(weight_a.dim() == 2, "weight_a tensor's dim must be 2");
-  TORCH_CHECK(weight_b.dim() == 2, "weight_b tensor's dim must be 2");
+  TORCH_CHECK(weight.dim() == 2, "weight tensor's dim must be 2");
 
-  TORCH_CHECK(input.size(1) == weight_a.size(1), "input and weight_a must be same in last dim");
-  TORCH_CHECK(input.size(1) == weight_b.size(1), "input and weight_b must be same in last dim");
+  TORCH_CHECK(input.size(1) == weight.size(1), "input and weight must be same in last dim");
   TORCH_CHECK(input.size(1) == 16384, "only support hc dim is 16384");
 
   int num_batch = input.size(0);
@@ -204,7 +196,7 @@ torch::Tensor fuse_H_post_mapping_H_res_mapping_and_residual_add_entry(
 
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
-      "fuse_cal_mixes_hat_hat_H_and_r(Tensor input, Tensor weight_a, Tensor weight_b, float "
+      "fuse_cal_mixes_hat_hat_H_and_r(Tensor input, Tensor weight, float "
       "norm_eps) -> "
       "Tensor output_mixes");
   m.impl("fuse_cal_mixes_hat_hat_H_and_r", torch::kCUDA,

@@ -43,7 +43,8 @@ def test_fuse_cal_mixes_hat_hat_H_and_r(num_batch, hc_dim, mix_hc, norm_eps):
 
     w_a = w.to(dtype=torch.bfloat16)
     w_b = ((w - w_a.float()) * (256)).to(dtype=torch.bfloat16)
-    real_mixes = hpc.fuse_cal_mixes_hat_hat_H_and_r(x, w_a, w_b, norm_eps)
+    new_w = torch.cat([w_a, w_b], dim=0)
+    real_mixes = hpc.fuse_cal_mixes_hat_hat_H_and_r(x, new_w, norm_eps)
 
     assert allclose(ref_mixes, real_mixes, atol=0.3, rtol=4e-4)
 

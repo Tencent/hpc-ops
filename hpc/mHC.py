@@ -3,14 +3,13 @@ from torch import Tensor
 from typing import Tuple
 
 
-def fuse_cal_mixes_hat_hat_H_and_r(
-    x: Tensor, w_a: Tensor, w_b: Tensor, norm_eps: float = 1e-6
-) -> Tensor:
+def fuse_cal_mixes_hat_hat_H_and_r(x: Tensor, w: Tensor, norm_eps: float = 1e-6) -> Tensor:
     """Applies inverse root mean square of x, and linear porj for x and w.
     Specifically:
     1. r = torch.rsqrt(x.square().mean(dim=-1) + norm_eps)
     2. x = x / r
-    3. mixes_hat_hat_H = torch.mm(x, w_a.T, out_dtype=torch.float32) + (2**-8) * torch.mm(x, w_b.T, out_dtype=torch.float32)
+    3. gemm_out = torch.mm(x, w.T, out_dtype=torch.float32)
+    4. mixes_hat_hat_H = gemm_out[:,:mix_hc] + (2**-8) * gemm_out[:,mix_hc:]
 
     Executes via a custom high-performance GPU kernel.
 
@@ -19,12 +18,8 @@ def fuse_cal_mixes_hat_hat_H_and_r(
           Shape: [N, hc_dim] (N = batch size, hc_dim = hc_mult * d, hc_mult = HC expand ratio, d = hidden dim)
           Dtype: bfloat16
 
-      w_a: high bit of hc linear proj weight.
-          Shape: [mix_hc, hc_dim] (mix_hc = (2 + hc_mult) * hc_mult, hc_mult = HC expand ratio)
-          Dtype: bfloat16
-
-      w_b: low bit of hc linear proj weight.
-          Shape: [mix_hc, hc_dim] (mix_hc = (2 + hc_mult) * hc_mult, hc_mult = HC expand ratio)
+      w: high bit and low bit of hc linear proj weight.
+          Shape: [2 * mix_hc, hc_dim] (mix_hc = (2 + hc_mult) * hc_mult, hc_mult = HC expand ratio)
           Dtype: bfloat16
 
       norm_eps: norm eps, float, default value is 1e-6
@@ -35,11 +30,11 @@ def fuse_cal_mixes_hat_hat_H_and_r(
           Dtype: float32
     """
 
-    norm_x = torch.ops.hpc.fuse_cal_mixes_hat_hat_H_and_r(x, w_a, w_b, norm_eps)
+    norm_x = torch.ops.hpc.fuse_cal_mixes_hat_hat_H_and_r(x, w, norm_eps)
     # TODO(lando): remove torch impl
-    mixes_hat_hat_H = torch.mm(norm_x, w_a.T, out_dtype=torch.float32) + (1 / 256) * torch.mm(
-        norm_x, w_b.T, out_dtype=torch.float32
-    )
+    gemm_out = torch.mm(norm_x, w.T, out_dtype=torch.float32)
+    mix_hc = gemm_out.size(-1) // 2
+    mixes_hat_hat_H = gemm_out[:, :mix_hc] + (2**-8) * gemm_out[:, mix_hc:]
     return mixes_hat_hat_H
 
 
