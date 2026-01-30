@@ -77,17 +77,20 @@ torch::Tensor fused_repetition_penalties_softmax_entry(
   return out;
 }
 
-torch::Tensor topk_mask_logits_entry(const torch::Tensor& logits, std::optional<torch::Tensor> topk,
-                                     int64_t topk_val,
-                                     std::optional<torch::Tensor> reject_threshold,
-                                     double reject_threshold_val) {
+torch::Tensor topk_topp_mask_logits_entry(const torch::Tensor& logits,
+                                          std::optional<torch::Tensor> topk, int64_t topk_val,
+                                          std::optional<torch::Tensor> topp, double topp_val,
+                                          std::optional<torch::Tensor> reject_threshold,
+                                          double reject_threshold_val) {
   auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
   TORCH_CHECK(logits.is_contiguous(), "input tensor must be contiguous");
   TORCH_CHECK(logits.dtype() == torch::kFloat32,
               "logits must be float32 for current implementation");
 
   int int_bytes = 0;
+  void* topk_ptr = nullptr;
   if (topk.has_value()) {
+    topk_ptr = topk->data_ptr();
     TORCH_CHECK(topk->is_contiguous(), "topk tensor must be contiguous");
     if (topk->scalar_type() == torch::kInt32) {
       int_bytes = sizeof(int);
@@ -97,6 +100,14 @@ torch::Tensor topk_mask_logits_entry(const torch::Tensor& logits, std::optional<
       TORCH_CHECK(false, "topk dtype must be int32 or int64");
     }
   }
+
+  void* topp_ptr = nullptr;
+  if (topp.has_value()) {
+    topp_ptr = topp->data_ptr();
+    TORCH_CHECK(topp->is_contiguous(), "topp tensor must be contiguous");
+    TORCH_CHECK(topp->scalar_type() == torch::kFloat32, "topp dtype must be float32");
+  }
+
   if (reject_threshold.has_value()) {
     TORCH_CHECK(reject_threshold->is_contiguous(), "reject_threshold tensor must be contiguous");
   }
@@ -125,18 +136,16 @@ torch::Tensor topk_mask_logits_entry(const torch::Tensor& logits, std::optional<
   void* middle_logits_ptr = middle_logits.mutable_data_ptr();
   void* middle_tokens_ptr = middle_tokens.mutable_data_ptr();
   void* logits_ptr = logits.data_ptr();
-  void* topk_ptr = nullptr;
-  if (topk.has_value()) {
-    topk_ptr = topk->data_ptr();
-  }
+
   void* reject_threshold_ptr = nullptr;
   if (reject_threshold.has_value()) {
     reject_threshold_ptr = reject_threshold->data_ptr();
   }
 
-  topk_mask_logits_async(output_logits_ptr, sample_tokens_ptr, middle_logits_ptr, middle_tokens_ptr,
-                         logits_ptr, topk_ptr, topk_val, reject_threshold_ptr, reject_threshold_val,
-                         batch_size, vocab_size, vocab_size_padded, int_bytes, stream);
+  topk_topp_mask_logits_async(output_logits_ptr, sample_tokens_ptr, middle_logits_ptr,
+                              middle_tokens_ptr, logits_ptr, topk_ptr, topk_val, topp_ptr, topp_val,
+                              reject_threshold_ptr, reject_threshold_val, batch_size, vocab_size,
+                              vocab_size_padded, int_bytes, stream);
 
   return output_logits;
 }
@@ -151,7 +160,8 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.impl("fused_repetition_penalties_softmax", torch::kCUDA,
          &hpc::sampler::fused_repetition_penalties_softmax_entry);
   m.def(
-      "topk_mask_logits(Tensor logits, Tensor? topk, int topk_val, Tensor? reject_threshold, "
+      "topk_topp_mask_logits(Tensor logits, Tensor? topk, int topk_val,Tensor? topp, float "
+      "topp_val, Tensor? reject_threshold, "
       "float reject_threshold_val) -> Tensor");
-  m.impl("topk_mask_logits", torch::kCUDA, &hpc::sampler::topk_mask_logits_entry);
+  m.impl("topk_topp_mask_logits", torch::kCUDA, &hpc::sampler::topk_topp_mask_logits_entry);
 }
