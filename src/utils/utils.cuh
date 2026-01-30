@@ -594,6 +594,10 @@ __forceinline__ __device__ void cpasync_barrier_arrive_noinc(uint64_t const *sme
       : "r"(smem_addr));
 }
 
+__device__ __forceinline__ void fence_async_global() {
+  asm volatile("fence.proxy.async.global;\n");
+}
+
 }  // namespace hpc
 
 #endif  // SRC_UTILS_UTILS_CUH_

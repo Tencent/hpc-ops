@@ -85,7 +85,8 @@ torch::Tensor gemm_blockwise_entry(const torch::Tensor &x, const torch::Tensor &
 }
 
 torch::Tensor gemm_bf16xfp32_entry(const torch::Tensor &x, const torch::Tensor &w_high,
-                                   const torch::Tensor &w_low, double scale, bool use_fp32_output) {
+                                   const torch::Tensor &w_low, double scale, bool use_fp32_output,
+                                   std::optional<torch::Tensor> split_flag) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   TORCH_CHECK(x.is_contiguous(), "x tensor must be contiguous");
   TORCH_CHECK(w_high.is_contiguous(), "w_high tensor must be contiguous");
@@ -99,11 +100,41 @@ torch::Tensor gemm_bf16xfp32_entry(const torch::Tensor &x, const torch::Tensor &
   int k = x.size(1);
   int n = w_high.size(0);
 
+  TORCH_CHECK(n % 128 == 0, "n must to be divided by 128.");
+
   auto options = x.options();
 
   auto out_dtype = torch::kBFloat16;
   if (use_fp32_output) {
     out_dtype = torch::kFloat32;
+  }
+
+  int split_k = 1;
+  torch::Tensor split_y;
+  torch::Tensor split_flag_tensor;
+  void *split_y_ptr = nullptr;
+  void *split_flag_ptr = nullptr;
+
+  if (m <= 32) {
+    // use wgmma 64x16x16 instruction and splitk.
+    if (n == 512) {
+      split_k = 8;
+    } else if (n == 1024) {
+      split_k = 4;
+    } else if (n == 2048) {
+      split_k = 2;
+    }
+  }
+
+  if (split_k != 1) {
+    split_y = torch::empty({split_k, m, n}, options.dtype(torch::kFloat32));
+    if (split_flag.has_value()) {
+      split_flag_tensor = split_flag.value();
+    } else {
+      split_flag_tensor = torch::zeros({(m + 15) / 16, n / 128}, options.dtype(torch::kInt32));
+    }
+    split_y_ptr = split_y.mutable_data_ptr();
+    split_flag_ptr = split_flag_tensor.mutable_data_ptr();
   }
 
   torch::Tensor y = torch::empty({m, n}, options.dtype(out_dtype));
@@ -113,8 +144,8 @@ torch::Tensor gemm_bf16xfp32_entry(const torch::Tensor &x, const torch::Tensor &
   const auto *w_low_ptr = w_low.const_data_ptr();
   auto *y_ptr = y.mutable_data_ptr();
 
-  bool running = gemm_bf16xfp32_async(y_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
-                                      use_fp32_output, stream);
+  bool running = gemm_bf16xfp32_async(y_ptr, split_y_ptr, split_flag_ptr, x_ptr, w_high_ptr,
+                                      w_low_ptr, m, n, k, scale, use_fp32_output, split_k, stream);
 
   TORCH_CHECK(running, "gemm_bf16xfp32 launch failed!");
 
@@ -135,6 +166,6 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 
   m.def(
       "gemm_bf16xfp32(Tensor x, Tensor w_high, Tensor w_low, "
-      "float scale, bool use_fp32_output) -> (Tensor)");
+      "float scale, bool use_fp32_output, Tensor? split_flag) -> (Tensor)");
   m.impl("gemm_bf16xfp32", torch::kCUDA, &hpc::gemm::gemm_bf16xfp32_entry);
 }

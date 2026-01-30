@@ -14,7 +14,8 @@ from utils import allclose
 @pytest.mark.parametrize("n", [512, 1024, 2048])
 @pytest.mark.parametrize("k", [4096])
 @pytest.mark.parametrize("use_fp32_output", [True, False])
-def test_gemm_bf16xfp32(m, n, k, use_fp32_output):
+@pytest.mark.parametrize("use_split_flag", [True, False])
+def test_gemm_bf16xfp32(m, n, k, use_fp32_output, use_split_flag):
     dtype = torch.bfloat16
 
     x = torch.randn((m, k), dtype=torch.float, device="cuda").to(dtype)
@@ -24,8 +25,15 @@ def test_gemm_bf16xfp32(m, n, k, use_fp32_output):
     w_high = w.to(torch.bfloat16)
     w_low = ((w - w_high.float()) / scale).to(torch.bfloat16)
 
+    split_flag = None
+    if use_split_flag:
+        split_flag = hpc.get_gemm_bf16xfp32_workspace(n)
+
     gt = torch.matmul(x.float(), w.t())
 
-    my = hpc.gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output)
+    my = hpc.gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output, split_flag)
+
+    if use_split_flag:
+        assert (split_flag == 0).all()
 
     assert allclose(gt, my.float(), rtol=0.08, atol=0.01)

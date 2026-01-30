@@ -16,12 +16,12 @@ namespace gemm {
 
 namespace kernels {
 
-template <int kBlockSwizzle>
+template <int kBlockSwizzle, int kSplitK>
 __device__ __forceinline__ auto get_next_tile(int iblock, int num_tile_m, int num_tile_n,
                                               cutlass::FastDivmod swizzle_divider,
                                               cutlass::FastDivmod flat_divider) {
   int itile_m, itile_n;
-  int num_tile_bxn = kBlockSwizzle * num_tile_n;
+  int num_tile_bxn = kBlockSwizzle * num_tile_n * kSplitK;
   int total_sizzle_blocks = num_tile_m / kBlockSwizzle * num_tile_bxn;
 
   if (iblock >= total_sizzle_blocks) {
@@ -34,18 +34,59 @@ __device__ __forceinline__ auto get_next_tile(int iblock, int num_tile_m, int nu
     itile_n = i_bxn_res / kBlockSwizzle;
   }
 
-  return cute::make_tuple(itile_m, itile_n);
+  int ichunk = itile_n % kSplitK;
+  itile_n = itile_n / kSplitK;
+
+  return cute::make_tuple(itile_m, itile_n, ichunk);
 }
 
-template <typename Tin, typename Tout, typename TiledMma, typename TmaX, typename TmaWH,
-          typename TmaWL, typename TmaY, int kTileM, int kTileN, int kTileK, int kStage,
-          int kWarpGroupN, typename SLayoutX, typename SLayoutW, typename SLayoutY,
-          int kBlockSwizzle>
+template <typename Tout, int kTileM, int kTileN, int kSplitK, int kWarpCount>
+__device__ __forceinline__ void splitk_reduce(Tout *y_ptr, float *splitk_y_ptr, int m, int n,
+                                              int itile_m, int itile_n) {
+  int iwarp = threadIdx.x / 32;
+  int ilane = threadIdx.x % 32;
+
+  if (itile_m * kTileM + iwarp >= m) {
+    return;
+  }
+
+  auto *y_tile = y_ptr + (itile_m * kTileM + iwarp) * n + itile_n * kTileN + ilane * 4;
+  auto *splitk_y_tile =
+      splitk_y_ptr + (itile_m * kTileM + iwarp) * n + itile_n * kTileN + ilane * 4;
+
+  int local_m = m - (itile_m * kTileM + iwarp);
+
+#pragma unroll
+  for (int irow = 0; irow < kTileM; irow += kWarpCount) {
+    if (irow >= local_m) {
+      return;
+    }
+    auto y = load<float, 4>(splitk_y_tile + irow * n);
+
+#pragma unroll
+    for (int ichunk = 1; ichunk < kSplitK; ++ichunk) {
+      auto split_y = load<float, 4>(splitk_y_tile + ichunk * m * n + irow * n);
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        y[i] += split_y[i];
+      }
+    }
+
+    store(y_tile + irow * n, to<Tout>(y));
+  }
+}
+
+template <typename Tin, typename TY, typename Tout, typename TiledMma, typename TmaX,
+          typename TmaWH, typename TmaWL, typename TmaY, int kTileM, int kTileN, int kTileK,
+          int kStage, int kWarpGroupN, typename SLayoutX, typename SLayoutW, typename SLayoutY,
+          int kBlockSwizzle, int kSplitK>
 __global__ void __launch_bounds__(384, 1)
     gemm_bf16xfp32_kernel(const __grid_constant__ TmaX tma_x, const __grid_constant__ TmaWH tma_wh,
                           const __grid_constant__ TmaWL tma_wl, const __grid_constant__ TmaY tma_y,
-                          int m, int n, int k, float scale, cutlass::FastDivmod swizzle_divider,
-                          cutlass::FastDivmod flat_divider) {
+                          Tout *y_ptr, float *splitk_y_ptr, int *split_flag_ptr, int m, int n,
+                          int k, float scale, cutlass::FastDivmod swizzle_divider,
+                          cutlass::FastDivmod flat_divider,
+                          cutlass::FastDivmod reduce_flat_divider) {
   using namespace cute;  // NOLINT
 
   int idx = threadIdx.x;
@@ -67,7 +108,7 @@ __global__ void __launch_bounds__(384, 1)
   extern __shared__ uint8_t shm_data[] alignas(128);
   auto *shm_x = (Tin *)shm_data;
   auto *shm_w = (Tin *)shm_x + cosize(SLayoutX{});
-  auto *shm_y = (Tout *)(shm_w + cosize(SLayoutW{}));
+  auto *shm_y = (TY *)(shm_w + cosize(SLayoutW{}));
 
   auto sX = make_tensor(make_smem_ptr(shm_x), SLayoutX{});
   auto sW = make_tensor(make_smem_ptr(shm_w), SLayoutW{});
@@ -76,7 +117,7 @@ __global__ void __launch_bounds__(384, 1)
   auto gWH = tma_wh.get_tma_tensor(make_shape(n, k));
   auto gWL = tma_wl.get_tma_tensor(make_shape(n, k));
 
-  auto gY = make_tensor(make_gmem_ptr((Tout *)(nullptr)), make_shape(Int<kTileN>{}, Int<kTileM>{}),
+  auto gY = make_tensor(make_gmem_ptr((float *)(nullptr)), make_shape(Int<kTileN>{}, Int<kTileM>{}),
                         make_stride(Int<kTileM>{}, Int<1>{}));
 
   auto btma_x = tma_x.get_slice(0);
@@ -133,8 +174,8 @@ __global__ void __launch_bounds__(384, 1)
       int ntile_k = size<2>(tXg);
 
       while (true) {
-        auto [itile_m, itile_n] = get_next_tile<kBlockSwizzle>(iblock, num_tile_m, num_tile_n,
-                                                               swizzle_divider, flat_divider);
+        auto [itile_m, itile_n, ichunk] = get_next_tile<kBlockSwizzle, kSplitK>(
+            iblock, num_tile_m, num_tile_n, swizzle_divider, flat_divider);
 
         if (itile_m >= num_tile_m) {
           break;
@@ -143,7 +184,7 @@ __global__ void __launch_bounds__(384, 1)
         iblock += gridDim.x;
 
 #pragma unroll 1
-        for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
+        for (int itile_k = ichunk; itile_k < ntile_k; itile_k += kSplitK) {
           // load a
           wait_barrier(writable_x[ismem_write], phase);
           cute::copy(tma_x.with(readable_x[ismem_write]), tXg(_, itile_m, itile_k),
@@ -207,9 +248,11 @@ __global__ void __launch_bounds__(384, 1)
     int phase = 0;
 
     int iblock = blockIdx.x;
+    int last_tile_m = -1;
+    int last_tile_n = -1;
     while (true) {
-      auto [itile_m, itile_n] = get_next_tile<kBlockSwizzle>(iblock, num_tile_m, num_tile_n,
-                                                             swizzle_divider, flat_divider);
+      auto [itile_m, itile_n, ichunk] = get_next_tile<kBlockSwizzle, kSplitK>(
+          iblock, num_tile_m, num_tile_n, swizzle_divider, flat_divider);
       if (itile_m >= num_tile_m) {
         break;
       }
@@ -222,7 +265,7 @@ __global__ void __launch_bounds__(384, 1)
 
       tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
 #pragma unroll 1
-      for (int itilek = 0; itilek < ntile_k; ++itilek) {
+      for (int itilek = ichunk; itilek < ntile_k; itilek += kSplitK) {
         wait_barrier(readable_x[ismem_read], phase);
 
         // mma low
@@ -271,20 +314,20 @@ __global__ void __launch_bounds__(384, 1)
       }
 
       // float32 -> bfloat16
-      auto tYrh = make_tensor_like<Tout>(tYr_low);
+      auto tYrh = make_tensor_like<TY>(tYr_low);
 
 #pragma unroll
       for (int i = 0; i < size(tYr_low); ++i) {
-        tYrh(i) = (Tout)(tYr_low(i) * scale + tYr_high(i));
+        tYrh(i) = (TY)(tYr_low(i) * scale + tYr_high(i));
       }
 
       using STSM_ATOM =
           std::conditional_t<kTileM == 8, cute::SM90_U16x4_STSM_T, cute::SM90_U16x8_STSM_T>;
       using STS_ATOM =
-          std::conditional_t<std::is_same_v<Tout, float>, UniversalCopy<uint32_t>, STSM_ATOM>;
+          std::conditional_t<std::is_same_v<TY, float>, UniversalCopy<uint32_t>, STSM_ATOM>;
       // Epilogue
-      auto sY = make_tensor(make_smem_ptr((Tout *)shm_y), SLayoutY{});  // (M, N)
-      using R2SCopyAtomY = Copy_Atom<STS_ATOM, Tout>;
+      auto sY = make_tensor(make_smem_ptr((TY *)shm_y), SLayoutY{});  // (M, N)
+      using R2SCopyAtomY = Copy_Atom<STS_ATOM, TY>;
       auto tiled_copy_y = make_tiled_copy_C(R2SCopyAtomY{}, tiled_mma);
       auto thr_copy_y = tiled_copy_y.get_slice(idx_in_warpgroup);
 
@@ -296,18 +339,70 @@ __global__ void __launch_bounds__(384, 1)
 
       cute::copy(tiled_copy_y, tYr4s, tYs4r(_, _, _, iwarpgroup));
 
+      if constexpr (kSplitK > 1) {
+        if (is_leader_in_warpgroup) {
+          if (last_tile_m != -1 && last_tile_n != -1) {
+            auto *split_flag = split_flag_ptr + last_tile_m * num_tile_n + last_tile_n;
+            atomicAdd(split_flag, 1);
+          }
+          last_tile_m = itile_m;
+          last_tile_n = itile_n;
+        }
+      }
+
       syncwarpgroup(iwarpgroup);
       cute::tma_store_fence();
 
       if (is_leader_in_warpgroup) {
-        auto gY = tma_y.get_tma_tensor(make_shape(n, m));
+        auto gYY = tma_y.get_tma_tensor(make_shape(n, m, kSplitK));
         auto btma_y = tma_y.get_slice(0);
 
-        auto tYs = btma_y.partition_S(sY);  // (TMA, _2, _1)
-        auto tYg = btma_y.partition_D(gY);  // (TMA, TMA_M, TMA_N)
+        auto tYs = btma_y.partition_S(sY);   // (TMA, _2, _1)
+        auto tYg = btma_y.partition_D(gYY);  // (TMA, TMA_M, TMA_N)
 
-        cute::copy(tma_y, tYs(_, 0, 0, iwarpgroup), tYg(_, 2 * itile_n + iwarpgroup, itile_m));
+        cute::copy(tma_y, tYs(_, 0, 0, iwarpgroup),
+                   tYg(_, 2 * itile_n + iwarpgroup, itile_m, ichunk));
         tma_store_arrive();
+      }
+    }
+
+    if constexpr (kSplitK > 1) {
+      cute::tma_store_wait<0>();
+
+      fence_async_global();
+      __threadfence();
+      syncwarpgroup(iwarpgroup);
+
+      if (is_leader_in_warpgroup) {
+        if (last_tile_m != -1 && last_tile_n != -1) {
+          auto *split_flag = split_flag_ptr + last_tile_m * num_tile_n + last_tile_n;
+          atomicAdd(split_flag, 1);
+        }
+      }
+
+      bar_sync<128 * kWarpGroupN>(kWarpGroupN);
+
+      iblock = blockIdx.x;
+      __threadfence();
+      using NVTout = std::conditional_t<std::is_same_v<Tout, float>, float, __nv_bfloat16>;
+      while (true) {
+        int itile_m, itile_n;
+        reduce_flat_divider(itile_m, itile_n, iblock);
+
+        if (itile_m >= num_tile_m) {
+          break;
+        }
+        iblock += gridDim.x;
+        auto *split_flag = split_flag_ptr + itile_m * num_tile_n + itile_n;
+        while (load_global_volatile(split_flag) != kSplitK * kWarpGroupN) {
+        }
+        splitk_reduce<NVTout, kTileM, kTileN * kWarpGroupN, kSplitK, 128 * kWarpGroupN / 32>(
+            reinterpret_cast<NVTout *>(y_ptr), splitk_y_ptr, m, n, itile_m, itile_n);
+        bar_sync<128 * kWarpGroupN>(kWarpGroupN);
+        // reset flag
+        if (is_leader_in_warpgroup && iwarpgroup == 0) {
+          *split_flag = 0;
+        }
       }
     }
   }
@@ -316,13 +411,15 @@ __global__ void __launch_bounds__(384, 1)
 }  // namespace kernels
 
 template <typename Tin, typename Tout, int kTileM, int kTileN, int kTileK, int kStage,
-          int kWarpGroupN>
-void launch_gemm_bf16xfp32_kernel(void *y_ptr, const void *x_ptr, const void *w_high_ptr,
-                                  const void *w_low_ptr, int m, int n, int k, float scale,
-                                  cudaStream_t stream) {
+          int kWarpGroupN, int kSplitK>
+void launch_gemm_bf16xfp32_kernel(void *y_ptr, void *splitk_y_ptr, void *split_flag_ptr,
+                                  const void *x_ptr, const void *w_high_ptr, const void *w_low_ptr,
+                                  int m, int n, int k, float scale, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   constexpr int kBlockSwizzle = 4;
+
+  using TY = std::conditional_t<(kSplitK > 1), float, Tout>;
 
   auto X = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x_ptr)), make_shape(m, k),
                        make_stride(k, Int<1>{}));
@@ -330,19 +427,19 @@ void launch_gemm_bf16xfp32_kernel(void *y_ptr, const void *x_ptr, const void *w_
                             make_shape(n, k), make_stride(k, Int<1>{}));
   auto W_LOW = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(w_low_ptr)),
                            make_shape(n, k), make_stride(k, Int<1>{}));
-  auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(y_ptr)), make_shape(n, m),
-                       make_stride(Int<1>{}, n));
+  auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<TY *>(kSplitK > 1 ? splitk_y_ptr : y_ptr)),
+                       make_shape(n, m, kSplitK), make_stride(Int<1>{}, n, n * m));
 
   auto slayout_x = tile_to_shape(GMMA::Layout_K_SW128_Atom<Tin>{},
                                  make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{}));
   auto slayout_w = tile_to_shape(
       GMMA::Layout_K_SW128_Atom<Tin>{},
       make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kWarpGroupN>{}, Int<2>{}, Int<kStage>{}));
-  auto slayout_y = tile_to_shape(GMMA::Layout_MN_SW128_Atom<Tout>{},
+  auto slayout_y = tile_to_shape(GMMA::Layout_MN_SW128_Atom<TY>{},
                                  make_shape(Int<kTileN>{}, Int<kTileM>{}, Int<kWarpGroupN>{}));
 
   int shm_xw = sizeof(Tin) * (cosize(slayout_x) + cosize(slayout_w));
-  int shm_y = sizeof(Tout) * cosize(slayout_y);
+  int shm_y = sizeof(TY) * cosize(slayout_y);
   int shm_size = shm_xw + shm_y;
 
   auto tma_x = make_tma_copy(SM90_TMA_LOAD{}, X, take<0, 2>(slayout_x));
@@ -352,49 +449,93 @@ void launch_gemm_bf16xfp32_kernel(void *y_ptr, const void *x_ptr, const void *w_
 
   using MMA_ATOM =
       std::conditional_t<kTileM == 64, SM90_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>,
-                         SM90_64x8x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>>;
+                         SM90_64x16x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>>;
 
   auto tiled_mma = make_tiled_mma(MMA_ATOM{});
 
-  auto kernel =
-      kernels::gemm_bf16xfp32_kernel<Tin, Tout, decltype(tiled_mma), decltype(tma_x),
-                                     decltype(tma_wh), decltype(tma_wl), decltype(tma_y), kTileM,
-                                     kTileN, kTileK, kStage, kWarpGroupN, decltype(slayout_x),
-                                     decltype(slayout_w), decltype(slayout_y), kBlockSwizzle>;
+  auto kernel = kernels::gemm_bf16xfp32_kernel<
+      Tin, TY, Tout, decltype(tiled_mma), decltype(tma_x), decltype(tma_wh), decltype(tma_wl),
+      decltype(tma_y), kTileM, kTileN, kTileK, kStage, kWarpGroupN, decltype(slayout_x),
+      decltype(slayout_w), decltype(slayout_y), kBlockSwizzle, kSplitK>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
   int num_tile_m = (m + kTileM - 1) / kTileM;
-  int num_tile_n = (n + (kTileN * kWarpGroupN) - 1) / (kTileN * kWarpGroupN);
+  int num_tile_n = (n + (kTileN * kWarpGroupN) - 1) / (kTileN * kWarpGroupN) * kSplitK;
   int num_tile = num_tile_m * num_tile_n;
   int num_tile_bxn = kBlockSwizzle * num_tile_n;
   cutlass::FastDivmod swizzle_divider(num_tile_bxn);
   cutlass::FastDivmod flat_divider(num_tile_n);
+  cutlass::FastDivmod reduce_flat_divider(num_tile_n / kSplitK);
 
   dim3 block(size(tiled_mma) * kWarpGroupN + 128);
   dim3 grid(std::min(get_sm_count(), num_tile));
 
-  kernel<<<grid, block, shm_size, stream>>>(tma_x, tma_wh, tma_wl, tma_y, m, n, k, scale,
-                                            swizzle_divider, flat_divider);
+  kernel<<<grid, block, shm_size, stream>>>(
+      tma_x, tma_wh, tma_wl, tma_y, reinterpret_cast<Tout *>(y_ptr),
+      reinterpret_cast<float *>(splitk_y_ptr), reinterpret_cast<int *>(split_flag_ptr), m, n, k,
+      scale, swizzle_divider, flat_divider, reduce_flat_divider);
 }
 
-bool gemm_bf16xfp32_async(void *y_ptr, const void *x_ptr, const void *w_high_ptr,
-                          const void *w_low_ptr, int m, int n, int k, float scale,
-                          bool use_fp32_output, cudaStream_t stream) {
+bool gemm_bf16xfp32_async(void *y_ptr, void *splitk_y_ptr, void *split_flag_ptr, const void *x_ptr,
+                          const void *w_high_ptr, const void *w_low_ptr, int m, int n, int k,
+                          float scale, bool use_fp32_output, int splitk, cudaStream_t stream) {
   if (use_fp32_output) {
-    if (m > 128) {
-      launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, float, 64, 64, 64, 2, 2>(
-          y_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale, stream);
+    if (m > 32) {
+      constexpr int kSplitK = 1;
+      launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, float, 64, 64, 64, 2, 2, kSplitK>(
+          y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
+          stream);
     } else {
-      launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, float, 8, 64, 128, 3, 2>(
-          y_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale, stream);
+      if (splitk == 8) {
+        constexpr int kSplitK = 8;
+        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, float, 16, 64, 128, 3, 2, kSplitK>(
+            y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
+            stream);
+      } else if (splitk == 4) {
+        constexpr int kSplitK = 4;
+        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, float, 16, 64, 128, 3, 2, kSplitK>(
+            y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
+            stream);
+      } else if (splitk == 2) {
+        constexpr int kSplitK = 2;
+        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, float, 16, 64, 128, 3, 2, kSplitK>(
+            y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
+            stream);
+      } else {
+        constexpr int kSplitK = 1;
+        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, float, 16, 64, 128, 3, 2, kSplitK>(
+            y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
+            stream);
+      }
     }
   } else {
-    if (m > 128) {
-      launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, cute::bfloat16_t, 64, 64, 64, 2, 2>(
-          y_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale, stream);
+    if (m > 32) {
+      constexpr int kSplitK = 1;
+      launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, cute::bfloat16_t, 64, 64, 64, 2, 2, kSplitK>(
+          y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
+          stream);
     } else {
-      launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, cute::bfloat16_t, 8, 64, 128, 3, 2>(
-          y_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale, stream);
+      if (splitk == 8) {
+        constexpr int kSplitK = 8;
+        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, cute::bfloat16_t, 16, 64, 128, 3, 2,
+                                     kSplitK>(y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr,
+                                              w_high_ptr, w_low_ptr, m, n, k, scale, stream);
+      } else if (splitk == 4) {
+        constexpr int kSplitK = 4;
+        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, cute::bfloat16_t, 16, 64, 128, 3, 2,
+                                     kSplitK>(y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr,
+                                              w_high_ptr, w_low_ptr, m, n, k, scale, stream);
+      } else if (splitk == 2) {
+        constexpr int kSplitK = 2;
+        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, cute::bfloat16_t, 16, 64, 128, 3, 2,
+                                     kSplitK>(y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr,
+                                              w_high_ptr, w_low_ptr, m, n, k, scale, stream);
+      } else {
+        constexpr int kSplitK = 1;
+        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, cute::bfloat16_t, 16, 64, 128, 3, 2,
+                                     kSplitK>(y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr,
+                                              w_high_ptr, w_low_ptr, m, n, k, scale, stream);
+      }
     }
   }
   return true;

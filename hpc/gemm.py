@@ -41,8 +41,23 @@ def gemm_blockwise(
     return torch.ops.hpc.gemm_blockwise(x, weight, x_scale, w_scale, bias)
 
 
+def get_gemm_bf16xfp32_workspace(max_weight_hidden_size: int) -> Tensor:
+    kTileM = 16
+    kTileN = 128
+
+    max_splitk_m = 32
+    return torch.zeros(
+        (max_splitk_m // kTileM, max_weight_hidden_size // kTileN), dtype=torch.int32, device="cuda"
+    )
+
+
 def gemm_bf16xfp32(
-    x: Tensor, w_high: Tensor, w_low: Tensor, scale: Tensor, use_fp32_output: bool = False
+    x: Tensor,
+    w_high: Tensor,
+    w_low: Tensor,
+    scale: Tensor,
+    use_fp32_output: bool = False,
+    split_flag: Tensor = None,
 ) -> Tensor:
     """Performs fp32 GEMM operation with two bf16 gemm.
     Where
@@ -66,13 +81,16 @@ def gemm_bf16xfp32(
         use_fp32_output: Control Output dtype is float32 or bfloat16
             Shape: Scalar
             Dtype: bfloat16
+        split_flag: Optinal Input indicates the split finish state, should be init zero at the beginning.
+            Shape: [max_tokens / kTileM, n / kTileN]
+            Dtype: int32
     Returns:
         Tensor: Output tensor after matrix multiplication
             Shape: [m, n]
             Dtype: bfloat16 or float32.
 
     """
-    return torch.ops.hpc.gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output)
+    return torch.ops.hpc.gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output, split_flag)
 
 
 @torch.library.register_fake("hpc::pad_and_transpose")
