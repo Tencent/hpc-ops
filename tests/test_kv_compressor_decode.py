@@ -280,7 +280,8 @@ def test_c128_kv_compressor_decode(batch, dim, ratio):
         [torch.zeros(1, dtype=torch.int, device="cuda"), cu_compressed_seqlens], dim=0
     ).to(torch.int32)
 
-    compressed_kv = hpc.kv_compressor_decode(
+    compressed_kv = torch.zeros(batch, dim, dtype=kv.dtype, device=kv.device)
+    hpc.kv_compressor_decode(
         kv,
         score,
         ape,
@@ -292,6 +293,7 @@ def test_c128_kv_compressor_decode(batch, dim, ratio):
         dim,
         ratio,
         False,
+        compressed_kv,
     )
 
     compressed_torch = compressor_torch(
@@ -345,7 +347,9 @@ def test_c4_kv_compressor_decode(batch, dim, ratio):
     cu_compressed_seqlens = torch.cat(
         [torch.zeros(1, dtype=torch.int, device="cuda"), cu_compressed_seqlens], dim=0
     ).to(torch.int32)
-    compressed_kv = hpc.kv_compressor_decode(
+
+    compressed_kv = torch.zeros(batch, dim, dtype=kv.dtype, device=kv.device)
+    hpc.kv_compressor_decode(
         kv,
         score,
         ape,
@@ -357,6 +361,7 @@ def test_c4_kv_compressor_decode(batch, dim, ratio):
         dim,
         ratio,
         True,
+        compressed_kv,
     )
 
     compressed_torch = compressor_torch(
@@ -413,7 +418,9 @@ def test_c128_kv_compressor_decode_mtp(batch, dim, ratio, mtp):
     cu_compressed_seqlens = torch.cat(
         [torch.zeros(1, dtype=torch.int, device="cuda"), cu_compressed_seqlens], dim=0
     ).to(torch.int32)
-    compressed_kv = hpc.kv_compressor_decode(
+
+    compressed_kv = torch.zeros(batch, dim, dtype=kv.dtype, device=kv.device)
+    hpc.kv_compressor_decode(
         kv,
         score,
         ape,
@@ -425,6 +432,7 @@ def test_c128_kv_compressor_decode_mtp(batch, dim, ratio, mtp):
         dim,
         ratio,
         False,
+        compressed_kv,
     )
 
     compressed_torch = compressor_torch(
@@ -484,7 +492,9 @@ def test_c4_kv_compressor_decode_mtp(batch, dim, ratio, mtp):
     cu_compressed_seqlens = torch.cat(
         [torch.zeros(1, dtype=torch.int, device="cuda"), cu_compressed_seqlens], dim=0
     ).to(torch.int32)
-    compressed_kv = hpc.kv_compressor_decode(
+
+    compressed_kv = torch.zeros(batch, dim, dtype=kv.dtype, device=kv.device)
+    hpc.kv_compressor_decode(
         kv,
         score,
         ape,
@@ -496,6 +506,7 @@ def test_c4_kv_compressor_decode_mtp(batch, dim, ratio, mtp):
         dim,
         ratio,
         True,
+        compressed_kv,
     )
 
     compressed_torch = compressor_torch(
