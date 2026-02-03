@@ -68,7 +68,7 @@ void fuse_moe_blockwise_fp8_async(
     int gate_up_weight_scale_lastdim_pad4, int down_weight_scale_lastdim_pad4, int rank_ep,
     cudaStream_t stream) {
   int total_num_tokens = num_tokens * num_topk;
-  int num_tokens_per_group_avg = total_num_tokens / num_expert_local;
+  int num_tokens_per_group_avg = total_num_tokens / num_expert_total;
 
   using T1 = __nv_bfloat16;
   using T2 = __nv_fp8_e4m3;
