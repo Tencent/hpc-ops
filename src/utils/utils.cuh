@@ -414,10 +414,10 @@ __device__ __forceinline__ constexpr auto retile_fragment(Tensor &&tensor) {
   using namespace cute;  // NOLINT
 
   constexpr int R = decltype(tensor.layout())::rank;
-  static_assert(R == 3, "we only support rank 3 fragment");
+  static_assert(R >= 3, "rank must geater than or equal to 3");
 
-  auto thr_vmk = flatten(select<0>(tensor.layout()));
-  auto tile_mk = select<1, 2>(tensor.layout());
+  auto thr_vmk = append<3>(flatten(select<0>(tensor.layout())));
+  auto tile_mk = take<1, R>(tensor.layout());
 
   auto m_layout =
       coalesce(make_layout(make_shape(get<1>(thr_vmk.shape()), get<0>(tile_mk.shape())),
@@ -426,7 +426,14 @@ __device__ __forceinline__ constexpr auto retile_fragment(Tensor &&tensor) {
       make_shape(get<0>(thr_vmk.shape()), get<2>(thr_vmk.shape()), get<1>(tile_mk.shape())),
       make_stride(get<0>(thr_vmk.stride()), get<2>(thr_vmk.stride()), get<1>(tile_mk.stride()))));
 
-  return make_tensor(static_cast<Tensor &&>(tensor).data(), make_layout(m_layout, k_layout));
+  if constexpr (R == Int<3>{}) {
+    return make_tensor(static_cast<Tensor &&>(tensor).data(), make_layout(m_layout, k_layout));
+  } else {
+    auto r_layout = take<3, R>(make_layout(tensor.shape(), tensor.stride()));
+    auto mkr_layout = make_layout(m_layout, k_layout, r_layout);
+    auto t = make_tensor(static_cast<Tensor &&>(tensor).data(), mkr_layout);
+    return t(_, _, repeat<R - Int<3>{}>(_));
+  }
 }
 
 // STensor shape is (M, N) and row major
