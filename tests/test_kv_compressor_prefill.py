@@ -110,7 +110,7 @@ def compressor_torch(
         cur_seqlen = seqlens[ibatch]
         start_pos_this_batch = start_pos[ibatch]
 
-        if is_prefill:  # prefill
+        if start_pos_this_batch == 0 and is_prefill:  # prefill
             remainder = cur_seqlen % ratio
             cutoff = cur_seqlen - remainder
             if overlap:
@@ -209,6 +209,11 @@ def compressor_torch(
                         upper_partial_score = score_state[
                             cur_state_index, :ratio, :head_dim
                         ]  # [ratio,head_dim]
+                        if (
+                            start_pos_this_batch == 3
+                        ):  # for fist compression, overlap is non-existing
+                            upper_partial_kv.fill_(0)
+                            upper_partial_score.fill_(float("-inf"))
                         tmp_one_token_kv_for_compress = torch.cat(
                             [upper_partial_kv, kv_state[cur_state_index, ratio:, head_dim:]], dim=0
                         )
@@ -465,3 +470,288 @@ def test_compress_kv_prefill(batch, max_seqlen, head_dim, ratio):
     assert allclose(compressed_torch, compressed_kv, atol=1e-5)
     assert allclose(kv_state_for_torch, kv_state, atol=1e-5)
     assert allclose(score_state_for_torch, score_state, atol=1e-5)
+
+
+@pytest.mark.parametrize("batch", [117])
+@pytest.mark.parametrize("dim", [512])
+@pytest.mark.parametrize("ratio", [128])
+def test_c128_decode_by_prefill_kernel(batch, dim, ratio):
+    kv_state = torch.randn((batch, ratio, dim), dtype=torch.float, device="cuda")
+    score_state = torch.randn((batch, ratio, dim), dtype=torch.float, device="cuda")
+    state_index = torch.arange(batch, dtype=torch.int, device="cuda")
+    ape = torch.randn((ratio, dim), dtype=torch.float, device="cuda")
+
+    seqlens = torch.ones((batch,), dtype=torch.int, device="cuda")
+    cu_seqlens = torch.cumsum(seqlens, dim=0)
+    cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.int, device="cuda"), cu_seqlens], dim=0).to(
+        torch.int32
+    )
+
+    start_pos = torch.randint(low=0, high=127, size=(batch,), dtype=torch.int, device="cuda")
+    kv_state_for_torch = kv_state.clone()
+    score_state_for_torch = score_state.clone()
+
+    kv_and_score = torch.randn((batch, 2 * dim), dtype=torch.float, device="cuda")
+    kv, score = kv_and_score.split((dim, dim), dim=-1)
+
+    compressed_seqlens = ((start_pos + 1) % ratio == 0).to(torch.int32)
+    cu_compressed_seqlens = torch.cumsum(compressed_seqlens, dim=0)
+    cu_compressed_seqlens = torch.cat(
+        [torch.zeros(1, dtype=torch.int, device="cuda"), cu_compressed_seqlens], dim=0
+    ).to(torch.int32)
+    total_compressed_seqlen = cu_compressed_seqlens[-1].item()
+    compressed_kv = hpc.kv_compressor(
+        kv,
+        score,
+        cu_seqlens,
+        cu_compressed_seqlens,
+        total_compressed_seqlen,
+        kv_state,
+        score_state,
+        state_index,
+        start_pos,
+        ape,
+        ratio,
+        overlap=False,
+        head_dim=dim,
+        is_prefill=True,
+    )
+
+    compressed_torch = compressor_torch(
+        kv,
+        score,
+        cu_seqlens,
+        cu_compressed_seqlens,
+        kv_state_for_torch,
+        score_state_for_torch,
+        state_index,
+        start_pos,
+        ape,
+        ratio,
+        overlap=False,
+        head_dim=dim,
+        is_prefill=False,
+    )
+    assert allclose(kv_state, kv_state_for_torch)
+    assert allclose(score_state, score_state_for_torch)
+    valid_len = cu_compressed_seqlens[-1]
+    if valid_len:
+        assert allclose(
+            compressed_kv[:valid_len], compressed_torch[:valid_len], atol=1e-5, rtol=1e-5
+        )
+
+
+@pytest.mark.parametrize("batch", [111])
+@pytest.mark.parametrize("dim", [128, 512])
+@pytest.mark.parametrize("ratio", [4])
+def test_c4_decode_by_prefill_kernel(batch, dim, ratio):
+    kv_state = torch.randn((batch, 2 * ratio, 2 * dim), dtype=torch.float, device="cuda")
+    score_state = torch.randn((batch, 2 * ratio, 2 * dim), dtype=torch.float, device="cuda")
+    state_index = torch.arange(batch, dtype=torch.int, device="cuda")
+    ape = torch.randn((ratio, 2 * dim), dtype=torch.float, device="cuda")
+
+    seqlens = torch.ones((batch,), dtype=torch.int, device="cuda")
+    cu_seqlens = torch.cumsum(seqlens, dim=0)
+    cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.int, device="cuda"), cu_seqlens], dim=0).to(
+        torch.int32
+    )
+
+    start_pos = torch.randint(low=0, high=1117, size=(batch,), dtype=torch.int, device="cuda")
+    kv_state_for_torch = kv_state.clone()
+    score_state_for_torch = score_state.clone()
+
+    kv_and_score = torch.randn((batch, 2 * 2 * dim), dtype=torch.float, device="cuda")
+    kv, score = kv_and_score.split((2 * dim, 2 * dim), dim=-1)
+
+    compressed_seqlens = ((start_pos + 1) % ratio == 0).to(torch.int32)
+    cu_compressed_seqlens = torch.cumsum(compressed_seqlens, dim=0)
+    cu_compressed_seqlens = torch.cat(
+        [torch.zeros(1, dtype=torch.int, device="cuda"), cu_compressed_seqlens], dim=0
+    ).to(torch.int32)
+    total_compressed_seqlen = cu_compressed_seqlens[-1].item()
+    compressed_kv = hpc.kv_compressor(
+        kv,
+        score,
+        cu_seqlens,
+        cu_compressed_seqlens,
+        total_compressed_seqlen,
+        kv_state,
+        score_state,
+        state_index,
+        start_pos,
+        ape,
+        ratio,
+        overlap=True,
+        head_dim=dim,
+        is_prefill=True,
+    )
+
+    compressed_torch = compressor_torch(
+        kv,
+        score,
+        cu_seqlens,
+        cu_compressed_seqlens,
+        kv_state_for_torch,
+        score_state_for_torch,
+        state_index,
+        start_pos,
+        ape,
+        ratio,
+        overlap=True,
+        head_dim=dim,
+        is_prefill=False,
+    )
+    valid_len = cu_compressed_seqlens[-1]
+    if valid_len:
+        assert allclose(
+            compressed_kv[:valid_len], compressed_torch[:valid_len], atol=1e-5, rtol=1e-5
+        )
+    # not check state because it has some un-touched elems
+    # assert allclose(kv_state_for_torch, kv_state, atol=1e-5)
+
+
+@pytest.mark.parametrize("batch", [123])
+@pytest.mark.parametrize("dim", [512])
+@pytest.mark.parametrize("ratio", [128])
+@pytest.mark.parametrize("mtp", [1])
+def test_c128_decode_mtp_by_prefill_kernel(batch, dim, ratio, mtp):
+    assert mtp == 1
+
+    kv_state = torch.randn((batch, ratio, dim), dtype=torch.float, device="cuda")
+    score_state = torch.randn((batch, ratio, dim), dtype=torch.float, device="cuda")
+    state_index = torch.arange(batch, dtype=torch.int, device="cuda")
+    ape = torch.randn((ratio, dim), dtype=torch.float, device="cuda")
+
+    seqlens = torch.ones((batch,), dtype=torch.int, device="cuda") + mtp
+    cu_seqlens = torch.cumsum(seqlens, dim=0)
+    cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.int, device="cuda"), cu_seqlens], dim=0).to(
+        torch.int32
+    )
+
+    start_pos = torch.randint(low=0, high=127, size=(batch,), dtype=torch.int, device="cuda")
+    kv_state_for_torch = kv_state.clone()
+    score_state_for_torch = score_state.clone()
+
+    kv_and_score = torch.randn((batch * 2, 2 * dim), dtype=torch.float, device="cuda")
+    kv, score = kv_and_score.split((dim, dim), dim=-1)
+
+    cond1 = (start_pos + 1) % ratio == 0
+    cond2 = (start_pos + 2) % ratio == 0
+    compressed_seqlens = (cond1 | cond2).to(torch.int32)
+    cu_compressed_seqlens = torch.cumsum(compressed_seqlens, dim=0)
+    cu_compressed_seqlens = torch.cat(
+        [torch.zeros(1, dtype=torch.int, device="cuda"), cu_compressed_seqlens], dim=0
+    ).to(torch.int32)
+    total_compressed_seqlen = cu_compressed_seqlens[-1].item()
+    compressed_kv = hpc.kv_compressor(
+        kv,
+        score,
+        cu_seqlens,
+        cu_compressed_seqlens,
+        total_compressed_seqlen,
+        kv_state,
+        score_state,
+        state_index,
+        start_pos,
+        ape,
+        ratio,
+        overlap=False,
+        head_dim=dim,
+        is_prefill=True,
+    )
+
+    compressed_torch = compressor_torch(
+        kv,
+        score,
+        cu_seqlens,
+        cu_compressed_seqlens,
+        kv_state_for_torch,
+        score_state_for_torch,
+        state_index,
+        start_pos,
+        ape,
+        ratio,
+        overlap=False,
+        head_dim=dim,
+        is_prefill=False,
+    )
+    assert allclose(kv_state, kv_state_for_torch)
+    assert allclose(score_state, score_state_for_torch)
+    valid_len = cu_compressed_seqlens[-1]
+    if valid_len:
+        assert allclose(
+            compressed_kv[:valid_len], compressed_torch[:valid_len], atol=1e-5, rtol=1e-5
+        )
+
+
+@pytest.mark.parametrize("batch", [111])
+@pytest.mark.parametrize("dim", [128, 512])
+@pytest.mark.parametrize("ratio", [4])
+@pytest.mark.parametrize("mtp", [1])
+def test_c4_decode_mtp_by_prefill_kernel(batch, dim, ratio, mtp):
+    assert mtp == 1
+
+    kv_state = torch.randn((batch, 2 * ratio, 2 * dim), dtype=torch.float, device="cuda")
+    score_state = torch.randn((batch, 2 * ratio, 2 * dim), dtype=torch.float, device="cuda")
+    state_index = torch.arange(batch, dtype=torch.int, device="cuda")
+    ape = torch.randn((ratio, 2 * dim), dtype=torch.float, device="cuda")
+
+    seqlens = torch.ones((batch,), dtype=torch.int, device="cuda") + mtp
+    cu_seqlens = torch.cumsum(seqlens, dim=0)
+    cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.int, device="cuda"), cu_seqlens], dim=0).to(
+        torch.int32
+    )
+
+    start_pos = torch.randint(low=0, high=111, size=(batch,), dtype=torch.int, device="cuda")
+    start_pos.fill_(0)
+    kv_state_for_torch = kv_state.clone()
+    score_state_for_torch = score_state.clone()
+
+    kv_and_score = torch.randn((batch * 2, 2 * 2 * dim), dtype=torch.float, device="cuda")
+    kv, score = kv_and_score.split((2 * dim, 2 * dim), dim=-1)
+
+    cond1 = (start_pos + 1) % ratio == 0
+    cond2 = (start_pos + 2) % ratio == 0
+    compressed_seqlens = (cond1 | cond2).to(torch.int32)
+    cu_compressed_seqlens = torch.cumsum(compressed_seqlens, dim=0)
+    cu_compressed_seqlens = torch.cat(
+        [torch.zeros(1, dtype=torch.int, device="cuda"), cu_compressed_seqlens], dim=0
+    ).to(torch.int32)
+    total_compressed_seqlen = cu_compressed_seqlens[-1].item()
+    compressed_kv = hpc.kv_compressor(
+        kv,
+        score,
+        cu_seqlens,
+        cu_compressed_seqlens,
+        total_compressed_seqlen,
+        kv_state,
+        score_state,
+        state_index,
+        start_pos,
+        ape,
+        ratio,
+        overlap=True,
+        head_dim=dim,
+        is_prefill=True,
+    )
+
+    compressed_torch = compressor_torch(
+        kv,
+        score,
+        cu_seqlens,
+        cu_compressed_seqlens,
+        kv_state_for_torch,
+        score_state_for_torch,
+        state_index,
+        start_pos,
+        ape,
+        ratio,
+        overlap=True,
+        head_dim=dim,
+        is_prefill=False,
+    )
+    valid_len = cu_compressed_seqlens[-1]
+    if valid_len:
+        assert allclose(
+            compressed_kv[:valid_len], compressed_torch[:valid_len], atol=1e-5, rtol=1e-5
+        )

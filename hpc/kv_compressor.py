@@ -19,6 +19,7 @@ def kv_compressor(
     overlap: bool,
     head_dim: int,
     is_prefill: bool,
+    output: Tensor = None,
 ) -> Tensor:
     """Applies compressor to kv
 
@@ -65,6 +66,9 @@ def kv_compressor(
         is_prefill: is prefill or not
             Shape: Scalar
             Dtype: bool
+        output: optional inplace output tensor
+            Shape: [total_compressed_seqlen, head_dim]
+            Dtype: float32
 
 
     Returns:
@@ -89,6 +93,7 @@ def kv_compressor(
             overlap,
             head_dim,
             is_prefill,
+            output,
         )
     else:
         return torch.ops.hpc.kv_compressor_decode(
@@ -103,7 +108,7 @@ def kv_compressor(
             head_dim,
             ratio,
             overlap,
-            None,
+            output,
         )
 
 
@@ -123,6 +128,7 @@ def kv_compressor_fake(
     overlap,
     head_dim,
     is_prefill,
+    output,
 ):
     num_batch = cu_seqlens.shape[0] - 1
     if is_prefill:

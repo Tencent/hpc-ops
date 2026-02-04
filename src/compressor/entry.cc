@@ -19,7 +19,8 @@ torch::Tensor kv_compressor_entry(const torch::Tensor &kv, const torch::Tensor &
                                   int64_t total_compressed_seqlen, torch::Tensor &kv_states,
                                   torch::Tensor &score_states, const torch::Tensor &state_index,
                                   const torch::Tensor &start_pos, const torch::Tensor &ape,
-                                  int64_t ratio, bool overlap, int64_t head_dim, bool is_prefill) {
+                                  int64_t ratio, bool overlap, int64_t head_dim, bool is_prefill,
+                                  std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(kv.get_device());
   // kcache and vcache maybe not contiguous, we access them by stride
   // TORCH_CHECK(kv.is_contiguous(), "kv tensor must be contiguous");
@@ -58,8 +59,20 @@ torch::Tensor kv_compressor_entry(const torch::Tensor &kv, const torch::Tensor &
   }
 
   // Create output tensors or use provided ones
-  torch::Tensor compressed_kv = torch::empty({total_compressed_seqlen, head_dim},
-                                             torch::dtype(kv.dtype()).device(kv.device()));
+  torch::Tensor compressed_kv;
+
+  if (output.has_value()) {
+    compressed_kv = output.value();
+    TORCH_CHECK(compressed_kv.scalar_type() == torch::kFloat32,
+                "The output tensor data type must be float32");
+    TORCH_CHECK(
+        compressed_kv.size(0) == total_compressed_seqlen && compressed_kv.size(1) == head_dim,
+        "The output tensor must have shape [total_compressed_seqlen, head_dim]");
+
+  } else {
+    compressed_kv = torch::empty({total_compressed_seqlen, head_dim},
+                                 torch::dtype(kv.dtype()).device(kv.device()));
+  }
 
   // Prepare pointers
   auto *compressed_kv_ptr = compressed_kv.mutable_data_ptr<DType>();
@@ -183,7 +196,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "kv_compressor(Tensor kv, Tensor score, Tensor cu_seqlens, Tensor cu_compressed_seqlens, int "
       "total_compressed_seqlen, "
       "Tensor! kv_states, Tensor! score_states, Tensor state_index, Tensor start_pos, Tensor ape, "
-      "int ratio, bool overlap, int head_dim, bool is_prefill) -> (Tensor)");
+      "int ratio, bool overlap, int head_dim, bool is_prefill, Tensor? output) -> (Tensor)");
   m.impl("kv_compressor", torch::kCUDA, &hpc::compressor::kv_compressor_entry);
 }
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
