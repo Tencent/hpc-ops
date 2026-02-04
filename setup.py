@@ -69,5 +69,5 @@ setup(
     cmdclass={"build_ext": CMakeBuild},
     package_data={"_C": ["*.so"]},
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
-    install_requires=["torch"],
+    install_requires=["torch==2.7.0"],
 )
