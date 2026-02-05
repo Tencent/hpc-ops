@@ -480,7 +480,7 @@ bool gemm_bf16xfp32_async(void *y_ptr, void *splitk_y_ptr, void *split_flag_ptr,
                           const void *w_high_ptr, const void *w_low_ptr, int m, int n, int k,
                           float scale, bool use_fp32_output, int splitk, cudaStream_t stream) {
   if (use_fp32_output) {
-    if (m > 32) {
+    if (m > 128) {
       constexpr int kSplitK = 1;
       launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, float, 64, 64, 64, 2, 2, kSplitK>(
           y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
@@ -509,7 +509,7 @@ bool gemm_bf16xfp32_async(void *y_ptr, void *splitk_y_ptr, void *split_flag_ptr,
       }
     }
   } else {
-    if (m > 32) {
+    if (m > 128) {
       constexpr int kSplitK = 1;
       launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, cute::bfloat16_t, 64, 64, 64, 2, 2, kSplitK>(
           y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
