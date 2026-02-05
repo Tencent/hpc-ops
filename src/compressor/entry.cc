@@ -121,15 +121,6 @@ torch::Tensor kv_compressor_decode_entry(const torch::Tensor &kv, const torch::T
               "score must have same shape with kv")
   TORCH_CHECK(kv.stride(0) == score.stride(0), "kv.stride(0) == score.stride(0) must be true");
 
-  TORCH_CHECK(kv_states.dim() == score_states.dim() && kv_states.dim() == 3,
-              "kv_states and score_states dim must be  3");
-  TORCH_CHECK(score_states.size(0) == kv_states.size(0) &&
-                  score_states.size(1) == kv_states.size(1) &&
-                  score_states.size(2) == kv_states.size(2),
-              "score_states shape must be equal to kv_states");
-
-  TORCH_CHECK(kv_states.size(-1) == kv.size(-1), "kv_states and kv must have same dim");
-
   // mtp
   int batch_size = cu_compress_seqlens.size(0) - 1;
   TORCH_CHECK(kv.size(0) % batch_size == 0, "kv.size(0) % batch_size == 0 must be true");
@@ -152,10 +143,6 @@ torch::Tensor kv_compressor_decode_entry(const torch::Tensor &kv, const torch::T
   TORCH_CHECK(head_dim == 512 || head_dim == 128,
               "now only suport head_dim == 512 or head_dim == 128");
   TORCH_CHECK(kv.size(-1) == coff * head_dim, "kv.size(-1) must be (overlap + 1) * head_dim");
-  TORCH_CHECK(kv_states.size(0) >= batch_size, "kv_states.size(0) must be greater than batch_size");
-  TORCH_CHECK(kv_states.size(1) == coff * ratio, "kv_states.size(1) must be (overlap + 1) * ratio");
-  TORCH_CHECK(kv_states.size(2) == coff * head_dim,
-              "kv_states.size(2) must be (overlap + 1) * head_dim");
   TORCH_CHECK(ape.size(0) == ratio, "ape.size(0) must be equal to ratio");
   TORCH_CHECK(ape.size(1) == coff * head_dim,
               "ape.size(1) must be equal to (overlap + 1) * head_dim");
