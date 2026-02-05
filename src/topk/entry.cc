@@ -56,6 +56,9 @@ torch::Tensor topk_per_row_varlen_entry(const torch::Tensor &logits,
   int row_stride = logits.stride(0);
   int num_batch = cu_seqlens_q.size(0) - 1;
 
+  TORCH_CHECK(row_stride % 4 == 0,
+              "topk_per_row_varlen logits input stride(0) must to be divisible by 4.");
+
   torch::Tensor output;
   if (topk_indices.has_value()) {
     output = topk_indices.value();

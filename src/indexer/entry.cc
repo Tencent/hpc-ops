@@ -22,6 +22,7 @@ torch::Tensor mqa_indexer_logits_entry(const torch::Tensor &q, const torch::Tens
   TORCH_CHECK(cu_seqlens_q.device().is_cuda(), "cu_seqlens_q tensor must be cuda");
   TORCH_CHECK(block_ids.device().is_cuda(), "block_ids tensor must be cuda");
   TORCH_CHECK(seqlens_kv.device().is_cuda(), "seqlens_kv tensor must be cuda");
+  TORCH_CHECK(max_context_len % 4 == 0, "max_context_len must to be divisible by 4.");
 
   int total_seq_q = q.size(0);
   int num_head_q = q.size(1);
