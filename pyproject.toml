@@ -1,0 +1,59 @@
+[project]
+name = "hpc-ops"
+dynamic = ["version"]
+description = "High Performance Computing Operator"
+dependencies = ["apache-tvm-ffi", "torch>=2.4.0"]
+
+[project.optional-dependencies]
+cuda = ["nvidia-cuda-nvcc", "nvidia-cuda-cccl"]
+
+[build-system]
+requires = ["scikit-build-core", "apache-tvm-ffi>=0.1.8.post2"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+wheel.packages = ["hpc"]
+
+metadata.version.provider = "version_with_meta"
+metadata.version.provider-path = "."
+experimental = true
+build-dir = "build"
+
+wheel.py-api = "cp38"
+cmake.version = ">=3.27"
+
+wheel.exclude = ["*.cu", "*.h", "*.cuh", "*.cc"]
+
+[tool.cibuildwheel]
+archs = ["auto64"]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+skip = "*musllinux*"
+build = "cp38-*"
+environment-pass = ["CUDA_VERSION"]
+
+[tool.cibuildwheel.linux]
+repair-wheel-command = [
+    "auditwheel repair --exclude libtvm_ffi.so --exclude libcuda.so.1 --exclude '/usr/local/cuda*' -w {dest_dir} {wheel}",
+    "pipx run abi3audit --strict --report {wheel}",
+]
+environment.PATH = "/usr/local/cuda/bin:$PATH"
+before-all = """
+set -eux
+
+case "$(uname -m)" in
+    "x86_64")
+        dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
+        ;;
+    "aarch64")
+        dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/sbsa/cuda-rhel8.repo
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+
+cudaver="$(echo "${CUDA_VERSION:-"12.8"}" | cut -d '.' -f-2)"
+v="${cudaver//./-}"
+yum install -y "cuda-minimal-build-${v}" "cuda-driver-devel-${v}" "cuda-nvrtc-devel-${v}" nvidia-driver-cuda-libs
+"""

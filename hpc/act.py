@@ -3,6 +3,34 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from hpc import load_ffi_lib
+
+_lib = load_ffi_lib("_C.so")
+
+_torch_lib = torch.library.Library("hpc", "FRAGMENT")
+
+_torch_lib.define(
+    "act_mul_and_quant(Tensor input, Tensor scale, bool use_bf16_mul, Tensor? output) -> (Tensor)"
+)
+_torch_lib.impl("act_mul_and_quant",
+                 lambda input, scale, use_bf16_mul, output: _lib.act_mul_and_quant(input, scale, use_bf16_mul, output),
+                 "CUDA")
+
+_torch_lib.define(
+    "masked_act_mul_and_quant(Tensor input, Tensor scale, Tensor num_per_expert, Tensor? output) -> (Tensor)"
+)
+_torch_lib.impl("masked_act_mul_and_quant",
+                 lambda input, scale, num_per_expert, output: _lib.masked_act_mul_and_quant(input, scale, num_per_expert, output),
+                 "CUDA")
+
+_torch_lib.define(
+    "masked_act_mul_and_blockwise_quant(Tensor input, Tensor num_per_expert, Tensor? output, "
+    "Tensor? output_scale) -> (Tensor output, Tensor output_scale)"
+)
+_torch_lib.impl("masked_act_mul_and_blockwise_quant",
+                 lambda input, num_per_expert, output, output_scale: _lib.masked_act_mul_and_blockwise_quant(input, num_per_expert, output, output_scale),
+                 "CUDA")
+
 
 def act_mul_and_quant(
     gate_up: Tensor, scale: Tensor, use_bf16_mul: bool = True, output: Tensor = None

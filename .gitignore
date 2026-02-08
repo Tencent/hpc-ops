@@ -4,7 +4,9 @@ site/
 docs/
 .vscode/
 *.egg-info/
+CMakeFiles/
 _C.*.so
+_C.so
 __pycache__
 *.ncu-rep
 *.nsys-rep
@@ -12,3 +14,5 @@ __pycache__
 *.log
 test
 version.py
+compile_commands.json
+_codeql_detected_source_root

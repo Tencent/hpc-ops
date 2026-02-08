@@ -1,14 +1,13 @@
 // Copyright (C) 2026 Tencent.
 
-#include <torch/library.h>
+#include <tvm/ffi/function.h>
 
-#include <sstream>
 #include <string>
 
 #ifndef HPC_VERSION_STR
 #define HPC_VERSION_STR "unknown"
 #endif
 
-static const std::string version() { return HPC_VERSION_STR; }
+static std::string version() { return HPC_VERSION_STR; }
 
-TORCH_LIBRARY_FRAGMENT(hpc, m) { m.def("version", &version); }
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(version, version);

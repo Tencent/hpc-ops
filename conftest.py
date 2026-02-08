@@ -103,7 +103,7 @@ class TraceHook(object):
             ret = org_func(*args, **kwargs)
             save_data(tmp_after_invoke_file, "hpc", func_name, ret, args, kwargs)
 
-            pypath = os.path.realpath(list(Path(__file__).parent.glob("./build/lib.*/"))[0])
+            pypath = str(Path(__file__).parent)
             dump_test_py(tmp_py_file, tmp_before_invoke_file, tmp_after_invoke_file, pypath)
             print(tmp_py_file)
 
@@ -123,7 +123,6 @@ class TraceHook(object):
         return True
 
     def hook(self):
-        sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("./build/lib.*/"))[0]))
         module = __import__(self.module_name)
 
         dirs = dir(module)

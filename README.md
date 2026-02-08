@@ -43,13 +43,37 @@ HPC-Ops is a **production-grade, high-performance, and easy-to-use** operator li
 *You can set up the environment by installing the modules listed in requirements-dev.txt.*
 
 ### Install from Source
+
+#### With host CUDA toolchain
 ```bash
 git clone https://github.com/Tencent/hpc-ops.git
 cd hpc-ops
 
-# build packages
+# Ensure CUDA toolkit is installed on the host (e.g., /usr/local/cuda)
+pip install . -v
+```
+
+#### With pip-provided CUDA toolchain (no host CUDA required)
+
+Option A — pip toolchain in the current environment (use `--no-build-isolation`):
+
+```bash
+pip install nvidia-cuda-nvcc nvidia-cuda-cccl scikit-build-core cmake ninja
+pip install . -v --no-build-isolation
+```
+
+Option B — pip toolchain in another virtualenv or path:
+
+```bash
+# Point to the cu<ver> directory inside another venv's site-packages
+export WITH_PIP_CUDA_TOOLCHAIN=/path/to/venv/lib/python3.x/site-packages/nvidia/cu13
+pip install . -v
+```
+
+#### Build wheel
+```bash
 make wheel
-python3 -m pip install dist/*.whl   
+python3 -m pip install dist/*.whl
 ```
 
 ### Basic Usage

@@ -9,7 +9,7 @@ CSRC_FILES=$(CC_FILES) $(CU_FILES) $(CUH_FILES) $(H_FILES)
 
 
 all:
-	python3 setup.py build
+	pip install --no-build-isolation -e .
 
 wheel:
 	find . -type d -name "__pycache__" -exec rm -rf {} +

@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Tencent.
 
 #include <cutlass/version.h>
-#include <torch/library.h>
+#include <tvm/ffi/function.h>
 
 #include <cub/version.cuh>
 #include <sstream>
@@ -15,7 +15,7 @@
 #define HPC_GIT_HASH_STR "unknown"
 #endif
 
-static const std::string built_json() {
+static std::string built_json() {
   std::ostringstream oss;
 
   // NOLINTBEGIN clang-format off
@@ -42,4 +42,4 @@ static const std::string built_json() {
   return oss.str();
 }
 
-TORCH_LIBRARY_FRAGMENT(hpc, m) { m.def("built_json", &built_json); }
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(built_json, built_json);
