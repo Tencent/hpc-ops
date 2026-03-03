@@ -108,7 +108,12 @@ def gemm_blockwise_fake(x, weight, x_scale, w_scale, bias):
 
 @torch.library.register_fake("hpc::gemm_bf16xfp32")
 def gemm_bf16xfp32_fake(
-    a: Tensor, b_high: Tensor, b_low: Tensor, scale: Tensor, use_fp32_output: bool = False
+    a: Tensor,
+    b_high: Tensor,
+    b_low: Tensor,
+    scale: Tensor,
+    use_fp32_output: bool = False,
+    split_flag: Tensor = None,
 ):
     if use_fp32_output:
         return torch.empty((a.shape[0], b_high.shape[0]), dtype=torch.float32, device=a.device)
