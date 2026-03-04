@@ -47,7 +47,9 @@ def get_gemm_bf16xfp32_workspace(max_weight_hidden_size: int) -> Tensor:
 
     max_splitk_m = 32
     return torch.zeros(
-        (max_splitk_m // kTileM, max_weight_hidden_size // kTileN), dtype=torch.int32, device="cuda"
+        (max_splitk_m // kTileM, (max_weight_hidden_size + kTileN - 1) // kTileN),
+        dtype=torch.int32,
+        device="cuda",
     )
 
 

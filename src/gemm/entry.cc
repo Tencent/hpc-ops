@@ -100,7 +100,7 @@ torch::Tensor gemm_bf16xfp32_entry(const torch::Tensor &x, const torch::Tensor &
   int k = x.size(1);
   int n = w_high.size(0);
 
-  TORCH_CHECK(n % 128 == 0, "n must to be divided by 128.");
+  TORCH_CHECK(n % 64 == 0, "n must to be divided by 64.");
 
   auto options = x.options();
 
@@ -117,7 +117,7 @@ torch::Tensor gemm_bf16xfp32_entry(const torch::Tensor &x, const torch::Tensor &
 
   if (m <= 32) {
     // use wgmma 64x16x16 instruction and splitk.
-    if (n == 512) {
+    if (n == 512 || n == 192) {
       split_k = 8;
     } else if (n == 1024) {
       split_k = 4;
@@ -131,7 +131,8 @@ torch::Tensor gemm_bf16xfp32_entry(const torch::Tensor &x, const torch::Tensor &
     if (split_flag.has_value()) {
       split_flag_tensor = split_flag.value();
     } else {
-      split_flag_tensor = torch::zeros({(m + 15) / 16, n / 128}, options.dtype(torch::kInt32));
+      split_flag_tensor =
+          torch::zeros({(m + 15) / 16, (n + 127) / 128}, options.dtype(torch::kInt32));
     }
     split_y_ptr = split_y.mutable_data_ptr();
     split_flag_ptr = split_flag_tensor.mutable_data_ptr();

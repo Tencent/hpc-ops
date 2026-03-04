@@ -11,7 +11,7 @@ from utils import allclose
 
 
 @pytest.mark.parametrize("m", [16, 6, 12303])
-@pytest.mark.parametrize("n", [512, 1024, 2048])
+@pytest.mark.parametrize("n", [192, 512, 1024, 2048])
 @pytest.mark.parametrize("k", [4096])
 @pytest.mark.parametrize("use_fp32_output", [True, False])
 @pytest.mark.parametrize("use_split_flag", [True, False])
