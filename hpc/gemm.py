@@ -59,6 +59,7 @@ def gemm_bf16xfp32(
     w_low: Tensor,
     scale: Tensor,
     use_fp32_output: bool = False,
+    use_splitk: bool = True,
     split_flag: Tensor = None,
 ) -> Tensor:
     """Performs fp32 GEMM operation with two bf16 gemm.
@@ -83,6 +84,9 @@ def gemm_bf16xfp32(
         use_fp32_output: Control Output dtype is float32 or bfloat16
             Shape: Scalar
             Dtype: bfloat16
+        use_splitk: Control whether use splitk.
+            Shape: Scalar
+            Dtype: bool
         split_flag: Optinal Input indicates the split finish state, should be init zero at the beginning.
             Shape: [max_tokens / kTileM, n / kTileN]
             Dtype: int32
@@ -92,7 +96,7 @@ def gemm_bf16xfp32(
             Dtype: bfloat16 or float32.
 
     """
-    return torch.ops.hpc.gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output, split_flag)
+    return torch.ops.hpc.gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output, use_splitk, split_flag)
 
 
 @torch.library.register_fake("hpc::pad_and_transpose")
