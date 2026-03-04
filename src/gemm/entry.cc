@@ -85,8 +85,8 @@ torch::Tensor gemm_blockwise_entry(const torch::Tensor &x, const torch::Tensor &
 }
 
 torch::Tensor gemm_bf16xfp32_entry(const torch::Tensor &x, const torch::Tensor &w_high,
-                                   const torch::Tensor &w_low, double scale, bool use_fp32_output, bool use_splitk,
-                                   std::optional<torch::Tensor> split_flag) {
+                                   const torch::Tensor &w_low, double scale, bool use_fp32_output,
+                                   bool use_splitk, std::optional<torch::Tensor> split_flag) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   TORCH_CHECK(x.is_contiguous(), "x tensor must be contiguous");
   TORCH_CHECK(w_high.is_contiguous(), "w_high tensor must be contiguous");

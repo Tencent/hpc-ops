@@ -96,7 +96,9 @@ def gemm_bf16xfp32(
             Dtype: bfloat16 or float32.
 
     """
-    return torch.ops.hpc.gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output, use_splitk, split_flag)
+    return torch.ops.hpc.gemm_bf16xfp32(
+        x, w_high, w_low, scale, use_fp32_output, use_splitk, split_flag
+    )
 
 
 @torch.library.register_fake("hpc::pad_and_transpose")
