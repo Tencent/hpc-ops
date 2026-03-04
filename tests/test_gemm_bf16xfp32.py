@@ -31,7 +31,7 @@ def test_gemm_bf16xfp32(m, n, k, use_fp32_output, use_split_flag):
 
     gt = torch.matmul(x.float(), w.t())
 
-    my = hpc.gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output, split_flag)
+    my = hpc.gemm_bf16xfp32(x, w_high, w_low, scale, use_fp32_output, True, split_flag)
 
     if use_split_flag:
         assert (split_flag == 0).all()
