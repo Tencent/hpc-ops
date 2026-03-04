@@ -121,6 +121,7 @@ def gemm_bf16xfp32_fake(
     b_low: Tensor,
     scale: Tensor,
     use_fp32_output: bool = False,
+    use_splitk: bool = True,
     split_flag: Tensor = None,
 ):
     if use_fp32_output:
