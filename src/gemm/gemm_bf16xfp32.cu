@@ -50,6 +50,10 @@ __device__ __forceinline__ void splitk_reduce(Tout *y_ptr, float *splitk_y_ptr, 
     return;
   }
 
+  if (itile_n * kTileN + ilane * 4 >= n) {
+    return;
+  }
+
   auto *y_tile = y_ptr + (itile_m * kTileM + iwarp) * n + itile_n * kTileN + ilane * 4;
   auto *splitk_y_tile =
       splitk_y_ptr + (itile_m * kTileM + iwarp) * n + itile_n * kTileN + ilane * 4;
@@ -134,7 +138,7 @@ __global__ void __launch_bounds__(384, 1)
   auto tWLs = btma_wl.partition_D(sW);   // (TMA, _1, _1, kStage)
 
   int num_tile_m = size<1>(tXg);
-  int num_tile_n = size<1>(tWHg) / kWarpGroupN;
+  int num_tile_n = (size<1>(tWHg) + kWarpGroupN - 1) / kWarpGroupN;
 
   if (is_leader_in_block) {
 #pragma unroll
