@@ -1,5 +1,6 @@
 import torch
 from torch import Tensor
+from typing import Tuple, Optional
 
 
 def topk_per_row(
@@ -97,6 +98,20 @@ def topk_per_row_varlen(
     )
 
 
+def grouped_topk(
+    scores: Tensor,
+    topk: int,
+    num_expert_group: int,
+    topk_group: int,
+    scale: float,
+    renormalize: bool,
+    bias: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor]:
+    return torch.ops.hpc.grouped_topk(
+        scores, topk, num_expert_group, topk_group, scale, renormalize, bias
+    )
+
+
 @torch.library.register_fake("hpc::topk_per_row")
 def topk_per_row_fake(logits, seqlens, num_sp_tokens, top_k, topk_indices):
     return torch.empty((logits.shape[0], top_k), dtype=torch.int32, device=logits.device)
@@ -105,3 +120,19 @@ def topk_per_row_fake(logits, seqlens, num_sp_tokens, top_k, topk_indices):
 @torch.library.register_fake("hpc::topk_per_row_varlen")
 def topk_per_row_varlen_fake(logits, cu_seqlens_q, seqlens_kv, top_k, compress_ratio, topk_indices):
     return torch.empty((logits.shape[0], top_k), dtype=torch.int32, device=logits.device)
+
+
+@torch.library.register_fake("hpc::grouped_topk")
+def grouped_topk_fake(
+    scores: Tensor,
+    topk: int,
+    num_expert_group: int,
+    topk_group: int,
+    scale: float,
+    renormalize: bool,
+    bias: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor]:
+    num_tokens = scores.shape[0]
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=scores.device)
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device=scores.device)
+    return (topk_weights, topk_ids)
