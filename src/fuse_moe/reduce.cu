@@ -26,7 +26,7 @@ __global__ void reduce_kernel(T *y_ptr, const T *x_ptr, const int *topk_pos_ptr,
   int iblocky;
 
   block_divider(iblocky, iblockx, iblock);
-  int irow = iblocky;
+  uint64_t irow = iblocky;
   int icol = (threadIdx.x + iblockx * kThreadPerBlock) * kNumItemPer16B;
 
   __shared__ int pos_shm[kNumTopkMax];
@@ -51,7 +51,7 @@ __global__ void reduce_kernel(T *y_ptr, const T *x_ptr, const int *topk_pos_ptr,
       int ipos = pos_shm[i];
       float iscale = scale_shm[i];
       if (ipos >= 0) {
-        auto x_irow_ptr = x_ptr + ipos * hidden_size;
+        auto x_irow_ptr = x_ptr + static_cast<uint64_t>(ipos) * hidden_size;
         auto x_fp32 = to<float>(load<T, kNumItemPer16B>(x_irow_ptr + icol));
 #pragma unroll
         for (int j = 0; j < kNumItemPer16B; j++) {

@@ -105,7 +105,7 @@ __global__ void update_grouped_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
     __shared__ cute::TmaDescriptor smem_tma_desc[2];
 
     int num_seq = seqlens_ptr[igroup];
-    int cu_seqlen = cu_seqlens_ptr[igroup];
+    uint64_t cu_seqlen = cu_seqlens_ptr[igroup];
     auto *x_ibatch_ptr = x_ptr + cu_seqlen * k;
     auto *y_ibatch_ptr = y_ptr + cu_seqlen * n;
 
