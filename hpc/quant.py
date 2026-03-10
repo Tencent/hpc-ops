@@ -57,6 +57,45 @@ def per_token_group_quant(
     return output_fp8, quant_scale
 
 
+def per_token_group_fp8_quant(
+    x: Tensor,
+    group_size: int = 128,
+    quant_eps: float = 1e-12,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """fp8 blockwise quantization.
+    Args:
+        x (Tensor):
+            Input tensor of shape `[batch_size, hidden_states]`, with
+            `dtype == torch.bfloat16`, located on a CUDA device.
+        quant_eps (float, optional):
+            Minimum quantization scale used to avoid zero or extremely small
+            scales during FP8 quantization. Defaults to 1e-12.
+        group_size (int, optional):
+            Number of elements per quantization group for per-token,
+            group-wise quantization. Currently only `group_size == 128`
+            is supported. Defaults to 128.
+    Returns:
+        A tuple containing:
+            - output_fp8 (Tensor): Quantized output in fp8 format with shape
+                [batch_size, hidden_states].
+            - quant_scale (Tensor): Per-group quantization scales in float32 format
+                with shape [batch_size, hidden_states // group_size]. These scales
+                can be used for dequantization.
+
+    Raises:
+        RuntimeError: If the shapes or dtypes do not satisfy the constraints above.
+
+    Note:
+        - All input tensors must be on CUDA device and in bfloat16 format
+    """
+    output_fp8, quant_scale = torch.ops.hpc.per_token_group_fp8_quant(
+        x,
+        group_size,
+        quant_eps,
+    )
+    return output_fp8, quant_scale
+
+
 @torch.library.register_fake("hpc::per_token_group_quant")
 def per_token_group_quant_fake(
     x,

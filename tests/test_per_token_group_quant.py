@@ -2,12 +2,14 @@ import sys
 import os
 import pytest
 from pathlib import Path
+from typing import Tuple
 
 sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
 
 import hpc
 import torch
 import math
+from utils import allclose
 
 
 def per_token_group_quant(
@@ -97,6 +99,27 @@ def test_fused_layer_norm_with_scale_quant(
         f"✓ Test passed: batch_size={batch_size}, hidden_states={hidden_states}, "
         f"group_size={group_size}"
     )
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 128])
+@pytest.mark.parametrize(
+    "hidden_states", [384, 512, 768, 1024, 1536, 2048, 3072, 4096, 5120, 6144, 7168, 13824]
+)
+def test_per_token_group_fp8_quant(
+    batch_size,
+    hidden_states,
+):
+    torch.manual_seed(0)
+    group_size = 128
+    quant_eps = 1e-12
+
+    x = torch.randn(batch_size, hidden_states, dtype=torch.bfloat16, device="cuda")
+    my_fp8, my_scale = hpc.per_token_group_fp8_quant(x, group_size, quant_eps)
+
+    gt_fp8, gt_scale = per_token_group_quant(x, group_size, quant_eps)
+
+    assert allclose(gt_fp8, my_fp8, atol=32, rtol=0.01)
+    assert allclose(gt_scale, my_scale, atol=0.01, rtol=0.01)
 
 
 if __name__ == "__main__":
