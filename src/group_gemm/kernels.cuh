@@ -61,16 +61,84 @@ __device__ __forceinline__ void get_next_tile_vert(const int *cu_tiles_ptr, int 
 }
 
 template <typename Tin, typename Tout, typename TmaX, typename TmaY, int kTileM,
-          int kGroupPerThread, int kThreadPerBlock>
+          int kGroupPerThread, int kThreadPerBlock, bool kAssignTask = false, bool kUsePDL = false>
 __global__ void update_grouped_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
                                    cute::TmaDescriptor *tma_xy, const Tin *x_ptr, const Tout *y_ptr,
                                    const int *seqlens_ptr, const int *cu_seqlens_ptr,
-                                   int *tiles_ptr, int *cu_tiles_ptr, int num_group, int m, int n,
-                                   int k) {
+                                   int *tiles_ptr, int *cu_tiles_ptr, int4 *task_map_ptr,
+                                   int num_group, int m, int n, int k, int num_sm_count) {
   using namespace cute;  // NOLINT
 
   int idx = threadIdx.x;
   int igroup = blockIdx.x;
+
+  if constexpr (kUsePDL) {
+    cudaGridDependencySynchronize();
+  }
+
+  if constexpr (kAssignTask) {
+    if constexpr (kTileM == 8) {
+      if (igroup > num_group) {
+        int ilane = idx % 32;
+        igroup -= (num_group + 1);
+        __shared__ int shm_cu_tiles[kGroupPerThread];
+        vec_t<int, kGroupPerThread> tiles;
+#pragma unroll
+        for (int i = 0; i < kGroupPerThread; i++) {
+          int iexpert = idx * kGroupPerThread + i;
+          if (iexpert < num_group) {
+            tiles[i] = (seqlens_ptr[iexpert] + kTileM - 1) / kTileM;
+          } else {
+            tiles[i] = 0;
+          }
+        }
+
+        using BlockScan = cub::BlockScan<int, kThreadPerBlock>;
+        __shared__ typename BlockScan::TempStorage temp_storage;
+        int block_aggregate;
+        BlockScan(temp_storage).ExclusiveSum(tiles.data, tiles.data, block_aggregate);
+
+        int ithr_contain_cutile = igroup / kGroupPerThread;
+        int ilocal = igroup % kGroupPerThread;
+
+        auto &tiles_store = reshape<kGroupPerThread / 4, 4>(tiles);
+        if (idx == ithr_contain_cutile) {
+#pragma unroll
+          for (int i = 0; i < kGroupPerThread / 4; i++) {
+            store(shm_cu_tiles + 4 * i, tiles_store[i]);
+          }
+        }
+        __syncthreads();
+
+        constexpr int kTileN = 128;
+        int num_tile_n = n / kTileN;
+
+        int cu_tile_m = shm_cu_tiles[ilocal];
+        int num_tile_m = (seqlens_ptr[igroup] + kTileM - 1) / kTileM;
+        int cu_tiles = cu_tile_m * num_tile_n;
+
+        for (int im = 0; im < num_tile_m; im++) {
+          for (int in = ilane; in < num_tile_n; in += 32) {
+            int itile = cu_tiles + im * num_tile_n + in;
+            int4 task;
+            task.x = im;
+            task.y = in;
+            task.z = igroup;
+            task_map_ptr[itile] = task;
+          }
+        }
+
+        if (igroup == num_group - 1) {
+          int num_tiles = block_aggregate * num_tile_n;
+          for (int j = ilane; j < num_sm_count; j += 32) {
+            int4 task;
+            task.z = -1;
+            task_map_ptr[num_tiles + j] = task;
+          }
+        }
+      }
+    }
+  }
 
   if (igroup == num_group) {
     int tiles[kGroupPerThread];
@@ -138,13 +206,19 @@ __global__ void update_grouped_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
       tma_descriptor_cp_fence_release(tma_xy + igroup * 2 + i, smem_tma_desc[i]);
     }
   }
+
+  if constexpr (kUsePDL) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
 }
 
-template <typename Config, typename TmaA, typename TmaB, typename TmaD, bool IsLoopH>
+template <typename Config, typename TmaA, typename TmaB, typename TmaD, int kTaskLoopPolicy,
+          bool kUsePDL = false>
 __global__ void __launch_bounds__(384, 1)
     group_gemm_fp8_kernel(const __grid_constant__ TmaB tma_b, cute::TmaDescriptor *td_xy,
                           int *seqlens_ptr, float *yscale_ptr, int *tiles_ptr, int *cu_tiles_ptr,
-                          int num_group, int m, int n, int k, cutlass::FastDivmod flat_divider) {
+                          int4 *task_map_ptr, int num_group, int m, int n, int k,
+                          cutlass::FastDivmod flat_divider) {
   using namespace cute;  // NOLINT
 
   using Tin = typename Config::Tin;
@@ -162,8 +236,8 @@ __global__ void __launch_bounds__(384, 1)
   int idx = threadIdx.x;
 
   int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
+  int ilane = idx % 32;
   int elected = cute::elect_one_sync();
-  bool is_leader_in_block = (iwarp == 0) && elected;
   bool is_leader_in_warpgroup = ((iwarp % 4) == 0) && elected;
 
   __shared__ uint64_t writable[kStage];
@@ -173,15 +247,17 @@ __global__ void __launch_bounds__(384, 1)
   auto *shm_a = reinterpret_cast<Tin *>(shm_data);
   auto *shm_b = shm_a + cosize(SLayoutA{});
   auto *shm_c = reinterpret_cast<Tout *>(shm_b + cosize(SLayoutB{}));
-  int *shm_tiles = reinterpret_cast<int *>(shm_c + cosize(SLayoutCT{}));
+
+  using Ttask = std::conditional_t<kTaskLoopPolicy == 0, int4, int>;
+  Ttask *shm_tiles = reinterpret_cast<Ttask *>(shm_c + cosize(SLayoutCT{}));
 
   TmaA tma_a;
   TmaD tma_d;
 
-  int num_total_warps = blockDim.x / 32;
-  for (int i = iwarp; i < num_group * 2; i += num_total_warps) {
-    tma_descriptor_fence_acquire(td_xy + i);
-  }
+  // int num_total_warps = blockDim.x / 32;
+  // for (int i = iwarp; i < num_group * 2; i += num_total_warps) {
+  //   tma_descriptor_fence_acquire(td_xy + i);
+  // }
 
   auto sA = make_tensor(make_smem_ptr(shm_a), SLayoutA{});
   auto sB = make_tensor(make_smem_ptr(shm_b), SLayoutB{});
@@ -203,32 +279,53 @@ __global__ void __launch_bounds__(384, 1)
 
   int num_tile_n = size<1>(tBg);
 
-  if (is_leader_in_block) {
-#pragma unroll
-    for (int i = 0; i < kStage; ++i) {
-      initialize_barrier(readable[i], 1);
-      initialize_barrier(writable[i], size(TiledMma{}) / 128);
-    }
-  }
-
   // we can also use the following code to initialize the barrier
-  /*
   if (idx < kStage) {
-    readable[idx] = 0x7ffff800001ffffe;  // initialize_barrier(1);
-    writable[idx] = 0x7ffff000001ffffc;  // initialize_barrier(2);
-  }
-   */
-
-  int total_m = cu_tiles_ptr[num_group];
-  if (total_m <= 0) {
-    return;
+    initialize_barrier(readable[idx], 1);
+    initialize_barrier(writable[idx], size(TiledMma{}));
   }
 
-  if constexpr (IsLoopH) {
+  int total_m = 0;
+  int actual_tiles = 0;
+
+  if constexpr (kUsePDL) {
+    cudaGridDependencySynchronize();
+  }
+
+  if constexpr (kTaskLoopPolicy == 0) {
+    int warp_count = blockDim.x / 32;
+    int iwarp_block = blockIdx.x + gridDim.x * iwarp;
+    actual_tiles = cu_tiles_ptr[num_group] * (n / kTileN) + gridDim.x;
+    int iwave = 0;
+    while (iwarp_block < actual_tiles) {
+      int4 task = task_map_ptr[iwarp_block];
+
+      if (ilane == 0) {
+        shm_tiles[iwave * warp_count + iwarp] = task;
+      }
+      int igroup = task.z;
+      tma_descriptor_fence_acquire(td_xy + igroup * 2);
+      tma_descriptor_fence_acquire(td_xy + igroup * 2 + 1);
+      if (igroup < 0) {
+        break;
+      }
+      iwarp_block += gridDim.x * warp_count;
+      iwave++;
+    }
+  } else if constexpr (kTaskLoopPolicy == 1) {
+    int num_total_warps = blockDim.x / 32;
+    for (int i = iwarp; i < num_group * 2; i += num_total_warps) {
+      tma_descriptor_fence_acquire(td_xy + i);
+    }
     for (int i = idx; i < num_group; i += blockDim.x) {
       shm_tiles[i] = tiles_ptr[i];
     }
-  } else {
+  } else if constexpr (kTaskLoopPolicy == 2) {
+    int num_total_warps = blockDim.x / 32;
+    for (int i = iwarp; i < num_group * 2; i += num_total_warps) {
+      tma_descriptor_fence_acquire(td_xy + i);
+    }
+    total_m = cu_tiles_ptr[num_group];
     for (int i = idx; i < (num_group + 1); i += blockDim.x) {
       shm_tiles[i] = cu_tiles_ptr[i];
     }
@@ -255,10 +352,22 @@ __global__ void __launch_bounds__(384, 1)
       int ntile_k = size<2>(tAg);
 
       int igroup = 0;
+      int4 task;
+      int iwave = 0;
       int sum_tile_m = 0;
       int itile_m, itile_n;
+
       while (true) {
-        if constexpr (IsLoopH) {
+        if constexpr (kTaskLoopPolicy == 0) {
+          task = shm_tiles[iwave];
+          itile_m = task.x;
+          itile_n = task.y;
+          igroup = task.z;
+          if (igroup < 0) {
+            break;
+          }
+          iwave++;
+        } else if constexpr (kTaskLoopPolicy == 1) {
           get_next_tile_horizon(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, sum_tile_m,
                                 flat_divider);
           if (igroup < 0) {
@@ -301,10 +410,7 @@ __global__ void __launch_bounds__(384, 1)
     // math warpgroup
     cutlass::arch::warpgroup_reg_alloc<168>();
 
-    int idx_in_warpgroup = idx % 128;
     int iwarpgroup = idx / 128;
-    int iwarp_in_warpgroup = idx_in_warpgroup / 32;
-    int elected_idx_in_warpgroup = ((iwarp_in_warpgroup == 0) && elected);
 
     TiledMma tiled_mma;
 
@@ -324,8 +430,19 @@ __global__ void __launch_bounds__(384, 1)
     int igroup = 0;
     int sum_tile_m = 0;
     int itile_m, itile_n;
+    int4 task;
+    int iwave = 0;
     while (true) {
-      if constexpr (IsLoopH) {
+      if constexpr (kTaskLoopPolicy == 0) {
+        task = shm_tiles[iwave];
+        itile_m = task.x;
+        itile_n = task.y;
+        igroup = task.z;
+        if (igroup < 0) {
+          break;
+        }
+        iwave++;
+      } else if constexpr (kTaskLoopPolicy == 1) {
         get_next_tile_horizon(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, sum_tile_m,
                               flat_divider);
         if (igroup < 0) {
@@ -364,9 +481,7 @@ __global__ void __launch_bounds__(384, 1)
         warpgroup_wait<0>();
         warpgroup_fence_operand(tCr);
 
-        if (elected_idx_in_warpgroup) {
-          arrive_barrier(writable[ismem_read]);
-        }
+        arrive_barrier(writable[ismem_read]);
 
 #pragma unroll
         for (int i = 0; i < size(tCr); ++i) {
@@ -391,8 +506,9 @@ __global__ void __launch_bounds__(384, 1)
       // Epilogue
       auto sCT =
           make_tensor(make_smem_ptr(reinterpret_cast<Tout *>(shm_c)), SLayoutCT{});  // (M, N)
-      using R2SCopyAtomC = Copy_Atom<cute::SM90_U16x8_STSM_T, Tout>;
-      // using R2SCopyAtomC = Copy_Atom<cute::SM90_U16x4_STSM_T, Tout>;
+      using STSM_ATOM =
+          std::conditional_t<kTileM == 8, cute::SM90_U16x4_STSM_T, cute::SM90_U16x8_STSM_T>;
+      using R2SCopyAtomC = Copy_Atom<STSM_ATOM, Tout>;
       auto tiled_copy_c = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);
       auto thr_copy_c = tiled_copy_c.get_slice(idx);
 
@@ -420,19 +536,23 @@ __global__ void __launch_bounds__(384, 1)
       }
     }
   }
+
+  if constexpr (kUsePDL) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
 }
 
 template <typename Config, typename TmaA, typename TmaB, typename TmaC, typename TmaAS,
-          typename TmaBS, bool IsLoopH>
+          typename TmaBS, int kTaskLoopPolicy, bool kUsePDL = false>
 __global__ void __launch_bounds__(384, 1)
     group_gemm_blockwise_fp8_kernel(const __grid_constant__ TmaB tma_b,
                                     const __grid_constant__ TmaAS tma_as,
                                     const __grid_constant__ TmaBS tma_bs,
                                     cute::TmaDescriptor *td_xy, int *seqlens_ptr, float *xscale_ptr,
                                     float *wscale_ptr, int *tiles_ptr, int *cu_tiles_ptr,
-                                    int num_group, int m, int n, int k, int m_pad, int num_block_n,
-                                    int num_block_k, int num_block_k_pad4,
-                                    cutlass::FastDivmod flat_divider) {
+                                    int4 *task_map_ptr, int num_group, int m, int n, int k,
+                                    int m_pad, int num_block_n, int num_block_k,
+                                    int num_block_k_pad4, cutlass::FastDivmod flat_divider) {
   using namespace cute;  // NOLINT
 
   using Tin = typename Config::Tin;
@@ -453,8 +573,8 @@ __global__ void __launch_bounds__(384, 1)
   int idx = threadIdx.x;
 
   int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
+  int ilane = idx % 32;
   int elected = cute::elect_one_sync();
-  bool is_leader_in_block = (iwarp == 0) && elected;
   bool is_leader_in_warpgroup = ((iwarp % 4) == 0) && elected;
 
   __shared__ uint64_t writable[kStage];
@@ -466,15 +586,12 @@ __global__ void __launch_bounds__(384, 1)
   auto *shm_c = reinterpret_cast<Tout *>(shm_b + cosize(SLayoutB{}));
   auto *shm_as = reinterpret_cast<float *>(shm_c + cosize(SLayoutCT{}));
   auto *shm_bs = reinterpret_cast<float *>(shm_as + cosize(SLayoutAS{}));
-  int *shm_tiles = reinterpret_cast<int *>(shm_bs + cosize(SLayoutBS{}));
+
+  using Ttask = std::conditional_t<kTaskLoopPolicy == 0, int4, int>;
+  Ttask *shm_tiles = reinterpret_cast<Ttask *>(shm_bs + cosize(SLayoutBS{}));
 
   TmaA tma_a;
   TmaC tma_c;
-
-  int num_total_warps = blockDim.x / 32;
-  for (int i = iwarp; i < num_group * 2; i += num_total_warps) {
-    tma_descriptor_fence_acquire(td_xy + i);
-  }
 
   auto sA = make_tensor(make_smem_ptr(shm_a), SLayoutA{});
   auto sB = make_tensor(make_smem_ptr(shm_b), SLayoutB{});
@@ -508,32 +625,53 @@ __global__ void __launch_bounds__(384, 1)
 
   int num_tile_n = size<1>(tBg);
 
-  if (is_leader_in_block) {
-#pragma unroll
-    for (int i = 0; i < kStage; ++i) {
-      initialize_barrier(readable[i], 1);
-      initialize_barrier(writable[i], size(TiledMma{}) / 128);
-    }
-  }
-
   // we can also use the following code to initialize the barrier
-  /*
   if (idx < kStage) {
-    readable[idx] = 0x7ffff800001ffffe;  // initialize_barrier(1);
-    writable[idx] = 0x7ffff000001ffffc;  // initialize_barrier(2);
-  }
-   */
-
-  int total_m = cu_tiles_ptr[num_group];
-  if (total_m <= 0) {
-    return;
+    initialize_barrier(readable[idx], 1);
+    initialize_barrier(writable[idx], size(TiledMma{}));
   }
 
-  if constexpr (IsLoopH) {
+  int total_m = 0;
+  int actual_tiles = 0;
+
+  if constexpr (kUsePDL) {
+    cudaGridDependencySynchronize();
+  }
+
+  if constexpr (kTaskLoopPolicy == 0) {
+    int warp_count = blockDim.x / 32;
+    int iwarp_block = blockIdx.x + gridDim.x * iwarp;
+    actual_tiles = cu_tiles_ptr[num_group] * (n / kTileN) + gridDim.x;
+    int iwave = 0;
+    while (iwarp_block < actual_tiles) {
+      int4 task = task_map_ptr[iwarp_block];
+
+      if (ilane == 0) {
+        shm_tiles[iwave * warp_count + iwarp] = task;
+      }
+      int igroup = task.z;
+      tma_descriptor_fence_acquire(td_xy + igroup * 2);
+      tma_descriptor_fence_acquire(td_xy + igroup * 2 + 1);
+      if (igroup < 0) {
+        break;
+      }
+      iwarp_block += gridDim.x * warp_count;
+      iwave++;
+    }
+  } else if constexpr (kTaskLoopPolicy == 1) {
+    int num_total_warps = blockDim.x / 32;
+    for (int i = iwarp; i < num_group * 2; i += num_total_warps) {
+      tma_descriptor_fence_acquire(td_xy + i);
+    }
     for (int i = idx; i < num_group; i += blockDim.x) {
       shm_tiles[i] = tiles_ptr[i];
     }
-  } else {
+  } else if constexpr (kTaskLoopPolicy == 2) {
+    int num_total_warps = blockDim.x / 32;
+    for (int i = iwarp; i < num_group * 2; i += num_total_warps) {
+      tma_descriptor_fence_acquire(td_xy + i);
+    }
+    total_m = cu_tiles_ptr[num_group];
     for (int i = idx; i < (num_group + 1); i += blockDim.x) {
       shm_tiles[i] = cu_tiles_ptr[i];
     }
@@ -561,10 +699,22 @@ __global__ void __launch_bounds__(384, 1)
       int ntile_k = size<2>(tAg);
 
       int igroup = 0;
+      int4 task;
+      int iwave = 0;
       int sum_tile_m = 0;
       int itile_m, itile_n;
+
       while (true) {
-        if constexpr (IsLoopH) {
+        if constexpr (kTaskLoopPolicy == 0) {
+          task = shm_tiles[iwave];
+          itile_m = task.x;
+          itile_n = task.y;
+          igroup = task.z;
+          if (igroup < 0) {
+            break;
+          }
+          iwave++;
+        } else if constexpr (kTaskLoopPolicy == 1) {
           get_next_tile_horizon(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, sum_tile_m,
                                 flat_divider);
           if (igroup < 0) {
@@ -612,10 +762,7 @@ __global__ void __launch_bounds__(384, 1)
     // math warpgroup
     cutlass::arch::warpgroup_reg_alloc<168>();
 
-    int idx_in_warpgroup = idx % 128;
     int iwarpgroup = idx / 128;
-    int iwarp_in_warpgroup = idx_in_warpgroup / 32;
-    int elected_idx_in_warpgroup = ((iwarp_in_warpgroup == 0) && elected);
 
     TiledMma tiled_mma;
 
@@ -642,8 +789,19 @@ __global__ void __launch_bounds__(384, 1)
     int igroup = 0;
     int sum_tile_m = 0;
     int itile_m, itile_n;
+    int4 task;
+    int iwave = 0;
     while (true) {
-      if constexpr (IsLoopH) {
+      if constexpr (kTaskLoopPolicy == 0) {
+        task = shm_tiles[iwave];
+        itile_m = task.x;
+        itile_n = task.y;
+        igroup = task.z;
+        if (igroup < 0) {
+          break;
+        }
+        iwave++;
+      } else if constexpr (kTaskLoopPolicy == 1) {
         get_next_tile_horizon(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, sum_tile_m,
                               flat_divider);
         if (igroup < 0) {
@@ -698,9 +856,7 @@ __global__ void __launch_bounds__(384, 1)
           }
         }
 
-        if (elected_idx_in_warpgroup) {
-          arrive_barrier(writable[ismem_read]);
-        }
+        arrive_barrier(writable[ismem_read]);
 
         ++ismem_read;
         if (ismem_read == kStage) {
@@ -720,8 +876,9 @@ __global__ void __launch_bounds__(384, 1)
       // Epilogue
       auto sCT =
           make_tensor(make_smem_ptr(reinterpret_cast<Tout *>(shm_c)), SLayoutCT{});  // (M, N)
-      using R2SCopyAtomC = Copy_Atom<cute::SM90_U16x8_STSM_T, Tout>;
-      // using R2SCopyAtomC = Copy_Atom<cute::SM90_U16x4_STSM_T, Tout>;
+      using STSM_ATOM =
+          std::conditional_t<kTileM == 8, cute::SM90_U16x4_STSM_T, cute::SM90_U16x8_STSM_T>;
+      using R2SCopyAtomC = Copy_Atom<STSM_ATOM, Tout>;
       auto tiled_copy_c = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);
       auto thr_copy_c = tiled_copy_c.get_slice(idx);
 
@@ -748,6 +905,10 @@ __global__ void __launch_bounds__(384, 1)
         tma_store_arrive();
       }
     }
+  }
+
+  if constexpr (kUsePDL) {
+    cudaTriggerProgrammaticLaunchCompletion();
   }
 }
 

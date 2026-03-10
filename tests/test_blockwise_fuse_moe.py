@@ -259,7 +259,7 @@ def naive_fuse_moe_blockwise(
     return y
 
 
-@pytest.mark.parametrize("num_tokens", [128])
+@pytest.mark.parametrize("num_tokens", [128, 512])
 @pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512, 256])

@@ -8,6 +8,7 @@
 #include <tuple>
 
 #include "src/group_gemm/group_gemm.h"
+#include "src/utils/utils.h"
 
 namespace hpc {
 namespace group_gemm {
@@ -17,7 +18,8 @@ torch::Tensor group_gemm_fp8_entry(const torch::Tensor &x, const torch::Tensor &
                                    const torch::Tensor &y_scale,
                                    const int64_t num_seq_per_group_avg,
                                    std::optional<torch::Tensor> output,
-                                   std::optional<torch::Tensor> tma_desc) {
+                                   std::optional<torch::Tensor> tma_desc,
+                                   std::optional<torch::Tensor> task_map_workspace) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
   TORCH_CHECK(weight.device().is_cuda(), "weight tensor must be cuda");
@@ -51,6 +53,16 @@ torch::Tensor group_gemm_fp8_entry(const torch::Tensor &x, const torch::Tensor &
     tmas = torch::empty({num_group * 2, 128}, options);
   }
 
+  int num_sm = get_sm_count();
+  int num_waves = 0;
+  torch::Tensor task_map;
+  void *task_map_ptr = nullptr;
+
+  if (num_seq_per_group_avg <= 8 && update_tma && task_map_workspace.has_value()) {
+    num_waves = task_map_workspace.value().size(0);
+    task_map_ptr = task_map_workspace.value().mutable_data_ptr();
+  }
+
   torch::Tensor tiles = torch::empty({num_group}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({num_group + 1}, options.dtype(torch::kInt32));
 
@@ -66,8 +78,8 @@ torch::Tensor group_gemm_fp8_entry(const torch::Tensor &x, const torch::Tensor &
   auto *cu_tiles_ptr = cu_tiles.mutable_data_ptr();
 
   group_gemm_fp8_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, yscale_ptr, tmas_ptr,
-                       tiles_ptr, cu_tiles_ptr, num_group, m, n, k, num_seq_per_group_avg,
-                       update_tma, stream);
+                       tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k,
+                       num_seq_per_group_avg, update_tma, false, stream);
 
   return y;
 }
@@ -76,7 +88,7 @@ torch::Tensor group_gemm_blockwise_fp8_entry(
     const torch::Tensor &x, const torch::Tensor &weight, const torch::Tensor &seqlens,
     const torch::Tensor &cu_seqlens, const torch::Tensor &x_scale, const torch::Tensor &w_scale,
     const int64_t num_seq_per_group_avg, std::optional<torch::Tensor> output,
-    std::optional<torch::Tensor> tma_desc) {
+    std::optional<torch::Tensor> tma_desc, std::optional<torch::Tensor> task_map_workspace) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
   TORCH_CHECK(weight.device().is_cuda(), "weight tensor must be cuda");
@@ -113,6 +125,16 @@ torch::Tensor group_gemm_blockwise_fp8_entry(
     tmas = torch::empty({num_group * 2, 128}, options);
   }
 
+  int num_sm = get_sm_count();
+  int num_waves = 0;
+  torch::Tensor task_map;
+  void *task_map_ptr = nullptr;
+
+  if (num_seq_per_group_avg <= 8 && update_tma && task_map_workspace.has_value()) {
+    num_waves = task_map_workspace.value().size(0);
+    task_map_ptr = task_map_workspace.value().mutable_data_ptr();
+  }
+
   torch::Tensor tiles = torch::empty({num_group}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({num_group + 1}, options.dtype(torch::kInt32));
 
@@ -129,9 +151,9 @@ torch::Tensor group_gemm_blockwise_fp8_entry(
   auto *cu_tiles_ptr = cu_tiles.mutable_data_ptr();
 
   group_gemm_blockwise_fp8_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr,
-                                 wscale_ptr, tmas_ptr, tiles_ptr, cu_tiles_ptr, num_group, m, n, k,
-                                 m_pad, num_block_k_pad4, num_seq_per_group_avg, update_tma,
-                                 stream);
+                                 wscale_ptr, tmas_ptr, tiles_ptr, cu_tiles_ptr, task_map_ptr,
+                                 num_waves, num_group, m, n, k, m_pad, num_block_k_pad4,
+                                 num_seq_per_group_avg, update_tma, false, stream);
 
   return y;
 }
@@ -191,13 +213,15 @@ torch::Tensor reformat_x_scale_entry(const torch::Tensor &x_scale, const torch::
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "group_gemm_fp8(Tensor x, Tensor weight, Tensor seqlens, Tensor cu_seqlens, Tensor y_scale, "
-      "int num_seq_per_group_avg, Tensor? output, Tensor? tma_desc) -> (Tensor)");
+      "int num_seq_per_group_avg, Tensor? output, Tensor? tma_desc, Tensor? task_map_workspace) -> "
+      "(Tensor)");
   m.impl("group_gemm_fp8", torch::kCUDA, &hpc::group_gemm::group_gemm_fp8_entry);
 
   m.def(
       "group_gemm_blockwise_fp8(Tensor x, Tensor weight, Tensor seqlens, Tensor cu_seqlens, Tensor "
       "xscale, Tensor wscale,"
-      "int num_seq_per_group_avg, Tensor? output, Tensor? tma_desc) -> (Tensor)");
+      "int num_seq_per_group_avg, Tensor? output, Tensor? tma_desc, Tensor? task_map_workspace) -> "
+      "(Tensor)");
   m.impl("group_gemm_blockwise_fp8", torch::kCUDA,
          &hpc::group_gemm::group_gemm_blockwise_fp8_entry);
 

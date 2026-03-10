@@ -8,6 +8,7 @@
 #include <tuple>
 
 #include "src/fuse_moe/fuse_moe.h"
+#include "src/utils/utils.h"
 
 namespace hpc {
 namespace fuse_moe {
@@ -61,8 +62,8 @@ count_and_gather_entry(const torch::Tensor &x, const torch::Tensor &topk_ids,
 
   count_and_gather_async(gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr,
                          x_ptr, topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr,
-                         gate_up_tmas_ptr, dowm_tmas_ptr, tiles_ptr, cu_tiles_ptr, num_seq,
-                         hidden_size, intermediate_size, num_topk, num_expert, rank_ep,
+                         gate_up_tmas_ptr, dowm_tmas_ptr, tiles_ptr, cu_tiles_ptr, nullptr, nullptr,
+                         num_seq, hidden_size, intermediate_size, num_topk, num_expert, rank_ep,
                          num_seq_per_group_avg, stream);
 
   return std::make_tuple(gate_up_input, gate_up_output, topk_pos, seqlens, cu_seqlens, tiles,
@@ -113,7 +114,7 @@ torch::Tensor reduce_entry(const torch::Tensor &x, const torch::Tensor &topk_pos
   auto *y_ptr = y.mutable_data_ptr();
 
   reduce_async(y_ptr, x_ptr, topk_pos_ptr, topk_scale_ptr, shared_output_ptr, total_num_seq,
-               num_seq, hidden_size, num_topk, stream);
+               num_seq, hidden_size, num_topk, false, stream);
 
   return y;
 }
@@ -170,6 +171,8 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   int num_expert = gate_up_weight.size(0);
   int intermediate_size = gate_up_weight.size(1);
   int num_topk = topk_ids.size(1);
+  int aligned_size = 0;
+  int num_tokens_per_group_avg = num_seq * num_topk / num_expert_total;
   TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
   auto options = x.options();
@@ -189,6 +192,39 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   torch::Tensor cu_seqlens = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
   torch::Tensor tiles = torch::empty({num_expert}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
+
+  if (num_tokens_per_group_avg <= 8) {
+    // aligned_size is actually the kTileM in group gemm
+    aligned_size = 8;
+  } else if (num_tokens_per_group_avg <= 16) {
+    aligned_size = 16;
+  } else if (num_tokens_per_group_avg <= 32) {
+    aligned_size = 32;
+  } else if (num_tokens_per_group_avg <= 48) {
+    aligned_size = 48;
+  } else {
+    aligned_size = 64;
+  }
+
+  int num_sm = get_sm_count();
+  constexpr int kTileN = 128;
+  int num_gateup_tiles =
+      ((num_seq + aligned_size - 1) / aligned_size) * (intermediate_size / kTileN) * num_expert;
+  int num_down_tiles =
+      ((num_seq + aligned_size - 1) / aligned_size) * (hidden_size / kTileN) * num_expert;
+  int num_gateup_waves = (num_gateup_tiles + num_sm - 1) / num_sm + 1;
+  int num_down_waves = (num_down_tiles + num_sm - 1) / num_sm + 1;
+  torch::Tensor gateup_task_map;
+  torch::Tensor down_task_map;
+  void *gateup_task_map_ptr = nullptr;
+  void *down_task_map_ptr = nullptr;
+
+  if (num_tokens_per_group_avg <= 8) {
+    gateup_task_map = torch::empty({num_gateup_waves, num_sm, 4}, options.dtype(torch::kInt32));
+    gateup_task_map_ptr = gateup_task_map.mutable_data_ptr();
+    down_task_map = torch::empty({num_down_waves, num_sm, 4}, options.dtype(torch::kInt32));
+    down_task_map_ptr = down_task_map.mutable_data_ptr();
+  }
 
   const auto *x_ptr = x.const_data_ptr();
   const auto *topk_ids_ptr = topk_ids.const_data_ptr();
@@ -216,7 +252,8 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
                  gate_up_scale_ptr, gate_up_tmas_ptr, act_and_mul_scale_ptr, down_input_ptr,
                  down_output_ptr, down_weight_ptr, down_scale_ptr, down_tmas_ptr, topk_ids_ptr,
                  topk_scale_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr,
-                 shared_output_ptr, num_seq, hidden_size, intermediate_size, num_topk,
+                 shared_output_ptr, gateup_task_map_ptr, down_task_map_ptr, num_gateup_waves,
+                 num_down_waves, num_seq, hidden_size, intermediate_size, num_topk,
                  num_expert_total, num_expert, rank_ep, use_bf16_mul, stream);
 
   return y;
@@ -293,7 +330,9 @@ torch::Tensor fuse_moe_blockwise_entry(
 
   TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
-  if (num_tokens_per_group_avg <= 16) {
+  if (num_tokens_per_group_avg <= 8) {
+    aligned_size = 8;
+  } else if (num_tokens_per_group_avg <= 16) {
     aligned_size = 16;
   } else if (num_tokens_per_group_avg <= 32) {
     aligned_size = 32;
@@ -329,6 +368,25 @@ torch::Tensor fuse_moe_blockwise_entry(
   torch::Tensor tiles = torch::empty({num_experts}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({num_experts + 1}, options.dtype(torch::kInt32));
 
+  int num_sm = get_sm_count();
+  int num_gateup_tiles =
+      ((num_tokens + aligned_size - 1) / aligned_size) * (intermediate_size / 128) * num_experts;
+  int num_down_tiles =
+      ((num_tokens + aligned_size - 1) / aligned_size) * (hidden_size / 128) * num_experts;
+  int num_gateup_waves = (num_gateup_tiles + num_sm - 1) / num_sm + 1;
+  int num_down_waves = (num_down_tiles + num_sm - 1) / num_sm + 1;
+  torch::Tensor gateup_task_map;
+  torch::Tensor down_task_map;
+  void *gateup_task_map_ptr = nullptr;
+  void *down_task_map_ptr = nullptr;
+
+  if (num_tokens_per_group_avg <= 8) {
+    gateup_task_map = torch::empty({num_gateup_waves, num_sm, 4}, options.dtype(torch::kInt32));
+    gateup_task_map_ptr = gateup_task_map.mutable_data_ptr();
+    down_task_map = torch::empty({num_down_waves, num_sm, 4}, options.dtype(torch::kInt32));
+    down_task_map_ptr = down_task_map.mutable_data_ptr();
+  }
+
   const auto *x_ptr = x.const_data_ptr();
   const auto *x_scale_ptr = x_scale.const_data_ptr();
   const auto *topk_ids_ptr = topk_ids.const_data_ptr();
@@ -358,8 +416,9 @@ torch::Tensor fuse_moe_blockwise_entry(
       gate_up_weight_ptr, gate_up_weight_scale_ptr, gate_up_tmas_ptr, down_input_ptr,
       down_input_scale_ptr, down_output_ptr, down_weight_ptr, down_weight_scale_ptr, down_tmas_ptr,
       topk_ids_ptr, topk_scale_ptr, topk_pos_ptr, num_tokens_per_group_ptr,
-      cu_num_tokens_per_group_ptr, tiles_ptr, cu_tiles_ptr, shared_output_ptr, num_tokens,
-      num_padded_tokens, hidden_size, intermediate_size, num_topk, num_expert_total, num_experts,
+      cu_num_tokens_per_group_ptr, tiles_ptr, cu_tiles_ptr, shared_output_ptr, gateup_task_map_ptr,
+      down_task_map_ptr, num_gateup_waves, num_down_waves, num_tokens, num_padded_tokens,
+      hidden_size, intermediate_size, num_topk, num_expert_total, num_experts,
       gate_up_weight_scale_lastdim_pad4, down_weight_scale_lastdim_pad4, rank_ep, stream);
   return y;
 }

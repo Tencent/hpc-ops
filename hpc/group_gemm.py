@@ -1,6 +1,7 @@
+from typing import Optional, Tuple
+
 import torch
 from torch import Tensor
-from typing import Tuple, Optional
 
 
 def reformat_x_scale(
@@ -55,6 +56,7 @@ def group_gemm_fp8(
     num_seq_per_group_avg: int = 32,
     output: Tensor = None,
     tma_desc: Tensor = None,
+    task_map_workspace: Tensor = None,
 ) -> Tensor:
     """Performs group GEMM operation with FP8 precision.
 
@@ -92,7 +94,15 @@ def group_gemm_fp8(
 
     """
     return torch.ops.hpc.group_gemm_fp8(
-        x, weight, seqlens, cu_seqlens, y_scale, num_seq_per_group_avg, output, tma_desc
+        x,
+        weight,
+        seqlens,
+        cu_seqlens,
+        y_scale,
+        num_seq_per_group_avg,
+        output,
+        tma_desc,
+        task_map_workspace,
     )
 
 
@@ -106,6 +116,7 @@ def group_gemm_blockwise_fp8(
     num_seq_per_group_avg: int = 32,
     output: Tensor = None,
     tma_desc: Tensor = None,
+    task_map_workspace: Tensor = None,
 ) -> Tensor:
     """Performs group GEMM operation with FP8 precision.
 
@@ -148,19 +159,45 @@ def group_gemm_blockwise_fp8(
 
     """
     return torch.ops.hpc.group_gemm_blockwise_fp8(
-        x, weight, seqlens, cu_seqlens, x_scale, w_scale, num_seq_per_group_avg, output, tma_desc
+        x,
+        weight,
+        seqlens,
+        cu_seqlens,
+        x_scale,
+        w_scale,
+        num_seq_per_group_avg,
+        output,
+        tma_desc,
+        task_map_workspace,
     )
 
 
 @torch.library.register_fake("hpc::group_gemm_fp8")
 def group_gemm_fp8_fake(
-    x, weight, seqlens, cu_seqlens, y_scale, num_seq_per_group_avg, output, tma_des
+    x,
+    weight,
+    seqlens,
+    cu_seqlens,
+    y_scale,
+    num_seq_per_group_avg,
+    output,
+    tma_desc,
+    task_map_workspace,
 ):
     return torch.empty((x.shape[0], weight.shape[1]), dtype=torch.bfloat16)
 
 
 @torch.library.register_fake("hpc::group_gemm_blockwise_fp8")
 def group_gemm_blockwise_fp8_fake(
-    x, weight, seqlens, cu_seqlens, x_scale, w_scale, num_seq_per_group_avg, output, tma_des
+    x,
+    weight,
+    seqlens,
+    cu_seqlens,
+    x_scale,
+    w_scale,
+    num_seq_per_group_avg,
+    output,
+    tma_desc,
+    task_map_workspace,
 ):
     return torch.empty((x.shape[0], weight.shape[1]), dtype=torch.bfloat16)

@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 #include <cub/cub.cuh>
+#include <iostream>
 
 #include "cute/tensor.hpp"
 #include "src/group_gemm/config.h"
@@ -99,8 +100,9 @@ template <int kTileM, int kTileN, int kTileK, int kTileS, int kStage, int kWarpg
 void launch_group_gemm_blockwise_fp8(void *y_ptr, const void *x_ptr, const void *w_ptr,
                                      const void *seqlens_ptr, const void *cu_seqlens_ptr,
                                      const void *xscale_ptr, const void *wscale_ptr, void *tmas_ptr,
-                                     void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m,
-                                     int n, int k, int m_pad, int num_block_k_pad4, bool update_tma,
+                                     void *tiles_ptr, void *cu_tiles_ptr, void *task_map_ptr,
+                                     int num_waves, int num_group, int m, int n, int k, int m_pad,
+                                     int num_block_k_pad4, bool update_tma, bool use_pdl,
                                      cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
@@ -131,6 +133,7 @@ void launch_group_gemm_blockwise_fp8(void *y_ptr, const void *x_ptr, const void 
 
   auto *tma_xy = static_cast<cute::TmaDescriptor *>(tmas_ptr);
 
+  int num_sm = get_sm_count();
   // 0. update tma
   if (update_tma) {
     vec_t<cute::TmaDescriptor, 2> td_xy{
@@ -140,11 +143,86 @@ void launch_group_gemm_blockwise_fp8(void *y_ptr, const void *x_ptr, const void 
 
     constexpr int kGroupPerThread = 8;
     constexpr int kThreadPerBlock = 32;
-    kernels::update_grouped_tma<Tin, Tout, decltype(tma_x), decltype(tma_y), kTileM,
-                                kGroupPerThread, kThreadPerBlock>
-        <<<num_group + 1, kThreadPerBlock, 0, stream>>>(
-            td_xy, tma_xy, (const Tin *)x_ptr, (const Tout *)y_ptr, (const int *)seqlens_ptr,
-            (const int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k);
+
+    if (use_pdl) {
+      constexpr bool kUsePDL = true;
+      if (task_map_ptr != nullptr) {
+        constexpr bool kAssignTask = true;
+
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+
+        // Set the attribute in a kernel launch configuration
+        cudaLaunchConfig_t launch_config{};
+
+        // Base launch configuration
+        launch_config.gridDim = 2 * num_group + 1;
+        launch_config.blockDim = kThreadPerBlock;
+        launch_config.dynamicSmemBytes = 0;
+        launch_config.stream = stream;
+
+        // Add special attribute for PDL
+        launch_config.attrs = attribute;
+        launch_config.numAttrs = 1;
+
+        auto kernel =
+            kernels::update_grouped_tma<Tin, Tout, decltype(tma_x), decltype(tma_y), kTileM,
+                                        kGroupPerThread, kThreadPerBlock, kAssignTask, kUsePDL>;
+
+        cudaLaunchKernelEx(&launch_config, kernel, td_xy, tma_xy, (const Tin *)x_ptr,
+                           (const Tout *)y_ptr, (const int *)seqlens_ptr,
+                           (const int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr,
+                           (int4 *)task_map_ptr, num_group, m, n, k, num_sm);
+      } else {
+        constexpr bool kAssignTask = false;
+
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+
+        // Set the attribute in a kernel launch configuration
+        cudaLaunchConfig_t launch_config{};
+
+        // Base launch configuration
+        launch_config.gridDim = num_group + 1;
+        launch_config.blockDim = kThreadPerBlock;
+        launch_config.dynamicSmemBytes = 0;
+        launch_config.stream = stream;
+
+        // Add special attribute for PDL
+        launch_config.attrs = attribute;
+        launch_config.numAttrs = 1;
+
+        auto kernel =
+            kernels::update_grouped_tma<Tin, Tout, decltype(tma_x), decltype(tma_y), kTileM,
+                                        kGroupPerThread, kThreadPerBlock, kAssignTask, kUsePDL>;
+
+        cudaLaunchKernelEx(&launch_config, kernel, td_xy, tma_xy, (const Tin *)x_ptr,
+                           (const Tout *)y_ptr, (const int *)seqlens_ptr,
+                           (const int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr,
+                           (int4 *)task_map_ptr, num_group, m, n, k, 0);
+      }
+    } else {
+      constexpr bool kUsePDL = false;
+      if (task_map_ptr != nullptr) {
+        constexpr bool kAssignTask = true;
+        kernels::update_grouped_tma<Tin, Tout, decltype(tma_x), decltype(tma_y), kTileM,
+                                    kGroupPerThread, kThreadPerBlock, kAssignTask, kUsePDL>
+            <<<2 * num_group + 1, kThreadPerBlock, 0, stream>>>(
+                td_xy, tma_xy, (const Tin *)x_ptr, (const Tout *)y_ptr, (const int *)seqlens_ptr,
+                (const int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr,
+                (int4 *)task_map_ptr, num_group, m, n, k, num_sm);
+      } else {
+        constexpr bool kAssignTask = false;
+        kernels::update_grouped_tma<Tin, Tout, decltype(tma_x), decltype(tma_y), kTileM,
+                                    kGroupPerThread, kThreadPerBlock, kAssignTask, kUsePDL>
+            <<<num_group + 1, kThreadPerBlock, 0, stream>>>(
+                td_xy, tma_xy, (const Tin *)x_ptr, (const Tout *)y_ptr, (const int *)seqlens_ptr,
+                (const int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr,
+                (int4 *)task_map_ptr, num_group, m, n, k, 0);
+      }
+    }
   }
 
   // 1. group gemm
@@ -154,35 +232,158 @@ void launch_group_gemm_blockwise_fp8(void *y_ptr, const void *x_ptr, const void 
 
     // dim3 block(size(Config::TiledMma{}) + 128);
     dim3 block(384);
-    dim3 grid(get_sm_count());
+    dim3 grid(num_sm);
 
-    int shm_seq = sizeof(int) * (num_group + 1);
-    int shm_size = config.get_shm_size() + shm_seq;
+    if (use_pdl) {
+      constexpr bool kUsePDL = true;
+      if (task_map_ptr != nullptr) {
+        constexpr bool kTaskLoopPolicy = 0;
 
-    if (k <= 1024 || n <= 1024) {
-      constexpr bool IsLoopH = true;
-      auto kernel =
-          kernels::group_gemm_blockwise_fp8_kernel<decltype(config), decltype(tma_x),
-                                                   decltype(tma_w), decltype(tma_y),
-                                                   decltype(tma_xs), decltype(tma_ws), IsLoopH>;
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+        int shm_seq = sizeof(int4) * num_waves;
+        int shm_size = config.get_shm_size() + shm_seq;
 
-      kernel<<<grid, block, shm_size, stream>>>(
-          tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
-          (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k, m_pad,
-          num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+
+        // Set the attribute in a kernel launch configuration
+        cudaLaunchConfig_t launch_config{};
+
+        // Base launch configuration
+        launch_config.gridDim = grid;
+        launch_config.blockDim = block;
+        launch_config.dynamicSmemBytes = shm_size;
+        launch_config.stream = stream;
+
+        // Add special attribute for PDL
+        launch_config.attrs = attribute;
+        launch_config.numAttrs = 1;
+
+        auto kernel = kernels::group_gemm_blockwise_fp8_kernel<
+            decltype(config), decltype(tma_x), decltype(tma_w), decltype(tma_y), decltype(tma_xs),
+            decltype(tma_ws), kTaskLoopPolicy, kUsePDL>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+
+        cudaLaunchKernelEx(&launch_config, kernel, tma_w, tma_xs, tma_ws, tma_xy,
+                           (int *)seqlens_ptr, (float *)xscale_ptr, (float *)wscale_ptr,
+                           (int *)tiles_ptr, (int *)cu_tiles_ptr, (int4 *)task_map_ptr, num_group,
+                           m, n, k, m_pad, num_block_n, num_block_k, num_block_k_pad4,
+                           flat_divider);
+      } else if (k <= 1024 || n <= 1024) {
+        constexpr bool kTaskLoopPolicy = 1;
+
+        int shm_seq = sizeof(int) * (num_group + 1);
+        int shm_size = config.get_shm_size() + shm_seq;
+
+        auto kernel = kernels::group_gemm_blockwise_fp8_kernel<
+            decltype(config), decltype(tma_x), decltype(tma_w), decltype(tma_y), decltype(tma_xs),
+            decltype(tma_ws), kTaskLoopPolicy, kUsePDL>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+
+        // Set the attribute in a kernel launch configuration
+        cudaLaunchConfig_t launch_config{};
+
+        // Base launch configuration
+        launch_config.gridDim = grid;
+        launch_config.blockDim = block;
+        launch_config.dynamicSmemBytes = shm_size;
+        launch_config.stream = stream;
+
+        // Add special attribute for PDL
+        launch_config.attrs = attribute;
+        launch_config.numAttrs = 1;
+
+        cudaLaunchKernelEx(&launch_config, kernel, tma_w, tma_xs, tma_ws, tma_xy,
+                           (int *)seqlens_ptr, (float *)xscale_ptr, (float *)wscale_ptr,
+                           (int *)tiles_ptr, (int *)cu_tiles_ptr, (int4 *)task_map_ptr, num_group,
+                           m, n, k, m_pad, num_block_n, num_block_k, num_block_k_pad4,
+                           flat_divider);
+      } else {
+        constexpr bool kTaskLoopPolicy = 2;
+
+        int shm_seq = sizeof(int) * (num_group + 1);
+        int shm_size = config.get_shm_size() + shm_seq;
+
+        auto kernel = kernels::group_gemm_blockwise_fp8_kernel<
+            decltype(config), decltype(tma_x), decltype(tma_w), decltype(tma_y), decltype(tma_xs),
+            decltype(tma_ws), kTaskLoopPolicy, kUsePDL>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+
+        // Set the attribute in a kernel launch configuration
+        cudaLaunchConfig_t launch_config{};
+
+        // Base launch configuration
+        launch_config.gridDim = grid;
+        launch_config.blockDim = block;
+        launch_config.dynamicSmemBytes = shm_size;
+        launch_config.stream = stream;
+
+        // Add special attribute for PDL
+        launch_config.attrs = attribute;
+        launch_config.numAttrs = 1;
+
+        cudaLaunchKernelEx(&launch_config, kernel, tma_w, tma_xs, tma_ws, tma_xy,
+                           (int *)seqlens_ptr, (float *)xscale_ptr, (float *)wscale_ptr,
+                           (int *)tiles_ptr, (int *)cu_tiles_ptr, (int4 *)task_map_ptr, num_group,
+                           m, n, k, m_pad, num_block_n, num_block_k, num_block_k_pad4,
+                           flat_divider);
+      }
     } else {
-      constexpr bool IsLoopH = false;
-      auto kernel =
-          kernels::group_gemm_blockwise_fp8_kernel<decltype(config), decltype(tma_x),
-                                                   decltype(tma_w), decltype(tma_y),
-                                                   decltype(tma_xs), decltype(tma_ws), IsLoopH>;
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+      constexpr bool kUsePDL = false;
+      if (task_map_ptr != nullptr) {
+        constexpr bool kTaskLoopPolicy = 0;
 
-      kernel<<<grid, block, shm_size, stream>>>(
-          tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
-          (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k, m_pad,
-          num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+        int shm_seq = sizeof(int4) * num_waves;
+        int shm_size = config.get_shm_size() + shm_seq;
+
+        auto kernel = kernels::group_gemm_blockwise_fp8_kernel<
+            decltype(config), decltype(tma_x), decltype(tma_w), decltype(tma_y), decltype(tma_xs),
+            decltype(tma_ws), kTaskLoopPolicy, kUsePDL>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+
+        kernel<<<grid, block, shm_size, stream>>>(
+            tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
+            (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, (int4 *)task_map_ptr,
+            num_group, m, n, k, m_pad, num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+      } else if (k <= 1024 || n <= 1024) {
+        constexpr bool kTaskLoopPolicy = 1;
+
+        int shm_seq = sizeof(int) * (num_group + 1);
+        int shm_size = config.get_shm_size() + shm_seq;
+
+        auto kernel = kernels::group_gemm_blockwise_fp8_kernel<
+            decltype(config), decltype(tma_x), decltype(tma_w), decltype(tma_y), decltype(tma_xs),
+            decltype(tma_ws), kTaskLoopPolicy, kUsePDL>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+
+        kernel<<<grid, block, shm_size, stream>>>(
+            tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
+            (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, (int4 *)task_map_ptr,
+            num_group, m, n, k, m_pad, num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+      } else {
+        constexpr bool kTaskLoopPolicy = 2;
+
+        int shm_seq = sizeof(int) * (num_group + 1);
+        int shm_size = config.get_shm_size() + shm_seq;
+
+        auto kernel = kernels::group_gemm_blockwise_fp8_kernel<
+            decltype(config), decltype(tma_x), decltype(tma_w), decltype(tma_y), decltype(tma_xs),
+            decltype(tma_ws), kTaskLoopPolicy, kUsePDL>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+
+        kernel<<<grid, block, shm_size, stream>>>(
+            tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
+            (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, (int4 *)task_map_ptr,
+            num_group, m, n, k, m_pad, num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+      }
     }
   }
 }
@@ -190,10 +391,10 @@ void launch_group_gemm_blockwise_fp8(void *y_ptr, const void *x_ptr, const void 
 void group_gemm_blockwise_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                                     const void *seqlens_ptr, const void *cu_seqlens_ptr,
                                     const void *xscale_ptr, const void *wscale_ptr, void *tmas_ptr,
-                                    void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m,
-                                    int n, int k, int m_pad, int num_block_k_pad4,
-                                    int num_seq_per_group_avg, bool update_tma,
-                                    cudaStream_t stream) {
+                                    void *tiles_ptr, void *cu_tiles_ptr, void *task_map_ptr,
+                                    int num_waves, int num_group, int m, int n, int k, int m_pad,
+                                    int num_block_k_pad4, int num_seq_per_group_avg,
+                                    bool update_tma, bool use_pdl, cudaStream_t stream) {
   constexpr int kTileN = 128;
   constexpr int kTileK = 128;
   constexpr int kTileS = 64;
@@ -203,34 +404,46 @@ void group_gemm_blockwise_fp8_async(void *y_ptr, const void *x_ptr, const void *
   constexpr int kSwizzleW = 128;
   constexpr int kSwizzleY = 64;
 
-  if (num_seq_per_group_avg <= 16) {
+  if (num_seq_per_group_avg <= 8) {
+    constexpr int kTileM = 8;
+    constexpr int kStage = 8;
+    launch_group_gemm_blockwise_fp8<kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
+                                    kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
+        y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
+        tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
+        num_block_k_pad4, update_tma, use_pdl, stream);
+  } else if (num_seq_per_group_avg <= 16) {
     constexpr int kTileM = 16;
     constexpr int kStage = 8;
     launch_group_gemm_blockwise_fp8<kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
                                     kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
         y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
-        tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4, update_tma, stream);
+        tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
+        num_block_k_pad4, update_tma, use_pdl, stream);
   } else if (num_seq_per_group_avg <= 32) {
     constexpr int kTileM = 32;
     constexpr int kStage = 8;
     launch_group_gemm_blockwise_fp8<kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
                                     kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
         y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
-        tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4, update_tma, stream);
+        tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
+        num_block_k_pad4, update_tma, use_pdl, stream);
   } else if (num_seq_per_group_avg <= 48) {
     constexpr int kTileM = 48;
     constexpr int kStage = 8;
     launch_group_gemm_blockwise_fp8<kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
                                     kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
         y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
-        tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4, update_tma, stream);
+        tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
+        num_block_k_pad4, update_tma, use_pdl, stream);
   } else {
     constexpr int kTileM = 64;
     constexpr int kStage = 8;
     launch_group_gemm_blockwise_fp8<kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
                                     kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
         y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
-        tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4, update_tma, stream);
+        tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
+        num_block_k_pad4, update_tma, use_pdl, stream);
   }
 }
 

@@ -42,26 +42,48 @@ def naive_group_gemm(x, w, seqlens, cu_seqlens, xscale, wscale):
     return y
 
 
-@pytest.mark.parametrize("num_group", [128])
+@pytest.mark.parametrize("num_group", [256])
 # @pytest.mark.parametrize("actual_m", [16, 32, 64, 128, 256, 512])
-@pytest.mark.parametrize("actual_m", [30])
-@pytest.mark.parametrize("m", [32])
+@pytest.mark.parametrize("actual_m", [3, 30])
 @pytest.mark.parametrize("n", [1024])
 @pytest.mark.parametrize("k", [4096])
-def test_group_gemm1(num_group, actual_m, m, n, k):
+@pytest.mark.parametrize("use_task_map", [False, True])
+def test_group_gemm1(num_group, actual_m, n, k, use_task_map):
     torch.cuda.manual_seed(10086)
     dtype = torch.float8_e4m3fn
 
     seqlens = torch.full((num_group,), actual_m, dtype=torch.int32, device="cuda")
 
     total_seq = torch.sum(seqlens)
-    total_seq_pad = m * num_group
+
     mean_seq = int(total_seq / num_group)
     print(total_seq, mean_seq)
+
+    task_map_workspace = None
+    if mean_seq <= 8:
+        m = 8
+    elif mean_seq <= 16:
+        m = 16
+    elif mean_seq <= 32:
+        m = 32
+    elif mean_seq <= 48:
+        m = 48
+    else:
+        m = 64
+
+    if use_task_map:
+        num_tiles = ((m + 7) // 8) * (n // 128) * num_group
+        num_sm = 78
+        num_waves = (num_tiles + num_sm - 1) // num_sm + 1
+        task_map_workspace = torch.empty((num_waves, num_sm, 4), dtype=torch.int32, device="cuda")
+
+    total_seq_pad = m * num_group
     x = (torch.randn((total_seq, k), dtype=torch.float, device="cuda") / 10).to(dtype)
     w = (torch.randn((num_group, n, k), dtype=torch.float, device="cuda") / 10).to(dtype)
     xscale = torch.randn((k // 128, total_seq_pad), dtype=torch.float, device="cuda")
-    wscale = torch.randn((num_group, n // 128, k // 128), dtype=torch.float, device="cuda")
+    wscale = torch.randn(
+        (num_group, n // 128, ((k // 128 + 3) // 4) * 4), dtype=torch.float, device="cuda"
+    )
 
     cu_seqlens = torch.cumsum(
         torch.cat([torch.tensor([0], dtype=torch.int32, device="cuda"), seqlens]), dim=0
@@ -70,9 +92,16 @@ def test_group_gemm1(num_group, actual_m, m, n, k):
     print(cu_seqlens)
 
     for _ in range(1):
-        gt = naive_group_gemm(x, w, seqlens, cu_seqlens, xscale, wscale)
+        gt = naive_group_gemm(x, w, seqlens, cu_seqlens, xscale, wscale[:, :, : (k // 128)])
         my = hpc.group_gemm_blockwise_fp8(
-            x, w, seqlens, cu_seqlens, xscale, wscale, num_seq_per_group_avg=mean_seq
+            x,
+            w,
+            seqlens,
+            cu_seqlens,
+            xscale,
+            wscale,
+            num_seq_per_group_avg=mean_seq,
+            task_map_workspace=task_map_workspace,
         )
 
     print("gt")

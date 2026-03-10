@@ -187,7 +187,7 @@ std::tuple<torch::Tensor, torch::Tensor> act_mul_and_blockwise_quant_entry(
   }
 
   act_mul_and_blockwise_quant_async(output_ptr, output_scale_ptr, input_ptr, num_row, num_col,
-                                    stream);
+                                    false, stream);
   return std::make_tuple(output_tensor, output_scale_tensor);
 }
 }  // namespace activation

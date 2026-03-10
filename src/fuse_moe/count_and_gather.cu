@@ -10,16 +10,20 @@
 #include "src/fuse_moe/fuse_moe.h"
 #include "src/utils/tma.cuh"
 #include "src/utils/utils.cuh"
+#include "src/utils/utils.h"
 
 namespace hpc {
 namespace fuse_moe {
 
 namespace kernels {
 
+template <bool kUsePDL = false>
 __global__ void count_seq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, int *seqlens_ptr,
                                  int total_num_topk, int start_expert, int end_expert) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
-
+  if constexpr (kUsePDL) {
+    cudaGridDependencySynchronize();
+  }
   if ((idx < total_num_topk)) {
     int iexpert = topk_ids_ptr[idx];
     if ((iexpert >= start_expert) && (iexpert < end_expert)) {
@@ -27,9 +31,12 @@ __global__ void count_seq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, int
     }
     topk_pos_ptr[idx] = -1;
   }
+  if constexpr (kUsePDL) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
 }
 
-template <int kThreadPerBlock, int kGroupPerThread, int kTileM>
+template <int kThreadPerBlock, int kGroupPerThread, int kTileM, bool kUsePDL = false>
 __global__ void count_cuseq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, int *seqlens_ptr,
                                    int *cu_seqlens_ptr, int *tiles_ptr, int *cu_tiles_ptr,
                                    int num_seq, int num_topk, int total_num_topk, int num_expert,
@@ -39,6 +46,9 @@ __global__ void count_cuseq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, i
   // cusum
   int thread_seqs[kGroupPerThread];
   int thread_tiles[kGroupPerThread];
+  if constexpr (kUsePDL) {
+    cudaGridDependencySynchronize();
+  }
 #pragma unroll
   for (int i = 0; i < kGroupPerThread; i++) {
     int igroup = idx * kGroupPerThread + i;
@@ -78,9 +88,12 @@ __global__ void count_cuseq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, i
     cu_seqlens_ptr[num_expert] = seqs_aggregate;
     cu_tiles_ptr[num_expert] = tiles_aggregate;
   }
+  if constexpr (kUsePDL) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
 }
 
-template <int kThreadPerBlock, int kGroupPerThread, int kTileM>
+template <int kThreadPerBlock, int kGroupPerThread, int kTileM, bool kUsePDL = false>
 __global__ void count_seq_and_cuseq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr,
                                            int *seqlens_ptr, int *cu_seqlens_ptr, int *tiles_ptr,
                                            int *cu_tiles_ptr, int num_seq, int num_topk,
@@ -94,6 +107,10 @@ __global__ void count_seq_and_cuseq_kernel(const int *topk_ids_ptr, int *topk_po
     seqlens_shm[i] = 0;
   }
   __syncthreads();
+
+  if constexpr (kUsePDL) {
+    cudaGridDependencySynchronize();
+  }
 
   for (int i = idx; i < total_num_topk; i += blockDim.x) {
     int iexpert = topk_ids_ptr[i];
@@ -147,24 +164,32 @@ __global__ void count_seq_and_cuseq_kernel(const int *topk_ids_ptr, int *topk_po
     cu_seqlens_ptr[num_expert] = seqs_aggregate;
     cu_tiles_ptr[num_expert] = tiles_aggregate;
   }
+  if constexpr (kUsePDL) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
 }
 
 template <typename T1, typename T2, typename GateUpTmaX, typename GateUpTmaY, typename DownTmaX,
-          typename DownTmaY, int kWarpPerBlock>
+          typename DownTmaY, int kWarpPerBlock, int kTileM, bool kAssignTask, bool kUsePDL = false>
 __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
                               cute::TmaDescriptor *gate_up_tma_xy, cute::TmaDescriptor *down_tma_xy,
                               T1 *gate_up_input_ptr, T2 *gate_up_output_ptr, T1 *down_input_ptr,
                               T2 *down_output_ptr, const T1 *x_ptr, const int *topk_ids_ptr,
                               int *topk_pos_ptr, int *seqlens_ptr, int *cu_seqlens_ptr,
+                              int4 *gateup_task_map_ptr, int4 *down_task_map_ptr, int *cu_tiles_ptr,
                               int total_num_topk, int hidden_size, int intermediate_size,
                               int start_expert, int end_expert, int num_block_for_copy,
-                              cutlass::FastDivmod topk_divider) {
+                              int num_sm_count, cutlass::FastDivmod topk_divider) {
   constexpr int kThreadPerWarp = 32;
   int idx = threadIdx.x;
   int iblock = blockIdx.x;
   int iwarp = idx / kThreadPerWarp;
   int ilane = idx % kThreadPerWarp;
   int itopk = iblock * kWarpPerBlock + iwarp;
+
+  if constexpr (kUsePDL) {
+    cudaGridDependencySynchronize();
+  }
 
   if (iblock < num_block_for_copy) {
     if (itopk < total_num_topk) {
@@ -255,18 +280,87 @@ __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
         tma_descriptor_cp_fence_release(gate_up_tma_xy + igroup * 2 + i, smem_tma_desc[i]);
         tma_descriptor_cp_fence_release(down_tma_xy + igroup * 2 + i, smem_tma_desc[i + 2]);
       }
+    } else if (iwarp == 1) {
+      if constexpr (kAssignTask) {
+        if constexpr (kTileM == 8) {
+          constexpr int kTileN = 128;
+          int num_group = gridDim.x - num_block_for_copy;
+          int igroup = iblock - num_block_for_copy;
+          int num_tile_n = intermediate_size / kTileN;
+          int cu_tile_m = cu_tiles_ptr[igroup];
+          int num_tile_m = cu_tiles_ptr[igroup + 1] - cu_tile_m;
+          int cu_tiles = cu_tile_m * num_tile_n;
+
+          for (int im = 0; im < num_tile_m; im++) {
+            for (int in = ilane; in < num_tile_n; in += 32) {
+              int itile = cu_tiles + im * num_tile_n + in;
+              int4 task;
+              task.x = im;
+              task.y = in;
+              task.z = igroup;
+              gateup_task_map_ptr[itile] = task;
+            }
+          }
+
+          if (igroup == num_group - 1) {
+            int num_gateup_tiles = (num_tile_m + cu_tile_m) * num_tile_n;
+            for (int i = ilane; i < num_sm_count; i += 32) {
+              int4 task;
+              task.z = -1;
+              gateup_task_map_ptr[num_gateup_tiles + i] = task;
+            }
+          }
+        }
+      }
+
+    } else if (iwarp == 2) {
+      if constexpr (kAssignTask) {
+        if constexpr (kTileM == 8) {
+          constexpr int kTileN = 128;
+          int num_group = gridDim.x - num_block_for_copy;
+          int igroup = iblock - num_block_for_copy;
+          int num_tile_n = hidden_size / kTileN;
+          int cu_tile_m = cu_tiles_ptr[igroup];
+          int num_tile_m = cu_tiles_ptr[igroup + 1] - cu_tile_m;
+          int cu_tiles = cu_tile_m * num_tile_n;
+
+          for (int im = 0; im < num_tile_m; im++) {
+            for (int in = ilane; in < num_tile_n; in += 32) {
+              int itile = cu_tiles + im * num_tile_n + in;
+              int4 task;
+              task.x = im;
+              task.y = in;
+              task.z = igroup;
+              down_task_map_ptr[itile] = task;
+            }
+          }
+
+          if (igroup == num_group - 1) {
+            int num_down_tiles = (num_tile_m + cu_tile_m) * num_tile_n;
+            for (int i = ilane; i < num_sm_count; i += 32) {
+              int4 task;
+              task.z = -1;
+              down_task_map_ptr[num_down_tiles + i] = task;
+            }
+          }
+        }
+      }
     }
+  }
+  if constexpr (kUsePDL) {
+    cudaTriggerProgrammaticLaunchCompletion();
   }
 }
 
 }  // namespace kernels
 
-template <int kTileM, int kTileN, int kTileK, int kStage>
+template <int kTileM, int kTileN, int kTileK, int kStage, bool kUsePDL = false>
 void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
                              void *down_input_ptr, void *down_output_ptr, const void *x_ptr,
                              const void *topk_ids_ptr, void *topk_pos_ptr, void *seqlens_ptr,
                              void *cu_seqlens_ptr, void *gate_up_tmas_ptr, void *down_tmas_ptr,
-                             void *tiles_ptr, void *cu_tiles_ptr, int num_seq, int hidden_size,
+                             void *tiles_ptr, void *cu_tiles_ptr, void *gateup_task_map_ptr,
+                             void *down_task_map_ptr, int num_seq, int hidden_size,
                              int intermediate_size, int num_topk, int num_expert, int eprank,
                              int num_seq_per_group_avg, cudaStream_t stream) {
   using namespace cute;  // NOLINT
@@ -313,29 +407,81 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
     if (num_seq <= 128) {
       dim3 block(kThreadPerBlock);
       dim3 grid(1);
-      kernels::count_seq_and_cuseq_kernel<kThreadPerBlock, kGroupPerThread, kTileM>
-          <<<grid, block, num_expert * 4, stream>>>(
-              (const int *)topk_ids_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
-              (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_seq, num_topk,
-              total_num_topk, num_expert, start_expert, end_expert);
+      cudaLaunchAttribute attribute[1];
+      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attribute[0].val.programmaticStreamSerializationAllowed = 1;
+
+      // Set the attribute in a kernel launch configuration
+      cudaLaunchConfig_t config{};
+
+      // Base launch configuration
+      config.gridDim = grid;
+      config.blockDim = block;
+      config.dynamicSmemBytes = num_expert * 4;
+      config.stream = stream;
+
+      // Add special attribute for PDL
+      config.attrs = attribute;
+      config.numAttrs = 1;
+      auto kernel =
+          kernels::count_seq_and_cuseq_kernel<kThreadPerBlock, kGroupPerThread, kTileM, kUsePDL>;
+      cudaLaunchKernelEx(&config, kernel, (const int *)topk_ids_ptr, (int *)topk_pos_ptr,
+                         (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (int *)tiles_ptr,
+                         (int *)cu_tiles_ptr, num_seq, num_topk, total_num_topk, num_expert,
+                         start_expert, end_expert);
     } else {
       // 0.1 count seqlens
       {
         dim3 block(kThreadPerBlock);
         dim3 grid((total_num_topk + kThreadPerBlock - 1) / kThreadPerBlock);
-        kernels::count_seq_kernel<<<grid, block, 0, stream>>>(
-            (const int *)topk_ids_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr, total_num_topk,
-            start_expert, end_expert);
+
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+
+        // Set the attribute in a kernel launch configuration
+        cudaLaunchConfig_t config{};
+
+        // Base launch configuration
+        config.gridDim = grid;
+        config.blockDim = block;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+
+        // Add special attribute for PDL
+        config.attrs = attribute;
+        config.numAttrs = 1;
+        auto kernel = kernels::count_seq_kernel<kUsePDL>;
+        cudaLaunchKernelEx(&config, kernel, (const int *)topk_ids_ptr, (int *)topk_pos_ptr,
+                           (int *)seqlens_ptr, total_num_topk, start_expert, end_expert);
       }
       // 0.2 count cu_seqlens
       {
         dim3 block(kThreadPerBlock);
         dim3 grid(1);
-        kernels::count_cuseq_kernel<kThreadPerBlock, kGroupPerThread, kTileM>
-            <<<grid, block, num_expert * 4, stream>>>(
-                (const int *)topk_ids_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
-                (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_seq, num_topk,
-                total_num_topk, num_expert, start_expert, end_expert);
+
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+
+        // Set the attribute in a kernel launch configuration
+        cudaLaunchConfig_t config{};
+
+        // Base launch configuration
+        config.gridDim = grid;
+        config.blockDim = block;
+        config.dynamicSmemBytes = num_expert * 4;
+        config.stream = stream;
+
+        // Add special attribute for PDL
+        config.attrs = attribute;
+        config.numAttrs = 1;
+        auto kernel =
+            kernels::count_cuseq_kernel<kThreadPerBlock, kGroupPerThread, kTileM, kUsePDL>;
+        cudaLaunchKernelEx(&config, kernel, (const int *)topk_ids_ptr, (int *)topk_pos_ptr,
+                           (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (int *)tiles_ptr,
+                           (int *)cu_tiles_ptr, num_seq, num_topk, total_num_topk, num_expert,
+                           start_expert, end_expert);
       }
     }
   }
@@ -351,20 +497,57 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
 
     constexpr int kWarpPerBlock = 4;
     int num_block_for_copy = (total_num_topk + kWarpPerBlock - 1) / kWarpPerBlock;
+    int num_sm_count = get_sm_count();
 
     cutlass::FastDivmod topk_divider(num_topk);
 
     dim3 block(kWarpPerBlock * 32);
     dim3 grid(num_block_for_copy + num_expert);
 
-    kernels::gather_kernel<Tin, Tout, decltype(gata_up_tma_x), decltype(gata_up_tma_y),
-                           decltype(down_tma_x), decltype(down_tma_y), kWarpPerBlock>
-        <<<grid, block, 0, stream>>>(
-            td_xy, gate_up_tma_xy, down_tma_xy, (Tin *)gate_up_input_ptr,
-            (Tout *)gate_up_output_ptr, (Tin *)down_input_ptr, (Tout *)down_output_ptr,
-            (const Tin *)x_ptr, (const int *)topk_ids_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
-            (int *)cu_seqlens_ptr, total_num_topk, hidden_size, intermediate_size, start_expert,
-            end_expert, num_block_for_copy, topk_divider);
+    cudaLaunchAttribute attribute[1];
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = 1;
+
+    // Set the attribute in a kernel launch configuration
+    cudaLaunchConfig_t config{};
+
+    // Base launch configuration
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+
+    // Add special attribute for PDL
+    config.attrs = attribute;
+    config.numAttrs = 1;
+
+    if (gateup_task_map_ptr && down_task_map_ptr) {
+      constexpr int kAssignTask = true;
+      auto kernel =
+          kernels::gather_kernel<Tin, Tout, decltype(gata_up_tma_x), decltype(gata_up_tma_y),
+                                 decltype(down_tma_x), decltype(down_tma_y), kWarpPerBlock, kTileM,
+                                 kAssignTask, kUsePDL>;
+      cudaLaunchKernelEx(
+          &config, kernel, td_xy, gate_up_tma_xy, down_tma_xy, (Tin *)gate_up_input_ptr,
+          (Tout *)gate_up_output_ptr, (Tin *)down_input_ptr, (Tout *)down_output_ptr,
+          (const Tin *)x_ptr, (const int *)topk_ids_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
+          (int *)cu_seqlens_ptr, (int4 *)gateup_task_map_ptr, (int4 *)down_task_map_ptr,
+          (int *)cu_tiles_ptr, total_num_topk, hidden_size, intermediate_size, start_expert,
+          end_expert, num_block_for_copy, num_sm_count, topk_divider);
+    } else {
+      constexpr int kAssignTask = false;
+      auto kernel =
+          kernels::gather_kernel<Tin, Tout, decltype(gata_up_tma_x), decltype(gata_up_tma_y),
+                                 decltype(down_tma_x), decltype(down_tma_y), kWarpPerBlock, kTileM,
+                                 kAssignTask, kUsePDL>;
+      cudaLaunchKernelEx(
+          &config, kernel, td_xy, gate_up_tma_xy, down_tma_xy, (Tin *)gate_up_input_ptr,
+          (Tout *)gate_up_output_ptr, (Tin *)down_input_ptr, (Tout *)down_output_ptr,
+          (const Tin *)x_ptr, (const int *)topk_ids_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
+          (int *)cu_seqlens_ptr, (int4 *)gateup_task_map_ptr, (int4 *)down_task_map_ptr,
+          (int *)cu_tiles_ptr, total_num_topk, hidden_size, intermediate_size, start_expert,
+          end_expert, num_block_for_copy, num_sm_count, topk_divider);
+    }
   }
 }
 
@@ -372,44 +555,55 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gate_up_output_ptr, v
                             void *down_output_ptr, const void *x_ptr, const void *topk_ids_ptr,
                             void *topk_pos_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
                             void *gate_up_tmas_ptr, void *down_tmas_ptr, void *tiles_ptr,
-                            void *cu_tiles_ptr, int num_seq, int hidden_size, int intermediate_size,
-                            int num_topk, int num_expert, int eprank, int num_seq_per_group_avg,
+                            void *cu_tiles_ptr, void *gateup_task_map_ptr, void *down_task_map_ptr,
+                            int num_seq, int hidden_size, int intermediate_size, int num_topk,
+                            int num_expert, int eprank, int num_seq_per_group_avg,
                             cudaStream_t stream) {
   constexpr int kTileN = 128;
   constexpr int kTileK = 128;
 
-  if (num_seq_per_group_avg <= 16) {
-    constexpr int kTileM = 16;
+  constexpr bool kUsePDL = true;
+
+  if (num_seq_per_group_avg <= 8) {
+    constexpr int kTileM = 8;
     constexpr int kStage = 8;
-    launch_count_and_gather<kTileM, kTileN, kTileK, kStage>(
+    launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
-        cu_tiles_ptr, num_seq, hidden_size, intermediate_size, num_topk, num_expert, eprank,
-        num_seq_per_group_avg, stream);
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
+  } else if (num_seq_per_group_avg <= 16) {
+    constexpr int kTileM = 16;
+    constexpr int kStage = 8;
+    launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
+        gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
+        topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
   } else if (num_seq_per_group_avg <= 32) {
     constexpr int kTileM = 32;
     constexpr int kStage = 8;
-    launch_count_and_gather<kTileM, kTileN, kTileK, kStage>(
+    launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
-        cu_tiles_ptr, num_seq, hidden_size, intermediate_size, num_topk, num_expert, eprank,
-        num_seq_per_group_avg, stream);
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
   } else if (num_seq_per_group_avg <= 48) {
     constexpr int kTileM = 48;
     constexpr int kStage = 8;
-    launch_count_and_gather<kTileM, kTileN, kTileK, kStage>(
+    launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
-        cu_tiles_ptr, num_seq, hidden_size, intermediate_size, num_topk, num_expert, eprank,
-        num_seq_per_group_avg, stream);
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
   } else {
     constexpr int kTileM = 64;
     constexpr int kStage = 8;
-    launch_count_and_gather<kTileM, kTileN, kTileK, kStage>(
+    launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
-        cu_tiles_ptr, num_seq, hidden_size, intermediate_size, num_topk, num_expert, eprank,
-        num_seq_per_group_avg, stream);
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
   }
 }
 
