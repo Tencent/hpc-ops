@@ -7,7 +7,12 @@ def pad_and_transpose(x: Tensor) -> Tensor:
 
 
 def gemm_blockwise(
-    x: Tensor, weight: Tensor, x_scale: Tensor, w_scale: Tensor, bias: Tensor
+    x: Tensor,
+    weight: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    trans_xscale: bool = True,
+    bias: Tensor = None,
 ) -> Tensor:
     """Performs block wise quant GEMM operation with FP8 precision.
 
@@ -20,15 +25,13 @@ def gemm_blockwise(
             Shape: [n, k]
             Dtype: fp8
         x_scale: Scaling factor for x tensor
-            Shape: [k // 128, m_pad],  (m_pad = (m + 127) // 128 * 128)
+            Shape: [m, k // 128]
             Dtype: fp32
-            The origin x_scale shape is [m, k // 128], should pad to [m_pad, k // 128],
-            and transpose it, this should be handle in last quant kernel
         weight_scale: Scaling factor for weight tensor
-            Shape: [n // 128, 128]
+            Shape: [n // 128, alinged_to_4(k // 128)]
             Dtype: fp32
-            The origin weight_scale shape is [n // 128, k // 128], should pad to [n // 128, 128],
-            so the k <= 16384
+        trans_xscale: Whether transpose x_scale, Default is True
+            [m, k / 128] -> [k / 128, alinged_to_4(m)];
         bias: bias tensor
             Shape: [n]
             Dtype: fp32
@@ -38,7 +41,7 @@ def gemm_blockwise(
             Dtype: bfloat16
 
     """
-    return torch.ops.hpc.gemm_blockwise(x, weight, x_scale, w_scale, bias)
+    return torch.ops.hpc.gemm_blockwise(x, weight, x_scale, w_scale, trans_xscale, bias)
 
 
 def get_gemm_bf16xfp32_workspace(max_weight_hidden_size: int) -> Tensor:
