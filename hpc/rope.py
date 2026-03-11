@@ -18,6 +18,7 @@ def rope_norm_blocked_kvcache(
     k_norm_weight: Optional[Tensor] = None,
     out_q: Optional[Tensor] = None,
     out_k: Optional[Tensor] = None,
+    qk_norm_policy: Optional[int] = 1,
 ) -> Tuple[Tensor, Tensor]:
     """Applies Rotary Position Embedding (RoPE) with blocked KV cache. Supports QK normalization.
 
@@ -65,6 +66,9 @@ def rope_norm_blocked_kvcache(
         out_k: Optional output tensor for transformed key vectors.
             Shape: [num_rows, num_kv_heads, qk_head_dim]
             Dtype: bfloat16
+        qk_norm_policy: Optional policy for QK normalization. 1 means rope first, 2 means norm first.
+            Shape: scalar
+            Dtype: int
 
     Returns:
         A tuple of (out_q, out_k) tensors after RoPE(+ qk norm) transformation:
@@ -80,6 +84,8 @@ def rope_norm_blocked_kvcache(
         - KV cache is updated in-place with transformed K and original V
         - When out_q and out_k are provided, uses inplace operation
     """
+    if not use_qk_norm:
+        qk_norm_policy = 0  # 1 means rope first, 2 means norm first
     return torch.ops.hpc.rope_norm_blocked_kvcache(
         key_cache,
         value_cache,
@@ -89,7 +95,7 @@ def rope_norm_blocked_kvcache(
         q_index,
         kvcache_indices,
         is_prefill,
-        use_qk_norm,
+        qk_norm_policy,
         q_norm_weight,
         k_norm_weight,
         out_q,
@@ -116,6 +122,7 @@ def rope_norm_blocked_kvcache_w8c8_dqskv(
     out_q: Optional[Tensor] = None,
     out_k: Optional[Tensor] = None,
     out_attention: Optional[Tensor] = None,
+    qk_norm_policy: Optional[int] = 1,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Applies Rotary Position Embedding (RoPE) with blocked KV cache. Supports QK normalization.
 
@@ -184,6 +191,9 @@ def rope_norm_blocked_kvcache_w8c8_dqskv(
         out_attention: Optional output tensor for attention output, used in this op for building TMA descriptor.
             Shape: [num_rows, num_q_heads, v_head_dim]
             Dtype: bfloat16
+        qk_norm_policy: Policy for QK normalization. 1 means rope first, 2 means norm first.
+            Shape: scalar
+            Dtype: int
 
     Returns:
         A tuple of (out_q, out_k, q_scale, split_k_flag, out_attention, tma_tensor) tensors after RoPE(+ qk norm) transformation:
@@ -211,6 +221,8 @@ def rope_norm_blocked_kvcache_w8c8_dqskv(
         - KV cache is updated in-place with transformed K and original V
         - When out_q and out_k are provided, uses inplace operation
     """
+    if not use_qk_norm:
+        qk_norm_policy = 0  # 1 means rope first, 2 means norm first
     return torch.ops.hpc.rope_norm_blocked_kvcache_w8c8_dqskv(
         key_cache,
         value_cache,
@@ -220,7 +232,7 @@ def rope_norm_blocked_kvcache_w8c8_dqskv(
         q_index,
         kvcache_indices,
         is_prefill,
-        use_qk_norm,
+        qk_norm_policy,
         max_seqlens,
         k_scale,
         v_scale,
@@ -229,6 +241,48 @@ def rope_norm_blocked_kvcache_w8c8_dqskv(
         upper_max,
         out_q,
         out_k,
+        out_attention,
+    )
+
+
+def rope_norm_w8c8(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cos_sin: Tensor,
+    num_seqlen_per_req: Tensor,
+    q_index: Tensor,
+    is_prefill: bool,
+    max_seqlens: int,
+    k_scale: Tensor,
+    v_scale: Tensor,
+    qk_norm_policy: int = 0,
+    q_norm_weight: Optional[Tensor] = None,
+    k_norm_weight: Optional[Tensor] = None,
+    upper_max: Optional[float] = None,
+    out_q: Optional[Tensor] = None,
+    out_k: Optional[Tensor] = None,
+    out_v: Optional[Tensor] = None,
+    out_attention: Optional[Tensor] = None,
+):
+    return torch.ops.hpc.rope_norm_w8c8(
+        q,
+        k,
+        v,
+        cos_sin,
+        num_seqlen_per_req,
+        q_index,
+        is_prefill,
+        max_seqlens,
+        k_scale,
+        v_scale,
+        qk_norm_policy,
+        q_norm_weight,
+        k_norm_weight,
+        upper_max,
+        out_q,
+        out_k,
+        out_v,
         out_attention,
     )
 
@@ -330,93 +384,58 @@ def rope_norm_blocked_kvcache_w8c8_dqskv_fake(
     num_request = num_seqlen_per_req.shape[0]
     q_heads = (hidden_size - k_heads * qk_head_dim - v_heads * v_head_dim) // qk_head_dim
     max_seqlens_pad128 = ((max_seqlens + 127) // 128) * 128
+    out_q = torch.empty(
+        num_rows,
+        q_heads,
+        qk_head_dim,
+        dtype=qkv.dtype,
+        device=qkv.device,
+    )
+    out_k = torch.empty(
+        num_rows,
+        k_heads,
+        qk_head_dim,
+        dtype=qkv.dtype,
+        device=qkv.device,
+    )
+    q_scale = None
     if is_prefill:
-        return (
-            torch.empty(
-                num_rows,
-                q_heads,
-                qk_head_dim,
-                dtype=qkv.dtype,
-                device=qkv.device,
-            ),
-            torch.empty(
-                num_rows,
-                k_heads,
-                qk_head_dim,
-                dtype=qkv.dtype,
-                device=qkv.device,
-            ),
-            torch.empty(
-                num_request,
-                q_heads,
-                max_seqlens_pad128,
-                dtype=k_scale.dtype,
-                device=k_scale.device,
-            ),
-            torch.empty(
-                num_request,
-                k_heads,
-                dtype=torch.int32,
-                device=qkv.device,
-            ),
-            torch.empty(
-                num_rows,
-                q_heads,
-                v_head_dim,
-                dtype=qkv.dtype,
-                device=qkv.device,
-            ),
-            torch.empty(
-                num_request,
-                2,  # TMA tensors for Q and Output, respectively
-                128,  # TMA tensor size of each TMA descriptor
-                dtype=torch.uint8,
-                device=qkv.device,
-            ),
+        q_scale = torch.empty(
+            num_request,
+            q_heads,
+            max_seqlens_pad128,
+            dtype=k_scale.dtype,
+            device=k_scale.device,
         )
     else:
-        return (
-            torch.empty(
-                num_rows,
-                q_heads,
-                qk_head_dim,
-                dtype=qkv.dtype,
-                device=qkv.device,
-            ),
-            torch.empty(
-                num_rows,
-                k_heads,
-                qk_head_dim,
-                dtype=qkv.dtype,
-                device=qkv.device,
-            ),
-            torch.empty(
-                num_rows,
-                q_heads,
-                dtype=k_scale.dtype,
-                device=k_scale.device,
-            ),
-            torch.empty(
-                num_rows,
-                k_heads,
-                dtype=torch.int32,
-                device=qkv.device,
-            ),
-            torch.empty(
-                num_rows,
-                q_heads,
-                v_head_dim,
-                dtype=qkv.dtype,
-                device=qkv.device,
-            ),
-            torch.empty(
-                num_request,
-                2,  # TMA tensors for Q and Output, respectively
-                128,  # TMA tensor size of each TMA descriptor
-                dtype=torch.uint8,
-                device=qkv.device,
-            ),
+        q_scale = torch.empty(
+            num_rows,
+            q_heads,
+            dtype=k_scale.dtype,
+            device=k_scale.device,
         )
+
+    split_k_flag = torch.empty(
+        num_request,
+        k_heads,
+        dtype=torch.int32,
+        device=qkv.device,
+    )
+    out_attention = torch.empty(
+        num_rows,
+        q_heads,
+        v_head_dim,
+        dtype=qkv.dtype,
+        device=qkv.device,
+    )
+    tma_tensor = torch.empty(
+        num_request,
+        2,  # TMA tensors for Q and Output, respectively
+        128,  # TMA tensor size of each TMA descriptor
+        dtype=torch.uint8,
+        device=qkv.device,
+    )
+    return (out_q, out_k, q_scale, split_k_flag, out_attention, tma_tensor)
 
 
 @torch.library.register_fake("hpc::rope_interleave")

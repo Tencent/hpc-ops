@@ -210,6 +210,7 @@ def torch_rope_norm_blocked_prefill(
     use_qknorm=False,
     q_norm_weight=None,
     k_norm_weight=None,
+    qk_norm_policy=1,
 ):
     """Test RoPE prefill mode with PyTorch reference implementation."""
     assert is_prefill
@@ -244,14 +245,19 @@ def torch_rope_norm_blocked_prefill(
         ]
         token_offset += q_seq_len
 
-    q_input = q_input.view(num_rows, num_q_heads, qk_head_dim)
-    k_input = k_input.view(num_rows, num_kv_heads, qk_head_dim)
-    v_input = v_input.view(num_rows, num_kv_heads, v_head_dim)
+    q_ref = q_input.view(num_rows, num_q_heads, qk_head_dim)
+    k_ref = k_input.view(num_rows, num_kv_heads, qk_head_dim)
+    v_ref = v_input.view(num_rows, num_kv_heads, v_head_dim)
     # Compute reference Q and K
-    q_ref = apply_rotary_pos_emb_neox_reference(q_input, cos_sin_for_tokens)
-    k_ref = apply_rotary_pos_emb_neox_reference(k_input, cos_sin_for_tokens)
 
-    if use_qknorm:
+    if use_qknorm and qk_norm_policy == 2:
+        q_ref = apply_rms_norm_reference(q_ref, q_norm_weight)
+        k_ref = apply_rms_norm_reference(k_ref, k_norm_weight)
+
+    q_ref = apply_rotary_pos_emb_neox_reference(q_ref, cos_sin_for_tokens)
+    k_ref = apply_rotary_pos_emb_neox_reference(k_ref, cos_sin_for_tokens)
+
+    if use_qknorm and qk_norm_policy == 1:
         q_ref = apply_rms_norm_reference(q_ref, q_norm_weight)
         k_ref = apply_rms_norm_reference(k_ref, k_norm_weight)
 
@@ -270,7 +276,7 @@ def torch_rope_norm_blocked_prefill(
             # Update K cache
             kcache[cache_block_idx, pos_in_block, :, :] = k_ref[token_idx, :, :].to(dtype)
             # Update V cache
-            vcache[cache_block_idx, pos_in_block, :, :] = v_input[token_idx, :, :].to(dtype)
+            vcache[cache_block_idx, pos_in_block, :, :] = v_ref[token_idx, :, :].to(dtype)
             token_idx += 1
 
     out_q = q_ref.to(dtype)
@@ -347,6 +353,7 @@ def torch_rope_norm_blocked_decode(
     use_qknorm=False,
     q_norm_weight=None,
     k_norm_weight=None,
+    qk_norm_policy=1,
 ):
     """Test RoPE decode mode with PyTorch reference implementation."""
     assert not is_prefill
@@ -373,14 +380,19 @@ def torch_rope_norm_blocked_decode(
         position = seq_len - 1
         cos_sin_for_tokens[batch_idx] = cos_sin[position]
 
-    q_input = q_input.view(num_rows, num_q_heads, qk_head_dim)
-    k_input = k_input.view(num_rows, num_kv_heads, qk_head_dim)
-    v_input = v_input.view(num_rows, num_kv_heads, v_head_dim)
-    # Compute reference Q and K
-    q_ref = apply_rotary_pos_emb_neox_reference(q_input, cos_sin_for_tokens)
-    k_ref = apply_rotary_pos_emb_neox_reference(k_input, cos_sin_for_tokens)
+    q_ref = q_input.view(num_rows, num_q_heads, qk_head_dim)
+    k_ref = k_input.view(num_rows, num_kv_heads, qk_head_dim)
+    v_ref = v_input.view(num_rows, num_kv_heads, v_head_dim)
 
-    if use_qknorm:
+    if use_qknorm and qk_norm_policy == 2:
+        q_ref = apply_rms_norm_reference(q_ref, q_norm_weight)
+        k_ref = apply_rms_norm_reference(k_ref, k_norm_weight)
+
+    # Compute reference Q and K
+    q_ref = apply_rotary_pos_emb_neox_reference(q_ref, cos_sin_for_tokens)
+    k_ref = apply_rotary_pos_emb_neox_reference(k_ref, cos_sin_for_tokens)
+
+    if use_qknorm and qk_norm_policy == 1:
         q_ref = apply_rms_norm_reference(q_ref, q_norm_weight)
         k_ref = apply_rms_norm_reference(k_ref, k_norm_weight)
 
@@ -397,7 +409,7 @@ def torch_rope_norm_blocked_decode(
         # Update K cache
         kcache[cache_block_idx, pos_in_block, :, :] = k_ref[token_idx, :, :].to(dtype)
         # Update V cache
-        vcache[cache_block_idx, pos_in_block, :, :] = v_input[token_idx, :, :].to(dtype)
+        vcache[cache_block_idx, pos_in_block, :, :] = v_ref[token_idx, :, :].to(dtype)
 
         if pos_in_block == 0:
             kcache[cache_block_idx, 1:, :, :] = 0
@@ -415,7 +427,10 @@ def torch_rope_norm_blocked_decode(
 @pytest.mark.parametrize("num_q_head_head_dim", [(4, 128), (8, 128), (8, 80)])
 @pytest.mark.parametrize("num_kv_heads", [1])
 @pytest.mark.parametrize("use_qknorm", [False, True])
-def test_rope_norm_blocked_prefill(num_req, num_q_head_head_dim, num_kv_heads, use_qknorm):
+@pytest.mark.parametrize("qk_norm_policy", [1, 2])
+def test_rope_norm_blocked_prefill(
+    num_req, num_q_head_head_dim, num_kv_heads, use_qknorm, qk_norm_policy
+):
     req_length = torch.randint(20, 200, (num_req,)).tolist()
     num_q_heads = num_q_head_head_dim[0]
     qk_head_dim = num_q_head_head_dim[1]
@@ -464,6 +479,7 @@ def test_rope_norm_blocked_prefill(num_req, num_q_head_head_dim, num_kv_heads, u
         use_qknorm,
         q_norm_weight,
         k_norm_weight,
+        qk_norm_policy=qk_norm_policy,
     )
 
     torch_out_q, torch_out_k, torch_kcache, torch_vcache = torch_rope_norm_blocked_prefill(
@@ -478,6 +494,7 @@ def test_rope_norm_blocked_prefill(num_req, num_q_head_head_dim, num_kv_heads, u
         use_qknorm=use_qknorm,
         q_norm_weight=q_norm_weight,
         k_norm_weight=k_norm_weight,
+        qk_norm_policy=qk_norm_policy,
     )
 
     assert allclose(torch_out_q, my_out_q, atol=5e-2)
@@ -489,7 +506,10 @@ def test_rope_norm_blocked_prefill(num_req, num_q_head_head_dim, num_kv_heads, u
 @pytest.mark.parametrize("num_q_head_head_dim", [(4, 128), (8, 128), (8, 80)])
 @pytest.mark.parametrize("num_kv_heads", [1])
 @pytest.mark.parametrize("use_qknorm", [False, True])
-def test_rope_norm_blocked_decode(num_req, num_q_head_head_dim, num_kv_heads, use_qknorm):
+@pytest.mark.parametrize("qk_norm_policy", [1, 2])
+def test_rope_norm_blocked_decode(
+    num_req, num_q_head_head_dim, num_kv_heads, use_qknorm, qk_norm_policy
+):
     req_length = torch.randint(20, 200, (num_req,)).tolist()
     num_q_heads = num_q_head_head_dim[0]
     qk_head_dim = num_q_head_head_dim[1]
@@ -537,6 +557,7 @@ def test_rope_norm_blocked_decode(num_req, num_q_head_head_dim, num_kv_heads, us
         use_qknorm,
         q_norm_weight,
         k_norm_weight,
+        qk_norm_policy=qk_norm_policy,
     )
 
     torch_out_q, torch_out_k, torch_kcache, torch_vcache = torch_rope_norm_blocked_decode(
@@ -551,6 +572,7 @@ def test_rope_norm_blocked_decode(num_req, num_q_head_head_dim, num_kv_heads, us
         use_qknorm=use_qknorm,
         q_norm_weight=q_norm_weight,
         k_norm_weight=k_norm_weight,
+        qk_norm_policy=qk_norm_policy,
     )
 
     assert allclose(torch_out_q, my_out_q, atol=5e-2)
@@ -560,10 +582,126 @@ def test_rope_norm_blocked_decode(num_req, num_q_head_head_dim, num_kv_heads, us
 
 @pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
 @pytest.mark.parametrize("num_req", [7])
+@pytest.mark.parametrize("num_q_head_head_dim", [(8, 128)])
+@pytest.mark.parametrize("num_kv_heads", [1])
+@pytest.mark.parametrize("use_qknorm", [True])
+@pytest.mark.parametrize("qk_norm_policy", [1, 2])
+def test_rope_norm_prefill_fp8(
+    num_req, num_q_head_head_dim, num_kv_heads, use_qknorm, qk_norm_policy
+):
+    req_length = torch.randint(20, 200, (num_req,)).tolist()
+    num_q_heads = num_q_head_head_dim[0]
+    qk_head_dim = num_q_head_head_dim[1]
+    v_head_dim = num_q_head_head_dim[1]
+    kv_block_size = 64
+    max_num_kv_blocks = 1024
+    max_rope_position = 2048
+    dtype = torch.bfloat16
+    (
+        qkv,
+        num_seqlen_per_req,
+        cos_sin,
+        kcache,
+        vcache,
+        kv_indices,
+        q_norm_weight,
+        k_norm_weight,
+    ) = prepare_prefill_input(
+        num_req,
+        req_length,
+        num_q_heads,
+        num_kv_heads,
+        qk_head_dim,
+        v_head_dim,
+        kv_block_size,
+        max_num_kv_blocks,
+        max_rope_position,
+        dtype,
+    )
+    q_index, qkv_new = sample_and_extract_qkv(req_length, qkv)
+
+    # clone input for torch ref, incase inplace update
+    qkv_ref = qkv_new.clone()
+    kcache_ref = kcache.clone()
+    vcache_ref = vcache.clone()
+
+    k_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv_new.device)
+    v_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv_new.device)
+    kcache_fp8 = kcache.to(torch.float8_e4m3fn)
+    vcache_fp8 = vcache.to(torch.float8_e4m3fn)
+
+    seqlens = q_index[1:] - q_index[:-1]
+    max_seqlens = seqlens.max().item()
+
+    out_kv = torch.zeros(
+        (qkv_new.shape[0], num_kv_heads * qk_head_dim + num_kv_heads * v_head_dim),
+        dtype=torch.float8_e4m3fn,
+        device=qkv_new.device,
+    )
+
+    out_q_fp8, out_k_fp8, out_v_fp8, qk_scale, split_k_flag, out_attention, tma_tensor = (
+        hpc.rope_norm_w8c8(
+            q=qkv_new[:, : num_q_heads * qk_head_dim].reshape(-1, num_q_heads, qk_head_dim),
+            k=qkv_new[
+                :,
+                num_q_heads * qk_head_dim : num_q_heads * qk_head_dim + num_kv_heads * qk_head_dim,
+            ].reshape(-1, num_kv_heads, qk_head_dim),
+            v=qkv_new[:, num_q_heads * qk_head_dim + num_kv_heads * qk_head_dim :].reshape(
+                -1, num_kv_heads, v_head_dim
+            ),
+            cos_sin=cos_sin,
+            num_seqlen_per_req=num_seqlen_per_req,
+            q_index=q_index,
+            is_prefill=True,  # is_refill
+            max_seqlens=max_seqlens,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            qk_norm_policy=qk_norm_policy,
+            q_norm_weight=q_norm_weight,
+            k_norm_weight=k_norm_weight,
+            out_k=out_kv[:, : num_kv_heads * qk_head_dim].reshape(-1, num_kv_heads, qk_head_dim),
+            out_v=out_kv[:, num_kv_heads * qk_head_dim :].reshape(-1, num_kv_heads, v_head_dim),
+        )
+    )
+
+    # convert q_scale to original format
+    num_seq = seqlens.shape[0]
+    mask = torch.arange(qk_scale.shape[2]).expand(
+        qk_scale.shape[0], qk_scale.shape[2]
+    ).cuda() < seqlens.unsqueeze(1)
+    qk_scale_normal = qk_scale.permute(0, 2, 1)[mask].cuda()
+
+    q_bf16 = (out_q_fp8.to(torch.bfloat16) * qk_scale_normal[:, :, None]).to(torch.bfloat16) * (
+        1 / k_scale.to(torch.bfloat16)
+    )
+
+    torch_out_q, torch_out_k, torch_kcache, torch_vcache = torch_rope_norm_blocked_prefill(
+        kcache_ref,
+        vcache_ref,
+        qkv_ref,
+        cos_sin,
+        num_seqlen_per_req,
+        q_index,
+        kv_indices,
+        is_prefill=True,
+        use_qknorm=use_qknorm,
+        q_norm_weight=q_norm_weight,
+        k_norm_weight=k_norm_weight,
+        qk_norm_policy=qk_norm_policy,
+    )
+
+    assert allclose(torch_out_q, q_bf16, atol=0.5)
+
+
+@pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
+@pytest.mark.parametrize("num_req", [7])
 @pytest.mark.parametrize("num_q_head_head_dim", [(4, 128)])
 @pytest.mark.parametrize("num_kv_heads", [1])
 @pytest.mark.parametrize("use_qknorm", [True])
-def test_rope_norm_blocked_prefill_fp8(num_req, num_q_head_head_dim, num_kv_heads, use_qknorm):
+@pytest.mark.parametrize("qk_norm_policy", [1, 2])
+def test_rope_norm_blocked_prefill_fp8(
+    num_req, num_q_head_head_dim, num_kv_heads, use_qknorm, qk_norm_policy
+):
     req_length = torch.randint(20, 200, (num_req,)).tolist()
     num_q_heads = num_q_head_head_dim[0]
     qk_head_dim = num_q_head_head_dim[1]
@@ -624,6 +762,7 @@ def test_rope_norm_blocked_prefill_fp8(num_req, num_q_head_head_dim, num_kv_head
             v_scale=v_scale,
             q_norm_weight=q_norm_weight,
             k_norm_weight=k_norm_weight,
+            qk_norm_policy=qk_norm_policy,
         )
     )
 
@@ -650,6 +789,7 @@ def test_rope_norm_blocked_prefill_fp8(num_req, num_q_head_head_dim, num_kv_head
         use_qknorm=use_qknorm,
         q_norm_weight=q_norm_weight,
         k_norm_weight=k_norm_weight,
+        qk_norm_policy=qk_norm_policy,
     )
 
     my_kcache = kcache_fp8.float()
@@ -664,7 +804,10 @@ def test_rope_norm_blocked_prefill_fp8(num_req, num_q_head_head_dim, num_kv_head
 @pytest.mark.parametrize("num_q_head_head_dim", [(4, 128)])
 @pytest.mark.parametrize("num_kv_heads", [1])
 @pytest.mark.parametrize("use_qknorm", [True])
-def test_rope_norm_blocked_decode_fp8(num_req, num_q_head_head_dim, num_kv_heads, use_qknorm):
+@pytest.mark.parametrize("qk_norm_policy", [1, 2])
+def test_rope_norm_blocked_decode_fp8(
+    num_req, num_q_head_head_dim, num_kv_heads, use_qknorm, qk_norm_policy
+):
     req_length = torch.randint(20, 200, (num_req,)).tolist()
     num_q_heads = num_q_head_head_dim[0]
     qk_head_dim = num_q_head_head_dim[1]
@@ -721,6 +864,7 @@ def test_rope_norm_blocked_decode_fp8(num_req, num_q_head_head_dim, num_kv_heads
             v_scale=v_scale,
             q_norm_weight=q_norm_weight,
             k_norm_weight=k_norm_weight,
+            qk_norm_policy=qk_norm_policy,
         )
     )
 
@@ -740,6 +884,7 @@ def test_rope_norm_blocked_decode_fp8(num_req, num_q_head_head_dim, num_kv_heads
         use_qknorm=use_qknorm,
         q_norm_weight=q_norm_weight,
         k_norm_weight=k_norm_weight,
+        qk_norm_policy=qk_norm_policy,
     )
 
     my_kcache = kcache_fp8.float()

@@ -57,7 +57,7 @@ __device__ __forceinline__ void compute_rms_norm(float *thread_data, const float
 
 // Prefill Kernel: Each warp processes one row (one token)
 template <typename DType = __nv_bfloat16, int kNumWarpsPerBlock = 4, int kNumQHeads = 8,
-          int kNumKVHeads = 1, int kQKHeadDim = 80, int kVHeadDim = 80, bool kUseQKNorm = false>
+          int kNumKVHeads = 1, int kQKHeadDim = 80, int kVHeadDim = 80, int kQKNormPolicy = 0>
 __global__ void apply_rotary_pos_emb_prefill_kernel(
     DType *out_q_ptr, DType *kcache_ptr, DType *vcache_ptr, const DType *in_qkv_ptr,
     const float *cos_sin_ptr, const int *num_tokens_per_batch_ptr, const int *q_index_ptr,
@@ -128,7 +128,7 @@ __global__ void apply_rotary_pos_emb_prefill_kernel(
   int token_id_in_batch = token_id_in_batch_shm[iwarp];
 
   // Load norm weights into shared memory (only once per block)
-  if constexpr (kUseQKNorm) {
+  if constexpr (kQKNormPolicy > 0) {
     constexpr int kItemPerThread = 16 / sizeof(float);
     constexpr int kNumPacks = kQKHeadDim / kItemPerThread;
     static_assert(kQKHeadDim % kItemPerThread == 0,
@@ -195,13 +195,30 @@ __global__ void apply_rotary_pos_emb_prefill_kernel(
     constexpr int kNumRoundsHalf = (kQKHeadDim / 2 + kWarpSize - 1) / kWarpSize;
     constexpr int kNumItemPerThread = kNumRoundsHalf * 2;
     float q_float_buffer_reg[kNumItemPerThread] = {0};
+
 #pragma unroll
     for (int iround = 0; iround < kNumRoundsHalf; ++iround) {
       int i = iround * kWarpSize + ilane;
       if (i < kQKHeadDim / 2) {
         static_assert(std::is_same<DType, __nv_bfloat16>::value, "DType must be __nv_bfloat16");
-        float x1 = __bfloat162float(q_head_data[i]);
-        float x2 = __bfloat162float(q_head_data[i + kQKHeadDim / 2]);
+        q_float_buffer_reg[iround * 2] = __bfloat162float(q_head_data[i]);
+        q_float_buffer_reg[iround * 2 + 1] = __bfloat162float(q_head_data[i + kQKHeadDim / 2]);
+      }
+    }
+
+    // kQKNormPolicy==2 means norm first, then rope
+    if constexpr (kQKNormPolicy == 2) {
+      compute_rms_norm<kNumItemPerThread, kQKHeadDim, kWarpSize>(q_float_buffer_reg,
+                                                                 load_buffer_q_norm_weight, ilane);
+    }
+
+#pragma unroll
+    for (int iround = 0; iround < kNumRoundsHalf; ++iround) {
+      int i = iround * kWarpSize + ilane;
+      if (i < kQKHeadDim / 2) {
+        static_assert(std::is_same<DType, __nv_bfloat16>::value, "DType must be __nv_bfloat16");
+        float x1 = q_float_buffer_reg[iround * 2];
+        float x2 = q_float_buffer_reg[iround * 2 + 1];
         float cos_val = load_buffer_cos_sin[iwarp][i];
         float sin_val = load_buffer_cos_sin[iwarp][i + kQKHeadDim / 2];
         q_float_buffer_reg[iround * 2] = x1 * cos_val - x2 * sin_val;
@@ -209,8 +226,8 @@ __global__ void apply_rotary_pos_emb_prefill_kernel(
       }
     }
 
-    // Apply QK norm if enabled
-    if constexpr (kUseQKNorm) {
+    // kQKNormPolicy==1 means rope first, then norm
+    if constexpr (kQKNormPolicy == 1) {
       compute_rms_norm<kNumItemPerThread, kQKHeadDim, kWarpSize>(q_float_buffer_reg,
                                                                  load_buffer_q_norm_weight, ilane);
     }
@@ -235,12 +252,29 @@ __global__ void apply_rotary_pos_emb_prefill_kernel(
     constexpr int kNumRoundsHalf = (kQKHeadDim / 2 + kWarpSize - 1) / kWarpSize;
     constexpr int kNumItemPerThread = kNumRoundsHalf * 2;
     float k_float_buffer_reg[kNumItemPerThread] = {0};
+
 #pragma unroll
     for (int iround = 0; iround < kNumRoundsHalf; ++iround) {
       int i = iround * kWarpSize + ilane;
       if (i < kQKHeadDim / 2) {
-        float x1 = __bfloat162float(k_head_data[i]);
-        float x2 = __bfloat162float(k_head_data[i + kQKHeadDim / 2]);
+        static_assert(std::is_same<DType, __nv_bfloat16>::value, "DType must be __nv_bfloat16");
+        k_float_buffer_reg[iround * 2] = __bfloat162float(k_head_data[i]);
+        k_float_buffer_reg[iround * 2 + 1] = __bfloat162float(k_head_data[i + kQKHeadDim / 2]);
+      }
+    }
+
+    // kQKNormPolicy==2 means norm first, then rope
+    if constexpr (kQKNormPolicy == 2) {
+      compute_rms_norm<kNumItemPerThread, kQKHeadDim, kWarpSize>(k_float_buffer_reg,
+                                                                 load_buffer_k_norm_weight, ilane);
+    }
+
+#pragma unroll
+    for (int iround = 0; iround < kNumRoundsHalf; ++iround) {
+      int i = iround * kWarpSize + ilane;
+      if (i < kQKHeadDim / 2) {
+        float x1 = k_float_buffer_reg[iround * 2];
+        float x2 = k_float_buffer_reg[iround * 2 + 1];
         float cos_val = load_buffer_cos_sin[iwarp][i];
         float sin_val = load_buffer_cos_sin[iwarp][i + kQKHeadDim / 2];
         k_float_buffer_reg[iround * 2] = x1 * cos_val - x2 * sin_val;
@@ -248,8 +282,8 @@ __global__ void apply_rotary_pos_emb_prefill_kernel(
       }
     }
 
-    // Apply QK norm if enabled
-    if constexpr (kUseQKNorm) {
+    // kQKNormPolicy==1 means rope first, then norm
+    if constexpr (kQKNormPolicy == 1) {
       compute_rms_norm<kNumItemPerThread, kQKHeadDim, kWarpSize>(k_float_buffer_reg,
                                                                  load_buffer_k_norm_weight, ilane);
     }
@@ -293,7 +327,7 @@ __global__ void apply_rotary_pos_emb_prefill_kernel(
 // Decoding Kernel: Each warp processes one batch (one token per batch)
 // Uses double warps: first half for computation, second half for zeroing unused cache blocks
 template <typename DType = __nv_bfloat16, int kNumWarpsPerBlock = 4, int kNumQHeads = 8,
-          int kNumKVHeads = 1, int kQKHeadDim = 80, int kVHeadDim = 80, bool kUseQKNorm = false>
+          int kNumKVHeads = 1, int kQKHeadDim = 80, int kVHeadDim = 80, int kQKNormPolicy = 0>
 __global__ void apply_rotary_pos_emb_decoding_kernel(
     DType *out_q_ptr, DType *kcache_ptr, DType *vcache_ptr, const DType *in_qkv_ptr,
     const float *cos_sin_ptr, const int *num_tokens_per_batch_ptr, const int *kv_block_indices_ptr,
@@ -324,7 +358,7 @@ __global__ void apply_rotary_pos_emb_decoding_kernel(
     int token_id_in_batch = batch_id < num_batch ? num_tokens_per_batch_ptr[batch_id] - 1 : -1;
 
     // Load norm weights into shared memory (only once per block)
-    if constexpr (kUseQKNorm) {
+    if constexpr (kQKNormPolicy > 0) {
       constexpr int kItemPerThread = 16 / sizeof(float);
       constexpr int kNumPacks = kQKHeadDim / kItemPerThread;
       static_assert(kQKHeadDim % kItemPerThread == 0,
@@ -414,12 +448,29 @@ __global__ void apply_rotary_pos_emb_decoding_kernel(
         constexpr int kNumRoundsHalf = (kQKHeadDim / 2 + kWarpSize - 1) / kWarpSize;
         constexpr int kNumItemPerThread = kNumRoundsHalf * 2;
         float q_float_buffer_reg[kNumItemPerThread] = {0};
+
 #pragma unroll
         for (int iround = 0; iround < kNumRoundsHalf; ++iround) {
           int i = iround * kWarpSize + ilane;
           if (i < kQKHeadDim / 2) {
-            float x1 = __bfloat162float(q_head_data[i]);
-            float x2 = __bfloat162float(q_head_data[i + kQKHeadDim / 2]);
+            static_assert(std::is_same<DType, __nv_bfloat16>::value, "DType must be __nv_bfloat16");
+            q_float_buffer_reg[iround * 2] = __bfloat162float(q_head_data[i]);
+            q_float_buffer_reg[iround * 2 + 1] = __bfloat162float(q_head_data[i + kQKHeadDim / 2]);
+          }
+        }
+
+        // kQKNormPolicy==2 means norm first, then rope
+        if constexpr (kQKNormPolicy == 2) {
+          compute_rms_norm<kNumItemPerThread, kQKHeadDim, kWarpSize>(
+              q_float_buffer_reg, load_buffer_q_norm_weight, ilane);
+        }
+
+#pragma unroll
+        for (int iround = 0; iround < kNumRoundsHalf; ++iround) {
+          int i = iround * kWarpSize + ilane;
+          if (i < kQKHeadDim / 2) {
+            float x1 = q_float_buffer_reg[iround * 2];
+            float x2 = q_float_buffer_reg[iround * 2 + 1];
             float cos_val = cos_sin_data[i];
             float sin_val = cos_sin_data[i + kQKHeadDim / 2];
             q_float_buffer_reg[iround * 2] = x1 * cos_val - x2 * sin_val;
@@ -427,8 +478,8 @@ __global__ void apply_rotary_pos_emb_decoding_kernel(
           }
         }
 
-        // Apply QK norm if enabled
-        if constexpr (kUseQKNorm) {
+        // kQKNormPolicy==1 means rope first, then norm
+        if constexpr (kQKNormPolicy == 1) {
           compute_rms_norm<kNumItemPerThread, kQKHeadDim, kWarpSize>(
               q_float_buffer_reg, load_buffer_q_norm_weight, ilane);
         }
@@ -454,12 +505,29 @@ __global__ void apply_rotary_pos_emb_decoding_kernel(
         constexpr int kNumRoundsHalf = (kQKHeadDim / 2 + kWarpSize - 1) / kWarpSize;
         constexpr int kNumItemPerThread = kNumRoundsHalf * 2;
         float k_float_buffer_reg[kNumItemPerThread] = {0};
+
 #pragma unroll
         for (int iround = 0; iround < kNumRoundsHalf; ++iround) {
           int i = iround * kWarpSize + ilane;
           if (i < kQKHeadDim / 2) {
-            float x1 = __bfloat162float(k_head_data[i]);
-            float x2 = __bfloat162float(k_head_data[i + kQKHeadDim / 2]);
+            static_assert(std::is_same<DType, __nv_bfloat16>::value, "DType must be __nv_bfloat16");
+            k_float_buffer_reg[iround * 2] = __bfloat162float(k_head_data[i]);
+            k_float_buffer_reg[iround * 2 + 1] = __bfloat162float(k_head_data[i + kQKHeadDim / 2]);
+          }
+        }
+
+        // kQKNormPolicy==2 means norm first, then rope
+        if constexpr (kQKNormPolicy == 2) {
+          compute_rms_norm<kNumItemPerThread, kQKHeadDim, kWarpSize>(
+              k_float_buffer_reg, load_buffer_k_norm_weight, ilane);
+        }
+
+#pragma unroll
+        for (int iround = 0; iround < kNumRoundsHalf; ++iround) {
+          int i = iround * kWarpSize + ilane;
+          if (i < kQKHeadDim / 2) {
+            float x1 = k_float_buffer_reg[iround * 2];
+            float x2 = k_float_buffer_reg[iround * 2 + 1];
             float cos_val = cos_sin_data[i];
             float sin_val = cos_sin_data[i + kQKHeadDim / 2];
             k_float_buffer_reg[iround * 2] = x1 * cos_val - x2 * sin_val;
@@ -467,8 +535,8 @@ __global__ void apply_rotary_pos_emb_decoding_kernel(
           }
         }
 
-        // Apply QK norm if enabled
-        if constexpr (kUseQKNorm) {
+        // kQKNormPolicy==1 means rope first, then norm
+        if constexpr (kQKNormPolicy == 1) {
           compute_rms_norm<kNumItemPerThread, kQKHeadDim, kWarpSize>(
               k_float_buffer_reg, load_buffer_k_norm_weight, ilane);
         }
@@ -578,7 +646,7 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
     const int *q_index_ptr, const int *kv_block_indices_ptr, const float *q_norm_weight_ptr,
     const float *k_norm_weight_ptr, int kcache_block_offset, int vcache_block_offset, int num_batch,
     int max_num_kv_block_per_batch, int kv_block_size, int num_rows, int num_q_heads,
-    int num_kv_heads, int qk_head_dim, int v_head_dim, bool is_prefill, bool use_qk_norm,
+    int num_kv_heads, int qk_head_dim, int v_head_dim, bool is_prefill, int qk_norm_policy,
     cudaStream_t stream) {
   cutlass::FastDivmod kv_block_size_divider(kv_block_size);
 
@@ -594,22 +662,33 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
       dim3 block(kNumWarpsPerBlock * kWarpSize);
       dim3 grid((num_rows + kNumWarpsPerBlock - 1) / kNumWarpsPerBlock);
 
-      if (use_qk_norm) {
+      if (qk_norm_policy == 1) {  // rope first
+        constexpr int kQKNormPolicy = 1;
         kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
-                                                     kNumKVHeads, kQKHeadDim, kVHeadDim, true>
-            <<<grid, block, 0, stream>>>(
-                out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
-                k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
-                max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
-      } else {
+                                                     kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                     kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr,
+            kcache_block_offset, vcache_block_offset, num_batch, max_num_kv_block_per_batch,
+            kv_block_size_divider, num_rows);
+      } else if (qk_norm_policy == 2) {  // norm first
+        constexpr int kQKNormPolicy = 2;
         kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
-                                                     kNumKVHeads, kQKHeadDim, kVHeadDim, false>
-            <<<grid, block, 0, stream>>>(
-                out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
-                k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
-                max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
+                                                     kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                     kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr,
+            kcache_block_offset, vcache_block_offset, num_batch, max_num_kv_block_per_batch,
+            kv_block_size_divider, num_rows);
+      } else {  // no normalization
+        constexpr int kQKNormPolicy = 0;
+        kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
+                                                     kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                     kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr,
+            kcache_block_offset, vcache_block_offset, num_batch, max_num_kv_block_per_batch,
+            kv_block_size_divider, num_rows);
       }
 
     } else {
@@ -619,22 +698,33 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
       // addtional batch is used for clearing the kv cache
       dim3 grid(2 * ((num_batch + kWarpsPerBlock - 1) / kWarpsPerBlock));
       int num_compute_blocks = (num_batch + kWarpsPerBlock - 1) / kWarpsPerBlock;
-      if (use_qk_norm) {
+      if (qk_norm_policy == 1) {  // rope first
+        constexpr int kQKNormPolicy = 1;
         kernels::apply_rotary_pos_emb_decoding_kernel<__nv_bfloat16, kWarpsPerBlock, kNumQHeads,
-                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, true>
-            <<<grid, block, 0, stream>>>(out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                                         num_tokens_per_batch_ptr, kv_block_indices_ptr,
-                                         q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
-                                         vcache_block_offset, num_batch, max_num_kv_block_per_batch,
-                                         kv_block_size_divider, num_compute_blocks);
-      } else {
+                                                      kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                      kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
+            vcache_block_offset, num_batch, max_num_kv_block_per_batch, kv_block_size_divider,
+            num_compute_blocks);
+      } else if (qk_norm_policy == 2) {  // norm first
+        constexpr int kQKNormPolicy = 2;
         kernels::apply_rotary_pos_emb_decoding_kernel<__nv_bfloat16, kWarpsPerBlock, kNumQHeads,
-                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, false>
-            <<<grid, block, 0, stream>>>(out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                                         num_tokens_per_batch_ptr, kv_block_indices_ptr,
-                                         q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
-                                         vcache_block_offset, num_batch, max_num_kv_block_per_batch,
-                                         kv_block_size_divider, num_compute_blocks);
+                                                      kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                      kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
+            vcache_block_offset, num_batch, max_num_kv_block_per_batch, kv_block_size_divider,
+            num_compute_blocks);
+      } else {  // no normalization
+        constexpr int kQKNormPolicy = 0;
+        kernels::apply_rotary_pos_emb_decoding_kernel<__nv_bfloat16, kWarpsPerBlock, kNumQHeads,
+                                                      kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                      kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
+            vcache_block_offset, num_batch, max_num_kv_block_per_batch, kv_block_size_divider,
+            num_compute_blocks);
       }
     }
 
@@ -649,22 +739,33 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
       dim3 block(kNumWarpsPerBlock * kWarpSize);
       dim3 grid((num_rows + kNumWarpsPerBlock - 1) / kNumWarpsPerBlock);
 
-      if (use_qk_norm) {
+      if (qk_norm_policy == 1) {  // rope first
+        constexpr int kQKNormPolicy = 1;
         kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
-                                                     kNumKVHeads, kQKHeadDim, kVHeadDim, true>
-            <<<grid, block, 0, stream>>>(
-                out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
-                k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
-                max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
-      } else {
+                                                     kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                     kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr,
+            kcache_block_offset, vcache_block_offset, num_batch, max_num_kv_block_per_batch,
+            kv_block_size_divider, num_rows);
+      } else if (qk_norm_policy == 2) {  // norm first
+        constexpr int kQKNormPolicy = 2;
         kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
-                                                     kNumKVHeads, kQKHeadDim, kVHeadDim, false>
-            <<<grid, block, 0, stream>>>(
-                out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
-                k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
-                max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
+                                                     kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                     kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr,
+            kcache_block_offset, vcache_block_offset, num_batch, max_num_kv_block_per_batch,
+            kv_block_size_divider, num_rows);
+      } else {  // no normalization
+        constexpr int kQKNormPolicy = 0;
+        kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
+                                                     kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                     kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr,
+            kcache_block_offset, vcache_block_offset, num_batch, max_num_kv_block_per_batch,
+            kv_block_size_divider, num_rows);
       }
 
     } else {
@@ -674,22 +775,33 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
       dim3 grid(2 * ((num_batch + kWarpsPerBlock - 1) / kWarpsPerBlock));
       int num_compute_blocks = (num_batch + kWarpsPerBlock - 1) / kWarpsPerBlock;
 
-      if (use_qk_norm) {
+      if (qk_norm_policy == 1) {  // rope first
+        constexpr int kQKNormPolicy = 1;
         kernels::apply_rotary_pos_emb_decoding_kernel<__nv_bfloat16, kWarpsPerBlock, kNumQHeads,
-                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, true>
-            <<<grid, block, 0, stream>>>(out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                                         num_tokens_per_batch_ptr, kv_block_indices_ptr,
-                                         q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
-                                         vcache_block_offset, num_batch, max_num_kv_block_per_batch,
-                                         kv_block_size_divider, num_compute_blocks);
-      } else {
+                                                      kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                      kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
+            vcache_block_offset, num_batch, max_num_kv_block_per_batch, kv_block_size_divider,
+            num_compute_blocks);
+      } else if (qk_norm_policy == 2) {  // rope first
+        constexpr int kQKNormPolicy = 2;
         kernels::apply_rotary_pos_emb_decoding_kernel<__nv_bfloat16, kWarpsPerBlock, kNumQHeads,
-                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, false>
-            <<<grid, block, 0, stream>>>(out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                                         num_tokens_per_batch_ptr, kv_block_indices_ptr,
-                                         q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
-                                         vcache_block_offset, num_batch, max_num_kv_block_per_batch,
-                                         kv_block_size_divider, num_compute_blocks);
+                                                      kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                      kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
+            vcache_block_offset, num_batch, max_num_kv_block_per_batch, kv_block_size_divider,
+            num_compute_blocks);
+      } else {  // no normalization
+        constexpr int kQKNormPolicy = 0;
+        kernels::apply_rotary_pos_emb_decoding_kernel<__nv_bfloat16, kWarpsPerBlock, kNumQHeads,
+                                                      kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                      kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
+            vcache_block_offset, num_batch, max_num_kv_block_per_batch, kv_block_size_divider,
+            num_compute_blocks);
       }
     }
 
@@ -704,22 +816,33 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
       dim3 block(kNumWarpsPerBlock * kWarpSize);
       dim3 grid((num_rows + kNumWarpsPerBlock - 1) / kNumWarpsPerBlock);
 
-      if (use_qk_norm) {
+      if (qk_norm_policy == 1) {  // rope first
+        constexpr int kQKNormPolicy = 1;
         kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
-                                                     kNumKVHeads, kQKHeadDim, kVHeadDim, true>
-            <<<grid, block, 0, stream>>>(
-                out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
-                k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
-                max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
-      } else {
+                                                     kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                     kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr,
+            kcache_block_offset, vcache_block_offset, num_batch, max_num_kv_block_per_batch,
+            kv_block_size_divider, num_rows);
+      } else if (qk_norm_policy == 2) {  // norm first
+        constexpr int kQKNormPolicy = 2;
         kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
-                                                     kNumKVHeads, kQKHeadDim, kVHeadDim, false>
-            <<<grid, block, 0, stream>>>(
-                out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                num_tokens_per_batch_ptr, q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr,
-                k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
-                max_num_kv_block_per_batch, kv_block_size_divider, num_rows);
+                                                     kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                     kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr,
+            kcache_block_offset, vcache_block_offset, num_batch, max_num_kv_block_per_batch,
+            kv_block_size_divider, num_rows);
+      } else {  // no normalization
+        constexpr int kQKNormPolicy = 0;
+        kernels::apply_rotary_pos_emb_prefill_kernel<__nv_bfloat16, kNumWarpsPerBlock, kNumQHeads,
+                                                     kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                     kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            q_index_ptr, kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr,
+            kcache_block_offset, vcache_block_offset, num_batch, max_num_kv_block_per_batch,
+            kv_block_size_divider, num_rows);
       }
 
     } else {
@@ -730,22 +853,33 @@ void apply_rotary_pos_emb_blocked_kvcache_bf16_async(
       dim3 grid(2 * ((num_batch + kWarpsPerBlock - 1) / kWarpsPerBlock));
       int num_compute_blocks = (num_batch + kWarpsPerBlock - 1) / kWarpsPerBlock;
 
-      if (use_qk_norm) {
+      if (qk_norm_policy == 1) {  // rope first
+        constexpr int kQKNormPolicy = 1;
         kernels::apply_rotary_pos_emb_decoding_kernel<__nv_bfloat16, kWarpsPerBlock, kNumQHeads,
-                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, true>
-            <<<grid, block, 0, stream>>>(out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                                         num_tokens_per_batch_ptr, kv_block_indices_ptr,
-                                         q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
-                                         vcache_block_offset, num_batch, max_num_kv_block_per_batch,
-                                         kv_block_size_divider, num_compute_blocks);
-      } else {
+                                                      kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                      kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
+            vcache_block_offset, num_batch, max_num_kv_block_per_batch, kv_block_size_divider,
+            num_compute_blocks);
+      } else if (qk_norm_policy == 2) {  // rope first
+        constexpr int kQKNormPolicy = 2;
         kernels::apply_rotary_pos_emb_decoding_kernel<__nv_bfloat16, kWarpsPerBlock, kNumQHeads,
-                                                      kNumKVHeads, kQKHeadDim, kVHeadDim, false>
-            <<<grid, block, 0, stream>>>(out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr,
-                                         num_tokens_per_batch_ptr, kv_block_indices_ptr,
-                                         q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
-                                         vcache_block_offset, num_batch, max_num_kv_block_per_batch,
-                                         kv_block_size_divider, num_compute_blocks);
+                                                      kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                      kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
+            vcache_block_offset, num_batch, max_num_kv_block_per_batch, kv_block_size_divider,
+            num_compute_blocks);
+      } else {  // no normalization
+        constexpr int kQKNormPolicy = 0;
+        kernels::apply_rotary_pos_emb_decoding_kernel<__nv_bfloat16, kWarpsPerBlock, kNumQHeads,
+                                                      kNumKVHeads, kQKHeadDim, kVHeadDim,
+                                                      kQKNormPolicy><<<grid, block, 0, stream>>>(
+            out_q_ptr, kcache_ptr, vcache_ptr, in_qkv_ptr, cos_sin_ptr, num_tokens_per_batch_ptr,
+            kv_block_indices_ptr, q_norm_weight_ptr, k_norm_weight_ptr, kcache_block_offset,
+            vcache_block_offset, num_batch, max_num_kv_block_per_batch, kv_block_size_divider,
+            num_compute_blocks);
       }
     }
   } else {
