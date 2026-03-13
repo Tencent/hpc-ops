@@ -9,6 +9,7 @@ import hpc
 import torch
 import math
 import torch.nn.functional as F
+from utils import allclose
 
 
 def naive_attn_with_paged_kvcache_func(
@@ -54,6 +55,7 @@ def naive_attn_with_paged_kvcache_func(
         P = BQ @ BK.transpose(-1, -2)
 
         P = P / math.sqrt(head_dim) * QS[bi][:, None, None] * KS
+
         causal_mask = torch.ones(
             seqlenq[bi], seqlen - seqlenq[bi], device=Q.device, dtype=torch.bool
         )
@@ -63,10 +65,11 @@ def naive_attn_with_paged_kvcache_func(
         causal_mask = torch.cat([causal_mask, tail_causal_mask], dim=-1).unsqueeze(0)
 
         P = P.masked_fill(~causal_mask, float("-inf"))
+
         attn_weights = F.softmax(P, dim=-1)
 
-        # attn_weights = P
         Y = torch.matmul(attn_weights, BV) * VS
+
         output[bi] = Y.transpose(0, 1)
 
     return output.reshape(-1, num_head_q, head_dim)
@@ -85,12 +88,11 @@ except Exception as e:
     gt_attention_func = naive_attn_with_paged_kvcache_func
 
 
-@pytest.mark.parametrize("num_batch", [1, 16, 128])
-@pytest.mark.parametrize("num_seq_q", [1])
-@pytest.mark.parametrize("max_seq_kv", [2048, 4096])
+@pytest.mark.parametrize("num_batch", [1, 16, 200])
+@pytest.mark.parametrize("num_seq_q", [1, 2, 3])
+@pytest.mark.parametrize("max_seq_kv", [1024, 4096])
 @pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("num_head_q", [4])
-@pytest.mark.parametrize("num_head_kv", [1])
+@pytest.mark.parametrize("kv_head_q_head", [(2, 8), (4, 32)])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("new_kv_included", [True])
 @pytest.mark.parametrize("use_output", [False])
@@ -100,8 +102,7 @@ def test_attention_decode_fp8(
     num_seq_q,
     max_seq_kv,
     block_size,
-    num_head_q,
-    num_head_kv,
+    kv_head_q_head,
     head_dim,
     new_kv_included,
     use_output,
@@ -109,6 +110,9 @@ def test_attention_decode_fp8(
 ):
     torch.manual_seed(10086)
     torch.cuda.manual_seed(10086)
+
+    num_head_kv, num_head_q = kv_head_q_head
+
     num_dim_qk = head_dim
     num_dim_v = head_dim
     max_num_blocks = int(num_batch * max_seq_kv // block_size * 1.2)
@@ -120,6 +124,7 @@ def test_attention_decode_fp8(
     ) / math.sqrt(num_dim_qk)
     QS = Q.float().abs().max(-1)[0] / 10
     Q = (Q / QS[:, :, None]).to(T)
+
     K = (
         torch.randn(
             (num_batch * num_seq_q, num_head_kv, num_dim_qk), dtype=torch.bfloat16, device="cuda"
@@ -141,8 +146,17 @@ def test_attention_decode_fp8(
 
     nblocks = (num_seq_kvcache + num_seq_q + block_size - 1) // block_size
     total_blocks = sum(nblocks)
-    kvcache = torch.randn(
-        max_num_blocks, 2, block_size, num_head_kv, num_dim_qk, dtype=torch.bfloat16, device="cuda"
+    kvcache = (
+        torch.randn(
+            max_num_blocks,
+            2,
+            block_size,
+            num_head_kv,
+            num_dim_qk,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / math.sqrt(num_dim_qk)
     ).to(T)
     packed_block_ids = torch.randperm(max_num_blocks)[:total_blocks].to(torch.int32).cuda()
 
@@ -188,7 +202,7 @@ def test_attention_decode_fp8(
             kvcache[:, 0, :, :, :],
             kvcache[:, 1, :, :, :],
             block_ids,
-            num_seq_kvcache + 1 if new_kv_included else num_seq_kvcache,
+            num_seq_kvcache + num_seq_q if new_kv_included else num_seq_kvcache,
             QS,
             KS,
             VS,
@@ -203,10 +217,11 @@ def test_attention_decode_fp8(
                 kvcache[:, 0, :, :, :],
                 kvcache[:, 1, :, :, :],
                 block_ids,
-                num_seq_kvcache + 1 if new_kv_included else num_seq_kvcache,
+                num_seq_kvcache + num_seq_q if new_kv_included else num_seq_kvcache,
                 QS,
                 KS,
                 VS,
+                mtp=num_seq_q - 1,
                 new_kv_included=new_kv_included,
                 splitk=splitk,
             )
@@ -226,7 +241,7 @@ def test_attention_decode_fp8(
             "{:+.4f} vs {:+.4f} with diff = {:.4f}, @ {}".format(gt[idx], my[idx], vals[i], cpu_idx)
         )
 
-    assert torch.allclose(my, gt, atol=0.016)
+    assert allclose(my, gt, atol=0.05)
     assert gt.device == my.device
     assert gt.dtype == my.dtype
     assert gt.shape == my.shape

@@ -198,8 +198,9 @@ torch::Tensor attention_with_kvcache_prefill_fp8_entry(
 
 torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor &kcache,
                                           torch::Tensor &vcache, const torch::Tensor &block_ids,
-                                          const torch::Tensor &num_seq_kvcache,
+                                          const torch::Tensor &num_seq_kvcache, int64_t mtp,
                                           bool new_kv_included, bool use_splitk,
+                                          std::optional<torch::Tensor> split_flag,
                                           std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
 
@@ -212,21 +213,30 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   TORCH_CHECK(block_ids.scalar_type() == torch::kInt32, "block_ids dtype must be int32");
   TORCH_CHECK(num_seq_kvcache.scalar_type() == torch::kInt32,
               "num_seq_kvcache dtype must be int32");
+  TORCH_CHECK((mtp == 0 || mtp == 1 || mtp == 2), "we only support mtp 0, 1, 2.");
 
   int num_batch = num_seq_kvcache.size(0);
   int num_seq_q = q.size(0) / num_batch;
-  TORCH_CHECK(num_seq_q == 1, "num_seq_q must be 1");
+  TORCH_CHECK(num_seq_q == mtp + 1, "every request num_seq_q must be mtp + 1");
   int num_head_q = q.size(1);
   int num_dim_qk = q.size(2);
 
+  TORCH_CHECK((num_dim_qk == 128 || num_dim_qk == 80), "we only support head dim 128 and 80.");
+
   int num_kvcache_blocks = kcache.size(0);
   int block_size = kcache.size(1);
+
+  TORCH_CHECK((block_size == 32 || block_size == 64), "kvcache paged blocksize must be 32 and 64.");
 
   int num_head_k = kcache.size(2);
   int num_head_v = vcache.size(2);
   int num_dim_v = vcache.size(3);
 
   int num_seq_max_blocks = block_ids.size(1);
+
+  int heads_per_group = num_head_q / num_head_k;
+  TORCH_CHECK(heads_per_group == 4 || heads_per_group == 8,
+              "we only support num_head_q / num_head_k == 4 or 8.");
 
   const auto *q_ptr = q.const_data_ptr();
   auto *kcache_ptr = kcache.mutable_data_ptr();
@@ -245,7 +255,7 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   torch::Tensor lse;
   torch::Tensor split_out;
 
-  int splitk = 0;
+  int splitk = 1;
   // small batch increase splitk number to maximize sm usage.
   // 1. batch <= 32. split one request seqlenk to 16 parts.
   // 2. batch > 32. split one request seqlenk to 4 parts.
@@ -257,14 +267,24 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
     }
   }
 
-  if (splitk > 0) {
-    lse = torch::empty({num_batch, splitk, num_head_q}, q.options().dtype(torch::kFloat32));
-    split_out = torch::empty({num_batch, splitk, num_head_q, num_dim_v},
+  torch::Tensor split_flag_tensor;
+
+  if (splitk > 1) {
+    int pad_heads_per_group = ((heads_per_group + 7) / 8) * 8;
+    lse = torch::empty({num_batch, splitk, num_head_k, num_seq_q, pad_heads_per_group},
+                       q.options().dtype(torch::kFloat32));
+    split_out = torch::empty({num_batch, splitk, num_seq_q, num_head_q, num_dim_v},
                              q.options().dtype(torch::kFloat32));
+    if (split_flag.has_value()) {
+      split_flag_tensor = split_flag.value();
+    } else {
+      split_flag_tensor = torch::zeros({num_batch, num_head_k}, q.options().dtype(torch::kInt32));
+    }
   }
 
-  auto *lse_ptr = splitk > 0 ? lse.mutable_data_ptr() : nullptr;
-  auto *split_out_ptr = splitk > 0 ? split_out.mutable_data_ptr() : nullptr;
+  auto *lse_ptr = splitk > 1 ? lse.mutable_data_ptr() : nullptr;
+  auto *split_out_ptr = splitk > 1 ? split_out.mutable_data_ptr() : nullptr;
+  auto *split_flag_ptr = splitk > 1 ? split_flag_tensor.mutable_data_ptr<int>() : nullptr;
 
   auto *y_ptr = y.mutable_data_ptr();
 
@@ -275,9 +295,9 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
 
   bool running = attention_decode_bf16_async(
       y_ptr, lse_ptr, split_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
-      num_seq_kvcache_ptr, new_kv_included, splitk, num_batch, num_head_q, num_head_k, num_head_v,
-      num_dim_qk, num_dim_v, num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV,
-      stream);
+      num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, splitk, num_batch, num_seq_q,
+      num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+      num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
 
   TORCH_CHECK(running, "attn decode kernel launch failed!");
 
@@ -288,8 +308,9 @@ torch::Tensor attention_decode_fp8_entry(const torch::Tensor &q, torch::Tensor &
                                          torch::Tensor &vcache, const torch::Tensor &block_ids,
                                          const torch::Tensor &num_seq_kvcache,
                                          const torch::Tensor &qscale, const torch::Tensor &kscale,
-                                         const torch::Tensor &vscale, bool new_kv_included,
-                                         bool use_splitk, std::optional<torch::Tensor> split_flag,
+                                         const torch::Tensor &vscale, int64_t mtp,
+                                         bool new_kv_included, bool use_splitk,
+                                         std::optional<torch::Tensor> split_flag,
                                          std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
 
@@ -305,15 +326,20 @@ torch::Tensor attention_decode_fp8_entry(const torch::Tensor &q, torch::Tensor &
   TORCH_CHECK(block_ids.scalar_type() == torch::kInt32, "block_ids dtype must be int32");
   TORCH_CHECK(num_seq_kvcache.scalar_type() == torch::kInt32,
               "num_seq_kvcache dtype must be int32");
+  TORCH_CHECK((mtp == 0 || mtp == 1 || mtp == 2), "we only support mtp 0, 1, 2.");
 
   int num_batch = num_seq_kvcache.size(0);
   int num_seq_q = q.size(0) / num_batch;
-  TORCH_CHECK(num_seq_q == 1, "num_seq_q must be 1");
+  TORCH_CHECK(num_seq_q == mtp + 1, "every request num_seq_q must be mtp + 1");
   int num_head_q = q.size(1);
   int num_dim_qk = q.size(2);
 
+  TORCH_CHECK(num_dim_qk == 128, "we only support head dim 128.");
+
   int num_kvcache_blocks = kcache.size(0);
   int block_size = kcache.size(1);
+
+  TORCH_CHECK(block_size == 64, "kvcache paged blocksize must be 64.");
 
   int num_head_k = kcache.size(2);
   int num_head_v = vcache.size(2);
@@ -321,6 +347,10 @@ torch::Tensor attention_decode_fp8_entry(const torch::Tensor &q, torch::Tensor &
 
   int num_seq_max_blocks = block_ids.size(1);
   int qscale_pad_stride = qscale.stride(0);
+
+  int heads_per_group = num_head_q / num_head_k;
+  TORCH_CHECK(heads_per_group == 4 || heads_per_group == 8,
+              "we only support num_head_q / num_head_k == 4 or 8.");
 
   const auto *q_ptr = q.const_data_ptr();
   auto *kcache_ptr = kcache.mutable_data_ptr();
@@ -342,7 +372,7 @@ torch::Tensor attention_decode_fp8_entry(const torch::Tensor &q, torch::Tensor &
   torch::Tensor lse;
   torch::Tensor split_out;
 
-  int splitk = 0;
+  int splitk = 1;
   int splitk_min_len = 0;
 
   // small batch increase splitk number to maximize sm usage.
@@ -366,22 +396,25 @@ torch::Tensor attention_decode_fp8_entry(const torch::Tensor &q, torch::Tensor &
   }
 
   torch::Tensor split_flag_tensor;
-  if (split_flag.has_value()) {
-    split_flag_tensor = split_flag.value();
-  } else {
-    split_flag_tensor = torch::zeros({num_batch, num_head_k}, q.options().dtype(torch::kInt32));
-  }
 
-  if (splitk > 0) {
-    lse = torch::empty({num_batch, splitk * consumers, num_head_q},
+  bool use_split = splitk > 1 || consumers > 1;
+
+  if (use_split) {
+    int pad_heads_per_group = ((heads_per_group + 7) / 8) * 8;
+    lse = torch::empty({num_batch, splitk * consumers, num_head_k, num_seq_q, pad_heads_per_group},
                        q.options().dtype(torch::kFloat32));
-    split_out = torch::empty({num_batch, splitk * consumers, num_head_q, num_dim_v},
+    split_out = torch::empty({num_batch, splitk * consumers, num_seq_q, num_head_q, num_dim_v},
                              q.options().dtype(torch::kFloat32));
+    if (split_flag.has_value()) {
+      split_flag_tensor = split_flag.value();
+    } else {
+      split_flag_tensor = torch::zeros({num_batch, num_head_k}, q.options().dtype(torch::kInt32));
+    }
   }
 
-  auto *lse_ptr = splitk > 0 ? lse.mutable_data_ptr() : nullptr;
-  auto *split_out_ptr = splitk > 0 ? split_out.mutable_data_ptr() : nullptr;
-  auto *split_flag_ptr = split_flag_tensor.mutable_data_ptr<int>();
+  auto *lse_ptr = use_split ? lse.mutable_data_ptr() : nullptr;
+  auto *split_out_ptr = use_split ? split_out.mutable_data_ptr() : nullptr;
+  auto *split_flag_ptr = use_split ? split_flag_tensor.mutable_data_ptr<int>() : nullptr;
 
   auto *y_ptr = y.mutable_data_ptr();
 
@@ -393,9 +426,9 @@ torch::Tensor attention_decode_fp8_entry(const torch::Tensor &q, torch::Tensor &
   bool running = attention_decode_fp8_async(
       y_ptr, lse_ptr, split_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
       num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr, new_kv_included,
-      splitk, splitk_min_len, consumers, num_batch, num_head_q, num_head_k, num_head_v, num_dim_qk,
-      num_dim_v, num_kvcache_blocks, block_size, num_seq_max_blocks, qscale_pad_stride, ldY, ldQ,
-      ldK, ldV, stream);
+      splitk, splitk_min_len, consumers, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
+      num_dim_qk, num_dim_v, num_kvcache_blocks, block_size, num_seq_max_blocks, qscale_pad_stride,
+      ldY, ldQ, ldK, ldV, stream);
 
   TORCH_CHECK(running, "attn decode kernel launch failed!");
 
@@ -422,6 +455,8 @@ torch::Tensor attention_mla_with_kvcache_bf16_entry(const torch::Tensor &q,
 
   int num_kvcache_blocks = kvcache.size(0);
   int block_size = kvcache.size(1);
+
+  TORCH_CHECK(block_size == 64, "we only support kvcache block size 64.");
 
   int num_seq_max_blocks = block_ids.size(1);
 
@@ -558,12 +593,15 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 
   m.def(
       "attention_decode_bf16(Tensor q, Tensor! kcache, Tensor! vcache, Tensor block_ids, Tensor "
-      "num_seq_kvcache, bool new_kv_included, bool use_splitk, Tensor? output) -> (Tensor)");
+      "num_seq_kvcache, int mtp, bool new_kv_included, bool use_splitk, Tensor? split_flag, "
+      "Tensor? output) -> "
+      "(Tensor)");
   m.impl("attention_decode_bf16", torch::kCUDA, &hpc::attention::attention_decode_bf16_entry);
 
   m.def(
       "attention_decode_fp8(Tensor q, Tensor! kcache, Tensor! vcache, Tensor block_ids, Tensor "
-      "num_seq_kvcache, Tensor qscale, Tensor kscale, Tensor vscale, bool new_kv_included, bool "
+      "num_seq_kvcache, Tensor qscale, Tensor kscale, Tensor vscale, int mtp, bool "
+      "new_kv_included, bool "
       "use_splitk, Tensor? split_flag, Tensor? output) -> (Tensor)");
   m.impl("attention_decode_fp8", torch::kCUDA, &hpc::attention::attention_decode_fp8_entry);
 

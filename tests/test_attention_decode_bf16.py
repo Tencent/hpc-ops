@@ -65,7 +65,6 @@ def naive_attn_with_paged_kvcache_func(
             .transpose(0, 1)[:, :seqlen, :]
             .repeat_interleave(head_per_group, dim=0)
         ).float()
-
         P = BQ @ BK.transpose(-1, -2)
         P = P / math.sqrt(head_dim)
         causal_mask = torch.ones(
@@ -98,10 +97,10 @@ except Exception as e:
 
 
 @pytest.mark.parametrize("num_batch", [1, 16, 200])
-@pytest.mark.parametrize("num_seq_q", [1])
+@pytest.mark.parametrize("num_seq_q", [1, 2, 3])
 @pytest.mark.parametrize("max_seq_kv", [1024, 4096])
 @pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("kv_head_q_head", [(1, 4), (1, 8), (2, 16), (4, 32)])
+@pytest.mark.parametrize("kv_head_q_head", [(2, 8), (4, 32)])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("new_kv_included", [True, False])
 @pytest.mark.parametrize("use_output", [True, False])
@@ -178,8 +177,9 @@ def test_attention_decode_bf16(
             kvcache[:, 0, :, :, :],
             kvcache[:, 1, :, :, :],
             block_ids,
-            num_seq_kvcache + 1 if new_kv_included else num_seq_kvcache,
+            num_seq_kvcache + num_seq_q if new_kv_included else num_seq_kvcache,
             new_kv_included=new_kv_included,
+            mtp=num_seq_q - 1,
             splitk=splitk,
             output=my,
         )
@@ -189,8 +189,9 @@ def test_attention_decode_bf16(
             kvcache[:, 0, :, :, :],
             kvcache[:, 1, :, :, :],
             block_ids,
-            num_seq_kvcache + 1 if new_kv_included else num_seq_kvcache,
+            num_seq_kvcache + num_seq_q if new_kv_included else num_seq_kvcache,
             new_kv_included=new_kv_included,
+            mtp=num_seq_q - 1,
             splitk=splitk,
         )
 

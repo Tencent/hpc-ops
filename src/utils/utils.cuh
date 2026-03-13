@@ -607,4 +607,22 @@ __device__ __forceinline__ void fence_async_global() {
 
 }  // namespace hpc
 
+namespace cute {
+
+template <class... Args, class ThrLayout, class ValLayout, class Tiler>
+CUTE_HOST_DEVICE auto make_tiled_copy(Copy_Atom<Args...> const &copy_atom,
+                                      ThrLayout const &thr_layout, ValLayout const &val_layout,
+                                      Tiler const &tiler) {
+  // Take the raked_products to compute the Layout_MN
+  // (M,N) -> (thr_idx, val_idx)
+  auto layout_mn = raked_product(thr_layout, val_layout);
+  // (thr_idx, val_idx) -> (M,N)
+  auto layout_tv =
+      right_inverse(layout_mn).with_shape(make_shape(size(thr_layout), size(val_layout)));
+
+  return make_tiled_copy_impl(copy_atom, layout_tv, tiler);
+}
+
+}  // namespace cute
+
 #endif  // SRC_UTILS_UTILS_CUH_
