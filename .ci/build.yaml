@@ -128,6 +128,49 @@ stages:
           - verbose
           distribution: dist/hpc*.whl
         retry-times: 2
+    job_sfp:
+      name: Compile PyTorch-2.10
+      runs-on:
+        pool-name: docker
+        container:
+          image: mirrors.tencent.com/hunyuan_infer/text2text_infer:H-6.5.1.dev46
+      steps:
+      - checkout:
+          repo-id: rxOYK
+        name: git clone and checkout
+        with:
+          refName: "${BK_CI_HOOK_SOURCE_BRANCH}"
+          enableGitLfs: false
+      - name: complile whl
+        uses: linuxScript@1.*
+        with:
+          script: |-
+            set -xe
+            cd ${{ci.workspace}}
+            make wheel
+      - name: config pip for upload
+        id: NXn
+        uses: linuxScript@1.*
+        with:
+          script: |-
+            set -xe
+
+            cd ${{ci.workspace}}
+            pip config set global.index-url https://bkdevops:@mirrors.tencent.com/repository/pypi/tencent_pypi/simple/
+            pip config set global.extra-index-url https://bkdevops:@mirrors.tencent.com/pypi/simple/
+            pip config set global.timeout 600
+            pip config set install.trusted-host mirrors.tencent.com
+      - name: upload to pypi
+        uses: DistributionToGeneric@1.*
+        with:
+          username: reedlauliu
+          token: e0b4892c66d411f086b85254009bad14
+          repo_category: pypi
+          pypi_upload_arguments:
+          - skip_existing
+          - verbose
+          distribution: dist/hpc*.whl
+        retry-times: 2
 - name: stage-2
   label:
   - Build
@@ -270,3 +313,4 @@ notices:
 concurrency:
   queue-timeout-minutes: 10
 syntax-dialect: INHERIT
+
