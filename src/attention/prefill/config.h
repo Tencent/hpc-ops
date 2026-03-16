@@ -182,6 +182,103 @@ struct AttentionKVCachePrefillConfig {
 };
 
 template <typename Tin_, typename Tout_, typename TiledMmaQKAtom, typename TiledMmaPVAtom,
+          int kTileM_, int kTileN_, int kTileK_, int kTileV_, int kStage_, int kWarpgroupM_ = 2,
+          int kWarpgroupN_ = 1, int kSwizzleQ = 128, int kSwizzleK = 128, int kSwizzleV = 128,
+          int kSwizzleY = 128>
+struct MLAPrefillConfig {
+  using Tin = Tin_;
+  using Tout = Tout_;
+
+  static constexpr int kTileM = kTileM_;
+  static constexpr int kTileN = kTileN_;
+  static constexpr int kTileK = kTileK_;
+  static constexpr int kTileV = kTileV_;
+  static constexpr int kStage = kStage_;
+  static constexpr int kWarpgroupM = kWarpgroupM_;
+
+  template <int kSwizzle, typename T, bool kKmajor = true>
+  static constexpr auto slayout_selector() {
+    if constexpr (kSwizzle == 128) {
+      if constexpr (kKmajor) {
+        return cute::GMMA::Layout_K_SW128_Atom<T>{};
+      } else {
+        return cute::GMMA::Layout_MN_SW128_Atom<T>{};
+      }
+    } else if constexpr (kSwizzle == 64) {
+      if constexpr (kKmajor) {
+        return cute::GMMA::Layout_K_SW64_Atom<T>{};
+      } else {
+        return cute::GMMA::Layout_MN_SW64_Atom<T>{};
+      }
+    } else if constexpr (kSwizzle == 32) {
+      if constexpr (kKmajor) {
+        return cute::GMMA::Layout_K_SW32_Atom<T>{};
+      } else {
+        return cute::GMMA::Layout_MN_SW32_Atom<T>{};
+      }
+    } else {
+      if constexpr (kKmajor) {
+        return cute::GMMA::Layout_K_INTER_Atom<T>{};
+      } else {
+        return cute::GMMA::Layout_MN_INTER_Atom<T>{};
+      }
+    }
+  }
+
+  using SLayoutQAtom = decltype(slayout_selector<kSwizzleQ, Tin>());
+  using SLayoutKAtom = decltype(slayout_selector<kSwizzleK, Tin>());
+  using SLayoutVAtom = decltype(slayout_selector<kSwizzleV, Tin, false>());
+  using SLayoutYAtom = decltype(slayout_selector<kSwizzleY, Tout>());
+
+  using SLayoutQ =
+      decltype(tile_to_shape(SLayoutQAtom{}, make_shape(Int<kTileM>{}, Int<kTileK>{})));
+
+  using SLayoutK = decltype(tile_to_shape(SLayoutKAtom{},
+                                          make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{})));
+  using ShapeV =
+      Shape<Shape<_64, _2>, decltype(shape<0>(SLayoutK{})), decltype(shape<2>(SLayoutK{}))>;
+  using StrideV = decltype(make_identity_layout(SLayoutK{}.shape()).stride());
+  using TransposeMap = decltype(make_layout(
+      ShapeV{}, make_stride(get<1>(StrideV{}), get<0>(StrideV{}), get<2>(StrideV{}))));
+  using SLayoutV = decltype(composition(SLayoutK{}, TransposeMap{}));
+
+  // using SwizzleOp = Swizzle<3, 4, 3>;
+  // using KBaseShape  = Shape<Shape<_8, _8>, Shape<_64, _3>, Shape<_1, _2>>;
+  // using KBaseStride = Stride<Stride<_64, _512>, Stride<_1, _4096>, Stride<_0, Int<12288>>>;
+  // using KBaseLayout = Layout<KBaseShape, KBaseStride>;
+  // using SLayoutK = ComposedLayout<SwizzleOp, smem_ptr_flag_bits<16>, KBaseLayout>;
+
+  // using VBaseShape = Shape<Shape<_64, _2>, Shape<_8, _8>, Shape<_1, _2>>;
+  // using VBaseStride = Stride<Stride<_1, _4096>, Stride<_64, _512>, Stride<_0, Int<12288>>>;
+  // using VBaseLayout = Layout<VBaseShape, VBaseStride>;
+  // using SLayoutV = ComposedLayout<SwizzleOp, smem_ptr_flag_bits<16>, VBaseLayout>;
+
+  using SLayoutY =
+      decltype(tile_to_shape(SLayoutYAtom{}, make_shape(Int<kTileM>{}, Int<kTileV>{})));
+  using CopyBoxY = decltype(tile_to_shape(SLayoutYAtom{},
+                                          make_shape(Int<kTileM / kWarpgroupM>{}, Int<kTileV>{})));
+
+  template <typename TQ, typename TKV, typename TY>
+  auto get_tma(TQ q, TKV kv, TY y) {
+    auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, q, SLayoutQ{});
+    auto tma_kv = make_tma_copy(SM90_TMA_LOAD{}, kv, take<0, 2>(SLayoutK{}));
+    auto tma_y = make_tma_copy(SM90_TMA_STORE{}, y, CopyBoxY{});
+    return std::make_tuple(tma_q, tma_kv, tma_y);
+  }
+
+  using WarpgroupLayout =
+      decltype(make_layout(make_shape(Int<kWarpgroupM_>{}, Int<kWarpgroupN_>{}, Int<1>{})));
+  using TiledMmaQK = decltype(make_tiled_mma(TiledMmaQKAtom{}, WarpgroupLayout{}));
+  using TiledMmaPV = decltype(make_tiled_mma(TiledMmaPVAtom{}, WarpgroupLayout{}));
+
+  static constexpr int shm_qkv = (cosize(SLayoutQ{}) + cosize(SLayoutK{})) * sizeof(Tin);
+  static constexpr int shm_y = cosize(SLayoutY{}) * sizeof(Tout);
+  static constexpr int shm_size = shm_qkv + shm_y;
+
+  auto get_shm_size() { return shm_size; }
+};
+
+template <typename Tin_, typename Tout_, typename TiledMmaQKAtom, typename TiledMmaPVAtom,
           int kTileM_, int kTileN_, int kTileK_, int kTileV_, int kBlockSize_, int kStage_,
           int kWarpgroupM_ = 2, int kWarpgroupN_ = 1, int kSwizzleQ = 128, int kSwizzleK = 128,
           int kSwizzleV = 128, int kSwizzleY = 128>

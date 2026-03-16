@@ -9,6 +9,7 @@
 #include "src/attention/prefill/multi_stage_dim128.h"
 #include "src/attention/prefill/multi_stage_with_kvcache_dim128.h"
 #include "src/attention/prefill/warp_spec_dim128.h"
+#include "src/attention/prefill/warp_spec_mla.h"
 #include "src/attention/prefill/warp_spec_with_kvcache_dim128.h"
 #include "src/attention/prefill/warp_spec_with_kvcache_fp8_dim128.h"
 #include "src/utils/utils.h"
@@ -80,6 +81,18 @@ void attention_with_kvcache_prefill_fp8_async(
       block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
       max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks, block_size,
       num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+}
+
+void mla_prefill_bf16_async(void *y_ptr, const void *q_ptr, const void *kv_ptr,
+                            const void *seqlens_q_ptr, const void *cu_seqlens_q_ptr, void *tmas_ptr,
+                            int num_batch, int total_seq_q, int max_seq_q, int num_dim_qk,
+                            int num_dim_v, int num_head_q, int num_head_kv, int ldY, int ldQ,
+                            int ldKV, cudaStream_t stream) {
+  constexpr int kTileM = 64;
+  int max_total_blocks = (max_seq_q + kTileM - 1) / kTileM * num_batch * num_head_q;
+  prefill::warp_spec_mla_async(y_ptr, q_ptr, kv_ptr, seqlens_q_ptr, cu_seqlens_q_ptr, tmas_ptr,
+                               num_batch, total_seq_q, max_seq_q, num_dim_qk, num_dim_v, num_head_q,
+                               num_head_kv, ldY, ldQ, ldKV, stream);
 }
 
 }  // namespace attention

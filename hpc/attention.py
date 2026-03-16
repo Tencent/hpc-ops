@@ -500,6 +500,21 @@ def sparse_mla_with_kvcache_bf16(
     )
 
 
+def mla_prefill_bf16(
+    q: Tensor,
+    kv: Tensor,
+    seqlens_q: Tensor,
+    cu_seqlens_q: Tensor,
+    num_dim_qk: int,
+    num_dim_v: int,
+    max_seqlens_q: int,
+    output: Tensor = None,
+) -> Tensor:
+    return torch.ops.hpc.mla_prefill_bf16(
+        q, kv, seqlens_q, cu_seqlens_q, num_dim_qk, num_dim_v, max_seqlens_q, output
+    )
+
+
 @torch.library.register_fake("hpc::attention_prefill_bf16")
 def attention_prefill_bf16_fake(q, k, v, seqlens_q, cu_seqlens_q, max_seqlens_q, output):
     return torch.empty_like(q)

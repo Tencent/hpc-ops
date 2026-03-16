@@ -173,3 +173,54 @@ def test_attention_prefill_bf16(
     print(my[:5, :, 9:10])
 
     assert allclose(gt, my, atol=0.016)
+
+
+@pytest.mark.parametrize("num_batch", [1])
+@pytest.mark.parametrize("num_seq_q", [8000, 16000])
+@pytest.mark.parametrize("num_seq_kv", [8000, 16000])
+@pytest.mark.parametrize("num_head_q", [16])
+@pytest.mark.parametrize("num_head_kv", [16])
+@pytest.mark.parametrize("num_dim_qk", [192])
+@pytest.mark.parametrize("num_dim_v", [128])
+@pytest.mark.parametrize("use_output", [False])
+def test_mla_prefill_bf16(
+    num_batch, num_seq_q, num_seq_kv, num_head_q, num_head_kv, num_dim_qk, num_dim_v, use_output
+):
+
+    torch.cuda.manual_seed(2)
+
+    T = torch.bfloat16
+
+    total_seq_q = num_batch * num_seq_q
+    Q = torch.randn((total_seq_q, num_head_q, num_dim_qk), dtype=T, device="cuda")
+    K = torch.randn((total_seq_q, num_head_kv, num_dim_qk), dtype=T, device="cuda")
+    # V = K.clone()[:, :, :num_dim_v]
+    V = K.clone()
+
+    seqlens_q = torch.full((num_batch,), num_seq_q, dtype=torch.int32, device="cuda")
+    cu_seqlens_q = torch.cumsum(
+        torch.cat([torch.tensor([0], dtype=torch.int32, device="cuda"), seqlens_q]), dim=0
+    ).to(torch.int32)
+
+    max_seqlens_q = max(seqlens_q)
+
+    my = hpc.mla_prefill_bf16(Q, K, seqlens_q, cu_seqlens_q, num_dim_qk, num_dim_v, max_seqlens_q)
+
+    gt = gt_attention_func(
+        Q,
+        K,
+        V,
+        cu_seqlens_q,
+        cu_seqlens_q,
+        max_seqlen_q=max_seqlens_q,
+        max_seqlen_k=max_seqlens_q,
+        causal=True,
+    )
+
+    gt = gt.reshape(-1, num_head_q, num_dim_qk)[:, :, :num_dim_v]
+    # print("\ngt\n")
+    # print(gt)
+    # print("\nmy\n")
+    # print(my)
+
+    assert allclose(gt, my, atol=0.016)
