@@ -139,6 +139,7 @@ def fuse_moe(
     num_expert_total: int,
     use_bf16_mul: bool = True,
     shared_output: Tensor = None,
+    output: Tensor = None,
 ) -> Tensor:
     """Performs Mixture of Experts (MoE) forward operation with FP8 precision.
 
@@ -179,6 +180,9 @@ def fuse_moe(
         shared_output: output for shared experts, default is None
             Shape: [num_seq, hidden_size]
             Dtype: bfloat16
+        output: specify output tensor.
+            Shape: [num_seq, hidden_size]
+            Dtype: bfloat16
 
     Returns:
         torch.Tensor: Output tensor after MoE computation
@@ -212,6 +216,7 @@ def fuse_moe(
         rank_ep,
         num_expert_total,
         use_bf16_mul,
+        output,
     )
 
 
@@ -227,6 +232,7 @@ def fuse_moe_blockwise(
     rank_ep: int,
     num_expert_total: int,
     shared_output: Tensor = None,
+    output: Tensor = None,
 ) -> Tensor:
     """Performs Mixture of Experts (MoE) forward operation with FP8 precision.
 
@@ -271,6 +277,9 @@ def fuse_moe_blockwise(
         shared_output: output for shared experts, default is None
             Shape: [num_seq, hidden_size]
             Dtype: bfloat16
+        output: specify output tensor.
+            Shape: [num_seq, hidden_size]
+            Dtype: bfloat16
     Returns:
         torch.Tensor: Output tensor after MoE computation
             Shape: [num_tokens, hidden_size]
@@ -288,6 +297,7 @@ def fuse_moe_blockwise(
         shared_output,
         rank_ep,
         num_expert_total,
+        output,
     )
 
 
@@ -316,19 +326,21 @@ def reduce_fake(x, topk_pos, topk_scale):
 
 @torch.library.register_fake("hpc::fuse_moe")
 def fuse_moe_fake(
-    x,
-    gate_up_weight,
-    down_weight,
-    gate_up_scale,
-    down_scale,
-    act_and_mul_scale,
-    topk_ids,
-    topk_scale,
-    rank_ep,
-    num_expert_total,
-    use_bf16_mul,
+    x: Tensor,
+    gate_up_weight: Tensor,
+    down_weight: Tensor,
+    gate_up_scale: Tensor,
+    down_scale: Tensor,
+    act_and_mul_scale: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    rank_ep: int,
+    num_expert_total: int,
+    use_bf16_mul: bool = True,
+    shared_output: Tensor = None,
+    output: Tensor = None,
 ):
-    return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+    return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16, device=x.device)
 
 
 @torch.library.register_fake("hpc::fuse_moe_blockwise")
@@ -343,6 +355,7 @@ def fuse_moe_blockwise_fake(
     topk_scale: Tensor,
     rank_ep: int,
     num_expert_total: int,
-    use_bf16_mul: bool = True,
+    shared_output: Tensor = None,
+    output: Tensor = None,
 ):
-    return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+    return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16, device=x.device)

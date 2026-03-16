@@ -25,6 +25,11 @@ torch::Tensor group_gemm_fp8_entry(const torch::Tensor &x, const torch::Tensor &
   TORCH_CHECK(weight.device().is_cuda(), "weight tensor must be cuda");
   TORCH_CHECK(seqlens.device().is_cuda(), "seqlens tensor must be cuda");
   TORCH_CHECK(cu_seqlens.device().is_cuda(), "cu_seqlens tensor must be cuda");
+  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn && weight.dtype() == torch::kFloat8_e4m3fn,
+              "x and weight dtype must be fp8_e4m3");
+  TORCH_CHECK(seqlens.dtype() == torch::kInt32 && cu_seqlens.dtype() == torch::kInt32,
+              "seqlens and cu_seqlens dtype must be int32");
+  TORCH_CHECK(y_scale.dtype() == torch::kFloat32, "y_scale dtype must be float32");
   TORCH_CHECK(x.is_contiguous(), "x tensor a must be contiguous");
   TORCH_CHECK(weight.is_contiguous(), "weight tensor a must be contiguous");
   TORCH_CHECK(seqlens.size(0) == weight.size(0),
@@ -96,6 +101,12 @@ torch::Tensor group_gemm_blockwise_fp8_entry(
   TORCH_CHECK(cu_seqlens.device().is_cuda(), "cu_seqlens tensor must be cuda");
   TORCH_CHECK(x.is_contiguous(), "x tensor a must be contiguous");
   TORCH_CHECK(weight.is_contiguous(), "weight tensor a must be contiguous");
+  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn && weight.dtype() == torch::kFloat8_e4m3fn,
+              "x and weight dtype must be fp8_e4m3");
+  TORCH_CHECK(seqlens.dtype() == torch::kInt32 && cu_seqlens.dtype() == torch::kInt32,
+              "seqlens and cu_seqlens dtype must be int32");
+  TORCH_CHECK(x_scale.dtype() == torch::kFloat32 && w_scale.dtype() == torch::kFloat32,
+              "x_scale and w_scale dtype must be float32");
   TORCH_CHECK(seqlens.size(0) == weight.size(0),
               "seqlens and weight must share the same num_group");
   TORCH_CHECK(x.size(1) == weight.size(2), "x and weight must share the same k");

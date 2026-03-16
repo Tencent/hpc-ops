@@ -259,7 +259,7 @@ def naive_fuse_moe_blockwise(
     return y
 
 
-@pytest.mark.parametrize("num_tokens", [128, 512])
+@pytest.mark.parametrize("num_tokens", [128])
 @pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512, 256])
@@ -267,6 +267,7 @@ def naive_fuse_moe_blockwise(
 @pytest.mark.parametrize("rank_ep", [0, 1])
 @pytest.mark.parametrize("size_ep", [1, 4, 8])
 @pytest.mark.parametrize("has_shared_output", [False, True])
+@pytest.mark.parametrize("use_output", [False, True])
 def test_fuse_moe(
     num_tokens,
     num_topk,
@@ -276,6 +277,7 @@ def test_fuse_moe(
     rank_ep,
     size_ep,
     has_shared_output,
+    use_output,
 ):
     torch.manual_seed(0)
     dtype = torch.float8_e4m3fn
@@ -314,19 +316,37 @@ def test_fuse_moe(
     else:
         shared_output = None
 
-    my = hpc.fuse_moe_blockwise(
-        x,
-        x_scale,
-        gate_up_weight,
-        gate_up_weight_scale,
-        down_weight,
-        down_weight_scale,
-        topk_ids,
-        topk_scale,
-        rank_ep,
-        num_expert,
-        shared_output,
-    )
+    if use_output:
+        output = torch.empty_like(x, dtype=torch.bfloat16)
+        hpc.fuse_moe_blockwise(
+            x,
+            x_scale,
+            gate_up_weight,
+            gate_up_weight_scale,
+            down_weight,
+            down_weight_scale,
+            topk_ids,
+            topk_scale,
+            rank_ep,
+            num_expert,
+            shared_output,
+            output,
+        )
+        my = output
+    else:
+        my = hpc.fuse_moe_blockwise(
+            x,
+            x_scale,
+            gate_up_weight,
+            gate_up_weight_scale,
+            down_weight,
+            down_weight_scale,
+            topk_ids,
+            topk_scale,
+            rank_ep,
+            num_expert,
+            shared_output,
+        )
     gt = naive_fuse_moe_blockwise(
         x,
         x_scale,

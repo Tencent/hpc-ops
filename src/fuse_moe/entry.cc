@@ -124,10 +124,20 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
                              const torch::Tensor &down_scale,
                              const torch::Tensor &act_and_mul_scale, const torch::Tensor &topk_ids,
                              const torch::Tensor &topk_scale,
-                             const std::optional<torch::Tensor> &shared_output, int64_t rank_ep,
-                             int64_t num_expert_total, bool use_bf16_mul) {
+                             std::optional<torch::Tensor> shared_output, int64_t rank_ep,
+                             int64_t num_expert_total, bool use_bf16_mul,
+                             std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
+  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn &&
+                  gate_up_weight.dtype() == torch::kFloat8_e4m3fn &&
+                  down_weight.dtype() == torch::kFloat8_e4m3fn,
+              "x, gate_up_weight and down_weight dtype must be fp8_e4m3");
+  TORCH_CHECK(topk_ids.dtype() == torch::kInt32, "topk_ids dtype must be int32");
+  TORCH_CHECK(gate_up_scale.dtype() == torch::kFloat32 && down_scale.dtype() == torch::kFloat32 &&
+                  act_and_mul_scale.dtype() == torch::kFloat32 &&
+                  topk_scale.dtype() == torch::kFloat32,
+              "gate_up_scale, down_scale, act_and_mul_scale and topk_scale dtype must be float32");
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
   TORCH_CHECK(gate_up_weight.device().is_cuda(), "gate_up_weight tensor must be cuda");
   TORCH_CHECK(gate_up_scale.device().is_cuda(), "gate_up_scale tensor must be cuda");
@@ -176,7 +186,18 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
   auto options = x.options();
-  torch::Tensor y = torch::empty({num_seq, hidden_size}, options.dtype(torch::kBFloat16));
+  torch::Tensor y;
+  void *y_ptr = nullptr;
+  if (output.has_value()) {
+    TORCH_CHECK(output.value().size(0) == num_seq && output.value().size(1) == hidden_size,
+                "output shape must be [num_tokens, hidden_size]");
+    TORCH_CHECK(output.value().dtype() == torch::kBFloat16, "output dtype must be bfloat16");
+    TORCH_CHECK(output.value().device().is_cuda(), "output must be cuda tensor");
+    y_ptr = output.value().mutable_data_ptr();
+  } else {
+    y = torch::empty({num_seq, hidden_size}, options.dtype(torch::kBFloat16));
+    y_ptr = y.mutable_data_ptr();
+  }
 
   torch::Tensor gate_up_input = torch::empty({num_seq * num_topk, hidden_size}, options);
   torch::Tensor gate_up_output =
@@ -235,7 +256,6 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   const auto *down_weight_ptr = down_weight.const_data_ptr();
   const auto *down_scale_ptr = down_scale.const_data_ptr();
 
-  auto *y_ptr = y.mutable_data_ptr();
   auto *topk_pos_ptr = topk_pos.mutable_data_ptr();
   auto *seqlens_ptr = seqlens.mutable_data_ptr();
   auto *cu_seqlens_ptr = cu_seqlens.mutable_data_ptr();
@@ -255,18 +275,30 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
                  shared_output_ptr, gateup_task_map_ptr, down_task_map_ptr, num_gateup_waves,
                  num_down_waves, num_seq, hidden_size, intermediate_size, num_topk,
                  num_expert_total, num_expert, rank_ep, use_bf16_mul, stream);
-
-  return y;
+  if (output.has_value()) {
+    return output.value();
+  } else {
+    return y;
+  }
 }
 
 torch::Tensor fuse_moe_blockwise_entry(
     const torch::Tensor &x, const torch::Tensor &x_scale, const torch::Tensor &gate_up_weight,
     const torch::Tensor &gate_up_weight_scale, const torch::Tensor &down_weight,
     const torch::Tensor &down_weight_scale, const torch::Tensor &topk_ids,
-    const torch::Tensor &topk_scale, const std::optional<torch::Tensor> &shared_output,
-    int64_t rank_ep, int64_t num_expert_total) {
+    const torch::Tensor &topk_scale, std::optional<torch::Tensor> shared_output, int64_t rank_ep,
+    int64_t num_expert_total, std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
+  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn &&
+                  gate_up_weight.dtype() == torch::kFloat8_e4m3fn &&
+                  down_weight.dtype() == torch::kFloat8_e4m3fn,
+              "x, gate_up_weight and down_weight dtype must be fp8_e4m3");
+  TORCH_CHECK(topk_ids.dtype() == torch::kInt32, "topk_ids dtype must be int32");
+  TORCH_CHECK(gate_up_weight_scale.dtype() == torch::kFloat32 &&
+                  down_weight_scale.dtype() == torch::kFloat32 &&
+                  topk_scale.dtype() == torch::kFloat32,
+              "gate_up_scale, down_scale, act_and_mul_scale and topk_scale dtype must be float32");
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
   TORCH_CHECK(x_scale.device().is_cuda(), "x_scale tensor must be cuda");
   TORCH_CHECK(gate_up_weight.device().is_cuda(), "gate_up_weight tensor must be cuda");
@@ -346,7 +378,18 @@ torch::Tensor fuse_moe_blockwise_entry(
       aligned_size;
 
   auto options = x.options();
-  torch::Tensor y = torch::empty({num_tokens, hidden_size}, options.dtype(torch::kBFloat16));
+  torch::Tensor y;
+  void *y_ptr = nullptr;
+  if (output.has_value()) {
+    TORCH_CHECK(output.value().size(0) == num_tokens && output.value().size(1) == hidden_size,
+                "output shape must be [num_tokens, hidden_size]");
+    TORCH_CHECK(output.value().dtype() == torch::kBFloat16, "output dtype must be bfloat16");
+    TORCH_CHECK(output.value().device().is_cuda(), "output must be cuda tensor");
+    y_ptr = output.value().mutable_data_ptr();
+  } else {
+    y = torch::empty({num_tokens, hidden_size}, options.dtype(torch::kBFloat16));
+    y_ptr = y.mutable_data_ptr();
+  }
   torch::Tensor gate_up_input =
       torch::empty({num_tokens * num_topk, hidden_size}, options.dtype(torch::kFloat8_e4m3fn));
   torch::Tensor gate_up_input_scale =
@@ -396,7 +439,6 @@ torch::Tensor fuse_moe_blockwise_entry(
   const auto *down_weight_ptr = down_weight.const_data_ptr();
   const auto *down_weight_scale_ptr = down_weight_scale.const_data_ptr();
 
-  auto *y_ptr = y.mutable_data_ptr();
   auto *topk_pos_ptr = topk_pos.mutable_data_ptr();
   auto *num_tokens_per_group_ptr = num_tokens_per_group.mutable_data_ptr();
   auto *cu_num_tokens_per_group_ptr = cu_num_tokens_per_group.mutable_data_ptr();
@@ -420,7 +462,11 @@ torch::Tensor fuse_moe_blockwise_entry(
       down_task_map_ptr, num_gateup_waves, num_down_waves, num_tokens, num_padded_tokens,
       hidden_size, intermediate_size, num_topk, num_expert_total, num_experts,
       gate_up_weight_scale_lastdim_pad4, down_weight_scale_lastdim_pad4, rank_ep, stream);
-  return y;
+  if (output.has_value()) {
+    return output.value();
+  } else {
+    return y;
+  }
 }
 
 }  // namespace fuse_moe
@@ -442,7 +488,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "fuse_moe(Tensor x, Tensor gate_up_weight, Tensor down_weight, Tensor gate_up_scale, "
       "Tensor down_scale, Tensor act_and_mul_scale, Tensor topk_ids, Tensor topk_scale, Tensor ? "
       "shared_output, "
-      "int rank_ep, int num_expert_total, bool use_bf16_mul) -> (Tensor)");
+      "int rank_ep, int num_expert_total, bool use_bf16_mul, Tensor ? output) -> (Tensor)");
   m.impl("fuse_moe", torch::kCUDA, &hpc::fuse_moe::fuse_moe_entry);
 
   m.def(
@@ -450,6 +496,6 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "gate_up_weight_scale, "
       "Tensor down_weight, Tensor down_weight_scale, Tensor topk_ids, Tensor topk_scale, Tensor ? "
       "shared_output, "
-      "int rank_ep, int num_expert_total) -> (Tensor)");
+      "int rank_ep, int num_expert_total, Tensor ? output) -> (Tensor)");
   m.impl("fuse_moe_blockwise", torch::kCUDA, &hpc::fuse_moe::fuse_moe_blockwise_entry);
 }
