@@ -454,6 +454,7 @@ torch::Tensor attention_mla_with_kvcache_bf16_entry(const torch::Tensor &q,
   int head_dim = q.size(2);
 
   int num_kvcache_blocks = kvcache.size(0);
+  int block_size = kvcache.size(1);
 
   TORCH_CHECK(block_size == 64, "we only support kvcache block size 64.");
 
