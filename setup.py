@@ -5,6 +5,32 @@ import shutil
 import torch
 
 
+def detect_sm_arch():
+    """Detect SM architecture of the current GPU via torch."""
+    try:
+        if not torch.cuda.is_available():
+            return None
+        major, minor = torch.cuda.get_device_capability(0)
+        return str(major * 10 + minor)
+    except Exception:
+        return None
+
+
+# SM_ARCH: from environment variable, or auto-detected from the current GPU.
+# CI default (no env var, no GPU): falls back to "90".
+SM_ARCH = os.environ.get("SM_ARCH")
+if not SM_ARCH:
+    SM_ARCH = detect_sm_arch()
+    if SM_ARCH:
+        print(f"INFO: SM_ARCH not set, auto-detected from GPU: SM_ARCH={SM_ARCH}", file=sys.stderr)
+    else:
+        SM_ARCH = "90"
+        print(
+            f"WARNING: SM_ARCH not set and no GPU detected. Defaulting to SM_ARCH={SM_ARCH}.",
+            file=sys.stderr,
+        )
+
+
 class CMakeExtension(Extension):
     def __init__(self, name, version_macros=[], sourcedir=""):
         Extension.__init__(self, name, sources=[])
@@ -19,14 +45,32 @@ class CMakeBuild(build_ext):
 
     def build_extension(self, ext):
         build_lib_dir = os.path.dirname(self.get_ext_fullpath(ext.name))
-        build_temp_dir = os.path.join(self.build_temp, ext.name)
+
+        # Use a fixed, arch-specific build directory so that incremental builds
+        # work correctly: cmake's dependency tracking is preserved across calls
+        # to both 'python3 setup.py build' and 'python3 -m build'.
+        build_temp_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "build",
+            f"sm{SM_ARCH}",
+            ext.name,
+        )
 
         os.makedirs(build_lib_dir, exist_ok=True)
         os.makedirs(build_temp_dir, exist_ok=True)
 
-        cmake_args = [f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={build_lib_dir}", *ext.version_macros]
+        cmake_args = [
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={build_lib_dir}",
+            f"-DSM_ARCH={SM_ARCH}",
+            *ext.version_macros,
+        ]
 
-        subprocess.check_call(["cmake", ext.sourcedir] + cmake_args, cwd=build_temp_dir)
+        # Ensure nvcc is discoverable if not in PATH
+        cmake_env = os.environ.copy()
+
+        subprocess.check_call(
+            ["cmake", ext.sourcedir] + cmake_args, cwd=build_temp_dir, env=cmake_env
+        )
         subprocess.check_call(
             ["cmake", "--build", ".", "--config", "Release", "-j16"], cwd=build_temp_dir
         )
@@ -71,8 +115,8 @@ def get_version():
 
 version, git_hash = get_version()
 version_macros = [
-    '-DHPC_VERSION_STR="{}"'.format(version),
-    '-DHPC_GIT_HASH_STR="{}"'.format(git_hash),
+    "-DHPC_VERSION_STR={}".format(version),
+    "-DHPC_GIT_HASH_STR={}".format(git_hash),
 ]
 
 with open("hpc/version.py", "w") as fp:

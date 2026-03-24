@@ -3,6 +3,21 @@ project(hpc_ops LANGUAGES CXX CUDA)
 
 include(ExternalProject)
 
+# Map SM_ARCH number to nvcc architecture string.
+# SM90 and SM100 use the 'a' suffix to enable extended ISA (WGMMA, TMA, etc.)
+if("${SM_ARCH}" STREQUAL "89")
+  set(CUDA_ARCH_STR "89")
+elseif("${SM_ARCH}" STREQUAL "90")
+  set(CUDA_ARCH_STR "90a")
+elseif("${SM_ARCH}" STREQUAL "100")
+  set(CUDA_ARCH_STR "100a")
+else()
+  set(CUDA_ARCH_STR "${SM_ARCH}")
+endif()
+
+message(STATUS "Building for SM_ARCH=${SM_ARCH}  CUDA_ARCH=${CUDA_ARCH_STR}")
+
+# ── NVSHMEM (ExternalProject) ─────────────────────────────────────────────────
 set(NVSHMEM_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rd/nvshmem")
 set(NVSHMEM_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/nvshmem")
 
@@ -20,7 +35,7 @@ ExternalProject_Add(nvshmem_external
   BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build"
   CMAKE_ARGS
    -DMLX5_lib=${MLX5_LIBRARY}
-   -DCMAKE_CUDA_ARCHITECTURES=90a
+   -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH_STR}
    -DNVSHMEM_IBGDA_SUPPORT=ON
    -DCUDA_HOME=/usr/local/cuda
    -DCMAKE_INSTALL_PREFIX=${NVSHMEM_INSTALL_DIR}
@@ -56,9 +71,29 @@ set(CMAKE_BUILD_TYPE "Release")
 find_package(CUDAToolkit REQUIRED)
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
-file(GLOB_RECURSE SOURCES "src/*/*.cu" "src/*/*.cc")
-list(FILTER SOURCES EXCLUDE REGEX ".*test.*")
+# ── Source file collection ─────────────────────────────────────────────────────
+file(GLOB_RECURSE SOURCES "src/*.cc" "src/*.cu")
 
+set(FILTERED_SOURCES "")
+foreach(f ${SOURCES})
+  if(f MATCHES ".*/sm([0-9]+)/.*")
+    if(f MATCHES ".*/sm${SM_ARCH}/.*")
+      list(APPEND FILTERED_SOURCES "${f}")
+    endif()
+  else()
+    list(APPEND FILTERED_SOURCES "${f}")
+  endif()
+endforeach()
+
+list(FILTER FILTERED_SOURCES EXCLUDE REGEX ".*test.*")
+
+set(SOURCES ${FILTERED_SOURCES})
+
+message(STATUS "Source files for SM${SM_ARCH}:")
+foreach(f ${SOURCES})
+  message(STATUS "  ${f}")
+endforeach()
+# ──────────────────────────────────────────────────────────────────────────────
 
 add_library(_C MODULE ${SOURCES})
 
@@ -88,15 +123,15 @@ set_target_properties(
   CUDA_STANDARD_REQUIRED ON
   CUDA_EXTENSIONS OFF
 
-  CUDA_ARCHITECTURES "90a"
+  CUDA_ARCHITECTURES "${CUDA_ARCH_STR}"
 )
 
 target_compile_definitions(
   _C PRIVATE
   Py_LIMITED_API=0x03090000
   _GLIBCXX_USE_CXX11_ABI=1
-  HPC_GIT_HASH_STR=${HPC_GIT_HASH_STR}
-  HPC_VERSION_STR=${HPC_VERSION_STR}
+  HPC_GIT_HASH_STR=\"${HPC_GIT_HASH_STR}\"
+  HPC_VERSION_STR=\"${HPC_VERSION_STR}\"
 )
 
 execute_process(
@@ -114,7 +149,6 @@ print(';'.join(library_paths()), end='')
 "
   OUTPUT_VARIABLE TORCH_LIBRARY_PATHS
 )
-
 
 target_include_directories(
   _C PRIVATE
@@ -141,24 +175,91 @@ target_link_libraries(
   torch_cuda
 )
 
-target_compile_options(
-  _C PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:
-    -Werror=all-warnings
-    -lineinfo
-    --expt-relaxed-constexpr
-    -std=c++17
-    -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
-    -DNDEBUG
-    -Xptxas=-warn-double-usage,-warn-spills,-Werror,-v
-  >
-  $<$<COMPILE_LANGUAGE:CXX>:
-    -Wno-unused-result
-    -Wsign-compare
-    -g
-    -fwrapv
-    -Wall
-    -DTORCH_API_INCLUDE_EXTENSION_H
-    -DTORCH_EXTENSION_NAME=_C
-  >
-)
+# ── Per-architecture CUDA compile flags ───────────────────────────────────────
+if("${SM_ARCH}" STREQUAL "90")
+  target_compile_options(
+    _C PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      -Werror=all-warnings
+      -lineinfo
+      --expt-relaxed-constexpr
+      -std=c++17
+      -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
+      -DNDEBUG
+      -Xptxas=-warn-double-usage,-warn-spills,-Werror,-v
+    >
+    $<$<COMPILE_LANGUAGE:CXX>:
+      -Wno-unused-result
+      -Wsign-compare
+      -g
+      -fwrapv
+      -Wall
+      -DTORCH_API_INCLUDE_EXTENSION_H
+      -DTORCH_EXTENSION_NAME=_C
+    >
+  )
+elseif("${SM_ARCH}" STREQUAL "100")
+  target_compile_options(
+    _C PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      -Werror=all-warnings
+      -lineinfo
+      --expt-relaxed-constexpr
+      -std=c++17
+      -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
+      -DNDEBUG
+      -Xptxas=-warn-double-usage,-Werror,-v
+    >
+    $<$<COMPILE_LANGUAGE:CXX>:
+      -Wno-unused-result
+      -Wsign-compare
+      -g
+      -fwrapv
+      -Wall
+      -DTORCH_API_INCLUDE_EXTENSION_H
+      -DTORCH_EXTENSION_NAME=_C
+    >
+  )
+elseif("${SM_ARCH}" STREQUAL "89")
+  target_compile_options(
+    _C PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      -Werror=all-warnings
+      -lineinfo
+      --expt-relaxed-constexpr
+      -std=c++17
+      -DNDEBUG
+      -Xptxas=-warn-double-usage,-v
+    >
+    $<$<COMPILE_LANGUAGE:CXX>:
+      -Wno-unused-result
+      -Wsign-compare
+      -g
+      -fwrapv
+      -Wall
+      -DTORCH_API_INCLUDE_EXTENSION_H
+      -DTORCH_EXTENSION_NAME=_C
+    >
+  )
+else()
+  target_compile_options(
+    _C PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      -Werror=all-warnings
+      -lineinfo
+      --expt-relaxed-constexpr
+      -std=c++17
+      -DNDEBUG
+      -Xptxas=-warn-double-usage,-v
+    >
+    $<$<COMPILE_LANGUAGE:CXX>:
+      -Wno-unused-result
+      -Wsign-compare
+      -g
+      -fwrapv
+      -Wall
+      -DTORCH_API_INCLUDE_EXTENSION_H
+      -DTORCH_EXTENSION_NAME=_C
+    >
+  )
+endif()

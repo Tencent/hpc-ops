@@ -73,7 +73,7 @@ stages:
           script: |-
             set -xe
             cd ${{ci.workspace}}
-            make wheel
+            make sm90
       - name: upload to pypi
         uses: DistributionToGeneric@1.*
         with:
@@ -83,7 +83,7 @@ stages:
           pypi_upload_arguments:
           - skip_existing
           - verbose
-          distribution: dist/hpc*.whl
+          distribution: dist/sm90/hpc*.whl
         retry-times: 2
     job_lz_:
       name: Compile PyTorch-2.9
@@ -104,7 +104,7 @@ stages:
           script: |-
             set -xe
             cd ${{ci.workspace}}
-            make wheel
+            make sm90
       - name: config pip for upload
         id: NXn
         uses: linuxScript@1.*
@@ -126,7 +126,7 @@ stages:
           pypi_upload_arguments:
           - skip_existing
           - verbose
-          distribution: dist/hpc*.whl
+          distribution: dist/sm90/hpc*.whl
         retry-times: 2
     job_sfp:
       name: Compile PyTorch-2.10
@@ -147,7 +147,7 @@ stages:
           script: |-
             set -xe
             cd ${{ci.workspace}}
-            make wheel
+            make sm90
       - name: config pip for upload
         id: NXn
         uses: linuxScript@1.*
@@ -169,7 +169,7 @@ stages:
           pypi_upload_arguments:
           - skip_existing
           - verbose
-          distribution: dist/hpc*.whl
+          distribution: dist/sm90/hpc*.whl
         retry-times: 2
 - name: stage-2
   label:

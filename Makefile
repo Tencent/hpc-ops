@@ -8,13 +8,19 @@ CUH_FILES=$(shell find src -name "*.cuh")
 CSRC_FILES=$(CC_FILES) $(CU_FILES) $(CUH_FILES) $(H_FILES)
 
 
+# ── Default: build for the GPU installed on this machine ─────────────────────
 all:
 	python3 setup.py build
 
-cmake:
-	cmake -S . -B build
-	cmake --build build --parallel -v
+# ── Arch-specific wheel targets ───────────────────────────────────────────────
+# 'make sm90', 'make sm100', 'make sm89', etc.
+# Output wheel goes to dist/sm<arch>/.
+sm%:
+	find . -type d -name "__pycache__" -exec rm -rf {} +
+	mkdir -p dist/sm$*
+	SM_ARCH=$* python3 -m build --wheel --no-isolation --outdir dist/sm$*
 
+# ── wheel: build wheel for auto-detected arch ─────────────────────────────────
 wheel:
 	find . -type d -name "__pycache__" -exec rm -rf {} +
 	python3 -m build --wheel --no-isolation
