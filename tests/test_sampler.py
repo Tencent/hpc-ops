@@ -80,6 +80,31 @@ def test_fused_repetition_penalties_softmax(
     assert allclose(gt_y, y)
 
 
+def apply_top_k_only(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Apply top-k mask to the logits.
+
+    This implementation doesn't involve sorting the entire vocab.
+
+    The logits tensor may be updated in-place.
+    """
+    no_top_k_mask = k == logits.shape[1]
+    # Set non-top-k rows to 1 so that we can gather.
+    k = k.masked_fill(no_top_k_mask, 1)
+    max_top_k = k.max()
+    # topk.values tensor has shape [batch_size, max_top_k].
+    # Convert top k to 0-based index in range [0, max_top_k).
+    k_index = k.sub_(1).unsqueeze(1)
+    top_k_mask = logits.topk(max_top_k, dim=1).values.gather(1, k_index.long())
+    # Handle non-topk rows.
+    top_k_mask.masked_fill_(no_top_k_mask.unsqueeze(1), -float("inf"))
+    logits.masked_fill_(logits < top_k_mask, -float("inf"))
+    return logits
+
+
 def ref_top_k_top_p(
     logits: torch.Tensor,
     k: torch.Tensor | None,
@@ -122,24 +147,6 @@ def ref_top_k_top_p(
     return logits
 
 
-def torch_topk_mask_logits(logits, topk):
-    dim = -1
-    masked_logits = torch.full_like(logits, float("-inf"))
-    top_values, top_indices = torch.topk(logits, topk, dim=dim)
-    masked_logits.scatter_(dim, top_indices, top_values)
-    return masked_logits
-
-
-def reference_topk_mask_logits(logits, topk):
-    try:
-        import flashinfer
-
-        return flashinfer.sampling.top_k_mask_logits(logits, topk)
-    except ImportError:
-        print("flashinfer not found, using torch topk mask logits")
-        return ref_top_k_top_p(logits, topk)
-
-
 @pytest.mark.parametrize("batch_size", [1, 10])
 @pytest.mark.parametrize("vocab_size", [120818, 129024, 128512])
 @pytest.mark.parametrize("topk", [20])
@@ -150,10 +157,10 @@ def test_topk_mask_logits(batch_size, vocab_size, topk, topk_dtype):
 
     topk = torch.tensor([topk] * batch_size).to(topk_dtype).cuda()
 
-    my_output_logits = hpc.sampler.topk_mask_logits(logits, topk)
+    my_output_logits = hpc.topk_mask_logits(logits, topk)
     my_probs = my_output_logits.softmax(dim=-1, dtype=torch.float32)
 
-    gt_output_logits = reference_topk_mask_logits(logits, topk)
+    gt_output_logits = ref_top_k_top_p(logits, topk, None)
     gt_probs = gt_output_logits.softmax(dim=-1, dtype=torch.float32)
 
     assert allclose(gt_output_logits, my_output_logits)
@@ -172,7 +179,7 @@ def test_topk_topp_mask_logits(batch_size, vocab_size, topk, topp, topk_dtype):
     topk = torch.tensor([topk] * batch_size).to(topk_dtype).cuda()
     topp = torch.tensor([topp] * batch_size).to(torch.float32).cuda()
 
-    my_output_logits = hpc.sampler.topk_topp_mask_logits(logits, topk, topp)
+    my_output_logits = hpc.topk_topp_mask_logits(logits, topk, topp)
     my_probs = my_output_logits.softmax(dim=-1, dtype=torch.float32)
 
     gt_output_logits = ref_top_k_top_p(logits, topk, topp)
