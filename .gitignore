@@ -12,14 +12,14 @@ __pycache__
 *.log
 test
 version.py
+.DS_Store
 
-3rd/nvshmem/bin/
-3rd/nvshmem/include/
-3rd/nvshmem/lib/
-3rd/nvshmem/share/
-3rd/nvshmem/version.txt
-3rd/nvshmem/changelog
-3rd/nvshmem/git_commit.txt
-3rd/nvshmem/src/include/non_abi/nvshmem_build_options.h
-3rd/nvshmem/src/include/non_abi/nvshmem_version.h
-3rd/nvshmem/src/device/comm/transfer_device.cu
+3rd/ucl/nvshmem/bin/
+3rd/ucl/nvshmem/include/
+3rd/ucl/nvshmem/lib/
+3rd/ucl/nvshmem/share/
+3rd/ucl/nvshmem/version.txt
+3rd/ucl/nvshmem/changelog
+3rd/ucl/nvshmem/git_commit.txt
+3rd/ucl/nvshmem/src/include/non_abi/nvshmem_build_options.h
+3rd/ucl/nvshmem/src/include/non_abi/nvshmem_version.h

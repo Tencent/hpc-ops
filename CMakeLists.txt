@@ -18,8 +18,8 @@ endif()
 message(STATUS "Building for SM_ARCH=${SM_ARCH}  CUDA_ARCH=${CUDA_ARCH_STR}")
 
 # ── NVSHMEM (ExternalProject) ─────────────────────────────────────────────────
-set(NVSHMEM_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rd/nvshmem")
-set(NVSHMEM_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/nvshmem")
+set(NVSHMEM_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rd/ucl/nvshmem")
+set(NVSHMEM_INSTALL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rd/ucl/nvshmem")
 
 if(NOT EXISTS "${NVSHMEM_INSTALL_DIR}/include")
     file(MAKE_DIRECTORY "${NVSHMEM_INSTALL_DIR}/include")
@@ -53,23 +53,76 @@ ExternalProject_Add(nvshmem_external
    -DNVSHMEM_USE_GDRCOPY=OFF
    -DNVSHMEM_BUILD_EXAMPLES=OFF
    -DNVSHMEM_BUILD_TESTS=OFF
+   -DNVSHMEM_NVTX=OFF
    INSTALL_COMMAND $(MAKE) install
 )
 
-add_library(nvshmem STATIC IMPORTED GLOBAL)
+add_library(nvshmem_device STATIC IMPORTED GLOBAL)
 set_target_properties(
-  nvshmem PROPERTIES
-  IMPORTED_LOCATION ${NVSHMEM_INSTALL_DIR}/lib/libnvshmem.a
-  INTERFACE_INCLUDE_DIRECTORIES ${NVSHMEM_INSTALL_DIR}/include
+  nvshmem_device PROPERTIES
+  IMPORTED_LOCATION "${NVSHMEM_INSTALL_DIR}/lib/libnvshmem_device.a"
+  INTERFACE_INCLUDE_DIRECTORIES "${NVSHMEM_INSTALL_DIR}/include"
+)
+add_dependencies(nvshmem_device nvshmem_external)
+
+# Should Add "${NVSHMEM_INSTALL_DIR}/lib" to "LD_LIBRARY_PATH"
+add_library(nvshmem_host SHARED IMPORTED GLOBAL)
+set_target_properties(
+  nvshmem_host PROPERTIES
+  IMPORTED_LOCATION "${NVSHMEM_INSTALL_DIR}/lib/libnvshmem_host.so"
+  INTERFACE_INCLUDE_DIRECTORIES "${NVSHMEM_INSTALL_DIR}/include"
+)
+add_dependencies(nvshmem_host nvshmem_external)
+
+set(UCL_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rd/ucl")
+set(UCL_INSTALL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rd/ucl")
+
+if(NOT EXISTS "${UCL_INSTALL_DIR}/include")
+    file(MAKE_DIRECTORY "${UCL_INSTALL_DIR}/include")
+endif()
+
+ExternalProject_Add(ucl_external
+  SOURCE_DIR "${UCL_SRC_DIR}"
+  BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/ucl-build"
+  CMAKE_ARGS
+   -DCMAKE_CUDA_ARCHITECTURES=90a
+   -DCMAKE_INSTALL_PREFIX=${UCL_INSTALL_DIR}
+   -DCMAKE_BUILD_TYPE=Release
+   -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+  BUILD_COMMAND $(MAKE)
+  INSTALL_COMMAND $(MAKE) install
+  DEPENDS nvshmem_external
 )
 
-add_dependencies(nvshmem nvshmem_external)
+add_library(ucl STATIC IMPORTED GLOBAL)
+set_target_properties(
+  ucl PROPERTIES
+  IMPORTED_LOCATION ${UCL_INSTALL_DIR}/lib/libucl_hpc.a
+  INTERFACE_INCLUDE_DIRECTORIES "${UCL_INSTALL_DIR}/include"
+)
+add_dependencies(ucl ucl_external)
 
 enable_language(CUDA)
 set(CMAKE_BUILD_TYPE "Release")
 
 find_package(CUDAToolkit REQUIRED)
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+
+execute_process(
+  COMMAND python3 -c "
+from torch.utils.cpp_extension import include_paths
+print(';'.join(include_paths()), end='')
+"
+  OUTPUT_VARIABLE TORCH_INCLUDE_PATHS
+)
+
+execute_process(
+  COMMAND python3 -c "
+from torch.utils.cpp_extension import library_paths
+print(';'.join(library_paths()), end='')
+"
+  OUTPUT_VARIABLE TORCH_LIBRARY_PATHS
+)
 
 # ── Source file collection ─────────────────────────────────────────────────────
 file(GLOB_RECURSE SOURCES "src/*.cc" "src/*.cu")
@@ -134,26 +187,12 @@ target_compile_definitions(
   HPC_VERSION_STR=\"${HPC_VERSION_STR}\"
 )
 
-execute_process(
-  COMMAND python3 -c "
-from torch.utils.cpp_extension import include_paths
-print(';'.join(include_paths()), end='')
-"
-  OUTPUT_VARIABLE TORCH_INCLUDE_PATHS
-)
-
-execute_process(
-  COMMAND python3 -c "
-from torch.utils.cpp_extension import library_paths
-print(';'.join(library_paths()), end='')
-"
-  OUTPUT_VARIABLE TORCH_LIBRARY_PATHS
-)
-
 target_include_directories(
   _C PRIVATE
   ./
   3rd/cutlass/include
+  3rd/ucl/include
+  ${NVSHMEM_INSTALL_DIR}/include
   ${CUDAToolkit_INCLUDE_DIRS}
   ${TORCH_INCLUDE_PATHS}
 )
@@ -165,7 +204,9 @@ target_link_directories(
 
 target_link_libraries(
   _C PRIVATE
-  nvshmem
+  ucl
+  nvshmem_device
+  nvshmem_host
   cuda
   c10
   torch
@@ -174,6 +215,8 @@ target_link_libraries(
   c10_cuda
   torch_cuda
 )
+
+add_dependencies(_C ucl_external nvshmem_external)
 
 # ── Per-architecture CUDA compile flags ───────────────────────────────────────
 if("${SM_ARCH}" STREQUAL "90")

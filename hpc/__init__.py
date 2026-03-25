@@ -1,4 +1,5 @@
 import torch
+import ctypes
 import importlib
 import os
 import sys
@@ -39,6 +40,17 @@ def _export_functions(modules: Dict[str, ModuleType]):
 
         __all__.extend(funcs.keys())
 
+
+def _load_nvshmem_library():
+    _nvshmem_lib_dir = _pkg_dir.parent.parent.parent / "3rd" / "ucl" / "nvshmem" / "lib"
+    nvshmem_host_so = _nvshmem_lib_dir / "libnvshmem_host.so"
+    try:
+        ctypes.CDLL(str(nvshmem_host_so), mode=ctypes.RTLD_GLOBAL)
+    except OSError:
+        print(f"Error: Failed to load nvshmem library", file=sys.stderr)
+
+
+_load_nvshmem_library()
 
 so_files = list(Path(__file__).parent.glob("_C.*.so"))
 assert len(so_files) == 1, f"Expected one _C*.so file, found {len(so_files)}"

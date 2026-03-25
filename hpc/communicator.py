@@ -145,5 +145,49 @@ class MulticastCommunicator:
         pass
 
 
+class MultiNodeCommunicator:
+    def __init__(
+        self, rank: int, world_size: int, device_id: int = -1, comm_name="127.0.0.1:10086"
+    ):
+        pass
+
+    def CreateTensorSync(self, size: int, sub_team: int = -1) -> Dict[int, Tensor]:
+        pass
+
+    def Barrier(self) -> None:
+        pass
+
+    def GetRank(self) -> int:
+        pass
+
+    def GetWorldSize(self) -> int:
+        pass
+
+    def GetDeviceId(self) -> int:
+        pass
+
+    def CreateSubTeam(self, subgroup_size: int) -> int:
+        """Creates a new subgroup team with the specified size.
+
+        This method partitions the world into subgroups of the given size
+        and returns a team handle for the subgroup that this process belongs to.
+
+        Args:
+            subgroup_size: The number of processes in each subgroup.
+                Must be a divisor of world_size.
+
+        Returns:
+            The team idx handle for the newly created subgroup as an integer.
+            The underlying type is shmem_team_t (int32_t).
+
+        Example:
+            >>> comm = MultiNodeCommunicator(rank=0, world_size=16, device_id=0, comm_name="192.168.1.1:10086")
+            >>> # Create subgroups of 4 processes each (4 subgroups total)
+            >>> team = comm.CreateSubTeam(4)
+        """
+        pass
+
+
 # Alternative interface using torch C++ classes
 MulticastCommunicator = torch.classes.hpc.MulticastCommunicator
+MultiNodeCommunicator = torch.classes.hpc.MultiNodeCommunicator

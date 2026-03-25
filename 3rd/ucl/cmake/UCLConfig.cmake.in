@@ -1,0 +1,47 @@
+@PACKAGE_INIT@
+
+# UCL (Unified Communication Library) CMake Config File
+# UCL is a enhanced extensionsn for NVSHMEM
+
+include(CMakeFindDependencyMacro)
+
+# Find CUDA Toolkit dependency
+find_dependency(CUDAToolkit REQUIRED)
+
+# Find NVSHMEM in the fixed location (ucl/nvshmem)
+set(NVSHMEM_HOME "@PACKAGE_NVSHMEM_INSTALL_DIR@")
+set(NVSHMEM_INCLUDE_DIR "${NVSHMEM_HOME}/include")
+set(NVSHMEM_LIB_DIR "${NVSHMEM_HOME}/lib")
+
+# Verify NVSHMEM installation
+if(NOT EXISTS "${NVSHMEM_INCLUDE_DIR}/nvshmem.h")
+    message(FATAL_ERROR "NVSHMEM not found in ${NVSHMEM_HOME}")
+endif()
+
+# Create NVSHMEM imported targets (if not exist)
+if(NOT TARGET nvshmem::nvshmem_host)
+    add_library(nvshmem::nvshmem_host SHARED IMPORTED)
+    set_target_properties(nvshmem::nvshmem_host PROPERTIES
+        IMPORTED_LOCATION "${NVSHMEM_LIB_DIR}/libnvshmem_host.so"
+        INTERFACE_INCLUDE_DIRECTORIES "${NVSHMEM_INCLUDE_DIR}"
+    )
+endif()
+
+if(NOT TARGET nvshmem::nvshmem_device)
+    add_library(nvshmem::nvshmem_device STATIC IMPORTED)
+    set_target_properties(nvshmem::nvshmem_device PROPERTIES
+        IMPORTED_LOCATION "${NVSHMEM_LIB_DIR}/libnvshmem_device.a"
+        INTERFACE_INCLUDE_DIRECTORIES "${NVSHMEM_INCLUDE_DIR}"
+    )
+endif()
+
+# Include exported targets
+if(NOT TARGET ucl::ucl)
+  include("${CMAKE_CURRENT_LIST_DIR}/UCLTargets.cmake")
+endif()
+
+# Provide variables
+set(UCL_FOUND TRUE)
+set(UCL_INCLUDE_DIRS "@PACKAGE_INCLUDE_INSTALL_DIR@")
+set(UCL_LIBRARIES ucl::ucl)
+set(UCL_VERSION "@PROJECT_VERSION@")

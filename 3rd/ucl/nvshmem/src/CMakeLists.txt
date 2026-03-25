@@ -257,6 +257,11 @@ macro(nvshmem_library_set_base_config LIBNAME)
     PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:__STDC_LIMIT_MACROS;__STDC_CONSTANT_MACROS>
   )
 
+  # Disable NVTX if NVSHMEM_NVTX is OFF
+  if(NOT NVSHMEM_NVTX)
+    target_compile_definitions(${LIBNAME} PRIVATE NVTX_DISABLE)
+  endif()
+
   target_compile_options(${LIBNAME}
     INTERFACE $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<BOOL:${NVSHMEM_VERBOSE}>>:-Xptxas -v>
     PRIVATE $<IF:$<CONFIG:Debug>,-O0;-g;,-O3>
