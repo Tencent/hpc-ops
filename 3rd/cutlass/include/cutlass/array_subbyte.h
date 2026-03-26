@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -118,7 +118,7 @@ struct Array<T, N, false> {
     // result[0] = xxx;
     // ```
     // 
-    // Will leads to compiler warning on use of unintialized member variable. Although we know
+    // Will leads to compiler warning on use of uninitialized member variable. Although we know
     //      this read of uninitialized member variable is harmeless.
 
 #if defined(__clang__)

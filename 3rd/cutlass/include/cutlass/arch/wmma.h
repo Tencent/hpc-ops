@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -177,7 +177,7 @@ struct WmmaToCutlassDataType<__nv_bfloat16> {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // WMMA template structure defines nvcuda::wmma::fragments and static assertion chaeks
-// for a specific template paramterized data type (Element[A|B|C]), layout (Layout[A|B|C]), 
+// for a specific template parameterized data type (Element[A|B|C]), layout (Layout[A|B|C]), 
 // and native wmma size (Shape)
 /////////////////////////////////////////////////////////////////////////////////////////////////
 template <  

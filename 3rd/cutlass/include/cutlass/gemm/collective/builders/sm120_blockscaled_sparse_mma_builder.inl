@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2025 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -271,7 +271,7 @@ struct CollectiveBuilder<
 
   // Construct TileShape for SFB load from GMEM to SMEM.
   // It is required to keep consistency with BlockScaled granularity defined in Sm1xxBlkScaledConfig.
-  // So that TileShape for scaling factor needs to be defined as a mutliple of Blk_MN.
+  // So that TileShape for scaling factor needs to be defined as a multiple of Blk_MN.
   using TileShapeSf_MNK = decltype(make_shape(ceil_div(size<0>(TileShape_MNK{}), Blk_MN{}) * Blk_MN{},
                                            ceil_div(size<1>(TileShape_MNK{}), Blk_MN{}) * Blk_MN{}, 
                                            shape<2>(TileShape_MNK{})));
@@ -279,13 +279,13 @@ struct CollectiveBuilder<
   // Basic storage block for new Scaling Factor Layouts
   using mnBasicBlockShape  =  Shape<_32,_4>;
   using mnBasicBlockStride = Stride<_16,_4>;
-  using kBasicBlockShape  = Shape<Int<SFVectorSize>, Int<MMA_NSF>>;
+  using kBasicBlockShape  = Shape<Int<(int)SFVectorSize>, Int<MMA_NSF>>;
   using kBasicBlockStride = Stride<_0, _1>;
   
   using sSFA_shapeM       = decltype(prepend(size<0>(TileShape_MNK{}) / Blk_MN{},   mnBasicBlockShape{}));
   using sSF_strideMN      = decltype(prepend(                        Blk_Elems{},  mnBasicBlockStride{}));
   using sSFA_strideM      = sSF_strideMN;
-  using sSF_shapeK        = decltype(prepend(make_shape( Blk_SF{}/Int<MMA_NSF>{},   size<2>(TileShape_MNK{}) / Int<SFVectorSize>{} / Blk_SF{}),  kBasicBlockShape{}));
+  using sSF_shapeK        = decltype(prepend(make_shape( Blk_SF{}/Int<MMA_NSF>{},   size<2>(TileShape_MNK{}) / Int<(int)SFVectorSize>{} / Blk_SF{}),  kBasicBlockShape{}));
   
   using sSFA_strideK      = decltype(prepend(make_stride(         Int<MMA_NSF>{},   size<0>(TileShape_MNK{}) / Blk_MN{} * Blk_Elems{}), kBasicBlockStride{}));
   using sSFA_shape        = decltype(make_shape(  sSFA_shapeM{},   sSF_shapeK{}));

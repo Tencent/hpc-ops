@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2025 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -136,7 +136,7 @@ struct CollectiveMma<
   // Asymmetric buffering
   // Tensor A/B could have different buffering, with TILEK, and STAGEs.
   //    It let AsymmetricKRatio equals TILEK_A / TILEK_B, to make sure A/B's
-  //    pipeline keep same steps when procude / consume data.
+  //    pipeline keep same steps when produce / consume data.
   static constexpr int AsymmetricKRatio = DispatchPolicy::StagesA != DispatchPolicy::StagesB ? 2 : 1;
 
   using TileShapeB = decltype(make_shape(size<0>(TileShape{}),
@@ -253,7 +253,7 @@ struct CollectiveMma<
     struct TensorStorage : cute::aligned_struct<128, _0> {
       alignas(1024) cute::ArrayEngine<SmemAllocTypeA, cute::cosize_v<SmemLayoutA>> smem_A;
       alignas(1024) cute::ArrayEngine<SmemAllocTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
-      cute::ArrayEngine<ElementEMma, Int<SmemSizeE>{}> smem_E;
+      alignas(16)   cute::ArrayEngine<ElementEMma, Int<SmemSizeE>{}> smem_E;
     } tensors;
 
     using PipelineStorageMK = typename MainloopPipelineMK::SharedStorage;

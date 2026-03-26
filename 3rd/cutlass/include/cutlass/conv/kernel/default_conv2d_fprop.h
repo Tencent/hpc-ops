@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -1056,7 +1056,7 @@ struct DefaultConv2dFprop <
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Defines a kernel for Conv2dFprop specialization for Optimzed IteratorAlgorithm and 
+/// Defines a kernel for Conv2dFprop specialization for Optimized IteratorAlgorithm and 
 /// multistage pipeline.
 template <
   typename ElementA,
@@ -1184,7 +1184,7 @@ struct DefaultConv2dFprop <
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Defines a kernel for Conv2dFprop specialization for Optimzed IteratorAlgorithm and 
+/// Defines a kernel for Conv2dFprop specialization for Optimized IteratorAlgorithm and 
 // multistage pipeline with interleaved layout.
 template <
   typename ElementA,

@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2025 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -101,7 +101,8 @@ struct CollectiveMma<
   using StridePairB = StridePairB_;
   using SmemCopyAtomsA = SmemCopyAtomsA_;
   using SmemCopyAtomsB = SmemCopyAtomsB_;
-
+  using RuntimeDataTypeA = void*;
+  using RuntimeDataTypeB = void*;
   using TiledMma = TiledMma_;
   using AtomThrShapeMNK = Shape<decltype(shape<0>(typename TiledMma::ThrLayoutVMNK{})), _1, _1>;
   using DispatchPolicy = MainloopSm120TmaWarpSpecializedSparseBlockScaled<StagesA, StagesB, StagesE, SchedulerPipelineStageCount, ClusterShape>;
@@ -153,13 +154,13 @@ struct CollectiveMma<
   // Asymmetric buffering
   // Tensor A/B could have different buffering, with TILEK, and STAGEs.
   //    It let AsymmetricKRatio equals TILEK_A / TILEK_B, to make sure A/B's
-  //    pipeline keep same steps when procude / consume data.
+  //    pipeline keep same steps when produce / consume data.
   // Currently, AsymmetricKRatio = {1, 2} is the only support.
   static constexpr int AsymmetricKRatio = DispatchPolicy::StagesA != DispatchPolicy::StagesB ? 2 : 1;
 
   // Construct TileShape for SFB load from GMEM to SMEM.
   // It is required to keep consistency with BlockScaled granularity defined in Sm1xxBlkScaledConfig.
-  // So that TileShape for scaling factor needs to be defined as a mutliple of Blk_MN.
+  // So that TileShape for scaling factor needs to be defined as a multiple of Blk_MN.
   using Blk_MN      = typename Sm1xxBlkScaledConfig::Blk_MN;
   using TileShapeSF = decltype(make_shape(ceil_div(size<0>(CtaShape_MNK{}), Blk_MN{}) * Blk_MN{},
                                            ceil_div(size<1>(CtaShape_MNK{}), Blk_MN{}) * Blk_MN{},
@@ -295,9 +296,9 @@ struct CollectiveMma<
     struct TensorStorage : cute::aligned_struct<128> {
       alignas(1024) cute::ArrayEngine<SmemAllocTypeA, cute::cosize_v<SmemLayoutA>> smem_A;
       alignas(1024) cute::ArrayEngine<SmemAllocTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
-      cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFA>> smem_SFA;
-      cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFB>> smem_SFB;
-      cute::ArrayEngine<ElementEMma, Int<SmemSizeE>{}> smem_E;
+      alignas(16)   cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFA>> smem_SFA;
+      alignas(16)   cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFB>> smem_SFB;
+      alignas(16)   cute::ArrayEngine<ElementEMma, Int<SmemSizeE>{}> smem_E;
     } tensors;
 
     using PipelineStorageMK = typename MainloopPipelineMK::SharedStorage;

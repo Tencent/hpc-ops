@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -276,13 +276,26 @@ public:
       static constexpr int MaxClusterSize = 16;
       implementable &= size(args.hw_info.cluster_shape) <= MaxClusterSize;
       implementable &= size(args.hw_info.cluster_shape_fallback) <= MaxClusterSize;
-      implementable &= cutlass::detail::preferred_cluster_can_implement<AtomThrShapeMNK>(args.hw_info.cluster_shape, args.hw_info.cluster_shape_fallback);
+      // Early return if cluster shape validation failed to avoid division by zero below
+      if (not cutlass::detail::preferred_cluster_can_implement<AtomThrShapeMNK>(args.hw_info.cluster_shape, args.hw_info.cluster_shape_fallback)) {
+        CUTLASS_TRACE_HOST("  CAN IMPLEMENT: Invalid dynamic cluster shape\n");
+        return false;
+      }
+    }
+
+    auto cluster_shape = cutlass::detail::select_cluster_shape(ClusterShape{}, args.hw_info.cluster_shape);
+    auto cluster_shape_fallback = cutlass::detail::select_cluster_shape(ClusterShape{}, args.hw_info.cluster_shape_fallback);
+
+    // implicit gemm B tile can be small for conv, ensure multicast smem offsets are 128B aligned
+    int multicast_b_bits = (size<1>(TileShape{}) * size<2>(TileShape{}) / size<0>(cluster_shape)) * sizeof_bits_v<ElementB>;
+    int multicast_b_fallback_bits = (size<1>(TileShape{}) * size<2>(TileShape{}) / size<0>(cluster_shape_fallback)) * sizeof_bits_v<ElementB>;
+    implementable &= multicast_b_bits % (128*8) == 0 && multicast_b_fallback_bits % (128*8) == 0;
+    if (not implementable) {
+      CUTLASS_TRACE_HOST("  CAN IMPLEMENT: multicast size too large for B tile\n");
+      return false;
     }
 
     if constexpr (is_grouped_wgrad) {
-      auto cluster_shape = cutlass::detail::select_cluster_shape(ClusterShape{}, args.hw_info.cluster_shape);
-      auto cluster_shape_fallback = cutlass::detail::select_cluster_shape(ClusterShape{}, args.hw_info.cluster_shape_fallback);
-
       implementable &= size<0>(cluster_shape) == 1 && size<0>(cluster_shape_fallback) == 1;
 
       if (!implementable) {

@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2022 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2022 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -1353,6 +1353,186 @@ struct MMA_Traits<SM100_MMA_F16BF16_SS_SCALED<a_type, b_type, c_type,
   with(UMMA::ScaleOut accumulate, cute::integral_constant<uint32_t, NewScaleC> scaleC) const {
     return {accumulate, idesc_};
   }
+
+  template <UMMA::ScaleIn new_a_neg>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_F16BF16_SS_SCALED<a_type, b_type, c_type,
+                                  M, N, a_major, b_major,
+                                  ScaleC, new_a_neg, b_neg>>
+  with(cute::integral_constant<UMMA::ScaleIn, new_a_neg>) const {
+    return {accumulate_, UMMA::make_instr_desc<a_type, b_type, c_type, M, N, a_major, b_major, new_a_neg, b_neg>()};
+  }
+};
+
+// Special instantiation for interleaved complex (emulated)
+template <class ab_vtype, int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          uint32_t ScaleC, UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg>
+struct MMA_Traits<SM100_MMA_F16BF16_SS_SCALED<cutlass::complex<ab_vtype>, cutlass::complex<ab_vtype>, float,
+                                M, N, a_major, b_major,
+                                ScaleC, a_neg, b_neg>>
+{
+  static_assert(cute::sizeof_bits_v<ab_vtype> == 16, "Only supports 16bit base types");
+  using a_type = complex<ab_vtype>;
+  using b_type = complex<ab_vtype>;
+  using c_type = float;
+
+  using ValTypeD = c_type;
+  using ValTypeA = a_type;
+  using ValTypeB = b_type;
+  using ValTypeC = c_type;
+
+  using FrgTypeA = UMMA::smem_desc<a_major>;
+  using FrgTypeB = UMMA::smem_desc<b_major>;
+  using FrgTypeC = UMMA::tmem_frg_1sm<c_type>;
+
+  // Logical shape-K is always 256bits, transform to units of elements
+  static constexpr int K = 256 / cute::sizeof_bits<ValTypeA>::value;
+
+  static constexpr uint32_t ScalingFactor = ScaleC;
+
+  using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  using ThrID   = Layout<_1>;
+  using ALayout = Layout<Shape <_1,Shape <Int<M>,Int<K>>>,
+                         Stride<_0,Stride<    _1,Int<M>>>>;
+  using BLayout = Layout<Shape <_1,Shape <Int<N>,Int<K>>>,
+                         Stride<_0,Stride<    _1,Int<N>>>>;
+  using CLayout = Layout<Shape <_1,Shape <Int<M>,Int<N>>>,
+                         Stride<_0,Stride<    _1,Int<M>>>>;
+
+  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
+  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
+
+  UMMA::InstrDescriptor idesc_ = UMMA::make_instr_desc<
+    ab_vtype, ab_vtype, float, M, N, a_major, b_major, a_neg, b_neg>();
+
+  template <class TD, class DLayout,
+            class TA, class ALayout,
+            class TB, class BLayout,
+            class TC, class CLayout>
+  CUTE_HOST_DEVICE constexpr friend
+  void
+  mma_unpack(MMA_Traits          const& traits,
+             Tensor<TD, DLayout>      & D,
+             Tensor<TA, ALayout> const& A,
+             Tensor<TB, BLayout> const& B,
+             Tensor<TC, CLayout> const& C)
+  {
+    static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_rmem<TA>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
+
+    uint64_t desc_a = A[0];
+    uint64_t desc_b = B[0];
+    uint32_t tmem_c = raw_pointer_cast(D.data());
+    uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
+
+    SM100_MMA_F16BF16_SS_SCALED<a_type, b_type, c_type,
+                         M, N, a_major, b_major,
+                         ScaleC, a_neg, b_neg>::fma(desc_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc);
+
+  }
+
+  template <uint32_t NewScaleC>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_F16BF16_SS_SCALED<a_type, b_type, c_type,
+                                  M, N, a_major, b_major,
+                                  NewScaleC, a_neg, b_neg>>
+  with(UMMA::ScaleOut accumulate, cute::integral_constant<uint32_t, NewScaleC> scaleC) const {
+    return {accumulate, idesc_};
+  }
+
+  template <UMMA::ScaleIn new_a_neg>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_F16BF16_SS_SCALED<a_type, b_type, c_type,
+                                  M, N, a_major, b_major,
+                                  ScaleC, new_a_neg, b_neg>>
+  with(cute::integral_constant<UMMA::ScaleIn, new_a_neg>) const {
+    return {accumulate_, UMMA::make_instr_desc<ab_vtype, ab_vtype, float, M, N, a_major, b_major, new_a_neg, b_neg>()};
+  }
+};
+
+template <class a_type, class b_type, class c_type,
+          int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          uint32_t ScaleC, UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg, UMMA::Saturate c_sat>
+struct MMA_Traits<SM100_MMA_TF32_TS_SCALED<a_type, b_type, c_type,
+                                M, N, a_major, b_major,
+                                ScaleC, a_neg, b_neg, c_sat>>
+{
+  using ValTypeD = c_type;
+  using ValTypeA = a_type;
+  using ValTypeB = b_type;
+  using ValTypeC = c_type;
+  static_assert(cute::sizeof_bits_v<a_type> == cute::sizeof_bits_v<b_type> && cute::sizeof_bits_v<b_type> == 32, "SM100_MMA_TF32_TS_SCALED supports 32bit types");
+
+  using FrgTypeA = UMMA::tmem_frg_1sm<a_type, a_type, UMMA::TmemAllocMode::NonInterleaved>;
+  using FrgTypeB = UMMA::smem_desc<b_major>;
+  using FrgTypeC = UMMA::tmem_frg_1sm<c_type, int32_t, UMMA::TmemAllocMode::NonInterleaved>;
+
+  // Logical shape-K is always 256 bits; transform to units of elements
+  static constexpr int K = 256 / cute::sizeof_bits<ValTypeA>::value;
+
+  static constexpr uint32_t ScalingFactor = ScaleC;
+
+  using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  using ThrID   = Layout<_1>;
+  using ALayout = Layout<Shape <_1,Shape <Int<M>,Int<K>>>,
+                         Stride<_0,Stride<    _1,Int<M>>>>;
+  using BLayout = Layout<Shape <_1,Shape <Int<N>,Int<K>>>,
+                         Stride<_0,Stride<    _1,Int<N>>>>;
+  using CLayout = Layout<Shape <_1,Shape <Int<M>,Int<N>>>,
+                         Stride<_0,Stride<    _1,Int<M>>>>;
+
+  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
+  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
+
+  UMMA::InstrDescriptor idesc_ = UMMA::make_instr_desc<
+    a_type, b_type, c_type, M, N, a_major, b_major, a_neg, b_neg, c_sat>();
+
+  template <class TD, class DLayout,
+            class TA, class ALayout,
+            class TB, class BLayout,
+            class TC, class CLayout>
+  CUTE_HOST_DEVICE constexpr friend
+  void
+  mma_unpack(MMA_Traits          const& traits,
+             Tensor<TD, DLayout>      & D,
+             Tensor<TA, ALayout> const& A,
+             Tensor<TB, BLayout> const& B,
+             Tensor<TC, CLayout> const& C)
+  {
+    static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_tmem<TA>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
+
+    uint32_t tmem_a = raw_pointer_cast(A.data());
+    uint64_t desc_b = B[0];
+    uint32_t tmem_c = raw_pointer_cast(D.data());
+    uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
+
+    SM100_MMA_TF32_TS_SCALED<a_type, b_type, c_type,
+                          M, N, a_major, b_major,
+                          ScaleC, a_neg, b_neg>::fma(tmem_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc);
+  }
+
+  template <uint32_t NewScaleC>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_TF32_TS_SCALED<a_type, b_type, c_type,
+                                  M, N, a_major, b_major,
+                                  NewScaleC, a_neg, b_neg, c_sat>>
+  with(UMMA::ScaleOut accumulate, cute::integral_constant<uint32_t, NewScaleC> scaleC) const {
+    return {accumulate, idesc_};
+  }
+
+  template <UMMA::ScaleIn new_a_neg>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_TF32_TS_SCALED<a_type, b_type, c_type,
+                                  M, N, a_major, b_major,
+                                  ScaleC, new_a_neg, b_neg, c_sat>>
+  with(cute::integral_constant<UMMA::ScaleIn, new_a_neg>) const {
+    return {accumulate_, UMMA::make_instr_desc<a_type, b_type, c_type, M, N, a_major, b_major, new_a_neg, b_neg, c_sat>()};
+  }
 };
 
 template <class a_type, class b_type, class c_type,
@@ -1427,7 +1607,104 @@ struct MMA_Traits<SM100_MMA_F16BF16_TS_SCALED<a_type, b_type, c_type,
   with(UMMA::ScaleOut accumulate, cute::integral_constant<uint32_t, NewScaleC> scaleC) const {
     return {accumulate, idesc_};
   }
+
+  template <UMMA::ScaleIn new_a_neg>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_F16BF16_TS_SCALED<a_type, b_type, c_type,
+                                  M, N, a_major, b_major,
+                                  ScaleC, new_a_neg, b_neg, c_sat>>
+  with(cute::integral_constant<UMMA::ScaleIn, new_a_neg>) const {
+    return {accumulate_, UMMA::make_instr_desc<a_type, b_type, c_type, M, N, a_major, b_major, new_a_neg, b_neg, c_sat>()};
+  }
 };
+
+// Special instantiation for interleaved complex (emulated)
+template <class ab_vtype, int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          uint32_t ScaleC, UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg, UMMA::Saturate c_sat>
+struct MMA_Traits<SM100_MMA_F16BF16_TS_SCALED<cutlass::complex<ab_vtype>, cutlass::complex<ab_vtype>, float,
+                                M, N, a_major, b_major,
+                                ScaleC, a_neg, b_neg, c_sat>>
+{
+  static_assert(cute::sizeof_bits_v<ab_vtype> == 16, "Only supports 16bit base types");
+  using a_type = complex<ab_vtype>;
+  using b_type = complex<ab_vtype>;
+  using c_type = float;
+
+  using ValTypeD = c_type;
+  using ValTypeA = a_type;
+  using ValTypeB = b_type;
+  using ValTypeC = c_type;
+
+  using FrgTypeA = UMMA::tmem_frg_1sm<a_type, a_type, UMMA::TmemAllocMode::NonInterleaved>;
+  using FrgTypeB = UMMA::smem_desc<b_major>;
+  using FrgTypeC = UMMA::tmem_frg_1sm<c_type, int32_t, UMMA::TmemAllocMode::NonInterleaved>;
+
+  // Logical shape-K is always 256 bits; transform to units of elements
+  static constexpr int K = 256 / cute::sizeof_bits<ValTypeA>::value;
+
+  static constexpr uint32_t ScalingFactor = ScaleC;
+
+  using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  using ThrID   = Layout<_1>;
+  using ALayout = Layout<Shape <_1,Shape <Int<M>,Int<K>>>,
+                         Stride<_0,Stride<    _1,Int<M>>>>;
+  using BLayout = Layout<Shape <_1,Shape <Int<N>,Int<K>>>,
+                         Stride<_0,Stride<    _1,Int<N>>>>;
+  using CLayout = Layout<Shape <_1,Shape <Int<M>,Int<N>>>,
+                         Stride<_0,Stride<    _1,Int<M>>>>;
+
+  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
+  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
+
+  UMMA::InstrDescriptor idesc_ = UMMA::make_instr_desc<
+    ab_vtype, ab_vtype, float, M, N, a_major, b_major, a_neg, b_neg, c_sat>();
+
+  template <class TD, class DLayout,
+            class TA, class ALayout,
+            class TB, class BLayout,
+            class TC, class CLayout>
+  CUTE_HOST_DEVICE constexpr friend
+  void
+  mma_unpack(MMA_Traits          const& traits,
+             Tensor<TD, DLayout>      & D,
+             Tensor<TA, ALayout> const& A,
+             Tensor<TB, BLayout> const& B,
+             Tensor<TC, CLayout> const& C)
+  {
+    static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_tmem<TA>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
+
+    uint32_t tmem_a = raw_pointer_cast(A.data());
+    uint64_t desc_b = B[0];
+    uint32_t tmem_c = raw_pointer_cast(D.data());
+    uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
+
+    SM100_MMA_F16BF16_TS_SCALED<a_type, b_type, c_type,
+                         M, N, a_major, b_major,
+                         ScaleC, a_neg, b_neg>::fma(tmem_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc);
+  }
+
+  template <uint32_t NewScaleC>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_F16BF16_TS_SCALED<a_type, b_type, c_type,
+                                  M, N, a_major, b_major,
+                                  NewScaleC, a_neg, b_neg, c_sat>>
+  with(UMMA::ScaleOut accumulate, cute::integral_constant<uint32_t, NewScaleC> scaleC) const {
+    return {accumulate, idesc_};
+  }
+
+  template <UMMA::ScaleIn new_a_neg>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_F16BF16_TS_SCALED<a_type, b_type, c_type,
+                                  M, N, a_major, b_major,
+                                  ScaleC, new_a_neg, b_neg, c_sat>>
+  with(cute::integral_constant<UMMA::ScaleIn, new_a_neg>) const {
+    return {accumulate_, UMMA::make_instr_desc<ab_vtype, ab_vtype, float, M, N, a_major, b_major, new_a_neg, b_neg, c_sat>()};
+  }
+};
+
 
 template <class a_type, class b_type, class c_type,
           int M, int N, UMMA::Major a_major, UMMA::Major b_major,
@@ -1602,6 +1879,82 @@ struct MMA_Traits<SM100_MMA_F16BF16_SS_SPARSE<a_type, b_type, c_type,
     // Check sparse_ptr, check sparsity, check shape/layout?
     uint32_t tmem_e_addr = raw_pointer_cast(E.data());     // Move to a CoupledTensor rather than a .with()?
     return {accumulate_, {tmem_e_addr}, idesc_};
+  }
+};
+
+template <int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg,
+          UMMA::Saturate c_sat>
+struct MMA_Traits<SM100_MMA_TF32_TS_INTERLEAVED_CF32CTF32CTF32CF32_TN<
+                                M, N,
+                                a_major, b_major,
+                                a_neg, b_neg, c_sat>>
+{
+  using a_type = complex<tfloat32_t>;
+  using b_type = complex<tfloat32_t>;
+  using c_type = float;
+
+  using ValTypeD = c_type;
+  using ValTypeA = a_type;
+  using ValTypeB = b_type;
+  using ValTypeC = c_type;
+
+  using FrgTypeA = UMMA::tmem_frg_1sm<a_type, a_type, UMMA::TmemAllocMode::NonInterleaved>;
+  using FrgTypeB = UMMA::smem_desc<b_major>;
+  using FrgTypeC = UMMA::tmem_frg_1sm<c_type, int32_t, UMMA::TmemAllocMode::NonInterleaved>;
+
+  // Logical shape-K is always 256 bits; transform to units of elements
+  static constexpr int K = 256 / cute::sizeof_bits<ValTypeA>::value;
+
+  using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  using ThrID   = Layout<_1>;
+  using ALayout = Layout<Shape <_1,Shape <Int<M>,Int<K>>>,
+                         Stride<_0,Stride<    _1,Int<M>>>>;
+  using BLayout = Layout<Shape <_1,Shape <Int<N>,Int<K>>>,
+                         Stride<_0,Stride<    _1,Int<N>>>>;
+  using CLayout = Layout<Shape <_1,Shape <Int<M>,Int<N>>>,
+                         Stride<_0,Stride<    _1,Int<M>>>>;
+
+  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
+  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
+
+  // MMA based interleaved complex GEMM calculates realAcc and imagAcc separately.
+  // This MMA_traits is used to calculate 1 of the GEMMs below :
+  // 1. realAcc = realA * realB + (-imagA) * imagB
+  // 2. imagAcc = imagA * realB +   realA  * imagB
+  // So it requires complex<tfloat32_t> type operand A&B and float type operand Acc.
+  static_assert(a_major == UMMA::Major::K,    "SM100_MMA_TF32_TS_INTERLEAVED_CF32CTF32CTF32CF32_TN A from TMEM can't be transposed");
+  static_assert(b_major == UMMA::Major::K, "SM100_MMA_TF32_TS_INTERLEAVED_CF32CTF32CTF32CF32_TN B from SMEM requires non-transpose");
+
+  UMMA::InstrDescriptor idesc_ = UMMA::make_instr_desc<
+    tfloat32_t, tfloat32_t, float, M, N, a_major, b_major, a_neg, b_neg, c_sat>();
+
+  template <class TD, class DLayout,
+            class TA, class ALayout,
+            class TB, class BLayout,
+            class TC, class CLayout>
+  CUTE_HOST_DEVICE constexpr friend
+  void
+  mma_unpack(MMA_Traits          const& traits,
+             Tensor<TD, DLayout>      & D,
+             Tensor<TA, ALayout> const& A,
+             Tensor<TB, BLayout> const& B,
+             Tensor<TC, CLayout> const& C)
+  {
+    static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_tmem<TA>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
+
+    uint32_t tmem_a = raw_pointer_cast(A.data());
+    uint64_t desc_b = B[0];
+    uint32_t tmem_c = raw_pointer_cast(D.data());
+    uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
+
+    SM100_MMA_TF32_TS_INTERLEAVED_CF32CTF32CTF32CF32_TN<
+                  M, N,
+                  a_major, b_major,
+                  a_neg, b_neg, c_sat>::fma(tmem_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc);
   }
 };
 
@@ -1938,7 +2291,186 @@ struct MMA_Traits<SM100_MMA_F16BF16_2x1SM_SS_SCALED<a_type, b_type, c_type,
   with(UMMA::ScaleOut accumulate, cute::integral_constant<uint32_t, NewScaleC> scaleC) const {
     return {accumulate, idesc_};
   }
+
+  template <UMMA::ScaleIn new_a_neg>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_F16BF16_2x1SM_SS_SCALED<a_type, b_type, c_type,
+                                     M, N, a_major, b_major,
+                                     ScaleC, new_a_neg, b_neg>>
+  with(cute::integral_constant<UMMA::ScaleIn, new_a_neg>) const {
+    return {accumulate_, UMMA::make_instr_desc<a_type, b_type, c_type, M, N, a_major, b_major, new_a_neg, b_neg>()};
+  }
 };
+
+
+// Special instantiation for interleaved complex (emulated)
+template <class ab_vtype, int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          uint32_t ScaleC, UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg>
+struct MMA_Traits<SM100_MMA_F16BF16_2x1SM_SS_SCALED<cutlass::complex<ab_vtype>, cutlass::complex<ab_vtype>, float,
+                                     M, N, a_major, b_major,
+                                     ScaleC, a_neg, b_neg>>
+{
+  static_assert(cute::sizeof_bits_v<ab_vtype> == 16, "Only supports 16bit base types");
+  using a_type = complex<ab_vtype>;
+  using b_type = complex<ab_vtype>;
+  using c_type = float;
+
+  using ValTypeD = c_type;
+  using ValTypeA = a_type;
+  using ValTypeB = b_type;
+  using ValTypeC = c_type;
+
+  using FrgTypeA = UMMA::smem_desc<a_major>;
+  using FrgTypeB = UMMA::smem_desc<b_major>;
+  using FrgTypeC = UMMA::tmem_frg_2sm<c_type>;
+
+  // Size of instructions's K extent is always 256bits, convert to units of element
+  constexpr static int K = 256 / cute::sizeof_bits<ValTypeA>::value;
+  constexpr static uint32_t ScalingFactor = ScaleC;
+
+  using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  using ThrID   = Layout<_2>;
+  using ALayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<K>>>,
+                         Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+  using BLayout = Layout<Shape <      _2,Shape <Int<N/2>,Int<K>>>,
+                         Stride<Int<N/2>,Stride<      _1,Int<N>>>>;
+  using CLayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<N>>>,
+                         Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+
+  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
+  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
+
+  UMMA::InstrDescriptor idesc_ = UMMA::make_instr_desc<
+    ab_vtype, ab_vtype, float, M, N, a_major, b_major, a_neg, b_neg>();
+
+  template <class TD, class DLayout,
+            class TA, class ALayout,
+            class TB, class BLayout,
+            class TC, class CLayout>
+  CUTE_HOST_DEVICE constexpr friend
+  void
+  mma_unpack(MMA_Traits          const& traits,
+             Tensor<TD, DLayout>      & D,
+             Tensor<TA, ALayout> const& A,
+             Tensor<TB, BLayout> const& B,
+             Tensor<TC, CLayout> const& C)
+  {
+    static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_rmem<TA>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
+
+    uint64_t desc_a = A[0];
+    uint64_t desc_b = B[0];
+    uint32_t tmem_c = raw_pointer_cast(D.data());
+    uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
+
+    SM100_MMA_F16BF16_2x1SM_SS_SCALED<a_type, b_type, c_type,
+                               M, N, a_major, b_major,
+                               ScaleC, a_neg, b_neg>::fma(desc_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc);
+  }
+
+  template <uint32_t NewScaleC>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_F16BF16_2x1SM_SS_SCALED<a_type, b_type, c_type,
+                                     M, N, a_major, b_major,
+                                     NewScaleC, a_neg, b_neg>>
+  with(UMMA::ScaleOut accumulate, cute::integral_constant<uint32_t, NewScaleC> scaleC) const {
+    return {accumulate, idesc_};
+  }
+
+  template <UMMA::ScaleIn new_a_neg>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_F16BF16_2x1SM_SS_SCALED<a_type, b_type, c_type,
+                                     M, N, a_major, b_major,
+                                     ScaleC, new_a_neg, b_neg>>
+  with(cute::integral_constant<UMMA::ScaleIn, new_a_neg>) const {
+    return {accumulate_, UMMA::make_instr_desc<ab_vtype, ab_vtype, float, M, N, a_major, b_major, new_a_neg, b_neg>()};
+  }
+};
+
+template <class a_type, class b_type, class c_type,
+          int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          uint32_t ScaleC, UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg, UMMA::Saturate c_sat>
+struct MMA_Traits<SM100_MMA_TF32_2x1SM_TS_SCALED<a_type, b_type, c_type,
+                                     M, N, a_major, b_major,
+                                     ScaleC, a_neg, b_neg, c_sat>>
+{
+  using ValTypeD = c_type;
+  using ValTypeA = a_type;
+  using ValTypeB = b_type;
+  using ValTypeC = c_type;
+  static_assert(cute::sizeof_bits_v<a_type> == cute::sizeof_bits_v<b_type> && cute::sizeof_bits_v<b_type> == 32, "SM100_MMA_TF32_2x1SM_TS_SCALED supports 32bit types");
+
+  using FrgTypeA = UMMA::tmem_frg_2sm<a_type, a_type, UMMA::TmemAllocMode::Duplicated>;
+  using FrgTypeB = UMMA::smem_desc<b_major>;
+  using FrgTypeC = UMMA::tmem_frg_2sm<c_type>;
+
+  // Size of instructions' K extent is always 256 bits; convert to units of element
+  constexpr static int K = 256 / cute::sizeof_bits<ValTypeA>::value;
+  constexpr static uint32_t ScalingFactor = ScaleC;
+
+  using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  using ThrID   = Layout<_2>;
+  using ALayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<K>>>,
+                         Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+  using BLayout = Layout<Shape <      _2,Shape <Int<N/2>,Int<K>>>,
+                         Stride<Int<N/2>,Stride<      _1,Int<N>>>>;
+  using CLayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<N>>>,
+                         Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+
+  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
+  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
+
+  UMMA::InstrDescriptor idesc_ = UMMA::make_instr_desc<
+    a_type, b_type, c_type, M, N, a_major, b_major, a_neg, b_neg, c_sat>();
+
+  template <class TD, class DLayout,
+            class TA, class ALayout,
+            class TB, class BLayout,
+            class TC, class CLayout>
+  CUTE_HOST_DEVICE constexpr friend
+  void
+  mma_unpack(MMA_Traits          const& traits,
+             Tensor<TD, DLayout>      & D,
+             Tensor<TA, ALayout> const& A,
+             Tensor<TB, BLayout> const& B,
+             Tensor<TC, CLayout> const& C)
+  {
+    static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_tmem<TA>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
+
+    uint64_t tmem_a = raw_pointer_cast(A.data());
+    uint64_t desc_b = B[0];
+    uint32_t tmem_c = raw_pointer_cast(D.data());
+    uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
+
+    SM100_MMA_TF32_2x1SM_TS_SCALED<a_type, b_type, c_type,
+                               M, N, a_major, b_major,
+                               ScaleC, a_neg, b_neg, c_sat>::fma(tmem_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc);
+  }
+
+  template <uint32_t NewScaleC>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_TF32_2x1SM_TS_SCALED<a_type, b_type, c_type,
+                                        M, N, a_major, b_major,
+                                        NewScaleC, a_neg, b_neg, c_sat>>
+  with(UMMA::ScaleOut accumulate, cute::integral_constant<uint32_t, NewScaleC> scaleC) const {
+    return {accumulate, idesc_};
+  }
+
+  template <UMMA::ScaleIn new_a_neg>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_TF32_2x1SM_TS_SCALED<a_type, b_type, c_type,
+                                        M, N, a_major, b_major,
+                                        ScaleC, new_a_neg, b_neg, c_sat>>
+  with(cute::integral_constant<UMMA::ScaleIn, new_a_neg>) const {
+    return {accumulate_, UMMA::make_instr_desc<a_type, b_type, c_type, M, N, a_major, b_major, new_a_neg, b_neg, c_sat>()};
+  }
+};
+
 
 template <class a_type, class b_type, class c_type,
           int M, int N, UMMA::Major a_major, UMMA::Major b_major,
@@ -2011,7 +2543,104 @@ struct MMA_Traits<SM100_MMA_F16BF16_2x1SM_TS_SCALED<a_type, b_type, c_type,
   with(UMMA::ScaleOut accumulate, cute::integral_constant<uint32_t, NewScaleC> scaleC) const {
     return {accumulate, idesc_};
   }
+
+  template <UMMA::ScaleIn new_a_neg>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_F16BF16_2x1SM_TS_SCALED<a_type, b_type, c_type,
+                                        M, N, a_major, b_major,
+                                        ScaleC, new_a_neg, b_neg, c_sat>>
+  with(cute::integral_constant<UMMA::ScaleIn, new_a_neg>) const {
+    return {accumulate_, UMMA::make_instr_desc<a_type, b_type, c_type, M, N, a_major, b_major, new_a_neg, b_neg, c_sat>()};
+  }
 };
+
+
+// Special instantiation for interleaved complex (emulated)
+template <class ab_vtype, int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          uint32_t ScaleC, UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg, UMMA::Saturate c_sat>
+struct MMA_Traits<SM100_MMA_F16BF16_2x1SM_TS_SCALED<cutlass::complex<ab_vtype>, cutlass::complex<ab_vtype>, float,
+                                     M, N, a_major, b_major,
+                                     ScaleC, a_neg, b_neg, c_sat>>
+{
+  static_assert(cute::sizeof_bits_v<ab_vtype> == 16, "Only supports 16bit base types");
+  using a_type = complex<ab_vtype>;
+  using b_type = complex<ab_vtype>;
+  using c_type = float;
+
+  using ValTypeD = c_type;
+  using ValTypeA = a_type;
+  using ValTypeB = b_type;
+  using ValTypeC = c_type;
+
+  using FrgTypeA = UMMA::tmem_frg_2sm<a_type, a_type, UMMA::TmemAllocMode::Duplicated>;
+  using FrgTypeB = UMMA::smem_desc<b_major>;
+  using FrgTypeC = UMMA::tmem_frg_2sm<c_type>;
+
+  // Size of instructions' K extent is always 256 bits; convert to units of element
+  constexpr static int K = 256 / cute::sizeof_bits<ValTypeA>::value;
+  constexpr static uint32_t ScalingFactor = ScaleC;
+
+  using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  using ThrID   = Layout<_2>;
+  using ALayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<K>>>,
+                         Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+  using BLayout = Layout<Shape <      _2,Shape <Int<N/2>,Int<K>>>,
+                         Stride<Int<N/2>,Stride<      _1,Int<N>>>>;
+  using CLayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<N>>>,
+                         Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+
+  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
+  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
+
+  UMMA::InstrDescriptor idesc_ = UMMA::make_instr_desc<
+    ab_vtype, ab_vtype, float, M, N, a_major, b_major, a_neg, b_neg, c_sat>();
+
+  template <class TD, class DLayout,
+            class TA, class ALayout,
+            class TB, class BLayout,
+            class TC, class CLayout>
+  CUTE_HOST_DEVICE constexpr friend
+  void
+  mma_unpack(MMA_Traits          const& traits,
+             Tensor<TD, DLayout>      & D,
+             Tensor<TA, ALayout> const& A,
+             Tensor<TB, BLayout> const& B,
+             Tensor<TC, CLayout> const& C)
+  {
+    static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_tmem<TA>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
+
+    uint64_t tmem_a = raw_pointer_cast(A.data());
+    uint64_t desc_b = B[0];
+    uint32_t tmem_c = raw_pointer_cast(D.data());
+    uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
+
+    SM100_MMA_F16BF16_2x1SM_TS_SCALED<a_type, b_type, c_type,
+                               M, N, a_major, b_major,
+                               ScaleC, a_neg, b_neg, c_sat>::fma(tmem_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc);
+  }
+
+  template <uint32_t NewScaleC>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_F16BF16_2x1SM_TS_SCALED<a_type, b_type, c_type,
+                                        M, N, a_major, b_major,
+                                        NewScaleC, a_neg, b_neg, c_sat>>
+  with(UMMA::ScaleOut accumulate, cute::integral_constant<uint32_t, NewScaleC> scaleC) const {
+    return {accumulate, idesc_};
+  }
+
+  template <UMMA::ScaleIn new_a_neg>
+  CUTE_HOST_DEVICE constexpr
+  MMA_Traits<SM100_MMA_F16BF16_2x1SM_TS_SCALED<a_type, b_type, c_type,
+                                        M, N, a_major, b_major,
+                                        ScaleC, new_a_neg, b_neg, c_sat>>
+  with(cute::integral_constant<UMMA::ScaleIn, new_a_neg>) const {
+    return {accumulate_, UMMA::make_instr_desc<ab_vtype, ab_vtype, float, M, N, a_major, b_major, new_a_neg, b_neg, c_sat>()};
+  }
+};
+
 
 template <class a_type, class b_type, class c_type,
           int M, int N, UMMA::Major a_major, UMMA::Major b_major,
@@ -2186,6 +2815,82 @@ struct MMA_Traits<SM100_MMA_F16BF16_2x1SM_SS_SPARSE<a_type, b_type, c_type,
     // Check sparse_ptr, check sparsity, check shape/layout?
     uint32_t tmem_e_addr = raw_pointer_cast(E.data());
     return {accumulate_, {tmem_e_addr}, idesc_};
+  }
+};
+
+template <int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg,
+          UMMA::Saturate c_sat>
+struct MMA_Traits<SM100_MMA_TF32_2x1SM_TS_INTERLEAVED_CF32CTF32CTF32CF32_TN<
+                                     M, N,
+                                     a_major, b_major,
+                                     a_neg, b_neg, c_sat>>
+{
+  using a_type = complex<tfloat32_t>;
+  using b_type = complex<tfloat32_t>;
+  using c_type = float;
+
+  using ValTypeD = c_type;
+  using ValTypeA = a_type;
+  using ValTypeB = b_type;
+  using ValTypeC = c_type;
+
+  using FrgTypeA = UMMA::tmem_frg_2sm<a_type, a_type, UMMA::TmemAllocMode::Duplicated>;
+  using FrgTypeB = UMMA::smem_desc<b_major>;
+  using FrgTypeC = UMMA::tmem_frg_2sm<c_type>;
+
+  // Size of instructions' K extent is always 256 bits; convert to units of element
+  constexpr static int K = 256 / cute::sizeof_bits<ValTypeA>::value;
+
+  using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  using ThrID   = Layout<_2>;
+  using ALayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<K>>>,
+                         Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+  using BLayout = Layout<Shape <      _2,Shape <Int<N/2>,Int<K>>>,
+                         Stride<Int<N/2>,Stride<      _1,Int<N>>>>;
+  using CLayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<N>>>,
+                         Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+
+  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
+  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
+
+  // Interleaved complex GEMM calculates realAcc and imagAcc separately.
+  // This MMA_traits is used to calculate 1 of the GEMMs below :
+  // 1. realAcc = realA * realB + (-imagA) * imagB
+  // 2. imagAcc = imagA * realB +   realA  * imagB
+  // So it requires complex<tfloat32_t> type operand A&B and float type operand Acc.
+  static_assert(a_major == UMMA::Major::K,    "SM100_MMA_TF32_2x1SM_TS_INTERLEAVED_CF32CTF32CTF32CF32_TN A from TMEM can't be transposed");
+  static_assert(b_major == UMMA::Major::K, "SM100_MMA_TF32_2x1SM_TS_INTERLEAVED_CF32CTF32CTF32CF32_TN B from SMEM requires non-transpose");
+
+  UMMA::InstrDescriptor idesc_ = UMMA::make_instr_desc<
+    tfloat32_t, tfloat32_t, float, M, N, a_major, b_major, a_neg, b_neg, c_sat>();
+
+  template <class TD, class DLayout,
+            class TA, class ALayout,
+            class TB, class BLayout,
+            class TC, class CLayout>
+  CUTE_HOST_DEVICE constexpr friend
+  void
+  mma_unpack(MMA_Traits          const& traits,
+             Tensor<TD, DLayout>      & D,
+             Tensor<TA, ALayout> const& A,
+             Tensor<TB, BLayout> const& B,
+             Tensor<TC, CLayout> const& C)
+  {
+    static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_tmem<TA>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
+
+    uint64_t tmem_a = raw_pointer_cast(A.data());
+    uint64_t desc_b = B[0];
+    uint32_t tmem_c = raw_pointer_cast(D.data());
+    uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
+
+    SM100_MMA_TF32_2x1SM_TS_INTERLEAVED_CF32CTF32CTF32CF32_TN<
+                       M, N,
+                       a_major, b_major,
+                       a_neg, b_neg, c_sat>::fma(tmem_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc);
   }
 };
 
@@ -2639,10 +3344,10 @@ struct MMA_Traits<SM100_MMA_F8F6F4_SS, a_type, b_type, c_type,
   using ValTypeC = c_type;
   static_assert(cute::sizeof_bits_v<a_type> <= 8 && cute::sizeof_bits_v<b_type> <= 8, "SM100_MMA_F8F6F4_SS supports types with leq 8bit types");
   static_assert(M == 64 || M == 128, "SM100_MMA_F8F6F4_SS M-mode size should be 64 or 128 for 1 CTA cluster MMA.");
-  static_assert((M == 64  && (N % 8 == 0)  && (8 <= N)  && (N <= 256)) ||
-                (M == 128 && (N % 16 == 0) && (16 <= N) && (N <= 256)),
-                "SM100_MMA_F8F6F4_SS N-mode size should be a multiple of 8 between 8 and 256 for M=64,\
-                 or a multiple of 16 between 16 and 256 for M=128.");
+  static_assert(((b_major == UMMA::Major::K) && ((N % 8 == 0) && (8 <= N) && (N <= 256))) ||
+                ((b_major == UMMA::Major::MN) && ((N % 16 == 0) && (16 <= N) && (N <= 256))),
+                "SM100_MMA_F8F6F4_SS N-mode size should be a multiple of 8 between 8 and 256 when B is K major. \
+                 SM100_MMA_F8F6F4_SS N-mode size should be a multiple of 16 between 16 and 256 when B is MN major.");
   using FrgTypeA = UMMA::smem_desc<a_major>;
   using FrgTypeB = UMMA::smem_desc<b_major>;
   using FrgTypeC = UMMA::tmem_frg_1sm<c_type>;
@@ -3051,14 +3756,16 @@ struct MMA_Traits<SM100_MMA_F8F6F4_2x1SM_SS, a_type, b_type, c_type,
                   cute::integral_constant<UMMA::ScaleIn, a_neg>,
                   cute::integral_constant<UMMA::ScaleIn, b_neg>>
 {
-
   using ValTypeD = c_type;
   using ValTypeA = a_type;
   using ValTypeB = b_type;
   using ValTypeC = c_type;
   static_assert(cute::sizeof_bits_v<a_type> <= 8 && cute::sizeof_bits_v<b_type> <= 8, "SM100_MMA_F8F6F4_2x1SM_SS supports types with leq 8bit types");
   static_assert(M == 128 || M == 256, "SM100_MMA_F8F6F4_2x1SM_SS M-mode size should be 64 or 128 for 1 CTA cluster MMA.");
-  static_assert((N % 32 == 0) && (32 <= N) && (N <= 256), "SM100_MMA_F8F6F4_2x1SM_SS N-mode size should be a multiple of 32 between 32 and 256.");
+  static_assert(((b_major == UMMA::Major::K) && ((N % 16 == 0) && (16 <= N) && (N <= 256))) ||
+                ((b_major == UMMA::Major::MN) && ((N % 32 == 0) && (32 <= N) && (N <= 256))),
+                "SM100_MMA_F8F6F4_2x1SM_SS N-mode size should be a multiple of 16 between 16 and 256 when B is K major. \
+                 SM100_MMA_F8F6F4_2x1SM_SS N-mode size should be a multiple of 32 between 32 and 256 when B is MN major.");
 
   using FrgTypeA = UMMA::smem_desc<a_major>;
   using FrgTypeB = UMMA::smem_desc<b_major>;
@@ -3842,6 +4549,189 @@ struct MMA_Traits<SM100_MMA_MXF4NVF4_2x1SM_SS_SPARSE<a_type, b_type, c_type, sf_
     uint32_t tmem_sfb_addr = raw_pointer_cast(SFB.data());     // Move to a CoupledTensor rather than a .with()?
     return {accumulate, tmem_sfa_addr, tmem_sfb_addr, {tmem_e_addr}, idesc_};
   }
+};
+
+/**
+ * Specialization for a vectorized FMA per thread.
+ */
+template <>
+struct MMA_Traits<SM100_2x1x1_F32F32F32F32>
+{
+  using ValTypeD = float;
+  using ValTypeA = float;
+  using ValTypeB = float;
+  using ValTypeC = float;
+
+  using Shape_MNK = Shape<_2,_1,_1>;
+  using ThrID   = Layout<_1>;
+
+  using ALayout = Layout<Shape<_1,_2>>;
+  using BLayout = Layout<Shape<_1,_1>>;
+  using CLayout = Layout<Shape<_1,_2>>;
+};
+
+template <>
+struct MMA_Traits<SM100_1x2x1_F32F32F32F32>
+{
+  using ValTypeD = float;
+  using ValTypeA = float;
+  using ValTypeB = float;
+  using ValTypeC = float;
+
+  using Shape_MNK = Shape<_1,_2,_1>;
+  using ThrID   = Layout<_1>;
+
+  using ALayout = Layout<Shape<_1,_1>>;
+  using BLayout = Layout<Shape<_1,_2>>;
+  using CLayout = Layout<Shape<_1,_2>>;
+};
+
+namespace SM103 {
+  // Common mma_unpack for all MMA_Ops in cute::SM103
+template <class MMA_Op,
+          class TD, class DLayout,
+          class TA, class ALayout,
+          class TB, class BLayout,
+          class TC, class CLayout>
+CUTE_HOST_DEVICE constexpr
+void
+mma_unpack(MMA_Traits<MMA_Op> const& traits,
+             Tensor<TD, DLayout>      & D,
+             Tensor<TA, ALayout> const& zA,
+             Tensor<TB, BLayout> const& zB,
+             Tensor<TC, CLayout> const& C)
+  {
+    auto [A, next_A, SFA] = unzip_tensor(zA);
+    auto [B, next_B, SFB] = unzip_tensor(zB);
+
+    static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_rmem<TA>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
+
+    uint64_t desc_a = A[0];
+    uint64_t desc_next_a = next_A[0];
+    uint64_t desc_b = B[0];
+    uint64_t desc_next_b = next_B[0];
+
+    auto desc_a_temp = reinterpret_cast<UMMA::SmemDescriptor &>(desc_a);
+    auto desc_next_a_temp = reinterpret_cast<UMMA::SmemDescriptor &>(desc_next_a);
+    desc_a_temp.lbo_mode_ = 1;
+    desc_a_temp.leading_byte_offset_ = desc_next_a_temp.start_address_;
+
+    auto desc_b_temp = reinterpret_cast<UMMA::SmemDescriptor &>(desc_b);
+    auto desc_next_b_temp = reinterpret_cast<UMMA::SmemDescriptor &>(desc_next_b);
+    desc_b_temp.lbo_mode_ = 1;
+    desc_b_temp.leading_byte_offset_ = desc_next_b_temp.start_address_;
+
+    uint32_t tmem_c = raw_pointer_cast(D.data());
+    UMMA::InstrDescriptorBlockScaled instr_desc =  traits.idesc_;
+    instr_desc.k_size_ = 1;
+    auto tsfa_addr = raw_pointer_cast(SFA.data());
+    auto tsfb_addr = raw_pointer_cast(SFB.data());
+
+    uint64_t idesc = UMMA::make_runtime_instr_desc_block_scaled<>(instr_desc, tsfa_addr, tsfb_addr);
+    // print("a: "); print(A); print("\n");
+    // print("b: "); print(B); print("\n");
+
+    MMA_Op::fma(reinterpret_cast<uint64_t &>(desc_a_temp), reinterpret_cast<uint64_t &>(desc_b_temp), tmem_c, uint32_t(traits.accumulate_), idesc, tsfa_addr, tsfb_addr);
+  }
+} // end namespace SM103
+
+
+template <class a_type, class b_type, class c_type, class sf_type,
+          int M, int N, int VS, UMMA::Major a_major, UMMA::Major b_major,
+          UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg>
+struct MMA_Traits<SM103::SM103_MXF4_ULTRA_SS_VS<a_type, b_type, c_type, sf_type,
+                                M, N, VS, a_major, b_major,
+                                a_neg, b_neg>>
+{
+  using ValTypeD   = c_type;
+  using ValTypeA   = a_type;
+  using ValTypeB   = b_type;
+  using ValTypeC   = c_type;
+  using ValTypeSFA = sf_type;
+  using ValTypeSFB = sf_type;
+
+  // Logical shape-K is always 256bits, transform to units of elements
+  constexpr static int K = 96;
+  constexpr static int SFVecSize = VS;
+
+  static_assert(a_major == UMMA::Major::K && b_major == UMMA::Major::K, "This MMA does not support transpose");
+
+  using FrgTypeA   = UMMA::smem_desc<a_major>;
+  using FrgTypeB   = UMMA::smem_desc<b_major>;
+  using FrgTypeC   = UMMA::tmem_frg_1sm<c_type>;
+  using FrgTypeSFA = UMMA::tmem_sf_frg<sf_type, SFVecSize, 1, true>;
+  using FrgTypeSFB = UMMA::tmem_sf_frg<sf_type, SFVecSize, 1, false>;
+
+  using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  using ThrID   = Layout<_1>;
+  using ALayout = Layout<Shape <_1,Shape <Int<M>,Int<K>>>,
+                         Stride<_0,Stride<    _1,Int<M>>>>;
+  using BLayout = Layout<Shape <_1,Shape <Int<N>,Int<K>>>,
+                         Stride<_0,Stride<    _1,Int<N>>>>;
+  using CLayout = Layout<Shape <_1,Shape <Int<M>,Int<N>>>,
+                         Stride<_0,Stride<    _1,Int<M>>>>;
+
+  using MMA_ScaleFactor = SM100_MMA_MXF4_SS<a_type, b_type, c_type, sf_type,
+                              M, (round_up(N, 128)), VS, a_major, b_major,
+                              a_neg, b_neg>;
+
+  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
+  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
+
+  UMMA::InstrDescriptorBlockScaled idesc_ = UMMA::make_instr_desc_block_scaled<
+    a_type, b_type, c_type, sf_type, M, N, a_major, b_major, a_neg, b_neg>();
+};
+
+template <class a_type, class b_type, class c_type, class sf_type,
+          int M, int N, int VS, UMMA::Major a_major, UMMA::Major b_major,
+          UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg>
+struct MMA_Traits<SM103::SM103_MXF4_ULTRA_2x1SM_SS_VS<a_type, b_type, c_type, sf_type,
+                                M, N, VS, a_major, b_major,
+                                a_neg, b_neg>>
+{
+  using ValTypeD   = c_type;
+  using ValTypeA   = a_type;
+  using ValTypeB   = b_type;
+  using ValTypeC   = c_type;
+  using ValTypeSFA = sf_type;
+  using ValTypeSFB = sf_type;
+
+  // Logical shape-K is always 256bits, transform to units of elements
+  constexpr static int K = 96;
+  constexpr static int SFVecSize = VS;
+
+  static_assert(a_major == UMMA::Major::K && b_major == UMMA::Major::K, "This MMA does not support transpose");
+
+  using FrgTypeA   = UMMA::smem_desc<a_major>;
+  using FrgTypeB   = UMMA::smem_desc<b_major>;
+  using FrgTypeC   = UMMA::tmem_frg_2sm<c_type>;
+  constexpr static UMMA::TmemAllocMode TmemAlloc = M == 128 ?
+      UMMA::TmemAllocMode::ScaleFactorDuplicated2by2 : UMMA::TmemAllocMode::ScaleFactorDuplicated4by1;
+  using FrgTypeSFA = UMMA::tmem_sf_frg<sf_type, SFVecSize, 2,  true, TmemAlloc>;
+  using FrgTypeSFB = UMMA::tmem_sf_frg<sf_type, SFVecSize, 2, false, TmemAlloc>;
+
+  using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  using ThrID   = Layout<_2>;
+  using ALayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<K>>>,
+                         Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+  using BLayout = Layout<Shape <      _2,Shape <Int<N/2>,Int<K>>>,
+                         Stride<Int<N/2>,Stride<      _1,Int<N>>>>;
+  using CLayout = Layout<Shape <      _2,Shape <Int<M/2>,Int<N>>>,
+                         Stride<Int<M/2>,Stride<      _1,Int<M>>>>;
+
+  using MMA_ScaleFactor = SM100_MMA_MXF4_SS<a_type, b_type, c_type, sf_type,
+                                (M/2 > 64 ? M/2 : M), (round_up(N, 128)), VS, a_major, b_major,
+                                a_neg, b_neg>;
+
+
+  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
+  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
+
+  UMMA::InstrDescriptorBlockScaled idesc_ = UMMA::make_instr_desc_block_scaled<
+    a_type, b_type, c_type, sf_type, M, N, a_major, b_major, a_neg, b_neg>();
 };
 
 } // end namespace cute

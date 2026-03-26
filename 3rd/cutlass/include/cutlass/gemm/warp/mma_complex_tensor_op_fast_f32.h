@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -598,7 +598,7 @@ public:
       for (int n = 0; n < MmaIterations::kColumn; ++n) {
 
         // negate OperandB to accumulate  -(a.imag()*b.imag())
-        // negating OperandB emits less instrucitons than negating OperandA as OperandB has less elements
+        // negating OperandB emits less instructions than negating OperandA as OperandB has less elements
         negate<InstMmaOperandB> negate_op;
 
         // Real-valued accumulator part
