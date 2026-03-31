@@ -548,6 +548,36 @@ __device__ __forceinline__ int atom_cas_acquire(uint32_t *addr, uint32_t compare
   return old_val;
 }
 
+__device__ __forceinline__ uint64_t atom_cas_relaxed_64(uint64_t *addr, uint64_t compare,
+                                                        uint64_t value) {
+  uint64_t old_val;
+  asm volatile("atom.global.relaxed.sys.cas.b64 %0, [%1], %2, %3;"
+               : "=l"(old_val)
+               : "l"(addr), "l"(compare), "l"(value)
+               : "memory");
+  return old_val;
+}
+
+__device__ __forceinline__ uint64_t atom_cas_release_64(uint64_t *addr, uint64_t compare,
+                                                        uint64_t value) {
+  uint64_t old_val;
+  asm volatile("atom.global.release.sys.cas.b64 %0, [%1], %2, %3;"
+               : "=l"(old_val)
+               : "l"(addr), "l"(compare), "l"(value)
+               : "memory");
+  return old_val;
+}
+
+__device__ __forceinline__ uint64_t atom_cas_acquire_64(uint64_t *addr, uint64_t compare,
+                                                        uint64_t value) {
+  uint64_t old_val;
+  asm volatile("atom.global.acquire.sys.cas.b64 %0, [%1], %2, %3;"
+               : "=l"(old_val)
+               : "l"(addr), "l"(compare), "l"(value)
+               : "memory");
+  return old_val;
+}
+
 __device__ __forceinline__ void put_signal_relaxed(uint32_t *addr) {
   while (atom_cas_relaxed(addr, 0, 1) != 0) {
   }
@@ -565,6 +595,26 @@ __device__ __forceinline__ void wait_signal_relaxed(uint32_t *addr) {
 
 __device__ __forceinline__ void wait_signal_acquire(uint32_t *addr) {
   while (atom_cas_acquire(addr, 1, 0) != 1) {
+  }
+}
+
+__device__ __forceinline__ void put_signal_relaxed_64(uint64_t *addr) {
+  while (atom_cas_relaxed_64(addr, 0ULL, 1ULL) != 0) {
+  }
+}
+
+__device__ __forceinline__ void put_signal_release_64(uint64_t *addr) {
+  while (atom_cas_release_64(addr, 0ULL, 1ULL) != 0) {
+  }
+}
+
+__device__ __forceinline__ void wait_signal_relaxed_64(uint64_t *addr) {
+  while (atom_cas_relaxed_64(addr, 1ULL, 0ULL) != 1) {
+  }
+}
+
+__device__ __forceinline__ void wait_signal_acquire_64(uint64_t *addr) {
+  while (atom_cas_acquire_64(addr, 1ULL, 0ULL) != 1) {
   }
 }
 

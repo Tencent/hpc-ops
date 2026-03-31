@@ -126,6 +126,7 @@ print(';'.join(library_paths()), end='')
 
 # ── Source file collection ─────────────────────────────────────────────────────
 file(GLOB_RECURSE SOURCES "src/*.cc" "src/*.cu")
+list(FILTER SOURCES EXCLUDE REGEX ".*/ucl_comm/.*\\.cu$")
 
 set(FILTERED_SOURCES "")
 foreach(f ${SOURCES})
@@ -147,6 +148,141 @@ foreach(f ${SOURCES})
   message(STATUS "  ${f}")
 endforeach()
 # ──────────────────────────────────────────────────────────────────────────────
+
+file(GLOB UCL_COMM_SOURCES "src/ucl_comm/*.cu")
+
+add_library(shmem_ops_lib STATIC ${UCL_COMM_SOURCES})
+
+set_target_properties(
+  shmem_ops_lib PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/
+  CUDA_SEPARABLE_COMPILATION ON
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF
+  POSITION_INDEPENDENT_CODE ON
+
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF
+
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON
+  CUDA_EXTENSIONS OFF
+
+  CUDA_ARCHITECTURES "${CUDA_ARCH_STR}"
+)
+
+target_include_directories(
+  shmem_ops_lib PUBLIC
+  ./
+  3rd/cutlass/include
+  3rd/ucl/include
+  ${NVSHMEM_INSTALL_DIR}/include
+  ${CUDAToolkit_INCLUDE_DIRS}
+  ${TORCH_INCLUDE_PATHS}
+)
+
+target_link_directories(
+  shmem_ops_lib PUBLIC
+  ${TORCH_LIBRARY_PATHS}
+  ${UCL_INSTALL_DIR}/lib
+  ${NVSHMEM_INSTALL_DIR}/lib
+)
+
+target_link_libraries(
+  shmem_ops_lib PUBLIC
+  ucl
+  nvshmem_device
+  nvshmem_host
+)
+
+target_compile_definitions(
+  shmem_ops_lib PRIVATE
+  _GLIBCXX_USE_CXX11_ABI=1
+)
+
+# ── Per-architecture CUDA compile flags ───────────────────────────────────────
+if("${SM_ARCH}" STREQUAL "90")
+  target_compile_options(
+    shmem_ops_lib PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      -Werror=all-warnings
+      -lineinfo
+      --expt-relaxed-constexpr
+      -std=c++17
+      -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
+      -DNDEBUG
+      -Xptxas=-warn-double-usage,-v
+    >
+    $<$<COMPILE_LANGUAGE:CXX>:
+      -Wno-unused-result
+      -Wsign-compare
+      -g
+      -fwrapv
+      -Wall
+    >
+  )
+elseif("${SM_ARCH}" STREQUAL "100")
+  target_compile_options(
+    shmem_ops_lib PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      -Werror=all-warnings
+      -lineinfo
+      --expt-relaxed-constexpr
+      -std=c++17
+      -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
+      -DNDEBUG
+      -Xptxas=-warn-double-usage,-v
+    >
+    $<$<COMPILE_LANGUAGE:CXX>:
+      -Wno-unused-result
+      -Wsign-compare
+      -g
+      -fwrapv
+      -Wall
+    >
+  )
+elseif("${SM_ARCH}" STREQUAL "89")
+  target_compile_options(
+    shmem_ops_lib PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      -Werror=all-warnings
+      -lineinfo
+      --expt-relaxed-constexpr
+      -std=c++17
+      -DNDEBUG
+      -Xptxas=-warn-double-usage,-v
+    >
+    $<$<COMPILE_LANGUAGE:CXX>:
+      -Wno-unused-result
+      -Wsign-compare
+      -g
+      -fwrapv
+      -Wall
+    >
+  )
+else()
+  target_compile_options(
+    shmem_ops_lib PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      -Werror=all-warnings
+      -lineinfo
+      --expt-relaxed-constexpr
+      -std=c++17
+      -DNDEBUG
+      -Xptxas=-warn-double-usage,-v
+    >
+    $<$<COMPILE_LANGUAGE:CXX>:
+      -Wno-unused-result
+      -Wsign-compare
+      -g
+      -fwrapv
+      -Wall
+    >
+  )
+endif()
+
+add_dependencies(shmem_ops_lib ucl_external nvshmem_external)
+
 
 add_library(_C MODULE ${SOURCES})
 
@@ -204,9 +340,7 @@ target_link_directories(
 
 target_link_libraries(
   _C PRIVATE
-  ucl
-  nvshmem_device
-  nvshmem_host
+  shmem_ops_lib
   cuda
   c10
   torch
@@ -216,7 +350,7 @@ target_link_libraries(
   torch_cuda
 )
 
-add_dependencies(_C ucl_external nvshmem_external)
+add_dependencies(_C shmem_ops_lib)
 
 # ── Per-architecture CUDA compile flags ───────────────────────────────────────
 if("${SM_ARCH}" STREQUAL "90")
