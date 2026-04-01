@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -160,7 +160,7 @@ struct DefaultSymmComplex<
   Operator, SplitKSerial, BlasMode::kSymmetric> {
 
   static BlasMode const kBlasMode = BlasMode::kSymmetric;
-  // Complex Transform don't appply to A or B for SYMM
+  // Complex Transform don't apply to A or B for SYMM
   static ComplexTransform const TransformA = ComplexTransform::kNone; 
   static ComplexTransform const TransformB = ComplexTransform::kNone; 
 
@@ -353,7 +353,7 @@ struct DefaultSymmComplex<
   Operator, SplitKSerial, BlasMode::kSymmetric> {
 
   static BlasMode const kBlasMode = BlasMode::kSymmetric;
-  // Complex Transform don't appply to A or B for SYMM
+  // Complex Transform don't apply to A or B for SYMM
   static ComplexTransform const TransformA = ComplexTransform::kNone; 
   static ComplexTransform const TransformB = ComplexTransform::kNone; 
 

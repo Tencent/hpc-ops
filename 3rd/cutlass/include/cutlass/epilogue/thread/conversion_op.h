@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -62,6 +62,7 @@ public:
   using ElementOutput = ElementOutput_;
   using ElementAccumulator = ElementAccumulator_;
   using ElementCompute = ElementAccumulator_;
+  using ElementD = ElementOutput;                     // for use with cute::collective::DefaultEpilogue
 
   static int const kCount = Count;
 
@@ -121,6 +122,21 @@ public:
     // Convert to destination numeric type
     NumericArrayConverter<ElementOutput, ElementAccumulator, kCount, Round> destination_converter;
 
+    return destination_converter(accumulator);
+  }
+
+  //
+  // Specializations for scalar (for use with cute::collective::DefaultEpilogue)
+  //
+  CUTLASS_HOST_DEVICE
+  ElementD operator()(ElementAccumulator const accumulator, ElementAccumulator const source) const {
+    NumericConverter<ElementD, ElementAccumulator, Round> destination_converter;
+    return destination_converter(source);
+  }
+
+  CUTLASS_HOST_DEVICE
+  ElementD operator()(ElementAccumulator const accumulator) const {
+    NumericConverter<ElementD, ElementAccumulator, Round> destination_converter;
     return destination_converter(accumulator);
   }
 };

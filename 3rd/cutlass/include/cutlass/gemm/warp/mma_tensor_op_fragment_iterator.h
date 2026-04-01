@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -33,7 +33,7 @@
     \brief This defines a "fragment" iterator for visiting the fragments of a warp tile
       that participate in one warp-level mma operation.
 
-      Typically, this is used to access the accumulator tile/fragement of a warp-level mma operation.
+      Typically, this is used to access the accumulator tile/fragment of a warp-level mma operation.
       The accumulator tile is then partitioned into smaller tiles/fragments that can be fed into 
       next warp-level mma operation. 
 

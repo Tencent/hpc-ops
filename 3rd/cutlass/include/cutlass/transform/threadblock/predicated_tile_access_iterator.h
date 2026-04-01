@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -419,7 +419,7 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::PitchLinear,
   /// Tracks thread's coordinate offset in the matrix for current tile.
   /// This is only used in the following cases:
   /// - when Gather is true, strided coordinate needed to access indices (contiguous offset is tracked via pointer_)
-  /// - when Permute is true, both coordinates are neeeded as input into permutation function (pointer_ is fixed)
+  /// - when Permute is true, both coordinates are needed as input into permutation function (pointer_ is fixed)
   TensorCoord coord_offset_;
 
  private:

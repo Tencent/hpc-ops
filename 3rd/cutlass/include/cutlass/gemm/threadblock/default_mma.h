@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -91,7 +91,7 @@ template <
     typename InstructionShape_,
     /// Number of stages used in the pipelined mainloop
     int Stages,
-    /// Operation perfomed by GEMM
+    /// Operation performed by GEMM
     typename Operator,
     /// Store the accumulators in row major or column major.  Row major is used
     /// when output layout is interleaved.
@@ -417,7 +417,7 @@ template <
     typename InstructionShape,
     /// Number of stages used in the multistage mainloop
     int Stages,
-    /// Operation perfomed by GEMM
+    /// Operation performed by GEMM
     typename Operator,
     /// Gather operand A by using an index array
     bool GatherA,
@@ -498,7 +498,7 @@ template <
     typename InstructionShape,
     /// Number of stages used in the multistage mainloop
     int Stages,
-    /// Operation perfomed by GEMM
+    /// Operation performed by GEMM
     typename Operator,
     /// Use zfill or predicate for out-of-bound cp.async
     SharedMemoryClearOption SharedMemoryClear,

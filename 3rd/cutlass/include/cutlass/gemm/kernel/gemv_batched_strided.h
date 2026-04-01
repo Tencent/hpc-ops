@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -70,7 +70,7 @@ namespace detail
       using CDType = typename FragmentCD::value_type;
 
       static_assert(FragmentCD::kElements == FragmentAccumulator::kElements,
-                    "Mistmatch in fragment sizes.");
+                    "Mismatch in fragment sizes.");
 
       for (int i = 0; i < FragmentCD::kElements; ++i)
       {

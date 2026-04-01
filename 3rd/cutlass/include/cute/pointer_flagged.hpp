@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -166,23 +166,6 @@ downcast(ComposedLayout<SwizzleFn,smem_sparse_ptr_flag_bits<S,B>,Layout> const& 
 //
 // Display utilities
 //
-
-// Capture and cast smem_ptr_flag Layouts to offset-0 layouts
-template <class SwizzleFn, int B, class Layout>
-CUTE_HOST_DEVICE
-void
-print_layout(ComposedLayout<SwizzleFn,smem_ptr_flag_bits<B>,Layout> const& layout)
-{
-  print_layout(as_position_independent_swizzle_layout(layout));
-}
-
-template <class SwizzleFn, int B, class Layout>
-CUTE_HOST_DEVICE
-void
-print_latex(ComposedLayout<SwizzleFn,smem_ptr_flag_bits<B>,Layout> const& layout)
-{
-  print_latex(as_position_independent_swizzle_layout(layout));
-}
 
 template <int B>
 CUTE_HOST_DEVICE void print(smem_ptr_flag_bits<B> ptr)

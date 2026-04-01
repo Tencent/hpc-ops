@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -43,6 +43,36 @@
 
 namespace cute
 {
+template <>
+struct Copy_Traits<SM100_LOAD_256bit_CACHE_NOALLOCATION>
+{
+  // Logical thread id to thread idx (one-thread)
+  using ThrID = Layout<_1>;
+
+  // Map from (src-thr,src-val) to bit
+  using SrcLayout = Layout<Shape<_1,_256>>;
+  // Map from (dst-thr,dst-val) to bit
+  using DstLayout = Layout<Shape<_1,_256>>;
+
+  // Reference map from (thr,val) to bit
+  using RefLayout = SrcLayout;
+};
+
+template <>
+struct Copy_Traits<SM100_STORE_256bit_CACHE_NOALLOCATION>
+{
+  // Logical thread id to thread idx (one-thread)
+  using ThrID = Layout<_1>;
+
+  // Map from (src-thr,src-val) to bit
+  using SrcLayout = Layout<Shape<_1,_256>>;
+  // Map from (dst-thr,dst-val) to bit
+  using DstLayout = Layout<Shape<_1,_256>>;
+
+  // Reference map from (thr,val) to bit
+  using RefLayout = SrcLayout;
+};
+
 template <>
 struct Copy_Traits<SM100_U8x8_LDSM_T>
 {

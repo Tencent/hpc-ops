@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -289,7 +289,7 @@ public:
   static constexpr int NumWarpTilePerWarpgroupTile = NumWarpsPerWarpGroup * (Steps == 8 ? 2 : 1);
 
   static constexpr int WarpTileSize                = WarpgroupTileSize / NumWarpTilePerWarpgroupTile;
-  static_assert(WarpTileSize >= WarpThreadShapeN && WarpTileSize >= WarpThreadShapeK, "Invaild warp thread shape." );
+  static_assert(WarpTileSize >= WarpThreadShapeN && WarpTileSize >= WarpThreadShapeK, "Invalid warp thread shape." );
   static constexpr int TilesPerWarp                = 2;                     // Each Warp would process 2 warp_tiles in one step.
   static constexpr int64_t WarpTileNCoordLUT = 06723763275316420;
   static constexpr int64_t WarpTileKCoordLUT = 05410541064206420;
@@ -510,7 +510,7 @@ public:
   static constexpr int NumWarpTilePerWarpgroupTile = NumWarpsPerWarpGroup * (Steps == 8 ? 2 : 1);
 
   static constexpr int WarpTileSize                = WarpgroupTileSize / NumWarpTilePerWarpgroupTile;
-  static_assert(WarpTileSize >= WarpThreadShapeN && WarpTileSize >= WarpThreadShapeK, "Invaild warp thread shape." );
+  static_assert(WarpTileSize >= WarpThreadShapeN && WarpTileSize >= WarpThreadShapeK, "Invalid warp thread shape." );
   static constexpr int TilesPerWarp                = 2;                     // Each Warp would process 2 warp_tiles in one step.
   static constexpr int64_t WarpTileNCoordLUT = 06723763275316420;
   static constexpr int64_t WarpTileKCoordLUT = 05410541064206420;

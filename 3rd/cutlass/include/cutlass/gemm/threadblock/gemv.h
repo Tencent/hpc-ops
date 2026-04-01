@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -92,7 +92,7 @@ public:
     FragmentC &accum,                 ///< destination accumulator tile
     IteratorA iterator_A,             ///< iterator over A operand in global memory
     IteratorB iterator_B,             ///< iterator over B operand in global memory
-    FragmentC const &src_accum) {     ///< source accumualtor tile
+    FragmentC const &src_accum) {     ///< source accumulator tile
 
     //
     // Prologue
