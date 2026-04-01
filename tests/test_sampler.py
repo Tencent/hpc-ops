@@ -148,16 +148,21 @@ def ref_top_k_top_p(
 
 
 @pytest.mark.parametrize("batch_size", [1, 10])
-@pytest.mark.parametrize("vocab_size", [120818, 129024, 128512])
-@pytest.mark.parametrize("topk", [20])
+@pytest.mark.parametrize("vocab_size", [120832, 129024])
+@pytest.mark.parametrize("topk", [20, 50])
 @pytest.mark.parametrize("topk_dtype", [torch.int32, torch.int64])
 def test_topk_mask_logits(batch_size, vocab_size, topk, topk_dtype):
+
+    if topk <= 32:
+        max_topk = 32
+    elif topk > 32 and topk <= 64:
+        max_topk = 64
 
     logits = torch.randn(batch_size, vocab_size).cuda()
 
     topk = torch.tensor([topk] * batch_size).to(topk_dtype).cuda()
 
-    my_output_logits = hpc.topk_mask_logits(logits, topk)
+    my_output_logits = hpc.topk_mask_logits(logits, topk, max_topk=max_topk)
     my_probs = my_output_logits.softmax(dim=-1, dtype=torch.float32)
 
     gt_output_logits = ref_top_k_top_p(logits, topk, None)
@@ -168,18 +173,23 @@ def test_topk_mask_logits(batch_size, vocab_size, topk, topk_dtype):
 
 
 @pytest.mark.parametrize("batch_size", [1, 10])
-@pytest.mark.parametrize("vocab_size", [120818, 129024, 128512])
-@pytest.mark.parametrize("topk", [20])
+@pytest.mark.parametrize("vocab_size", [120832, 129024])
+@pytest.mark.parametrize("topk", [20, 50])
 @pytest.mark.parametrize("topp", [0.9])
 @pytest.mark.parametrize("topk_dtype", [torch.int32])
 def test_topk_topp_mask_logits(batch_size, vocab_size, topk, topp, topk_dtype):
+
+    if topk <= 32:
+        max_topk = 32
+    elif topk > 32 and topk <= 64:
+        max_topk = 64
 
     logits = torch.randn(batch_size, vocab_size).cuda()
 
     topk = torch.tensor([topk] * batch_size).to(topk_dtype).cuda()
     topp = torch.tensor([topp] * batch_size).to(torch.float32).cuda()
 
-    my_output_logits = hpc.topk_topp_mask_logits(logits, topk, topp)
+    my_output_logits = hpc.topk_topp_mask_logits(logits, topk, topp, max_topk=max_topk)
     my_probs = my_output_logits.softmax(dim=-1, dtype=torch.float32)
 
     gt_output_logits = ref_top_k_top_p(logits, topk, topp)

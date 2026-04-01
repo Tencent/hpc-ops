@@ -48,6 +48,7 @@ def topk_mask_logits(
     logits: Tensor,
     topk: Union[Optional[Tensor], int] = 0,
     reject_threshold: Union[Optional[Tensor], float] = 0.0,
+    max_topk: int = 32,
 ) -> Tensor:
     """TopK Sampling.
     The output logits keep the TopK values in their original positions and set all others to -inf. This operation is NOT in-place.
@@ -61,6 +62,8 @@ def topk_mask_logits(
         reject_threshold: reject_threshold is used to filt the low probability tokens
             Shape: [batch_size] or float
             Dtype: float
+        max_topk: Upper bound of topk values across the batch, used to allocate intermediate buffer. User must ensure all topk values <= max_topk.
+            Default: 32
     Return:
         output_logits: New output logits tensor that keeps TopK logits in original position and set others to -inf
             Shape: [batch_size, vocab_size]
@@ -72,6 +75,7 @@ def topk_mask_logits(
         *_to_tensor_scalar_tuple(topk),
         *_to_tensor_scalar_tuple(topp),
         *_to_tensor_scalar_tuple(reject_threshold),
+        max_topk,
     )
 
 
@@ -80,6 +84,7 @@ def topk_topp_mask_logits(
     topk: Union[Optional[Tensor], int] = 0,
     topp: Union[Optional[Tensor], float] = 0.0,
     reject_threshold: Union[Optional[Tensor], float] = 0.0,
+    max_topk: int = 32,
 ) -> Tensor:
     """TopK Sampling.
     The output logits keep the TopK values in their original positions and set all others to -inf. This operation is NOT in-place.
@@ -93,6 +98,8 @@ def topk_topp_mask_logits(
         reject_threshold: reject_threshold is used to filt the low probability tokens
             Shape: [batch_size] or float
             Dtype: float
+        max_topk: Upper bound of topk values across the batch, used to allocate intermediate buffer. User must ensure all topk values <= max_topk.
+            Default: 32
     Return:
         output_logits: New output logits tensor that keeps TopK logits in original position and set others to -inf
             Shape: [batch_size, vocab_size]
@@ -103,4 +110,5 @@ def topk_topp_mask_logits(
         *_to_tensor_scalar_tuple(topk),
         *_to_tensor_scalar_tuple(topp),
         *_to_tensor_scalar_tuple(reject_threshold),
+        max_topk,
     )

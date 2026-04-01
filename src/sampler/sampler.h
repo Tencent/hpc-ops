@@ -17,7 +17,8 @@ void topk_topp_mask_logits_async(void* output_logits, void* out, void* middle_lo
                                  void* middle_tokens, void* logits, void* topk, int topk_val,
                                  void* topp, float topp_val, void* reject_threshold,
                                  float reject_threshold_val, int batch_size, int vocab_size,
-                                 int vocab_size_padded, int int_bytes, cudaStream_t stream);
+                                 int vocab_size_padded, int int_bytes, int max_topk_val,
+                                 cudaStream_t stream);
 
 void argmax_async(void* out, void* logits, int batch_size, int vocab_size, cudaStream_t stream);
 

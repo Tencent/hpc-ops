@@ -81,7 +81,7 @@ torch::Tensor topk_topp_mask_logits_entry(const torch::Tensor& logits,
                                           std::optional<torch::Tensor> topk, int64_t topk_val,
                                           std::optional<torch::Tensor> topp, double topp_val,
                                           std::optional<torch::Tensor> reject_threshold,
-                                          double reject_threshold_val) {
+                                          double reject_threshold_val, int64_t max_topk_val) {
   auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
   TORCH_CHECK(logits.is_contiguous(), "input tensor must be contiguous");
   TORCH_CHECK(logits.dtype() == torch::kFloat32,
@@ -117,13 +117,12 @@ torch::Tensor topk_topp_mask_logits_entry(const torch::Tensor& logits,
   int vocab_size_padded = logits.stride(0);
 
   // Used for temp storage of topk tokens and logits of first stage topk
-  // Fixed size for current implementation
   constexpr int kBlockPerBatch = 8;
-  constexpr int kMaxTopK = 32;
+  TORCH_CHECK(max_topk_val > 0, "max_topk_val must be positive");
 
-  torch::Tensor middle_logits = torch::empty({batch_size, kMaxTopK * kBlockPerBatch},
+  torch::Tensor middle_logits = torch::empty({batch_size, max_topk_val * kBlockPerBatch},
                                              torch::dtype(torch::kFloat32).device(logits.device()));
-  torch::Tensor middle_tokens = torch::empty({batch_size, kMaxTopK * kBlockPerBatch},
+  torch::Tensor middle_tokens = torch::empty({batch_size, max_topk_val * kBlockPerBatch},
                                              torch::dtype(torch::kInt32).device(logits.device()));
   torch::Tensor sample_tokens =
       torch::empty({batch_size, 1}, torch::dtype(torch::kInt32).device(logits.device()));
@@ -145,7 +144,7 @@ torch::Tensor topk_topp_mask_logits_entry(const torch::Tensor& logits,
   topk_topp_mask_logits_async(output_logits_ptr, sample_tokens_ptr, middle_logits_ptr,
                               middle_tokens_ptr, logits_ptr, topk_ptr, topk_val, topp_ptr, topp_val,
                               reject_threshold_ptr, reject_threshold_val, batch_size, vocab_size,
-                              vocab_size_padded, int_bytes, stream);
+                              vocab_size_padded, int_bytes, max_topk_val, stream);
 
   return output_logits;
 }
@@ -162,6 +161,6 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "topk_topp_mask_logits(Tensor logits, Tensor? topk, int topk_val,Tensor? topp, float "
       "topp_val, Tensor? reject_threshold, "
-      "float reject_threshold_val) -> Tensor");
+      "float reject_threshold_val, int max_topk_val) -> Tensor");
   m.impl("topk_topp_mask_logits", torch::kCUDA, &hpc::sampler::topk_topp_mask_logits_entry);
 }
