@@ -22,7 +22,11 @@ torch::Tensor pad_and_transpose_entry(const torch::Tensor &x) {
   torch::Tensor y = torch::empty({n, m_pad}, options);
   const auto *x_ptr = x.const_data_ptr();
   auto *y_ptr = y.mutable_data_ptr();
-  pad_and_transpose_async(y_ptr, x_ptr, m, n, m_pad, stream);
+
+  bool running = pad_and_transpose_async(y_ptr, x_ptr, m, n, m_pad, stream);
+
+  TORCH_CHECK(running, "pad_and_transpose_async launch failed!");
+
   return y;
 }
 
@@ -96,94 +100,53 @@ torch::Tensor gemm_blockwise_entry(const torch::Tensor &x, const torch::Tensor &
     split_flag_ptr = split_flag.mutable_data_ptr();
   }
 
+  bool running = false;
+
   if (trans_xscale) {
     int m_pad = (m + 3) / 4 * 4;
     auto scale_options = x_scale.options();
     torch::Tensor new_x_scale = torch::empty({k / 128, m_pad}, scale_options);
     auto *new_x_scale_ptr = new_x_scale.mutable_data_ptr();
     pad_and_transpose_async(new_x_scale_ptr, x_scale_ptr, m, x_scale.size(1), m_pad, stream);
-    gemm_blockwise_fp8_async(y_ptr, split_y_ptr, split_flag_ptr, x_ptr, weight_ptr, new_x_scale_ptr,
-                             weight_scale_ptr, bias_ptr, m, n, k, m_pad, num_block_k, num_block_n,
-                             splitk, stream);
+    running = gemm_blockwise_fp8_async(y_ptr, split_y_ptr, split_flag_ptr, x_ptr, weight_ptr,
+                                       new_x_scale_ptr, weight_scale_ptr, bias_ptr, m, n, k, m_pad,
+                                       num_block_k, num_block_n, splitk, stream);
   } else {
     int m_pad = x_scale.size(1);
     TORCH_CHECK(x_scale.size(0) == k / 128, "x_scale dim 0 must be k / 128");
     TORCH_CHECK(m_pad == (m + 3) / 4 * 4, "x_scale dim 1 must aligned to 4");
-    gemm_blockwise_fp8_async(y_ptr, split_y_ptr, split_flag_ptr, x_ptr, weight_ptr, x_scale_ptr,
-                             weight_scale_ptr, bias_ptr, m, n, k, m_pad, num_block_k, num_block_n,
-                             splitk, stream);
+    running = gemm_blockwise_fp8_async(y_ptr, split_y_ptr, split_flag_ptr, x_ptr, weight_ptr,
+                                       x_scale_ptr, weight_scale_ptr, bias_ptr, m, n, k, m_pad,
+                                       num_block_k, num_block_n, splitk, stream);
   }
+
+  TORCH_CHECK(running, "gemm_blockwise_fp8_async launch failed!");
 
   return y;
 }
 
-torch::Tensor gemm_bf16xfp32_entry(const torch::Tensor &x, const torch::Tensor &w_high,
-                                   const torch::Tensor &w_low, double scale, bool use_fp32_output,
-                                   bool use_splitk, std::optional<torch::Tensor> split_flag) {
+torch::Tensor gemm_entry(const torch::Tensor &x, const torch::Tensor &weight) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
-  TORCH_CHECK(x.is_contiguous(), "x tensor must be contiguous");
-  TORCH_CHECK(w_high.is_contiguous(), "w_high tensor must be contiguous");
-  TORCH_CHECK(w_low.is_contiguous(), "w_low tensor must be contiguous");
-
-  TORCH_CHECK(x.dtype() == torch::kBFloat16, "x dtype must be bfloat16");
-  TORCH_CHECK(w_high.dtype() == torch::kBFloat16, "w_high dtype must be bfloat16");
-  TORCH_CHECK(w_low.dtype() == torch::kBFloat16, "w_low dtype must be bfloat16");
+  TORCH_CHECK(x.is_contiguous(), "x tensor a must be contiguous");
+  TORCH_CHECK(weight.is_contiguous(), "weight tensor a must be contiguous");
+  TORCH_CHECK(x.size(1) == weight.size(1), "x and weight must share the same k");
 
   int m = x.size(0);
   int k = x.size(1);
-  int n = w_high.size(0);
-
-  TORCH_CHECK(n % 64 == 0, "n must to be divided by 64.");
+  int n = weight.size(0);
 
   auto options = x.options();
-
-  auto out_dtype = torch::kBFloat16;
-  if (use_fp32_output) {
-    out_dtype = torch::kFloat32;
-  }
-
-  int split_k = 1;
-  torch::Tensor split_y;
-  torch::Tensor split_flag_tensor;
-  void *split_y_ptr = nullptr;
-  void *split_flag_ptr = nullptr;
-
-  if (use_splitk) {
-    if (m <= 32) {
-      // use wgmma 64x16x16 instruction and splitk.
-      if (n == 512 || n == 192) {
-        split_k = 8;
-      } else if (n == 1024) {
-        split_k = 4;
-      } else if (n == 2048) {
-        split_k = 2;
-      }
-    }
-  }
-
-  if (split_k != 1) {
-    split_y = torch::empty({split_k, m, n}, options.dtype(torch::kFloat32));
-    if (split_flag.has_value()) {
-      split_flag_tensor = split_flag.value();
-    } else {
-      split_flag_tensor =
-          torch::zeros({(m + 15) / 16, (n + 127) / 128}, options.dtype(torch::kInt32));
-    }
-    split_y_ptr = split_y.mutable_data_ptr();
-    split_flag_ptr = split_flag_tensor.mutable_data_ptr();
-  }
-
-  torch::Tensor y = torch::empty({m, n}, options.dtype(out_dtype));
+  torch::Tensor y = torch::empty({m, n}, options.dtype(torch::kBFloat16));
 
   const auto *x_ptr = x.const_data_ptr();
-  const auto *w_high_ptr = w_high.const_data_ptr();
-  const auto *w_low_ptr = w_low.const_data_ptr();
+  const auto *weight_ptr = weight.const_data_ptr();
   auto *y_ptr = y.mutable_data_ptr();
 
-  bool running = gemm_bf16xfp32_async(y_ptr, split_y_ptr, split_flag_ptr, x_ptr, w_high_ptr,
-                                      w_low_ptr, m, n, k, scale, use_fp32_output, split_k, stream);
-
-  TORCH_CHECK(running, "gemm_bf16xfp32 launch failed!");
+  if (x.dtype() == torch::kBFloat16) {
+    gemm_bf16_async(y_ptr, x_ptr, weight_ptr, m, n, k, stream);
+  } else {
+    gemm_fp8_async(y_ptr, x_ptr, weight_ptr, m, n, k, stream);
+  }
 
   return y;
 }
@@ -201,8 +164,6 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def("pad_and_transpose(Tensor x) -> (Tensor)");
   m.impl("pad_and_transpose", torch::kCUDA, &hpc::gemm::pad_and_transpose_entry);
 
-  m.def(
-      "gemm_bf16xfp32(Tensor x, Tensor w_high, Tensor w_low, "
-      "float scale, bool use_fp32_output, bool use_splitk, Tensor? split_flag) -> (Tensor)");
-  m.impl("gemm_bf16xfp32", torch::kCUDA, &hpc::gemm::gemm_bf16xfp32_entry);
+  m.def("gemm(Tensor x, Tensor w) -> (Tensor)");
+  m.impl("gemm", torch::kCUDA, &hpc::gemm::gemm_entry);
 }

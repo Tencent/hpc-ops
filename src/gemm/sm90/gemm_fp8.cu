@@ -7,12 +7,11 @@
 
 #include "cute/tensor.hpp"
 #include "cutlass/arch/reg_reconfig.h"
-#include "src/gem3/gemm.h"
 #include "src/utils/tma.cuh"
 #include "src/utils/utils.cuh"
 
 namespace hpc {
-namespace gem3 {
+namespace gemm {
 
 namespace kernels {
 
@@ -261,8 +260,8 @@ __global__ void __launch_bounds__(384, 1)
 
 }  // namespace kernels
 
-void gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr, int m, int n, int k,
-                cudaStream_t stream) {
+bool gemm_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr, int m, int n, int k,
+                    cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   using Tin = cute::float_e4m3_t;
@@ -321,7 +320,8 @@ void gemm_async(void *y_ptr, const void *x_ptr, const void *w_ptr, int m, int n,
 
   kernel<<<grid, block, shm_size, stream>>>(tma_x, tma_w, tma_y, m, n, k, swizzle_divider,
                                             flat_divider);
+  return true;
 }
 
-}  // namespace gem3
+}  // namespace gemm
 }  // namespace hpc

@@ -6,7 +6,6 @@
 #include <torch/library.h>
 
 #include "src/gem3/gem3.h"
-#include "src/gem3/gemm.h"
 
 namespace hpc {
 namespace gem3 {
@@ -47,29 +46,7 @@ torch::Tensor entry(const torch::Tensor &q, const torch::Tensor &k, const torch:
   return y;
 }
 
-torch::Tensor gemm(const torch::Tensor &x, const torch::Tensor &weight) {
-  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
-  TORCH_CHECK(x.is_contiguous(), "x tensor a must be contiguous");
-  TORCH_CHECK(weight.is_contiguous(), "weight tensor a must be contiguous");
-  TORCH_CHECK(x.size(1) == weight.size(1), "x and weight must share the same k");
-
-  int m = x.size(0);
-  int k = x.size(1);
-  int n = weight.size(0);
-
-  auto options = x.options();
-  torch::Tensor y = torch::empty({m, n}, options.dtype(torch::kBFloat16));
-
-  const auto *x_ptr = x.const_data_ptr();
-  const auto *weight_ptr = weight.const_data_ptr();
-  auto *y_ptr = y.mutable_data_ptr();
-
-  gemm_async(y_ptr, x_ptr, weight_ptr, m, n, k, stream);
-
-  return y;
-}
-
 }  // namespace gem3
 }  // namespace hpc
 
-TORCH_LIBRARY_FRAGMENT(hpc, m) { m.def("gem3", &hpc::gem3::entry).def("gemm", &hpc::gem3::gemm); }
+TORCH_LIBRARY_FRAGMENT(hpc, m) { m.def("gem3", &hpc::gem3::entry); }

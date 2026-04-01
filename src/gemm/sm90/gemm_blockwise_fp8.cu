@@ -621,7 +621,7 @@ void launch_gemm_blockwise_fp8(void *y_ptr, void *split_y_ptr, void *split_flag_
     LAUNCH_GEMM_INTERNAL(TM, 1); \
   }
 
-void gemm_blockwise_fp8_async(void *y_ptr, void *split_y_ptr, void *split_flag_ptr,
+bool gemm_blockwise_fp8_async(void *y_ptr, void *split_y_ptr, void *split_flag_ptr,
                               const void *x_ptr, const void *w_ptr, const void *x_scale_ptr,
                               const void *weight_scale_ptr, const void *bias_ptr, int m, int n,
                               int k, int m_pad, int num_block_k, int num_block_n, int splitk,
@@ -642,9 +642,11 @@ void gemm_blockwise_fp8_async(void *y_ptr, void *split_y_ptr, void *split_flag_p
   } else {
     DISPATCH_SPLIT_K(64);
   }
+
+  return true;
 }
 
-void pad_and_transpose_async(void *new_scale_ptr, const void *scale_ptr, int m, int n, int m_pad,
+bool pad_and_transpose_async(void *new_scale_ptr, const void *scale_ptr, int m, int n, int m_pad,
                              cudaStream_t stream) {
   constexpr int TM = 32;
   constexpr int TN = 32;
@@ -672,6 +674,7 @@ void pad_and_transpose_async(void *new_scale_ptr, const void *scale_ptr, int m, 
         reinterpret_cast<float *>(new_scale_ptr), reinterpret_cast<const float *>(scale_ptr), m, n,
         m_pad, num_tile_n);
   }
+  return true;
 }
 
 #undef LAUNCH_GEMM_INTERNAL
