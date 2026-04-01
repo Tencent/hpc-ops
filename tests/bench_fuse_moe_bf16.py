@@ -53,7 +53,7 @@ def parse_args():
 # Batch sizes to sweep
 # ---------------------------------------------------------------------------
 
-BATCH_SIZES = [i for i in range(1, 17)]
+BATCH_SIZES = [i for i in range(1, 65)] + [4096, 8192]
 
 
 # ---------------------------------------------------------------------------
@@ -280,13 +280,12 @@ def bench_sglang(x, gate_up_weight, down_weight, topk_ids, topk_scale,
 
 def main():
     args = parse_args()
-
+    tp_size = args.tp_size
     hidden_size = args.hidden_size
-    intermediate_size = args.intermediate_size
+    intermediate_size = args.intermediate_size // tp_size
     num_experts = args.num_experts
     topk = args.topk
-    tp_size = args.tp_size
-    num_experts_local = num_experts // tp_size
+    num_experts_local = num_experts
 
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
