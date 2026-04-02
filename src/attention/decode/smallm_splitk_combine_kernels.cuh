@@ -23,8 +23,15 @@ __global__ void attention_decode_bf16_smallm_splitk_combine_kernel(
     T *y_ptr, const float *split_input_ptr, const float *lse_ptr, const int *num_seq_kvcache_ptr,
     bool new_kv_included, int num_head_q) {
   int ibatch = blockIdx.x;
-  int ihead = threadIdx.x / 32;
+  // Each warp handles one Q-head. If num_head_q * 32 > 1024, tile along
+  // blockIdx.y so that each block contains at most 1024 threads.
+  int heads_per_block = blockDim.x / 32;
+  int ihead = blockIdx.y * heads_per_block + threadIdx.x / 32;
   int ilane = threadIdx.x % 32;
+
+  if (ihead >= num_head_q) {
+    return;
+  }
 
   constexpr int kItemsPerThread = 4;
   constexpr int kSeqlenQ = 1;

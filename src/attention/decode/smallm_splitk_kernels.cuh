@@ -194,17 +194,115 @@ __device__ __forceinline__ void load_paged_kv(TmaK &tma_k, TmaV &tma_v, uint64_t
                                 sizeof(Tin) * load_blocks * kBlockSize * num_dim_v);
 }
 
+// Swizzle safety (must stay in sync with SLayoutQ / SLayoutY / SLayoutSplitY):
+// - Q load: num_dim_qk multiple of 8; uint4 never crosses head boundaries.
+// - Y store: Swizzle period 16 BF16; d aligned to 8 => uint4 safe; float->BF16 in registers.
+// - splitY store: Swizzle period 8 floats; d aligned to 4 => float4 safe.
+
+template <typename Tin, typename TensorQG, typename TensorSQ>
+__device__ __forceinline__ void load_q_group_direct_to_smem(
+    TensorQG const &Q, TensorSQ &sQ, int ihead_q0, int ibatch,
+    int heads_per_group, int num_dim_qk, int rank_in_threads, int num_threads) {
+  using namespace cute;  // NOLINT
+
+  const int total_elems = heads_per_group * num_dim_qk;
+  constexpr int kVecSize = 8;  // uint4 = 128 bits = 8 BF16 elements
+  const int kVecStride   = num_threads * kVecSize;
+
+  const Tin *q_base = Q(ihead_q0, _, ibatch).data().get();
+  for (int base = rank_in_threads * kVecSize; base + kVecSize <= total_elems;
+       base += kVecStride) {
+    int lh = base / num_dim_qk;
+    int k  = base % num_dim_qk;
+    store(&sQ(lh, k), load<Tin, kVecSize>(q_base + base));
+  }
+  const int vec_covered = (total_elems / kVecStride) * kVecStride;
+  for (int elem = vec_covered + rank_in_threads; elem < total_elems; elem += num_threads) {
+    int lh = elem / num_dim_qk;
+    int k  = elem % num_dim_qk;
+    sQ(lh, k) = Q(ihead_q0 + lh, k, ibatch);
+  }
+}
+
+template <typename Tout, typename TensorSY, typename TensorGY>
+__device__ __forceinline__ void store_sY_to_gmem_bf16(
+    TensorSY &sY, TensorGY &Y, int ihead_q0, int ibatch, int heads_per_group, int num_dim_v,
+    int idx, int kMathThreads) {
+  using namespace cute;  // NOLINT
+
+  const int vec_size      = 8;
+  const int num_dim_v_vec = num_dim_v / vec_size;
+  const int num_dim_v_rem = num_dim_v % vec_size;
+  const int total_vec     = heads_per_group * num_dim_v_vec;
+  for (int lin = idx; lin < total_vec; lin += kMathThreads) {
+    int lh    = lin / num_dim_v_vec;
+    int d_idx = lin % num_dim_v_vec;
+    int d     = d_idx * vec_size;
+    uint4 val;
+    Tout *v16 = reinterpret_cast<Tout *>(&val);
+#pragma unroll
+    for (int i = 0; i < vec_size; ++i) {
+      v16[i] = static_cast<Tout>(static_cast<float>(sY(d + i, lh)));
+    }
+
+    store(&Y(d, ihead_q0 + lh, ibatch), load<Tout, vec_size>(v16));
+  }
+  if (num_dim_v_rem > 0) {
+    const int d_base    = num_dim_v_vec * vec_size;
+    const int total_rem = heads_per_group * num_dim_v_rem;
+    for (int lin = idx; lin < total_rem; lin += kMathThreads) {
+      int lh = lin / num_dim_v_rem;
+      int d  = d_base + lin % num_dim_v_rem;
+      Y(d, ihead_q0 + lh, ibatch) = static_cast<Tout>(static_cast<float>(sY(d, lh)));
+    }
+  }
+}
+
+template <typename TensorSSplitY, typename TensorGSplitY>
+__device__ __forceinline__ void store_sSplitY_to_gmem_float(
+    TensorSSplitY &sSplitY, TensorGSplitY &splitY, int ihead_q0, int ichunk, int ibatch,
+    int heads_per_group, int num_dim_v, int idx, int kMathThreads) {
+  using namespace cute;  // NOLINT
+
+  const int vec_size      = 4;
+  const int num_dim_v_vec = num_dim_v / vec_size;
+  const int num_dim_v_rem = num_dim_v % vec_size;
+  const int total_vec     = heads_per_group * num_dim_v_vec;
+  for (int lin = idx; lin < total_vec; lin += kMathThreads) {
+    int lh    = lin / num_dim_v_vec;
+    int d_idx = lin % num_dim_v_vec;
+    int d     = d_idx * vec_size;
+    float4 val;
+    val.x = sSplitY(d, lh);
+    val.y = sSplitY(d + 1, lh);
+    val.z = sSplitY(d + 2, lh);
+    val.w = sSplitY(d + 3, lh);
+
+    store(&splitY(d, ihead_q0 + lh, ichunk, ibatch), load<float, vec_size>(&val));
+  }
+  if (num_dim_v_rem > 0) {
+    const int d_base    = num_dim_v_vec * vec_size;
+    const int total_rem = heads_per_group * num_dim_v_rem;
+    for (int lin = idx; lin < total_rem; lin += kMathThreads) {
+      int lh = lin / num_dim_v_rem;
+      int d  = d_base + lin % num_dim_v_rem;
+      splitY(d, ihead_q0 + lh, ichunk, ibatch) = sSplitY(d, lh);
+    }
+  }
+}
+
 template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int kTileV,
           typename TiledMmaQK, typename TiledMmaSV, typename TmaQ, typename TmaK, typename TmaV,
-          typename TmaY, typename TmaSplitY, typename SLayoutQ, typename SLayoutK,
+          typename TmaY, typename TmaSplitY, typename TensorQ, typename TensorY, typename TensorSplitY, typename SLayoutQ, typename SLayoutK,
           typename SLayoutP, typename SLayoutS, typename SLayoutV, typename SLayoutY,
           typename SLayoutSplitY, int kBlockSize, int kStage, int kSplitK, int kSplitMinLen>
 __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
     const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
     const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaY tma_y,
-    const __grid_constant__ TmaSplitY tma_splity, float *lse_ptr, const int *block_ids_ptr,
-    const int *num_seq_kvcache_ptr, bool new_kv_included, int num_batch, int num_dim_qk,
-    int num_dim_v, int num_head_q, int num_head_k, int num_head_v, int heads_per_group,
+    const __grid_constant__ TmaSplitY tma_splity, TensorQ Q, TensorY Y, TensorSplitY splitY, 
+    float *lse_ptr, const int *block_ids_ptr, const int *num_seq_kvcache_ptr,
+    bool new_kv_included, int num_batch, int num_dim_qk, int num_dim_v,
+    int num_head_q, int num_head_k, int num_head_v, int heads_per_group,
     int num_kvcache_blocks, int num_seq_max_blocks, float one_over_dk_log2e) {
   using namespace cute;  // NOLINT
 
@@ -212,6 +310,7 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
   int ihead_kv = blockIdx.x;
   int ibatch = blockIdx.y;
   int ichunk = blockIdx.z;
+  const int ihead_q0 = ihead_kv * heads_per_group;
 
   constexpr int kMathThreads = size(TiledMmaQK{});
   constexpr int kWarpsPerWrapGroup = 4;
@@ -344,11 +443,13 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
     // cutlass::arch::warpgroup_reg_dealloc<24>();
     bool is_leader_in_load = ((iwarp == kMathThreads / 32) && elected);
 
-    if (is_leader_in_load) {
-      // Load Q
-      cute::copy(tma_q.with(q_readable), tQg(_, ihead_kv, _, ibatch), tQs(_, 0, _));
-      set_barrier_transaction_bytes(
-          q_readable, sizeof(Tin) * max(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
+    if ((heads_per_group == kTileN) || (num_head_q == 4 && num_head_k == 1)) {
+      if (is_leader_in_load) {
+        // Load Q
+        cute::copy(tma_q.with(q_readable), tQg(_, ihead_kv, _, ibatch), tQs(_, 0, _));
+        set_barrier_transaction_bytes(
+            q_readable, sizeof(Tin) * max(heads_per_group, size<0, 0, 1>(tQg)) * num_dim_qk);
+      }
     }
   }
 
@@ -429,9 +530,9 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
     auto gI = make_identity_tensor(gAtt.shape());
     auto tI = thr_mma_qk.partition_C(gI);
 
-    auto tAttr_mn = retile_fragment(tAttr);
-    constexpr int kM = size<0>(tAttr_mn);
-    constexpr int kN = size<1>(tAttr_mn);
+    auto tAttr_mn_shape = retile_fragment(tAttr);
+    constexpr int kM = size<0>(tAttr_mn_shape);
+    constexpr int kN = size<1>(tAttr_mn_shape);
     Tensor gMax = make_tensor<float>(Int<kN>{});
     Tensor gSum = make_tensor<float>(Int<kN>{});
 
@@ -447,7 +548,14 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
 
     tiled_mma_sv.accumulate_ = GMMA::ScaleOut::One;
 
-    wait_barrier(q_readable, 0);
+    if ((heads_per_group == kTileN) || (num_head_q == 4 && num_head_k == 1)) {
+      wait_barrier(q_readable, 0);
+    } else {
+      // if not using TMA, math warpgroup loads Q using kMathThreads threads.
+      load_q_group_direct_to_smem<Tin>(Q, sQ, ihead_q0, ibatch, heads_per_group, num_dim_qk,
+                                       idx, kMathThreads);
+      syncwarpgroup(iwarpgroup);
+    }
 
     int phase = 0;
     int istage_read = 0;
@@ -483,7 +591,7 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
           int iposq = num_seq_kvcache + get<1>(tI_mn(im, in)) / heads_per_group;
           int iposk = itile_seq_kv * kTileM + get<0>(tI_mn(im, in));
 
-          if ((iposk > iposq) || (iposk >= num_seq_kv)) {
+          if ((in >= heads_per_group) || (iposk > iposq) || (iposk >= num_seq_kv)) {
             tAttr_mn(im, in) = -std::numeric_limits<float>::infinity();
           }
         }
@@ -549,9 +657,20 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
         arrive_barrier(k_writable[istage_read]);
       }
 
+      auto tAttr_mn_full = retile_fragment(tAttr);
+#pragma unroll
+      for (int im = 0; im < kM; ++im) {
+#pragma unroll
+        for (int in = 0; in < kN; ++in) {
+          if (in >= heads_per_group) {
+            tAttr_mn_full(im, in) = -std::numeric_limits<float>::infinity();
+          }
+        }
+      }
+
       auto tYr_mn = retile_fragment(tYr);
       // online softmax
-      online_softmax<false, kTileN, kM, kN>(tAttr_mn, gMax, gSum, tYr_mn, one_over_dk_log2e,
+      online_softmax<false, kTileN, kM, kN>(tAttr_mn_full, gMax, gSum, tYr_mn, one_over_dk_log2e,
                                             shm_max, iwarpgroup, iwarp_in_warpgroup,
                                             ilane_in_warpgroup);
 
@@ -613,12 +732,17 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
       cute::copy(r2s_tiled_copy, tYr4s, tYs4r);
       syncwarpgroup(iwarpgroup);
       tma_store_fence();
-      // using TMA to store
-      if (is_leader_in_warpgroup) {
-        auto tYss = btma_y.partition_S(sY);  // (TMA, TMA_M, TMA_N)
-        auto tYgg = btma_y.partition_D(gY);  // (TMA, TMA_M, TMA_N, b)
 
-        cute::copy(tma_y, tYss(_, _, 0), tYgg(_, _, ihead_kv, ibatch));
+      if ((heads_per_group == kTileN) || (num_head_q == 4 && num_head_k == 1)) {
+        // using TMA to store
+        if (is_leader_in_warpgroup) {
+          auto tYss = btma_y.partition_S(sY);  // (TMA, TMA_M, TMA_N)
+          auto tYgg = btma_y.partition_D(gY);  // (TMA, TMA_M, TMA_N, b)
+          cute::copy(tma_y, tYss(_, _, 0), tYgg(_, _, ihead_kv, ibatch));
+        }
+      } else {
+        store_sY_to_gmem_bf16<Tout>(sY, Y, ihead_q0, ibatch, heads_per_group, num_dim_v,
+                                             idx, kMathThreads);
       }
     } else {
       // Epilogue: write register-C to global memory
@@ -633,26 +757,42 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_splitk_kernel(
       syncwarpgroup(iwarpgroup);
       tma_store_fence();
 
-      // using TMA to store
-      if (is_leader_in_warpgroup) {
-        auto tYss = btma_splity.partition_S(sSplitY);  // (TMA, TMA_M, TMA_N)
-        auto tYgg = btma_splity.partition_D(gSplitY);  // (TMA, TMA_M, TMA_N, b)
-
-        cute::copy(tma_splity, tYss(_, _, 0), tYgg(_, _, ihead_kv, ichunk, ibatch));
+      if ((heads_per_group == kTileN) || (num_head_q == 4 && num_head_k == 1)) {
+        // using TMA to store
+        if (is_leader_in_warpgroup) {
+          auto tYss = btma_splity.partition_S(sSplitY);  // (TMA, TMA_M, TMA_N)
+          auto tYgg = btma_splity.partition_D(gSplitY);  // (TMA, TMA_M, TMA_N, b)
+          cute::copy(tma_splity, tYss(_, _, 0), tYgg(_, _, ihead_kv, ichunk, ibatch));
+        }
+      } else {
+          store_sSplitY_to_gmem_float(sSplitY, splitY, ihead_q0, ichunk, ibatch,
+                                       heads_per_group, num_dim_v, idx, kMathThreads);
       }
 
       int ilane = idx % 32;
       // write lse
-      if (iwarp == 0 && ilane < heads_per_group / kN) {
-        vec_t<float, kN> lse;
+      // Vector store for full kN-element groups, scalar for the remainder.
+      if (iwarp == 0 && ilane * kN < heads_per_group) {
+        bool base_aligned = (reinterpret_cast<uintptr_t>(lse_batch) % (sizeof(float) * kN)) == 0;
+        if (base_aligned && ilane * kN + kN <= heads_per_group) {
+          vec_t<float, kN> lse;
 #pragma unroll
-        for (int in = 0; in < kN; ++in) {
-          lse[in] = gMax(in) + log2f_ftz(gSum(in));
+          for (int in = 0; in < kN; ++in) {
+            lse[in] = gMax(in) + log2f_ftz(gSum(in));
+          }
+          store(lse_batch + ilane * kN, lse);
+        } else {
+#pragma unroll
+          for (int in = 0; in < kN; ++in) {
+            if (ilane * kN + in < heads_per_group) {
+              lse_batch[ilane * kN + in] = gMax(in) + log2f_ftz(gSum(in));
+            }
+          }
         }
-        store(lse_batch + ilane * kN, lse);
       }
     }
   }
+
 }
 
 }  // namespace kernels

@@ -41,7 +41,7 @@ void launch_attention_decode_bf16_dim128_smallm_splitk(
                        make_shape(num_dim_v, kBlockSize, num_head_v, num_kvcache_blocks),
                        make_stride(Int<1>{}, num_head_v * num_dim_v, num_dim_v, ldV));
 
-  auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<const Tout *>(y_ptr)),
+  auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(y_ptr)),
                        make_shape(num_dim_v, num_head_q, num_batch),
                        make_stride(Int<1>{}, num_dim_v, ldY));
 
@@ -107,14 +107,16 @@ void launch_attention_decode_bf16_dim128_smallm_splitk(
 
   auto kernel = kernels::attention_decode_bf16_multistage_ws_smallm_splitk_kernel<
       Tout, Tin, kTileM, kTileN, kTileK, kTileV, TiledMmaQK, TiledMmaSV, decltype(tma_q),
-      decltype(tma_k), decltype(tma_v), decltype(tma_y), decltype(tma_splity), decltype(slayout_q),
+      decltype(tma_k), decltype(tma_v), decltype(tma_y), decltype(tma_splity),
+      decltype(Q), decltype(Y),  decltype(splitY), decltype(slayout_q),
       decltype(slayout_k), decltype(slayout_p), decltype(slayout_s), decltype(slayout_v),
       decltype(slayout_y), decltype(slayout_splity), kBlockSize, kStage, kSplitK, kSplitMinLen>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
   kernel<<<grid, block, shm_size, stream>>>(
-      tma_q, tma_k, tma_v, tma_y, tma_splity, reinterpret_cast<float *>(lse_ptr), block_ids_ptr,
-      num_seq_kvcache_ptr, new_kv_included, num_batch, num_dim_qk, num_dim_v, num_head_q,
+      tma_q, tma_k, tma_v, tma_y, tma_splity, Q, Y, splitY, 
+      reinterpret_cast<float *>(lse_ptr), block_ids_ptr, num_seq_kvcache_ptr,
+      new_kv_included, num_batch, num_dim_qk, num_dim_v, num_head_q,
       num_head_k, num_head_v, heads_per_group, num_kvcache_blocks, num_seq_max_blocks,
       one_over_dk_log2e);
 }
@@ -144,10 +146,16 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
 
   int heads_per_group = num_head_q / num_head_k;
 
+  if (heads_per_group == 1 || heads_per_group > 8) {
+    std::cout << "launch launch_attention_decode_bf16_dim128_smallm failed with "
+              << "  heads_per_group: " << heads_per_group << std::endl;
+    return false;
+  }
+
   if (splitk == 4) {
     constexpr int kSplitK = 4;
     constexpr int kSplitMinLen = 4096;
-    if (heads_per_group == 8 || heads_per_group == 4) {
+    if (heads_per_group <= 8) {
       constexpr int kHeadsPerGroup = 8;
       if (block_size == 32) {
         constexpr int kBlockSize = 32;
@@ -167,8 +175,11 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
       }
       using Tout = __nv_bfloat16;
-      dim3 grid(num_batch);
-      dim3 block(32 * num_head_q);
+
+      // Cap heads_per_block at 32 (= 1024 / 32) and tile extra heads in blockIdx.y.
+      int heads_per_block = std::min(num_head_q, 32);
+      dim3 grid(num_batch, (num_head_q + heads_per_block - 1) / heads_per_block);
+      dim3 block(32 * heads_per_block);
       kernels::attention_decode_bf16_smallm_splitk_combine_kernel<Tout, kTileM, kTileV, kSplitK,
                                                                   kSplitMinLen, kConsumers>
           <<<grid, block, 0, stream>>>(reinterpret_cast<Tout *>(y_ptr),
@@ -179,7 +190,7 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
   } else if (splitk == 16) {
     constexpr int kSplitK = 16;
     constexpr int kSplitMinLen = 512;
-    if (heads_per_group == 8 || heads_per_group == 4) {
+    if (heads_per_group <= 8) {
       constexpr int kHeadsPerGroup = 8;
       if (block_size == 32) {
         constexpr int kBlockSize = 32;
@@ -199,8 +210,11 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
       }
       using Tout = __nv_bfloat16;
-      dim3 grid(num_batch);
-      dim3 block(32 * num_head_q);
+
+      // Cap heads_per_block at 32 (= 1024 / 32) and tile extra heads in blockIdx.y.
+      int heads_per_block = std::min(num_head_q, 32);
+      dim3 grid(num_batch, (num_head_q + heads_per_block - 1) / heads_per_block);
+      dim3 block(32 * heads_per_block);
       kernels::attention_decode_bf16_smallm_splitk_combine_kernel<Tout, kTileM, kTileV, kSplitK,
                                                                   kSplitMinLen, kConsumers>
           <<<grid, block, 0, stream>>>(reinterpret_cast<Tout *>(y_ptr),
