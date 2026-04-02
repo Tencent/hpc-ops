@@ -14,6 +14,8 @@ test
 version.py
 .DS_Store
 
+3rd/ucl/include/
+3rd/ucl/lib/
 3rd/ucl/nvshmem/bin/
 3rd/ucl/nvshmem/include/
 3rd/ucl/nvshmem/lib/
@@ -23,3 +25,4 @@ version.py
 3rd/ucl/nvshmem/git_commit.txt
 3rd/ucl/nvshmem/src/include/non_abi/nvshmem_build_options.h
 3rd/ucl/nvshmem/src/include/non_abi/nvshmem_version.h
+3rd/ucl/nvshmem/src/device/comm/
