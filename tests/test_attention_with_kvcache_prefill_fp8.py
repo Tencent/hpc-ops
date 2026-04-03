@@ -23,7 +23,8 @@ def naive_attn_with_kvcache_func(
     q,
     k_cache,
     v_cache,
-    qkscale,
+    qscale,
+    kscale,
     vscale,
     cache_seqlens,
     page_table,
@@ -33,7 +34,7 @@ def naive_attn_with_kvcache_func(
     num_batch, num_seq_q, num_head_q, num_dim_qk = q.shape
     num_blocks, block_size, num_head_kv, _ = k_cache.shape
     _, _, _, num_dim_v = v_cache.shape
-    _, _, max_seq_q_pad = qkscale.shape
+    _, _, max_seq_q_pad = qscale.shape
 
     num_group = num_head_q // num_head_kv
     output = torch.empty_like(q).to(torch.bfloat16)
@@ -57,9 +58,9 @@ def naive_attn_with_kvcache_func(
             .repeat_interleave(num_group, dim=0)
         ).float()
 
-        scale = qkscale[i, :, :].unsqueeze(-1)[:, :num_seq_q, :]
+        scale = qscale[i, :, :].unsqueeze(-1)[:, :num_seq_q, :]
 
-        scores = torch.matmul(BQ, BK.transpose(-2, -1)) * scale / math.sqrt(num_dim_qk)
+        scores = torch.matmul(BQ, BK.transpose(-2, -1)) * scale * kscale[0] / math.sqrt(num_dim_qk)
         if causal:
             causal_mask = (
                 torch.tril(torch.ones(num_seq_kv, num_seq_kv, device=q.device, dtype=torch.bool))[
@@ -128,12 +129,13 @@ def test_attention_with_kvcache_prefill_fp8(
     v = torch.randn(
         (num_batch * num_seq_q, num_head_kv, num_dim_v), dtype=torch.bfloat16, device="cuda"
     ).to(torch.float8_e4m3fn)
-    qkscale = (
+    qscale = (
         torch.abs(
             torch.randn((num_batch, num_head_q, num_seq_q_pad), dtype=torch.float32, device="cuda")
         )
         / 10
     )
+    kscale = torch.randn((1), dtype=torch.float32, device="cuda").abs() * 10
     vscale = torch.randn((1), dtype=torch.float32, device="cuda")
 
     seqlens_q = torch.full((num_batch,), num_seq_q, dtype=torch.int32, device="cuda")
@@ -169,7 +171,8 @@ def test_attention_with_kvcache_prefill_fp8(
         q=q,
         k_cache=kvcache[:, 0, :, :],
         v_cache=kvcache[:, 1, :, :],
-        qkscale=qkscale,
+        qscale=qscale,
+        kscale=kscale,
         vscale=vscale,
         cache_seqlens=seqlens_kvcache,
         page_table=block_ids,
@@ -180,7 +183,8 @@ def test_attention_with_kvcache_prefill_fp8(
         q.reshape(-1, num_head_q, num_dim_qk),
         kvcache[:, 0, :, :, :],
         kvcache[:, 1, :, :, :],
-        qkscale,
+        qscale,
+        kscale,
         vscale,
         cu_seqlens_q,
         block_ids,

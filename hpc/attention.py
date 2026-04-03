@@ -129,7 +129,8 @@ def attention_with_kvcache_prefill_fp8(
     q: Tensor,
     kcache: Tensor,
     vcache: Tensor,
-    qkscale: Tensor,
+    qscale: Tensor,
+    kscale: Tensor,
     vscale: Tensor,
     cu_seqlens_q: Tensor,
     block_ids: Tensor,
@@ -156,8 +157,11 @@ def attention_with_kvcache_prefill_fp8(
                  Constrainst the unused slots in last block of vcache for each request to be set zeros.
             Shape: [num_blocks, block_size, num_head_kv, num_dim_v]
             Dtype: fp8
-        qkscale: QK fp8 quant scale. Per Token Per Head Fp8 Quant.
+        qscale: QK fp8 quant scale. Per Token Per Head Fp8 Quant.
             Shape: [num_batch, num_head_q, max_seqlens_q_pad]
+            Dtype: float32
+        kscale: K fp8 quant scale. Per Tensor Fp8 Quant.
+            Shape: [1]
             Dtype: float32
         vscale: V fp8 quant scale. Per Tensor Fp8 Quant.
             Shape: [1]
@@ -193,7 +197,8 @@ def attention_with_kvcache_prefill_fp8(
         q,
         kcache,
         vcache,
-        qkscale,
+        qscale,
+        kscale,
         vscale,
         cu_seqlens_q,
         block_ids,
@@ -365,7 +370,8 @@ def attention_with_kvcache_prefill_fp8_fake(
     q,
     kcache,
     vcache,
-    qkscale,
+    qscale,
+    kscale,
     vscale,
     cu_seqlens_q,
     block_ids,

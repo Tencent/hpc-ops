@@ -242,7 +242,7 @@ struct AttentionKVCachePrefillFp8Config {
       SLayoutVTAtom{}, make_shape(Int<kTileV>{}, Int<kTileN>{}, Int<kStage * kWarpgroupM>{})));
   using SLayoutY =
       decltype(tile_to_shape(SLayoutYAtom{}, make_shape(Int<kTileM>{}, Int<kTileV>{})));
-  using SLayoutQKS = decltype(make_layout(make_shape(Int<kTileM>{}), make_stride(Int<1>{})));
+  using SLayoutQS = decltype(make_layout(make_shape(Int<kTileM>{}), make_stride(Int<1>{})));
 
   using CopyBoxK =
       decltype(tile_to_shape(SLayoutKAtom{}, make_shape(Int<kBlockSize>{}, Int<kTileK>{})));
@@ -251,14 +251,14 @@ struct AttentionKVCachePrefillFp8Config {
   using CopyBoxY = decltype(tile_to_shape(SLayoutYAtom{},
                                           make_shape(Int<kTileM / kWarpgroupM>{}, Int<kTileV>{})));
 
-  template <typename TQ, typename TK, typename TV, typename TY, typename TQKS>
-  auto get_tma(TQ q, TK k, TV v, TY y, TQKS qks) {
+  template <typename TQ, typename TK, typename TV, typename TY, typename TQS>
+  auto get_tma(TQ q, TK k, TV v, TY y, TQS qs) {
     auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, q, SLayoutQ{});
     auto tma_k = make_tma_copy(SM90_TMA_LOAD{}, k, CopyBoxK{});
     auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, v, CopyBoxV{});
     auto tma_y = make_tma_copy(SM90_TMA_STORE{}, y, CopyBoxY{});
-    auto tma_qks = make_tma_copy(SM90_TMA_LOAD{}, qks, SLayoutQKS{});
-    return std::make_tuple(tma_q, tma_k, tma_v, tma_y, tma_qks);
+    auto tma_qs = make_tma_copy(SM90_TMA_LOAD{}, qs, SLayoutQS{});
+    return std::make_tuple(tma_q, tma_k, tma_v, tma_y, tma_qs);
   }
 
   using WarpgroupLayout =
@@ -270,8 +270,8 @@ struct AttentionKVCachePrefillFp8Config {
       (cosize(SLayoutQ{}) + cosize(SLayoutK{}) + cosize(SLayoutV{}) + cosize(SLayoutVT{})) *
       sizeof(Tin);
   static constexpr int shm_y = cosize(SLayoutY{}) * sizeof(Tout);
-  static constexpr int shm_qks = cosize(SLayoutQKS{}) * sizeof(float);
-  static constexpr int shm_size = shm_qkv + shm_y + shm_qks;
+  static constexpr int shm_qs = cosize(SLayoutQS{}) * sizeof(float);
+  static constexpr int shm_size = shm_qkv + shm_y + shm_qs;
 
   auto get_shm_size() { return shm_size; }
 };
