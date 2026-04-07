@@ -122,8 +122,8 @@ __forceinline__ __device__ void online_compress(DType* compressed_kv_ptr, const 
     auto* right_ape_ptr = ape_ptr + kHeadDim;
 #pragma unroll
     for (int irow = 0; irow < kRatio; irow++) {
-      auto* kv_irow = partial_kv_ptr + irow * kv_stride;
-      auto* score_irow = partial_score_ptr + irow * kv_stride;
+      auto* kv_irow = partial_kv_ptr + irow * (int64_t)kv_stride;
+      auto* score_irow = partial_score_ptr + irow * (int64_t)kv_stride;
       auto* ape_irow = right_ape_ptr + irow * kWidth;
       auto kv_lvecs = load<DType, kItemPerThread>(kv_irow + tidx * kItemPerThread);
       auto score_vecs = load<DType, kItemPerThread>(score_irow + tidx * kItemPerThread);
@@ -219,8 +219,8 @@ __global__ void kv_compressor_prefill(float* compressed_kv_ptr, const float* kv_
     return;
   }
   constexpr int kWidth = kHeadDim * (1 + int(kOverlap));
-  auto* kv = kv_ptr + (cu_seqlens_ptr[batch_id] + icompress * kRatio) * kv_stride;
-  auto* score = score_ptr + (cu_seqlens_ptr[batch_id] + icompress * kRatio) * kv_stride;
+  auto* kv = kv_ptr + (cu_seqlens_ptr[batch_id] + icompress * kRatio) * (int64_t)kv_stride;
+  auto* score = score_ptr + (cu_seqlens_ptr[batch_id] + icompress * kRatio) * (int64_t)kv_stride;
 
   auto* kv_state =
       kv_states_ptr + state_index_ptr[batch_id] * kWidth * (1 + int(kOverlap)) * kRatio;
@@ -236,8 +236,8 @@ __global__ void kv_compressor_prefill(float* compressed_kv_ptr, const float* kv_
     for (int i = 0; i < seqlen; i++) {
       int cur_pos = start_pos + i;
       int local_pos = cur_pos % kRatio;
-      auto* kv_row = kv + i * kv_stride;
-      auto* score_row = score + i * kv_stride;
+      auto* kv_row = kv + i * (int64_t)kv_stride;
+      auto* score_row = score + i * (int64_t)kv_stride;
       auto* ape_row = ape_ptr + local_pos * kWidth;
 
       // copy down left state
@@ -309,10 +309,11 @@ __global__ void kv_compressor_prefill(float* compressed_kv_ptr, const float* kv_
 
           // copy upper left state from the last compressed block
           int icompress_last = (cu_seqlens_ptr[batch_id + 1] - cu_seqlens_ptr[batch_id]) / kRatio;
-          auto* kv_upper =
-              kv_ptr + (cu_seqlens_ptr[batch_id] + (icompress_last - 1) * kRatio) * kv_stride;
+          auto* kv_upper = kv_ptr + (cu_seqlens_ptr[batch_id] + (icompress_last - 1) * kRatio) *
+                                        (int64_t)kv_stride;
           auto* score_upper =
-              score_ptr + (cu_seqlens_ptr[batch_id] + (icompress_last - 1) * kRatio) * kv_stride;
+              score_ptr +
+              (cu_seqlens_ptr[batch_id] + (icompress_last - 1) * kRatio) * (int64_t)kv_stride;
           copy_tile_to_state<DType, kItemPerThread, kHeadDim, kRatio>(kv_state, kv_upper, kRatio,
                                                                       kWidth, kv_stride, tidx);
           add_copy_tile_to_state<DType, kItemPerThread, kHeadDim, kRatio>(
@@ -320,9 +321,9 @@ __global__ void kv_compressor_prefill(float* compressed_kv_ptr, const float* kv_
 
         } else {  // not first compress block, give the upper block ptr
           auto* kv_upper =
-              kv_ptr + (cu_seqlens_ptr[batch_id] + (icompress - 1) * kRatio) * kv_stride;
-          auto* score_upper =
-              score_ptr + (cu_seqlens_ptr[batch_id] + (icompress - 1) * kRatio) * kv_stride;
+              kv_ptr + (cu_seqlens_ptr[batch_id] + (icompress - 1) * kRatio) * (int64_t)kv_stride;
+          auto* score_upper = score_ptr + (cu_seqlens_ptr[batch_id] + (icompress - 1) * kRatio) *
+                                              (int64_t)kv_stride;
           online_compress<DType, kItemPerThread, kRatio, kHeadDim, kWidth, kOverlap>(
               out_ptr, kv_upper, score_upper, ape_ptr, kv_stride, tidx);
         }
