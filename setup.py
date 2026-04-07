@@ -71,8 +71,9 @@ class CMakeBuild(build_ext):
         subprocess.check_call(
             ["cmake", ext.sourcedir] + cmake_args, cwd=build_temp_dir, env=cmake_env
         )
+        parallel = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL", "8")
         subprocess.check_call(
-            ["cmake", "--build", ".", "--config", "Release", "-j16"], cwd=build_temp_dir
+            ["cmake", "--build", ".", "--config", "Release", f"-j{parallel}"], cwd=build_temp_dir
         )
 
         so_src_path = os.path.join(build_temp_dir, "_C.abi3.so")
@@ -94,12 +95,13 @@ def get_version():
         .lstrip("v")
     )
     torch_version = "torch" + torch.__version__.split("+")[0].replace(".", "")
+    cuda_version = "cuda" + (torch.version.cuda or "").replace(".", "")
 
     newest_tag_hash = subprocess.check_output(
         ["git", "rev-list", "--tags", "--max-count=1"], stderr=subprocess.DEVNULL, text=True
     ).strip()[:7]
     if newest_tag_hash == git_hash:
-        return f"{newest_tag}+{torch_version}", git_hash
+        return f"{newest_tag}+{torch_version}.{cuda_version}.sm{SM_ARCH}", git_hash
     else:
         try:
             commit_count = subprocess.check_output(
@@ -110,7 +112,10 @@ def get_version():
         except subprocess.CalledProcessError:
             commit_count = "0"
 
-        return f"{newest_tag}.dev{commit_count}+g{git_hash}.{torch_version}", git_hash
+        version_str = (
+            f"{newest_tag}.dev{commit_count}+g{git_hash}.{torch_version}.{cuda_version}.sm{SM_ARCH}"
+        )
+        return version_str, git_hash
 
 
 version, git_hash = get_version()

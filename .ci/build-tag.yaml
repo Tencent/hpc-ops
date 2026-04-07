@@ -20,43 +20,11 @@ stages:
   - Build
   jobs:
     job_Cty:
-      name: Compile-Torch270
+      name: torch290+cu129+sm90
       runs-on:
         pool-name: docker
         container:
-          image: mirrors.tencent.com/hunyuan_infer/text2text_infer:H-5.2.1-v1
-      steps:
-      - checkout:
-          repo-id: rxOYK
-        name: git clone and checkout
-        with:
-          refName: "${BK_CI_HOOK_SOURCE_BRANCH}"
-      - name: complile whl
-        uses: linuxScript@1.*
-        with:
-          script: |-
-            set -xe
-
-            cd ${{ci.workspace}}
-            make wheel
-
-      - name: upload to pypi
-        uses: DistributionToGeneric@1.*
-        with:
-          username: reedlauliu
-          token: e0b4892c66d411f086b85254009bad14
-          repo_category: pypi
-          pypi_upload_arguments:
-          - skip_existing
-          - verbose
-          distribution: dist/hpc*.whl
-        retry-times: 2
-    job_N46:
-      name: Compile-Torch290
-      runs-on:
-        pool-name: docker
-        container:
-          image: mirrors.tencent.com/hunyuan_infer/text2text_infer:H-6.2.1.dev32
+          image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.0
       steps:
       - checkout:
           repo-id: rxOYK
@@ -64,21 +32,19 @@ stages:
         with:
           refName: "${BK_CI_HOOK_SOURCE_BRANCH}"
           enableGitLfs: false
-      - name: complile whl
+      - name: compile sm90
         uses: linuxScript@1.*
         with:
           script: |-
             set -xe
-
             cd ${{ci.workspace}}
-            make wheel
+            pip install build cmake
+            make sm90
       - name: config pip for upload
-        id: NXn
         uses: linuxScript@1.*
         with:
           script: |-
             set -xe
-
             cd ${{ci.workspace}}
             pip config set global.index-url https://bkdevops:@mirrors.tencent.com/repository/pypi/tencent_pypi/simple/
             pip config set global.extra-index-url https://bkdevops:@mirrors.tencent.com/pypi/simple/
@@ -95,12 +61,12 @@ stages:
           - verbose
           distribution: dist/hpc*.whl
         retry-times: 2
-    job_sfp:
-      name: Compile-Torch210
+    job_N46:
+      name: torch2100+cu129+sm90
       runs-on:
         pool-name: docker
         container:
-          image: mirrors.tencent.com/hunyuan_infer/text2text_infer:H-6.5.1.dev46
+          image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.2
       steps:
       - checkout:
           repo-id: rxOYK
@@ -108,21 +74,103 @@ stages:
         with:
           refName: "${BK_CI_HOOK_SOURCE_BRANCH}"
           enableGitLfs: false
-      - name: complile whl
+      - name: compile sm90
         uses: linuxScript@1.*
         with:
           script: |-
             set -xe
-
             cd ${{ci.workspace}}
-            make wheel
+            pip install build cmake
+            make sm90
       - name: config pip for upload
-        id: NXn
         uses: linuxScript@1.*
         with:
           script: |-
             set -xe
-
+            cd ${{ci.workspace}}
+            pip config set global.index-url https://bkdevops:@mirrors.tencent.com/repository/pypi/tencent_pypi/simple/
+            pip config set global.extra-index-url https://bkdevops:@mirrors.tencent.com/pypi/simple/
+            pip config set global.timeout 600
+            pip config set install.trusted-host mirrors.tencent.com
+      - name: upload to pypi
+        uses: DistributionToGeneric@1.*
+        with:
+          username: reedlauliu
+          token: e0b4892c66d411f086b85254009bad14
+          repo_category: pypi
+          pypi_upload_arguments:
+          - skip_existing
+          - verbose
+          distribution: dist/hpc*.whl
+        retry-times: 2
+    job_sfp_sm90:
+      name: torch2100+cu130+sm90
+      runs-on:
+        pool-name: docker
+        container:
+          image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.3
+      steps:
+      - checkout:
+          repo-id: rxOYK
+        name: git clone and checkout
+        with:
+          refName: "${BK_CI_HOOK_SOURCE_BRANCH}"
+          enableGitLfs: false
+      - name: compile sm90
+        uses: linuxScript@1.*
+        with:
+          script: |-
+            set -xe
+            cd ${{ci.workspace}}
+            pip install build cmake
+            make sm90
+      - name: config pip for upload
+        uses: linuxScript@1.*
+        with:
+          script: |-
+            set -xe
+            cd ${{ci.workspace}}
+            pip config set global.index-url https://bkdevops:@mirrors.tencent.com/repository/pypi/tencent_pypi/simple/
+            pip config set global.extra-index-url https://bkdevops:@mirrors.tencent.com/pypi/simple/
+            pip config set global.timeout 600
+            pip config set install.trusted-host mirrors.tencent.com
+      - name: upload to pypi
+        uses: DistributionToGeneric@1.*
+        with:
+          username: reedlauliu
+          token: e0b4892c66d411f086b85254009bad14
+          repo_category: pypi
+          pypi_upload_arguments:
+          - skip_existing
+          - verbose
+          distribution: dist/hpc*.whl
+        retry-times: 2
+    job_sfp_sm100:
+      name: torch2100+cu130+sm100
+      runs-on:
+        pool-name: docker
+        container:
+          image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.3
+      steps:
+      - checkout:
+          repo-id: rxOYK
+        name: git clone and checkout
+        with:
+          refName: "${BK_CI_HOOK_SOURCE_BRANCH}"
+          enableGitLfs: false
+      - name: compile sm100
+        uses: linuxScript@1.*
+        with:
+          script: |-
+            set -xe
+            cd ${{ci.workspace}}
+            pip install build cmake
+            make sm100
+      - name: config pip for upload
+        uses: linuxScript@1.*
+        with:
+          script: |-
+            set -xe
             cd ${{ci.workspace}}
             pip config set global.index-url https://bkdevops:@mirrors.tencent.com/repository/pypi/tencent_pypi/simple/
             pip config set global.extra-index-url https://bkdevops:@mirrors.tencent.com/pypi/simple/

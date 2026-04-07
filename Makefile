@@ -14,11 +14,11 @@ all:
 
 # ── Arch-specific wheel targets ───────────────────────────────────────────────
 # 'make sm90', 'make sm100', 'make sm89', etc.
-# Output wheel goes to dist/sm<arch>/.
+# Output wheel goes to dist/
 sm%:
 	find . -type d -name "__pycache__" -exec rm -rf {} +
-	mkdir -p dist/sm$*
-	SM_ARCH=$* python3 -m build --wheel --no-isolation --outdir dist/sm$*
+	mkdir -p dist
+	SM_ARCH=$* python3 -m build --wheel --no-isolation --outdir dist
 
 # ── wheel: build wheel for auto-detected arch ─────────────────────────────────
 wheel:
