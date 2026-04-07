@@ -19,11 +19,12 @@ namespace prefill {
 template <int kBlockSize>
 void launch_warp_spec_with_kvcache_fp8_dim128(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
-    const void *qkscale_ptr, const void *vscale_ptr, const void *cu_seqlens_q_ptr,
-    const void *block_ids_ptr, const void *seqlens_kvcache_ptr, void *tmas_ptr, int num_batch,
-    int total_seq_q, int max_seq_q, int max_seq_q_pad, int num_dim_qk, int num_dim_v,
-    int num_head_q, int num_head_kv, int num_kvcache_blocks, int block_size, int num_seq_max_blocks,
-    int ldY, int ldQ, int ldK, int ldV, cudaStream_t stream) {
+    const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
+    const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
+    void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
+    int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
+    int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV,
+    cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   using Tin = cute::float_e4m3_t;
@@ -41,9 +42,9 @@ void launch_warp_spec_with_kvcache_fp8_dim128(
   auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<const Tout *>(y_ptr)),
                        make_shape(max_seq_q, num_dim_v, num_head_q),
                        make_stride(ldY, Int<1>{}, num_dim_v));
-  auto QKS = make_tensor(make_gmem_ptr(reinterpret_cast<const float *>(qkscale_ptr)),
-                         make_shape(max_seq_q_pad, num_head_q, num_batch),
-                         make_stride(Int<1>{}, max_seq_q_pad, num_head_q * max_seq_q_pad));
+  auto QS = make_tensor(make_gmem_ptr(reinterpret_cast<const float *>(qscale_ptr)),
+                        make_shape(max_seq_q_pad, num_head_q, num_batch),
+                        make_stride(Int<1>{}, max_seq_q_pad, num_head_q * max_seq_q_pad));
 
   auto *tma_qy = static_cast<cute::TmaDescriptor *>(tmas_ptr);
   constexpr float kLog2e = 1.4426950408889634f;
@@ -55,7 +56,7 @@ void launch_warp_spec_with_kvcache_fp8_dim128(
                                                   128, kBlockSize, 2, 2, 1, 128, 128, 128, 128>;
 
   Config config;
-  auto [tma_q, tma_k, tma_v, tma_y, tma_qks] = config.get_tma(Q, K, V, Y, QKS);
+  auto [tma_q, tma_k, tma_v, tma_y, tma_qks] = config.get_tma(Q, K, V, Y, QS);
 
   // 0. update tma
   {
@@ -86,32 +87,33 @@ void launch_warp_spec_with_kvcache_fp8_dim128(
         decltype(tma_qks)>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     kernel<<<grid, block, shm_size, stream>>>(
-        tma_qy, tma_k, tma_v, tma_qks, (const float *)qkscale_ptr, (const float *)vscale_ptr,
-        (const int *)cu_seqlens_q_ptr, (const int *)seqlens_kvcache_ptr, (const int *)block_ids_ptr,
-        num_batch, max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
-        num_kvcache_blocks, block_size, num_seq_max_blocks, one_over_dk_log2e, head_kv_divmod,
-        head_q_divmod, tile_m_divmod);
+        tma_qy, tma_k, tma_v, tma_qks, (const float *)qscale_ptr, (const float *)kscale_ptr,
+        (const float *)vscale_ptr, (const int *)cu_seqlens_q_ptr, (const int *)seqlens_kvcache_ptr,
+        (const int *)block_ids_ptr, num_batch, max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v,
+        num_head_q, num_head_kv, num_kvcache_blocks, block_size, num_seq_max_blocks,
+        one_over_dk_log2e, head_kv_divmod, head_q_divmod, tile_m_divmod);
   }
 }
 
 void warp_spec_with_kvcache_fp8_dim128_async(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
-    const void *qkscale_ptr, const void *vscale_ptr, const void *cu_seqlens_q_ptr,
-    const void *block_ids_ptr, const void *seqlens_kvcache_ptr, void *tmas_ptr, int num_batch,
-    int total_seq_q, int max_seq_q, int max_seq_q_pad, int num_dim_qk, int num_dim_v,
-    int num_head_q, int num_head_kv, int num_kvcache_blocks, int block_size, int num_seq_max_blocks,
-    int ldY, int ldQ, int ldK, int ldV, cudaStream_t stream) {
+    const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
+    const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
+    void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
+    int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
+    int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV,
+    cudaStream_t stream) {
   if (block_size == 32) {
     constexpr int kBlockSize = 32;
     launch_warp_spec_with_kvcache_fp8_dim128<kBlockSize>(
-        y_ptr, q_ptr, kcache_ptr, vcache_ptr, qkscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
+        y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
         block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
         max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
         block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
   } else if (block_size == 64) {
     constexpr int kBlockSize = 64;
     launch_warp_spec_with_kvcache_fp8_dim128<kBlockSize>(
-        y_ptr, q_ptr, kcache_ptr, vcache_ptr, qkscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
+        y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
         block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
         max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
         block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);

@@ -89,22 +89,21 @@ __device__ __forceinline__ void online_softmax(ATensor &&tAttr_mn, MTensor &&gMa
   }
 }
 
-template <typename ATensor, typename MTensor, typename STensor, typename YTensor,
-          typename QKSTensor>
+template <typename ATensor, typename MTensor, typename STensor, typename YTensor, typename QSTensor>
 __device__ __forceinline__ void online_softmax_with_scale(ATensor &&tAttr_mn, MTensor &&gMax,
                                                           STensor &&gSum, YTensor &&tYr_mn,
-                                                          QKSTensor &&tQKS, int kM, int kN,
+                                                          QSTensor &&tQS, int kM, int kN,
                                                           float one_over_dk_log2e) {
 #pragma unroll
   for (int im = 0; im < kM; ++im) {
-    float qks_im = tQKS[im];
-    tAttr_mn(im, 0) = tAttr_mn(im, 0) * qks_im;
+    float qs_im = tQS[im];
+    tAttr_mn(im, 0) = tAttr_mn(im, 0) * qs_im;
     float row_max = tAttr_mn(im, 0);
     float row_sum = 0.f;
 
 #pragma unroll
     for (int in = 1; in < kN; ++in) {
-      float local_max = tAttr_mn(im, in) * qks_im;
+      float local_max = tAttr_mn(im, in) * qs_im;
       tAttr_mn(im, in) = local_max;
       row_max = fmaxf(row_max, local_max);
     }
@@ -992,17 +991,17 @@ __global__ void __launch_bounds__(384, 1)
 }
 
 template <typename Config, typename TmaQ, typename TmaK, typename TmaV, typename TmaY,
-          typename TmaQKS>
+          typename TmaQS>
 __global__ void __launch_bounds__(384, 1)
     attention_with_kvcache_prefill_fp8_warp_specialization_kernel(
         cute::TmaDescriptor *td_qy, const __grid_constant__ TmaK tma_k,
-        const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaQKS tma_qks,
-        const float *qkscale_ptr, const float *vscale_ptr, const int *cu_seqlens_q_ptr,
-        const int *seqlens_kvcache_ptr, const int *block_ids_ptr, int num_batch, int max_seq_q,
-        int max_seq_q_pad, int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv,
-        int num_kvcache_blocks, int block_size, int num_seq_max_blocks, float one_over_dk_log2e,
-        cutlass::FastDivmod head_kv_divmod, cutlass::FastDivmod head_q_divmod,
-        cutlass::FastDivmod tile_m_divmod) {
+        const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaQS tma_qs,
+        const float *qscale_ptr, const float *kscale_ptr, const float *vscale_ptr,
+        const int *cu_seqlens_q_ptr, const int *seqlens_kvcache_ptr, const int *block_ids_ptr,
+        int num_batch, int max_seq_q, int max_seq_q_pad, int num_dim_qk, int num_dim_v,
+        int num_head_q, int num_head_kv, int num_kvcache_blocks, int block_size,
+        int num_seq_max_blocks, float one_over_dk_log2e, cutlass::FastDivmod head_kv_divmod,
+        cutlass::FastDivmod head_q_divmod, cutlass::FastDivmod tile_m_divmod) {
   using namespace cute;  // NOLINT
 
   using Tin = typename Config::Tin;
@@ -1014,7 +1013,7 @@ __global__ void __launch_bounds__(384, 1)
   using SLayoutV = typename Config::SLayoutV;
   using SLayoutVT = typename Config::SLayoutVT;
   using SLayoutY = typename Config::SLayoutY;
-  using SLayoutQKS = typename Config::SLayoutQKS;
+  using SLayoutQS = typename Config::SLayoutQS;
 
   constexpr int kTileM = Config::kTileM;
   constexpr int kTileN = Config::kTileN;
@@ -1044,8 +1043,8 @@ __global__ void __launch_bounds__(384, 1)
   auto *shm_v = shm_k + cosize(SLayoutK{});
   auto *shm_vt = shm_v + cosize(SLayoutV{});
   auto *shm_y = reinterpret_cast<Tout *>(shm_vt + cosize(SLayoutVT{}));
-  auto *shm_qks = reinterpret_cast<float *>(shm_y + cosize(SLayoutY{}));
-  auto *shm_seqlens_q = reinterpret_cast<int *>(shm_qks + cosize(SLayoutQKS{}));
+  auto *shm_qs = reinterpret_cast<float *>(shm_y + cosize(SLayoutY{}));
+  auto *shm_seqlens_q = reinterpret_cast<int *>(shm_qs + cosize(SLayoutQS{}));
   auto *shm_seqlens_kv = shm_seqlens_q + num_batch;
   auto *shm_seqlens_qstart = shm_seqlens_kv + num_batch;
 
@@ -1059,7 +1058,7 @@ __global__ void __launch_bounds__(384, 1)
   auto gV =
       tma_v.get_tma_tensor(make_shape(num_dim_v, kBlockSize, num_head_kv, num_kvcache_blocks));
   auto gY = tma_y.get_tma_tensor(make_shape(max_seq_q, num_dim_v, num_head_q));
-  auto gQKS = tma_qks.get_tma_tensor(make_shape(max_seq_q_pad, num_head_q, num_batch));
+  auto gQS = tma_qs.get_tma_tensor(make_shape(max_seq_q_pad, num_head_q, num_batch));
 
   auto gAtt =
       make_tensor(make_gmem_ptr(static_cast<float *>(nullptr)),
@@ -1077,25 +1076,25 @@ __global__ void __launch_bounds__(384, 1)
   auto sV = make_tensor(make_smem_ptr(shm_v), SLayoutV{});
   auto sVT = make_tensor(make_smem_ptr(shm_vt), SLayoutVT{});
   auto sY = make_tensor(make_smem_ptr(shm_y), SLayoutY{});
-  auto sQKS = make_tensor(make_smem_ptr(shm_qks), SLayoutQKS{});
+  auto sQS = make_tensor(make_smem_ptr(shm_qs), SLayoutQS{});
 
   // Block Level tma
   auto btma_q = tma_q.get_slice(0);
   auto btma_k = tma_k.get_slice(0);
   auto btma_v = tma_v.get_slice(0);
   auto btma_y = tma_y.get_slice(0);
-  auto btma_qks = tma_qks.get_slice(0);
+  auto btma_qs = tma_qs.get_slice(0);
 
   // Thread Level Tensor
-  auto tQg = btma_q.partition_S(gQ);        // (TMA, TMA_M, TMA_K, head, batch)
-  auto tKg = btma_k.partition_S(gK);        // (TMA, TMA_N, TMA_K, head, batch)
-  auto tVg = btma_v.partition_S(gV);        // (TMA, TMA_V, TMA_N, head, batch)
-  auto tQKSg = btma_qks.partition_S(gQKS);  // (TMA, TMA_M, head, batch)
+  auto tQg = btma_q.partition_S(gQ);     // (TMA, TMA_M, TMA_K, head, batch)
+  auto tKg = btma_k.partition_S(gK);     // (TMA, TMA_N, TMA_K, head, batch)
+  auto tVg = btma_v.partition_S(gV);     // (TMA, TMA_V, TMA_N, head, batch)
+  auto tQSg = btma_qs.partition_S(gQS);  // (TMA, TMA_M, head, batch)
 
-  auto tQs = btma_q.partition_D(sQ);        // (TMA, _1, _1)
-  auto tKs = btma_k.partition_D(sK);        // (TMA, _1, _1, kStage)
-  auto tVs = btma_v.partition_D(sV);        // (TMA, _1, _1, kStage)
-  auto tQKSs = btma_qks.partition_D(sQKS);  // (TMA, _1)
+  auto tQs = btma_q.partition_D(sQ);     // (TMA, _1, _1)
+  auto tKs = btma_k.partition_D(sK);     // (TMA, _1, _1, kStage)
+  auto tVs = btma_v.partition_D(sV);     // (TMA, _1, _1, kStage)
+  auto tQSs = btma_qs.partition_D(sQS);  // (TMA, _1)
 
   TiledMmaQK tiled_mma_qk;
   TiledMmaPV tiled_mma_pv;
@@ -1180,9 +1179,9 @@ __global__ void __launch_bounds__(384, 1)
         // Load Q
         wait_barrier(writable_q, phase_q);
         cute::copy(tma_q.with(td_q, readable_q), tQg(_, itile_m, _, ihead_q), tQs(_, 0, _));
-        cute::copy(tma_qks.with(readable_q), tQKSg(_, itile_m, ihead_q, ibatch), tQKSs(_, 0));
+        cute::copy(tma_qs.with(readable_q), tQSg(_, itile_m, ihead_q, ibatch), tQSs(_, 0));
         set_barrier_transaction_bytes(
-            readable_q, sizeof(Tin) * cosize(SLayoutQ{}) + sizeof(float) * cosize(SLayoutQKS{}));
+            readable_q, sizeof(Tin) * cosize(SLayoutQ{}) + sizeof(float) * cosize(SLayoutQS{}));
         phase_q ^= 1;
 
         int num_tile_kv = (start_seq_q + (itile_m + 1) * kTileM + kTileN - 1) / kTileN;
@@ -1270,7 +1269,8 @@ __global__ void __launch_bounds__(384, 1)
     int phase = 0;
     int phase_q = 0;
 
-    float tQKS[kM];
+    float tQS[kM];
+    float kscale = kscale_ptr[0];
     float vscale = vscale_ptr[0];
 
     while (true) {
@@ -1303,7 +1303,7 @@ __global__ void __launch_bounds__(384, 1)
       auto tI_mn = retile_fragment(tI);
 #pragma unroll
       for (int im = 0; im < kM; im++) {
-        tQKS[im] = sQKS(get<0>(tI_mn(im, 0)));
+        tQS[im] = sQS(get<0>(tI_mn(im, 0))) * kscale;
       }
 
 #pragma unroll 1
@@ -1355,7 +1355,7 @@ __global__ void __launch_bounds__(384, 1)
 
         auto tYr_mn = retile_fragment(tYr);
         // online softmax
-        online_softmax_with_scale(tAttr_mn, gMax, gSum, tYr_mn, tQKS, kM, kN, one_over_dk_log2e);
+        online_softmax_with_scale(tAttr_mn, gMax, gSum, tYr_mn, tQS, kM, kN, one_over_dk_log2e);
 
         // convert P to fp8 and permute for pv gemm
         auto tAttr_float32x4 = recast<float4>(tAttr);
