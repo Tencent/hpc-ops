@@ -68,10 +68,10 @@ __device__ __forceinline__ bool get_task(const int* num_seq_kvcache_ptr, bool ne
   num_blocks_per_chunk = (num_seq_per_chunk + kBlockSize - 1) / kBlockSize;
 
   num_tile_kv = (num_seq_kv + kTileN - 1) / kTileN;
-  num_tile_full = (num_seq_kvcache + kTileN - 1) / kTileN;
+  num_tile_full = num_seq_kvcache / kTileN;
 
   if (is_last_chunk) {
-    num_tile_causal = num_tile_kv - num_tile_full + (num_seq_kvcache % kTileN != 0);
+    num_tile_causal = num_tile_kv - num_tile_full;
   } else {
     num_tile_causal = 0;
   }
@@ -426,7 +426,10 @@ __device__ __forceinline__ void final_online_softmax(TensorY& tYr_nm, TensorS& g
 #pragma unroll
   for (int im = 0; im < kM; ++im) {
     gSum(im) = warp_sum[im];
-    float one_over_gsum = rcpf_ftz(warp_sum[im]);
+    float one_over_gsum = 0;
+    if (warp_sum[im] != 0) {
+      one_over_gsum = rcpf_ftz(warp_sum[im]);
+    }
 #pragma unroll
     for (int in = 0; in < cute::size<0>(tYr_nm); ++in) {
       tYr_nm(in, im) = tYr_nm(in, im) * one_over_gsum;
