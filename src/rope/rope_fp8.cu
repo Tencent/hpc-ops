@@ -521,10 +521,10 @@ __global__ void apply_rotary_pos_emb_blocked_prefill_fp8_kernel(
   // KV cache layout: [cache_block_idx][pos_in_block][kv_head][head_dim]
   // [warning] : here we assume the cache block is allocated when the token is the first of this
   // new cache block
-  QType *k_cache_row_start = kcache_ptr + cache_block_idx * kcache_block_offset +
+  QType *k_cache_row_start = kcache_ptr + (int64_t)cache_block_idx * (int64_t)kcache_block_offset +
                              pos_in_block * (kNumKVHeads * kQKHeadDim);
-  QType *v_cache_row_start =
-      vcache_ptr + cache_block_idx * vcache_block_offset + pos_in_block * (kNumKVHeads * kVHeadDim);
+  QType *v_cache_row_start = vcache_ptr + (int64_t)cache_block_idx * (int64_t)vcache_block_offset +
+                             pos_in_block * (kNumKVHeads * kVHeadDim);
 
   DType *row_data = load_buffer[iwarp];
 
@@ -805,9 +805,11 @@ __global__ void apply_rotary_pos_emb_decoding_fp8_kernel(
           kv_block_indices_ptr[batch_id * max_num_kv_block_per_batch + block_idx_in_batch];
 
       // KV cache layout: [cache_block_idx][pos_in_block][kv_head][head_dim]
-      QType *k_cache_row_start = kcache_ptr + cache_block_idx * kcache_block_offset +
+      QType *k_cache_row_start = kcache_ptr +
+                                 (int64_t)cache_block_idx * (int64_t)kcache_block_offset +
                                  pos_in_block * (kNumKVHeads * kQKHeadDim);
-      QType *v_cache_row_start = vcache_ptr + cache_block_idx * vcache_block_offset +
+      QType *v_cache_row_start = vcache_ptr +
+                                 (int64_t)cache_block_idx * (int64_t)vcache_block_offset +
                                  pos_in_block * (kNumKVHeads * kVHeadDim);
 
       DType *row_data = load_buffer_qkv[iwarp];
@@ -1013,7 +1015,8 @@ __global__ void apply_rotary_pos_emb_decoding_fp8_kernel(
         // Zero K cache
         {
           constexpr int kNumElemPerRow = kNumKVHeads * kQKHeadDim;
-          QType *k_cache_block_start = kcache_ptr + cache_block_idx * kcache_block_offset;
+          QType *k_cache_block_start =
+              kcache_ptr + (int64_t)cache_block_idx * (int64_t)kcache_block_offset;
           // Start from row 1 (skip row 0 as it's being written by compute warps)
           for (int row = 1; row < kv_block_size_divider.divisor; ++row) {
             QType *k_row_pack_ptr = k_cache_block_start + row * kNumKVHeads * kQKHeadDim;
@@ -1027,7 +1030,8 @@ __global__ void apply_rotary_pos_emb_decoding_fp8_kernel(
         // Zero V cache
         {
           constexpr int kNumElemPerRow = kNumKVHeads * kVHeadDim;
-          QType *v_cache_block_start = vcache_ptr + cache_block_idx * vcache_block_offset;
+          QType *v_cache_block_start =
+              vcache_ptr + (int64_t)cache_block_idx * (int64_t)vcache_block_offset;
           // Start from row 1 (skip row 0 as it's being written by compute warps)
           for (int row = 1; row < kv_block_size_divider.divisor; ++row) {
             QType *v_row_pack_ptr = v_cache_block_start + row * kNumKVHeads * kVHeadDim;
