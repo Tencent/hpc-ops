@@ -4,7 +4,6 @@
 #include <stdio.h>
 
 #include <cub/cub.cuh>
-#include <iostream>
 #include "cute/tensor.hpp"
 #include "src/group_gemm/config.h"
 #include "src/group_gemm/group_gemm.h"
