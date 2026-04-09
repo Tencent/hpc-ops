@@ -1,5 +1,4 @@
 // Copyright (C) 2026 Tencent.
-
 #include <cuda.h>
 #include <stdio.h>
 

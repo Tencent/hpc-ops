@@ -142,6 +142,8 @@ __device__ __forceinline__ constexpr auto to(const vec_t<T, N> &v) {
       o[i] = __float22bfloat162_rn(*reinterpret_cast<const float2 *>(&v[2 * i]));
     }
     return o;
+  } else if constexpr (std::is_same_v<T, U>) {
+    return v;
   }
 }
 
@@ -303,6 +305,14 @@ __device__ __forceinline__ float rcpf_ftz(float x) {
   return r;
 }
 
+// y = 1 / (1 + e^(-x))
+__device__ __forceinline__ float sigmoid(float x) { return rcpf_ftz(1.f + expf_ftz(-x)); }
+__device__ __forceinline__ float sqrt_ftz(float x) {
+  float r;
+  asm volatile("sqrt.approx.ftz.f32 %0, %1;\n" : "=f"(r) : "f"(x));
+  return r;
+}
+
 // y = max(0, x)
 __device__ __forceinline__ float relu(float x) { return fmaxf(0, x); }
 
@@ -404,10 +414,10 @@ __device__ __forceinline__ constexpr auto retile_fragment(Tensor &&tensor) {
   using namespace cute;  // NOLINT
 
   constexpr int R = decltype(tensor.layout())::rank;
-  static_assert(R == 3, "we only support rank 3 fragment");
+  static_assert(R >= 3, "rank must geater than or equal to 3");
 
-  auto thr_vmk = flatten(select<0>(tensor.layout()));
-  auto tile_mk = select<1, 2>(tensor.layout());
+  auto thr_vmk = append<3>(flatten(select<0>(tensor.layout())));
+  auto tile_mk = take<1, R>(tensor.layout());
 
   auto m_layout =
       coalesce(make_layout(make_shape(get<1>(thr_vmk.shape()), get<0>(tile_mk.shape())),
@@ -416,7 +426,14 @@ __device__ __forceinline__ constexpr auto retile_fragment(Tensor &&tensor) {
       make_shape(get<0>(thr_vmk.shape()), get<2>(thr_vmk.shape()), get<1>(tile_mk.shape())),
       make_stride(get<0>(thr_vmk.stride()), get<2>(thr_vmk.stride()), get<1>(tile_mk.stride()))));
 
-  return make_tensor(static_cast<Tensor &&>(tensor).data(), make_layout(m_layout, k_layout));
+  if constexpr (R == Int<3>{}) {
+    return make_tensor(static_cast<Tensor &&>(tensor).data(), make_layout(m_layout, k_layout));
+  } else {
+    auto r_layout = take<3, R>(make_layout(tensor.shape(), tensor.stride()));
+    auto mkr_layout = make_layout(m_layout, k_layout, r_layout);
+    auto t = make_tensor(static_cast<Tensor &&>(tensor).data(), mkr_layout);
+    return t(_, _, repeat<R - Int<3>{}>(_));
+  }
 }
 
 // STensor shape is (M, N) and row major
@@ -574,5 +591,23 @@ __device__ __forceinline__ void bar_sync(int barrier_id) {
   asm volatile("barrier.cta.sync %0, %1;\n" ::"r"(barrier_id), "n"(N) : "memory");
 }
 }  // namespace hpc
+
+namespace cute {
+
+template <class... Args, class ThrLayout, class ValLayout, class Tiler>
+CUTE_HOST_DEVICE auto make_tiled_copy(Copy_Atom<Args...> const &copy_atom,
+                                      ThrLayout const &thr_layout, ValLayout const &val_layout,
+                                      Tiler const &tiler) {
+  // Take the raked_products to compute the Layout_MN
+  // (M,N) -> (thr_idx, val_idx)
+  auto layout_mn = raked_product(thr_layout, val_layout);
+  // (thr_idx, val_idx) -> (M,N)
+  auto layout_tv =
+      right_inverse(layout_mn).with_shape(make_shape(size(thr_layout), size(val_layout)));
+
+  return make_tiled_copy_impl(copy_atom, layout_tv, tiler);
+}
+
+}  // namespace cute
 
 #endif  // SRC_UTILS_UTILS_CUH_

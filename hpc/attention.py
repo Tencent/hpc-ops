@@ -209,8 +209,10 @@ def attention_decode_bf16(
     vcache: Tensor,
     block_ids: Tensor,
     num_seq_kvcache: Tensor,
+    mtp: int = 0,
     new_kv_included: bool = False,
     splitk: bool = True,
+    split_flag: Tensor = None,
     output: Tensor = None,
 ) -> Tensor:
     """Computes attention decode using bfloat16 precision.
@@ -236,6 +238,9 @@ def attention_decode_bf16(
         num_seq_kvcache: number tokens in kvcache before cur iteration.
             Shape: [num_batch]
             Dtype: int32
+        mtp: number draft tokens.
+            Shape: scalar
+            Dtype: int32
         new_kv_included: the seqlen in num_seq_kvcache include new kv or not.
             Shape: scalar
             Dtype: bool
@@ -259,7 +264,16 @@ def attention_decode_bf16(
         - The batch size (num_batch) must be consistent across all input tensors
     """
     return torch.ops.hpc.attention_decode_bf16(
-        q, kcache, vcache, block_ids, num_seq_kvcache, new_kv_included, splitk, output
+        q,
+        kcache,
+        vcache,
+        block_ids,
+        num_seq_kvcache,
+        mtp,
+        new_kv_included,
+        splitk,
+        split_flag,
+        output,
     )
 
 
@@ -272,6 +286,7 @@ def attention_decode_fp8(
     qscale: Tensor,
     kscale: Tensor,
     vscale: Tensor,
+    mtp: int = 0,
     new_kv_included: bool = False,
     splitk: bool = True,
     split_flag: Tensor = None,
@@ -341,6 +356,7 @@ def attention_decode_fp8(
         qscale,
         kscale,
         vscale,
+        mtp,
         new_kv_included,
         splitk,
         split_flag,
