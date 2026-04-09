@@ -186,7 +186,7 @@ def test_attention_decode_fp8(
         v_scale,
         new_kv_included=new_kv_included,
         splitk=splitk,
-        mtp=num_seq_q-1,
+        mtp=num_seq_q - 1,
     )
 
     assert allclose(my, gt, atol=0.1)
