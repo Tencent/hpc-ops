@@ -20,7 +20,7 @@ template <int kNumWarpsPerCTA, int kElementsPerThread, int TM, int TN>
 __global__ void reformat_x_scale_kernel(float *output_ptr, const float *xscale_ptr,
                                         const int *seqlens_ptr, const int *cu_seqlens_ptr,
                                         int num_group, int m, int n, int tilem) {
-  __shared__ float shm_tile[TM][33];  // manual swizze for avoid bank conflict
+  __shared__ float shm_tile[TM][33];  // manual swizzle for avoid bank conflict
 
   int iblock = blockIdx.x;
   int idx = threadIdx.x;
@@ -60,36 +60,36 @@ __global__ void reformat_x_scale_kernel(float *output_ptr, const float *xscale_p
   int src_row_bound = src_global_row + valid_seq_num;
   int dst_col_bound = dst_global_col + valid_seq_num;
 
-#pragma unroll 1
   for (int i = 0; i < valid_seq_num; i += TM) {
-    // global memory(read row) -> shared memory(store row)
-    if (src_row < src_row_bound) {
-      // Because it reads 4 floats at a time, when the number of valid elements is
-      // not divisible by 4, it will read extra invalid elements.
-      auto r = load<float, kElementsPerThread>(xscale_ptr + src_row * n + src_col);
+    for (int j = 0; j < n; j += TN) {
+      // global memory(read row) -> shared memory(store row)
+      if ((src_row + i) < src_row_bound && (src_col + j) < n) {
+        // Because it reads 4 floats at a time, when the number of valid elements is
+        // not divisible by 4, it will read extra invalid elements.
+        auto r = load<float, kElementsPerThread>(xscale_ptr + (src_row + i) * n + (src_col + j));
 #pragma unroll
-      for (int j = 0; j < kElementsPerThread; ++j) {
-        shm_tile[src_local_row][src_local_col + j] = r[j];
+        for (int k = 0; k < kElementsPerThread; ++k) {
+          shm_tile[src_local_row][src_local_col + k] = r[k];
+        }
       }
-    }
-    src_row += TM;
+      __syncthreads();
 
-    __syncthreads();
-
-    // shared memory(read column) -> global memory(store row)
-    if (dst_col < dst_col_bound) {
-      vec_t<float, kElementsPerThread> r;
+      // shared memory(read column) -> global memory(store row)
+      if ((dst_col + i) < dst_col_bound && (dst_row + j) < n) {
+        vec_t<float, kElementsPerThread> r;
 #pragma unroll
-      for (int j = 0; j < kElementsPerThread; ++j) {
-        r[j] = shm_tile[dst_local_col + j][dst_local_row];
+        for (int k = 0; k < kElementsPerThread; ++k) {
+          r[k] = shm_tile[dst_local_col + k][dst_local_row];
+        }
+        // Because it write 4 floats at a time, when the number of valid elements is
+        // not divisible by 4, it will write extra invalid elements.
+        // However, this doesn't matter, because the extra invalid elements will not
+        // be used by the downstream group GEMM operation.
+        store(output_ptr + (dst_row + j) * m + (dst_col + i), r);
       }
-      // Because it write 4 floats at a time, when the number of valid elements is
-      // not divisible by 4, it will write extra invalid elements.
-      // However, this doesn't matter, because the extra invalid elements will not
-      // be used by the downstream group GEMM operation.
-      store(output_ptr + dst_row * m + dst_col, r);
+
+      __syncthreads();
     }
-    dst_col += TM;
   }
 }
 
@@ -466,7 +466,7 @@ void reformat_x_scale_async(void *output_ptr, const void *xscale_ptr, const void
             reinterpret_cast<float *>(output_ptr), reinterpret_cast<const float *>(xscale_ptr),
             reinterpret_cast<const int *>(seqlens_ptr),
             reinterpret_cast<const int *>(cu_seqlens_ptr), num_group, m, n, tilem);
-  } else {  // n == 32
+  } else {  // n == 32 or n == 56
     dim3 block(256);
     // This is a temporary implementation
     // When seqlens[i] is large, maybe be unblance

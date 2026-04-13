@@ -183,22 +183,27 @@ torch::Tensor reformat_x_scale_entry(const torch::Tensor &x_scale, const torch::
 
   int m = x_scale.size(0);
   int n = x_scale.size(1);
-  TORCH_CHECK(n == 16 || n == 32, "n must be 16 or 32(for dsv4 group gemm k=2048 or 4096)");
+  TORCH_CHECK(n == 16 || n == 32 || n == 56,
+              "n must be 16, 32 or 56(for group gemm k=2048, k=4096 or k=7168)");
 
   int num_group = seqlens.size(0);
   int tilem = 0;
   // careful!!! here logit must be corresponds with group_gemm_blockwise_fp8_async
-  if (num_seq_per_group_avg <= 16) {
+  if (num_seq_per_group_avg <= 8) {
+    tilem = 8;
+  } else if (num_seq_per_group_avg <= 16) {
     tilem = 16;
   } else if (num_seq_per_group_avg <= 32) {
     tilem = 32;
+  } else if (num_seq_per_group_avg <= 48) {
+    tilem = 48;
   } else {
     tilem = 64;
   }
   int num_seq_pad_per_group = m / num_group;
   TORCH_CHECK(num_seq_pad_per_group % tilem == 0,
               "The sparse pad length of x_scale for each group must be aligned to multiple of "
-              "16/32/64 according to num_seq_per_group_avg");
+              "8/16/32/48/64 according to num_seq_per_group_avg");
 
   torch::Tensor output;
   if (out_x_scale.has_value()) {

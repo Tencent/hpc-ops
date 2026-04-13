@@ -128,9 +128,9 @@ def test_group_gemm1(num_group, actual_m, n, k, use_task_map):
 
 @pytest.mark.skipif(os.getenv("NV_SANITIZER_INJECTION_PORT_BASE"), reason="skip sanitizer")
 @pytest.mark.parametrize("num_group", [256])
-@pytest.mark.parametrize("actual_m", [30])
-@pytest.mark.parametrize("m", [1280])
-@pytest.mark.parametrize("k", [4096])
+@pytest.mark.parametrize("actual_m", [1, 10, 25, 47, 50])
+@pytest.mark.parametrize("m", [768])
+@pytest.mark.parametrize("k", [2048, 4096, 7168])
 def test_reformat_x_scale(num_group, actual_m, m, k):
     total_seq_pad = m * num_group
     xscale = torch.rand((total_seq_pad, k // 128), dtype=torch.float, device="cuda")
@@ -152,10 +152,14 @@ def test_reformat_x_scale(num_group, actual_m, m, k):
     mean_seq = int(total_seq / num_group)
 
     def get_tilem(avg_bs):
-        if avg_bs <= 16:
+        if avg_bs <= 8:
+            return 8
+        elif avg_bs <= 16:
             return 16
         elif avg_bs <= 32:
             return 32
+        elif avg_bs <= 48:
+            return 48
         else:
             return 64
 
@@ -217,11 +221,11 @@ def naive_deepep_input_format_group_gemm(x, w, seqlens, cu_seqlens, xscale, wsca
 
 
 @pytest.mark.skipif(os.getenv("NV_SANITIZER_INJECTION_PORT_BASE"), reason="skip sanitizer")
-@pytest.mark.parametrize("num_group", [256])
-@pytest.mark.parametrize("actual_m", [30])
-@pytest.mark.parametrize("m", [1280])
+@pytest.mark.parametrize("num_group", [16])
+@pytest.mark.parametrize("actual_m", [1, 10, 25, 47, 50])
+@pytest.mark.parametrize("m", [768])
 @pytest.mark.parametrize("n", [4096])
-@pytest.mark.parametrize("k", [4096])
+@pytest.mark.parametrize("k", [2048, 4096, 7168])
 def test_deepep_input_fromat_group_gemm1(num_group, actual_m, m, n, k):
     torch.cuda.manual_seed(10086)
     dtype = torch.float8_e4m3fn
