@@ -229,10 +229,10 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
 
   int num_sm = get_sm_count();
   constexpr int kTileN = 128;
-  int num_gateup_tiles =
-      ((num_seq + aligned_size - 1) / aligned_size) * (intermediate_size / kTileN) * num_expert;
-  int num_down_tiles =
-      ((num_seq + aligned_size - 1) / aligned_size) * (hidden_size / kTileN) * num_expert;
+  int num_gateup_tiles = ((num_seq + aligned_size - 1) / aligned_size) *
+                         ((intermediate_size + kTileN - 1) / kTileN) * num_expert;
+  int num_down_tiles = ((num_seq + aligned_size - 1) / aligned_size) *
+                       ((hidden_size + kTileN - 1) / kTileN) * num_expert;
   int num_gateup_waves = (num_gateup_tiles + num_sm - 1) / num_sm + 1;
   int num_down_waves = (num_down_tiles + num_sm - 1) / num_sm + 1;
   torch::Tensor gateup_task_map;
@@ -412,10 +412,11 @@ torch::Tensor fuse_moe_blockwise_entry(
   torch::Tensor cu_tiles = torch::empty({num_experts + 1}, options.dtype(torch::kInt32));
 
   int num_sm = get_sm_count();
-  int num_gateup_tiles =
-      ((num_tokens + aligned_size - 1) / aligned_size) * (intermediate_size / 128) * num_experts;
-  int num_down_tiles =
-      ((num_tokens + aligned_size - 1) / aligned_size) * (hidden_size / 128) * num_experts;
+  constexpr int kTileN = 128;
+  int num_gateup_tiles = ((num_tokens + aligned_size - 1) / aligned_size) *
+                         ((intermediate_size + kTileN - 1) / kTileN) * num_experts;
+  int num_down_tiles = ((num_tokens + aligned_size - 1) / aligned_size) *
+                       ((hidden_size + kTileN - 1) / kTileN) * num_experts;
   int num_gateup_waves = (num_gateup_tiles + num_sm - 1) / num_sm + 1;
   int num_down_waves = (num_down_tiles + num_sm - 1) / num_sm + 1;
   torch::Tensor gateup_task_map;

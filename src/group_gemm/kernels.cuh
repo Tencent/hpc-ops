@@ -111,7 +111,7 @@ __global__ void update_grouped_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
         __syncthreads();
 
         constexpr int kTileN = 128;
-        int num_tile_n = n / kTileN;
+        int num_tile_n = (n + kTileN - 1) / kTileN;
 
         int cu_tile_m = shm_cu_tiles[ilocal];
         int num_tile_m = (seqlens_ptr[igroup] + kTileM - 1) / kTileM;
@@ -295,7 +295,7 @@ __global__ void __launch_bounds__(384, 1)
   if constexpr (kTaskLoopPolicy == 0) {
     int warp_count = blockDim.x / 32;
     int iwarp_block = blockIdx.x + gridDim.x * iwarp;
-    actual_tiles = cu_tiles_ptr[num_group] * (n / kTileN) + gridDim.x;
+    actual_tiles = cu_tiles_ptr[num_group] * ((n + kTileN - 1) / kTileN) + gridDim.x;
     int iwave = 0;
     while (iwarp_block < actual_tiles) {
       int4 task = task_map_ptr[iwarp_block];
@@ -641,7 +641,7 @@ __global__ void __launch_bounds__(384, 1)
   if constexpr (kTaskLoopPolicy == 0) {
     int warp_count = blockDim.x / 32;
     int iwarp_block = blockIdx.x + gridDim.x * iwarp;
-    actual_tiles = cu_tiles_ptr[num_group] * (n / kTileN) + gridDim.x;
+    actual_tiles = cu_tiles_ptr[num_group] * ((n + kTileN - 1) / kTileN) + gridDim.x;
     int iwave = 0;
     while (iwarp_block < actual_tiles) {
       int4 task = task_map_ptr[iwarp_block];

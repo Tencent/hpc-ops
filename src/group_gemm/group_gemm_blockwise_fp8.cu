@@ -110,8 +110,8 @@ void launch_group_gemm_blockwise_fp8(void *y_ptr, const void *x_ptr, const void 
   using Tout = cute::bfloat16_t;
   using TS = float;
 
-  int num_block_k = k / kTileK;
-  int num_block_n = n / kTileN;
+  int num_block_k = (k + kTileK - 1) / kTileK;
+  int num_block_n = (n + kTileN - 1) / kTileN;
 
   auto X = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x_ptr)), make_shape(m, k),
                        make_stride(k, Int<1>{}));

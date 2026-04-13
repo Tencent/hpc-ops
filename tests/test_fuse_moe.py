@@ -154,7 +154,7 @@ def naive_fuse_moe_pertensor_fp8(
 @pytest.mark.parametrize("num_seq", [128])
 @pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("hidden_size", [512])
-@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("intermediate_size", [512, 96])
 @pytest.mark.parametrize("num_expert", [128])
 @pytest.mark.parametrize("rank_ep", [0, 1])
 @pytest.mark.parametrize("size_ep", [1, 4, 8])

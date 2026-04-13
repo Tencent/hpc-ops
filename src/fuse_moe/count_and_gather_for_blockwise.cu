@@ -309,7 +309,7 @@ __global__ void blockwise_gather_kernel(
           constexpr int kTileN = 128;
           int num_group = gridDim.x - num_block_for_copy;
           int igroup = iblock - num_block_for_copy;
-          int num_tile_n = intermediate_size / kTileN;
+          int num_tile_n = (intermediate_size + kTileN - 1) / kTileN;
           int cu_tile_m = cu_tiles_ptr[igroup];
           int num_tile_m = cu_tiles_ptr[igroup + 1] - cu_tile_m;
           int cu_tiles = cu_tile_m * num_tile_n;
@@ -341,7 +341,7 @@ __global__ void blockwise_gather_kernel(
           constexpr int kTileN = 128;
           int num_group = gridDim.x - num_block_for_copy;
           int igroup = iblock - num_block_for_copy;
-          int num_tile_n = hidden_size / kTileN;
+          int num_tile_n = (hidden_size + kTileN - 1) / kTileN;
           int cu_tile_m = cu_tiles_ptr[igroup];
           int num_tile_m = cu_tiles_ptr[igroup + 1] - cu_tile_m;
           int cu_tiles = cu_tile_m * num_tile_n;
