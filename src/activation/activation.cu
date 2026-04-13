@@ -64,6 +64,46 @@ __global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr, const __nv_bflo
   }
 }
 
+__global__ void act_mul_bf16_kernel(__nv_bfloat16 *out_ptr, const __nv_bfloat16 *gate_up_ptr,
+                                    const int *valid_row_range, const int num_row,
+                                    const int num_col, cutlass::FastDivmod block1D22D) {
+  int iblockx;
+  int iblocky;
+
+  block1D22D(iblocky, iblockx, blockIdx.x);
+  int it = threadIdx.x + iblockx * blockDim.x;
+
+  int irow = iblocky;
+  int my_valid_row_end_exclusive = valid_row_range ? valid_row_range[0] : num_row;
+  if (irow >= my_valid_row_end_exclusive) {
+    return;
+  }
+
+  using T = __nv_bfloat162;
+
+  const auto *gate_row_ptr = gate_up_ptr + irow * num_col * 2;
+  const auto *up_row_ptr = gate_row_ptr + num_col;
+  auto *out_row_ptr = out_ptr + irow * num_col;
+
+  int icol = it * 8;
+
+  if (icol < num_col) {
+    auto gate = to<float>(load<T, 4>(gate_row_ptr + icol));
+    auto up = to<float>(load<T, 4>(up_row_ptr + icol));
+
+    vec_t<__nv_bfloat16, 8> out;
+#pragma unroll
+    for (int i = 0; i < size(out); ++i) {
+      auto g = gate[i];
+      auto u = up[i];
+      auto result = silu(g) * u;
+      out[i] = __float2bfloat16_rn(result);
+    }
+
+    store(out_row_ptr + icol, out);
+  }
+}
+
 // input : gate + up
 __global__ void masked_act_mul_and_quant_kernel(
     __nv_fp8_e4m3 *output_ptr, const __nv_bfloat16 *input_ptr, const float *scale_ptr,
@@ -389,6 +429,18 @@ void masked_act_mul_and_blockwise_quant_async(__nv_fp8_e4m3 *output_ptr, float *
       output_ptr, output_scale_ptr, input_ptr, num_per_expert_ptr, num_total_tokens,
       num_intermediate_size, num_intermediate_size / 128, num_tokens_per_expert, Block2YX,
       Row2EandT, num_block_row);
+}
+
+void act_mul_bf16_async(__nv_bfloat16 *y_ptr, const __nv_bfloat16 *x_ptr,
+                        const int *valid_row_range, const int num_row, const int num_col,
+                        cudaStream_t stream) {
+  dim3 block(256);
+  int num_block_per_row = (num_col / 8 + block.x - 1) / block.x;
+  cutlass::FastDivmod block1D22D(num_block_per_row);
+  dim3 grid(num_row * num_block_per_row);
+
+  kernels::act_mul_bf16_kernel<<<grid, block, 0, stream>>>(
+      y_ptr, x_ptr, valid_row_range, num_row, num_col, block1D22D);
 }
 
 }  // namespace activation

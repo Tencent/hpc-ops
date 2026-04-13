@@ -291,6 +291,74 @@ def fuse_moe_blockwise_fp8(
     )
 
 
+def fuse_moe_bf16(
+    x: Tensor,
+    gate_up_weight: Tensor,
+    down_weight: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    rank_ep: int,
+    num_expert_total: int,
+    shared_output: Tensor = None,
+) -> Tensor:
+    """Performs Mixture of Experts (MoE) forward operation with BF16 precision.
+
+    This function executes the MoE computation with all matrix multiplications
+    performed in BF16 precision. The gate and up projections are fused into
+    a single matrix multiplication.
+
+    Args:
+        x: Input activation tensor
+            Shape: [num_seq, hidden_size]
+            Dtype: bfloat16
+        gate_up_weight: Combined weight tensor for gate and up projections
+            Shape: [num_expert_local, intermediate_size * 2, hidden_size]
+            Dtype: bfloat16
+        down_weight: Weight tensor for down projection
+            Shape: [num_expert_local, hidden_size, intermediate_size]
+            Dtype: bfloat16
+        topk_ids: Token indices assigned to each expert
+            Shape: [num_seq, num_topk]
+            Dtype: int32
+        topk_scale: Weighting factors for each token-expert assignment
+            Shape: [num_seq, num_topk]
+            Dtype: float32
+        rank_ep: Expert parallel rank (for distributed training)
+            Dtype: int32
+        num_expert_total: the total number of expert
+            Dtype: int32
+        shared_output: output for shared experts, default is None
+            Shape: [num_seq, hidden_size]
+            Dtype: bfloat16
+
+    Returns:
+        torch.Tensor: Output tensor after MoE computation
+            Shape: [num_seq, hidden_size]
+            Dtype: bfloat16
+
+    Raises:
+        RuntimeError: If the input tensors have incompatible shapes or types,
+            or if CUDA kernel execution fails.
+
+    Note:
+        - All input tensors must be on CUDA device
+        - The gate and up projections are combined into a single matrix multiplication
+        - BF16 precision is used for all matrix operations
+        - Activation function used is SiLU (Swish)
+        - Token routing is determined by topk_ids and weighted by topk_scale
+    """
+    return torch.ops.hpc.fuse_moe_bf16(
+        x,
+        gate_up_weight,
+        down_weight,
+        topk_ids,
+        topk_scale,
+        shared_output,
+        rank_ep,
+        num_expert_total,
+    )
+
+
 @torch.library.register_fake("hpc::count_and_gather")
 def count_and_gather_fake(
     x, topk_ids, num_expert, rank_ep, intermediate_size, num_seq_per_group_avg
@@ -344,5 +412,19 @@ def fuse_moe_blockwise_fp8_fake(
     rank_ep: int,
     num_expert_total: int,
     use_bf16_mul: bool = True,
+):
+    return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+
+
+@torch.library.register_fake("hpc::fuse_moe_bf16")
+def fuse_moe_bf16_fake(
+    x: Tensor,
+    gate_up_weight: Tensor,
+    down_weight: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    shared_output: Tensor,
+    rank_ep: int,
+    num_expert_total: int,
 ):
     return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
