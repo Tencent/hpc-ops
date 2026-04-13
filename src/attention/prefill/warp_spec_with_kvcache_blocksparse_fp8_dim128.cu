@@ -8,7 +8,7 @@
 #include "cute/tensor.hpp"
 #include "src/attention/prefill/config.h"
 #include "src/attention/prefill/kernels.cuh"
-#include "src/attention/prefill/warp_spec_with_kvcache_fp8_dim128.h"
+#include "src/attention/prefill/warp_spec_with_kvcache_blocksparse_fp8_dim128.h"
 #include "src/utils/tma.cuh"
 #include "src/utils/utils.cuh"
 
@@ -16,15 +16,15 @@ namespace hpc {
 namespace attention {
 namespace prefill {
 
-template <int kBlockSize>
-void launch_warp_spec_with_kvcache_fp8_dim128(
+template <int kBlockSize, bool kHasMask>
+void launch_warp_spec_with_kvcache_blocksparse_fp8_dim128(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
     void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
     int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV,
-    cudaStream_t stream) {
+    const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   using Tin = cute::float_e4m3_t;
@@ -70,7 +70,7 @@ void launch_warp_spec_with_kvcache_fp8_dim128(
                                        num_dim_qk, num_dim_v, num_head_q, ldQ, ldY);
   }
 
-  // 1. compute attention
+  // 1. compute block-sparse attention
   {
     int kv_group = num_head_q / num_head_kv;
     cutlass::FastDivmod head_kv_divmod(kv_group);
@@ -79,44 +79,70 @@ void launch_warp_spec_with_kvcache_fp8_dim128(
 
     int shm_size = config.get_shm_size();
     shm_size += sizeof(int) * num_batch * 3;
+    if constexpr (kHasMask) {
+      shm_size += (num_tile_kv_in_mask + 2) * sizeof(int);
+      shm_size = (shm_size + 15) & ~15;
+    }
 
     dim3 block(384);
     dim3 grid(get_sm_count());
-    auto kernel = kernels::attention_with_kvcache_prefill_fp8_warp_specialization_kernel<
-        decltype(config), decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y),
-        decltype(tma_qs)>;
+    auto kernel =
+        kernels::attention_with_kvcache_blocksparse_prefill_fp8_warp_specialization_kernel<
+            decltype(config), decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y),
+            decltype(tma_qs), kHasMask>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     kernel<<<grid, block, shm_size, stream>>>(
-        tma_qy, tma_k, tma_v, tma_qs, (const float *)qscale_ptr, (const float *)kscale_ptr,
-        (const float *)vscale_ptr, (const int *)cu_seqlens_q_ptr, (const int *)seqlens_kvcache_ptr,
-        (const int *)block_ids_ptr, num_batch, max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v,
-        num_head_q, num_head_kv, num_kvcache_blocks, block_size, num_seq_max_blocks,
-        one_over_dk_log2e, head_kv_divmod, head_q_divmod, tile_m_divmod);
+        tma_qy, tma_k, tma_v, tma_qs, (const float *)kscale_ptr, (const float *)vscale_ptr,
+        (const int *)cu_seqlens_q_ptr, (const int *)seqlens_kvcache_ptr, (const int *)block_ids_ptr,
+        num_batch, max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+        num_kvcache_blocks, num_seq_max_blocks, one_over_dk_log2e, head_kv_divmod, head_q_divmod,
+        tile_m_divmod, (const uint8_t *)block_mask_ptr, num_tile_kv_in_mask);
   }
 }
 
-void warp_spec_with_kvcache_fp8_dim128_async(
+void warp_spec_with_kvcache_blocksparse_fp8_dim128_async(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
     void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
     int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV,
-    cudaStream_t stream) {
+    const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream) {
+  bool has_mask = block_mask_ptr != nullptr;
   if (block_size == 32) {
     constexpr int kBlockSize = 32;
-    launch_warp_spec_with_kvcache_fp8_dim128<kBlockSize>(
-        y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
-        block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
-        max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
-        block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+    if (has_mask) {
+      launch_warp_spec_with_kvcache_blocksparse_fp8_dim128<kBlockSize, true>(
+          y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+          cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+          max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+          num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, block_mask_ptr,
+          num_tile_kv_in_mask, stream);
+    } else {
+      launch_warp_spec_with_kvcache_blocksparse_fp8_dim128<kBlockSize, false>(
+          y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+          cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+          max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+          num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, nullptr, 0,
+          stream);
+    }
   } else if (block_size == 64) {
     constexpr int kBlockSize = 64;
-    launch_warp_spec_with_kvcache_fp8_dim128<kBlockSize>(
-        y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
-        block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
-        max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
-        block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+    if (has_mask) {
+      launch_warp_spec_with_kvcache_blocksparse_fp8_dim128<kBlockSize, true>(
+          y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+          cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+          max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+          num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, block_mask_ptr,
+          num_tile_kv_in_mask, stream);
+    } else {
+      launch_warp_spec_with_kvcache_blocksparse_fp8_dim128<kBlockSize, false>(
+          y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+          cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+          max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+          num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, nullptr, 0,
+          stream);
+    }
   }
 }
 

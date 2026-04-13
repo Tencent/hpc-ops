@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 from torch import Tensor
 
@@ -204,6 +206,66 @@ def attention_with_kvcache_prefill_fp8(
         block_ids,
         seqlens_kvcache,
         max_seqlens_q,
+        output,
+    )
+
+
+def attention_with_kvcache_blocksparse_prefill_fp8(
+    q: Tensor,
+    kcache: Tensor,
+    vcache: Tensor,
+    qscale: Tensor,
+    kscale: Tensor,
+    vscale: Tensor,
+    cu_seqlens_q: Tensor,
+    block_ids: Tensor,
+    seqlens_kvcache: Tensor,
+    max_seqlens_q: int,
+    block_mask: Optional[Tensor] = None,
+    output: Tensor = None,
+) -> Tensor:
+    """Unified dense / block-sparse attention prefill with paged FP8 KV cache.
+
+    When `block_mask` is None, this dispatches to the dense-compatible
+    `kHasMask=False` path inside the unified kernel family.
+    When provided, only KV tiles marked True in `block_mask` are computed.
+
+    Recommendation: the causal diagonal tile (the last KV tile in each
+    Q-tile's causal range) should be True in block_mask to avoid NaN.
+    The kernel guarantees no deadlock regardless of mask content, but if
+    any Q-tile has zero active tiles, softmax(all -inf) will produce NaN.
+
+    Args:
+        q: Query tensor. Shape: [total_seq, num_head_q, num_dim_qk], Dtype: fp8_e4m3
+        kcache: Paged K cache. Shape: [num_blocks, block_size, num_head_kv, num_dim_qk], Dtype: fp8
+        vcache: Paged V cache. Shape: [num_blocks, block_size, num_head_kv, num_dim_v], Dtype: fp8
+        qscale: Per-token per-head Q dequant scale. Shape: [num_batch, num_head_q, max_seq_q_pad],
+            Dtype: float32
+        kscale: Per-tensor K dequant scale. Shape: [1], Dtype: float32
+        vscale: Per-tensor V dequant scale. Shape: [1], Dtype: float32
+        cu_seqlens_q: Cumulative Q lengths. Shape: [num_batch + 1], Dtype: int32
+        block_ids: Page table. Shape: [num_batch, max_blocks], Dtype: int32
+        seqlens_kvcache: KV cache lengths. Shape: [num_batch], Dtype: int32
+        max_seqlens_q: Max Q sequence length (scalar).
+        block_mask: Optional bool mask for KV tiles. True = compute, False = skip.
+            Shape: [num_batch, num_head_q, max_tile_m, num_tile_kv_in_mask], Dtype: uint8.
+        output: Optional pre-allocated output tensor.
+
+    Returns:
+        Tensor: Shape [total_seq, num_head_q, num_dim_v], Dtype: bfloat16.
+    """
+    return torch.ops.hpc.attention_with_kvcache_blocksparse_prefill_fp8(
+        q,
+        kcache,
+        vcache,
+        qscale,
+        kscale,
+        vscale,
+        cu_seqlens_q,
+        block_ids,
+        seqlens_kvcache,
+        max_seqlens_q,
+        block_mask,
         output,
     )
 
@@ -505,6 +567,64 @@ def sparse_mla_with_kvcache_bf16(
     )
 
 
+def attention_blocksparse_prefill_fp8(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_kv: Tensor,
+    max_seqlens_q: int,
+    max_seqlens_kv: int,
+    q_scale: Tensor,
+    k_scale: Tensor,
+    v_scale: Tensor,
+    softmax_scale: Optional[float] = None,
+    block_mask: Optional[Tensor] = None,
+    output: Tensor = None,
+) -> Tensor:
+    """Unified dense / block-sparse attention prefill with FP8 varlen QKV.
+
+    Supports MLA dim_qk=192, dim_v=128. When `block_mask` is None, dispatches
+    to the dense-compatible `kHasMask=False` path. When provided, only KV tiles
+    marked True in `block_mask` are computed.
+
+    Args:
+        q: Query tensor. Shape: [total_q, num_head_q, dim_qk], Dtype: fp8_e4m3
+        k: Key tensor. Shape: [total_kv, num_head_kv, dim_qk], Dtype: fp8_e4m3
+        v: Value tensor. Shape: [total_kv, num_head_kv, dim_v], Dtype: fp8_e4m3
+        cu_seqlens_q: Cumulative Q lengths. Shape: [B+1], Dtype: int32
+        cu_seqlens_kv: Cumulative KV lengths. Shape: [B+1], Dtype: int32
+        max_seqlens_q: Max Q sequence length (scalar).
+        max_seqlens_kv: Max KV sequence length (scalar).
+        q_scale: Per-tensor Q dequant scale. Shape: [1], Dtype: float32.
+        k_scale: Per-tensor K dequant scale. Shape: [1], Dtype: float32.
+        v_scale: Per-tensor V dequant scale. Shape: [1], Dtype: float32.
+        softmax_scale: Attention scale factor. Default: dim_qk ** -0.5.
+        block_mask: Optional sparse mask. Shape: [B, H_q, Qb, Kb], Dtype: uint8.
+        output: Optional pre-allocated output tensor.
+
+    Returns:
+        Tensor: Shape [total_q, num_head_q, dim_v], Dtype: bfloat16.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    return torch.ops.hpc.attention_blocksparse_prefill_fp8(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        max_seqlens_q,
+        max_seqlens_kv,
+        block_mask,
+        q_scale,
+        k_scale,
+        v_scale,
+        softmax_scale,
+        output,
+    )
+
+
 def mla_prefill_bf16(
     q: Tensor,
     kv: Tensor,
@@ -522,14 +642,16 @@ def mla_prefill_bf16(
 
 @torch.library.register_fake("hpc::attention_prefill_bf16")
 def attention_prefill_bf16_fake(q, k, v, seqlens_q, cu_seqlens_q, max_seqlens_q, output):
-    return torch.empty_like(q)
+    return torch.empty((q.size(0), q.size(1), v.size(-1)), dtype=torch.bfloat16, device=q.device)
 
 
 @torch.library.register_fake("hpc::attention_with_kvcache_prefill_bf16")
 def attention_with_kvcache_prefill_bf16_fake(
     q, kcache, vcache, cu_seqlens_q, block_ids, seqlens_kvcache, max_seqlens_q, output
 ):
-    return torch.empty_like(q)
+    return torch.empty(
+        (q.size(0), q.size(1), vcache.size(-1)), dtype=torch.bfloat16, device=q.device
+    )
 
 
 @torch.library.register_fake("hpc::attention_with_kvcache_prefill_fp8")
@@ -546,7 +668,48 @@ def attention_with_kvcache_prefill_fp8_fake(
     max_seqlens_q,
     output,
 ):
-    return torch.empty_like(q)
+    return torch.empty(
+        (q.size(0), q.size(1), vcache.size(-1)), dtype=torch.bfloat16, device=q.device
+    )
+
+
+@torch.library.register_fake("hpc::attention_with_kvcache_blocksparse_prefill_fp8")
+def attention_with_kvcache_blocksparse_prefill_fp8_fake(
+    q,
+    kcache,
+    vcache,
+    qscale,
+    kscale,
+    vscale,
+    cu_seqlens_q,
+    block_ids,
+    seqlens_kvcache,
+    max_seqlens_q,
+    block_mask=None,
+    output=None,
+):
+    return torch.empty(
+        (q.size(0), q.size(1), vcache.size(-1)), dtype=torch.bfloat16, device=q.device
+    )
+
+
+@torch.library.register_fake("hpc::attention_blocksparse_prefill_fp8")
+def attention_blocksparse_prefill_fp8_fake(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_kv,
+    max_seqlens_q,
+    max_seqlens_kv,
+    block_mask,
+    q_scale,
+    k_scale,
+    v_scale,
+    softmax_scale,
+    output,
+):
+    return torch.empty((q.size(0), q.size(1), v.size(-1)), dtype=torch.bfloat16, device=q.device)
 
 
 @torch.library.register_fake("hpc::attention_decode_bf16")
