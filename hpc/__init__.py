@@ -98,6 +98,10 @@ if len(so_files) != 1:
     )
 torch.ops.load_library(so_files[0])
 
+from .attention import QuantType
+
+torch.serialization.add_safe_globals([QuantType])
+
 __all__: list[str] = []
 
 _export_functions(_discover_modules())

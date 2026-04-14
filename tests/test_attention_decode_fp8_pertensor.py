@@ -207,6 +207,7 @@ def test_attention_decode_fp8(
             KS,
             VS,
             new_kv_included=new_kv_included,
+            quant_type=hpc.QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
             splitk=splitk,
             output=my,
         )
@@ -223,6 +224,7 @@ def test_attention_decode_fp8(
                 VS,
                 mtp=num_seq_q - 1,
                 new_kv_included=new_kv_included,
+                quant_type=hpc.QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
                 splitk=splitk,
             )
 

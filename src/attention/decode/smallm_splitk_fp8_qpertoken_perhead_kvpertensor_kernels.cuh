@@ -1,7 +1,7 @@
 // Copyright 2025 hpc-ops authors
 
-#ifndef SRC_ATTENTION_DECODE_SMALLM_SPLITK_FP8_KERNELS_CUH_
-#define SRC_ATTENTION_DECODE_SMALLM_SPLITK_FP8_KERNELS_CUH_
+#ifndef SRC_ATTENTION_DECODE_SMALLM_SPLITK_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_KERNELS_CUH_
+#define SRC_ATTENTION_DECODE_SMALLM_SPLITK_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_KERNELS_CUH_
 
 #include <cuda.h>
 #include <stdio.h>
@@ -25,7 +25,8 @@ template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int k
           typename SLayoutQ, typename SLayoutK, typename SLayoutP, typename SLayoutS,
           typename SLayoutVTma, typename SLayoutY, typename SLayoutSplitY, int kBlockSize,
           int kStage, int kSplitK, int kSplitMinLen>
-__global__ void attention_decode_fp8_multistage_ws_smallm_splitk_kernel(
+__global__ void
+attention_decode_fp8_multistage_ws_smallm_splitk_qpertoken_perhead_kvpertensor_kernel(
     const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
     const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaY tma_y,
     const __grid_constant__ TmaSplitY tma_splity, Tout *y_ptr, float *split_y_ptr, float *lse_ptr,
@@ -452,4 +453,4 @@ __global__ void attention_decode_fp8_multistage_ws_smallm_splitk_kernel(
 }  // namespace attention
 }  // namespace hpc
 
-#endif  // SRC_ATTENTION_DECODE_SMALLM_SPLITK_FP8_KERNELS_CUH_
+#endif  // SRC_ATTENTION_DECODE_SMALLM_SPLITK_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_KERNELS_CUH_

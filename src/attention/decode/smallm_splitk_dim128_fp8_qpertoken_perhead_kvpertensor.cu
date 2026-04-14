@@ -9,7 +9,7 @@
 #include "cute/tensor.hpp"
 #include "src/attention/decode/smallm_dim128.h"
 #include "src/attention/decode/smallm_splitk_combine_kernels.cuh"
-#include "src/attention/decode/smallm_splitk_fp8_kernels.cuh"
+#include "src/attention/decode/smallm_splitk_fp8_qpertoken_perhead_kvpertensor_kernels.cuh"
 
 namespace hpc {
 namespace attention {
@@ -139,12 +139,13 @@ void launch_attention_decode_fp8_dim128_smallm_splitk(
   constexpr float kLog2e = 1.4426950408889634f;
   float one_over_dk_log2e = 1.f / sqrtf(float(num_dim_qk)) * kLog2e;
 
-  auto kernel = kernels::attention_decode_fp8_multistage_ws_smallm_splitk_kernel<
-      Tout, Tin, kTileM, kTileN, kTileK, kTileV, kHeadsPerGroup, kWarpGroupN, TiledMmaQK,
-      TiledMmaSV, decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y),
-      decltype(tma_splity), decltype(slayout_q), decltype(slayout_k), decltype(slayout_p),
-      decltype(slayout_s), decltype(slayout_vtma), decltype(slayout_y), decltype(slayout_splity),
-      kBlockSize, kStage, kSplitK, kSplitMinLen>;
+  auto kernel = kernels::
+      attention_decode_fp8_multistage_ws_smallm_splitk_qpertoken_perhead_kvpertensor_kernel<
+          Tout, Tin, kTileM, kTileN, kTileK, kTileV, kHeadsPerGroup, kWarpGroupN, TiledMmaQK,
+          TiledMmaSV, decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y),
+          decltype(tma_splity), decltype(slayout_q), decltype(slayout_k), decltype(slayout_p),
+          decltype(slayout_s), decltype(slayout_vtma), decltype(slayout_y),
+          decltype(slayout_splity), kBlockSize, kStage, kSplitK, kSplitMinLen>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
   int pad_heads_per_group = ((heads_per_group + 7) / 8) * 8;
@@ -158,7 +159,7 @@ void launch_attention_decode_fp8_dim128_smallm_splitk(
       qscale_pad_stride, one_over_dk_log2e);
 }
 
-bool smallm_splitk_dim128_fp8_async(
+bool smallm_splitk_dim128_fp8_qpertoken_perhead_kvpertensor_async(
     void *y_ptr, void *lse_ptr, void *splitk_out_ptr, const void *q_ptr, void *kcache_ptr,
     void *vcache_ptr, const int *block_ids_ptr, const int *num_seq_kvcache_ptr,
     const float *qscale_ptr, const float *kscale_ptr, const float *vscale_ptr, int *split_flag_ptr,

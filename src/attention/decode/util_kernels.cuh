@@ -133,6 +133,60 @@ __device__ __forceinline__ void load_paged_kv(TmaK& tma_k, TmaV& tma_v, uint64_t
                                 sizeof(Tin) * load_blocks * kBlockSize * num_dim_v);
 }
 
+template <bool kCheckBound, int kBlockPerTileN, int kBlockSize, int kStage, typename Tin,
+          typename TmaK, typename TmaV, typename TmaKS, typename TensorGK, typename TensorSK,
+          typename TensorGV, typename TensorSV, typename TensorGKS, typename TensorSKS>
+__device__ __forceinline__ void load_paged_kv_with_scale(
+    TmaK& tma_k, TmaV& tma_v, TmaKS& tma_ks, uint64_t* k_writable, uint64_t* v_writable,
+    uint64_t* k_readable, uint64_t* v_readable, TensorGK& tKg, TensorSK& tKs, TensorGV& tVg,
+    TensorSV& tVs, TensorGKS& tKSg, TensorSKS& tKSs, int ihead_kv, int num_dim_qk, int num_dim_v,
+    int* block_ids, int num_blocks, int itile, int istage_write, int phase) {
+  using namespace cute;  // NOLINT
+
+  int load_blocks = kBlockPerTileN;
+  int istage = istage_write;
+
+  vec_t<int, kBlockPerTileN> blk_ids;
+
+#pragma unroll
+  for (int ikvblock = 0; ikvblock < kBlockPerTileN; ikvblock++) {
+    int kvblk_id = itile * kBlockPerTileN + ikvblock;
+    int blk_id = -1;
+    if constexpr (kCheckBound) {
+      if (kvblk_id < num_blocks) {
+        blk_id = block_ids[kvblk_id];
+      }
+    } else {
+      blk_id = block_ids[kvblk_id];
+    }
+    blk_ids[ikvblock] = blk_id;
+  }
+
+  wait_barrier(k_writable[istage], phase);
+#pragma unroll
+  for (int ikvblock = 0; ikvblock < kBlockPerTileN; ikvblock++) {
+    int blk_id = blk_ids[ikvblock];
+    cute::copy(tma_k.with(k_readable[istage]), tKg(_, 0, _, ihead_kv, blk_id),
+               tKs(_, ikvblock, _, istage));
+    cute::copy(tma_ks.with(k_readable[istage]), tKSg(_, 0, _, ihead_kv, blk_id),
+               tKSs(_, ikvblock, _, istage));
+  }
+  set_barrier_transaction_bytes(k_readable[istage],
+                                sizeof(Tin) * load_blocks * kBlockSize * num_dim_qk +
+                                    sizeof(float) * kBlockPerTileN * kBlockSize);
+
+  wait_barrier(v_writable[istage], phase);
+  // v
+#pragma unroll
+  for (int ikvblock = 0; ikvblock < kBlockPerTileN; ikvblock++) {
+    int blk_id = blk_ids[ikvblock];
+    cute::copy(tma_v.with(v_readable[istage]), tVg(_, _, 0, ihead_kv, blk_id),
+               tVs(_, _, ikvblock, istage));
+  }
+  set_barrier_transaction_bytes(v_readable[istage],
+                                sizeof(Tin) * load_blocks * kBlockSize * num_dim_v);
+}
+
 template <typename TiledMmaQK, typename TensorQ, typename TensorK, typename TensorAtt>
 __device__ __forceinline__ void qk_gemm(TiledMmaQK& tiled_mma_qk, TensorQ& tQr, TensorK& tKr,
                                         TensorAtt& tAttr, const int& istage) {
@@ -195,6 +249,31 @@ __device__ __forceinline__ void apply_casual_mask_with_scale(TensorAtt& tAttr_nm
         tAttr_nm(in, im) = -std::numeric_limits<float>::infinity();
       } else {
         tAttr_nm(in, im) *= scales(im);
+      }
+    }
+  }
+}
+
+template <int kTileN, int kHeadsPerGroup, typename TensorAtt, typename TensorI,
+          typename TensorQScale, typename TensorKScale>
+__device__ __forceinline__ void apply_casual_mask_with_scale(
+    TensorAtt& tAttr_nm, TensorI& tI_nm, TensorQScale& qscales, TensorKScale& kscales,
+    const int& itile_seq_kv, const int& num_seq_kvcache, const int& num_seq_kv) {
+  using namespace cute;  // NOLINT
+  constexpr int kN = size<0>(TensorAtt{});
+  constexpr int kM = size<1>(TensorAtt{});
+
+#pragma unroll
+  for (int im = 0; im < kM; ++im) {
+#pragma unroll
+    for (int in = 0; in < kN; ++in) {
+      int iposq = num_seq_kvcache + get<1>(tI_nm(in, im)) / kHeadsPerGroup;
+      int iposk = itile_seq_kv * kTileN + get<0>(tI_nm(in, im));
+
+      if ((iposk > iposq) || (iposk >= num_seq_kv)) {
+        tAttr_nm(in, im) = -std::numeric_limits<float>::infinity();
+      } else {
+        tAttr_nm(in, im) *= qscales(im) * kscales(in);
       }
     }
   }

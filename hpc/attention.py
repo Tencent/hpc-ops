@@ -3,6 +3,14 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+from enum import Enum
+
+
+class QuantType(Enum):
+    QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD = 0
+    QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR = 1
+    QPERTENSOR_KPERTENSOR_VPERTENSOR = 2
+
 
 def attention_prefill_bf16(
     q: Tensor,
@@ -355,6 +363,7 @@ def attention_decode_fp8(
     vscale: Tensor,
     mtp: int = 0,
     new_kv_included: bool = False,
+    quant_type: QuantType = QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
     splitk: bool = True,
     split_flag: Tensor = None,
     output: Tensor = None,
@@ -425,6 +434,7 @@ def attention_decode_fp8(
         vscale,
         mtp,
         new_kv_included,
+        quant_type.value,
         splitk,
         split_flag,
         output,
