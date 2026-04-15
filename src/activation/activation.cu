@@ -23,7 +23,7 @@ __global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr, const __nv_bflo
   block1D22D(iblocky, iblockx, blockIdx.x);
   int it = threadIdx.x + iblockx * blockDim.x;
 
-  int irow = iblocky;
+  uint64_t irow = iblocky;
   int my_valid_row_end_exclusive = valid_row_range ? valid_row_range[0] : num_row;
   if (irow >= my_valid_row_end_exclusive) {
     return;
@@ -42,6 +42,64 @@ __global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr, const __nv_bflo
     cudaGridDependencySynchronize();
   }
   if (icol < num_col) {
+    auto gate = to<float>(load<T, 4>(gate_row_ptr + icol));
+    auto up = to<float>(load<T, 4>(up_row_ptr + icol));
+
+    vec_t<float, 8> out;
+#pragma unroll
+    for (int i = 0; i < size(out); ++i) {
+      auto g = gate[i];
+      auto m = [&] {
+        if constexpr (kUseBFloat16PrecisionMultiply) {
+          auto u = __float2bfloat16_rn(up[i]);
+          return __bfloat162float(__float2bfloat16_rn(silu(g)) * u);
+        } else {
+          auto u = up[i];
+          return silu(g) * u;
+        }
+      }();
+      out[i] = m * scale;
+    }
+
+    auto out_fp8 = to<__nv_fp8x4_e4m3>(out);
+    store(out_row_ptr + icol, out_fp8);
+  }
+  if constexpr (kUsePDL) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+}
+
+template <int kNumWarpPerBlock, bool kUseBFloat16PrecisionMultiply = true, bool kUsePDL = false>
+__global__ void act_mul_and_quant_warp_per_row_kernel(__nv_fp8_e4m3 *out_ptr,
+                                                      const __nv_bfloat16 *gate_up_ptr,
+                                                      const float *scale_ptr,
+                                                      const int *valid_row_range, const int num_row,
+                                                      const int num_col) {
+  int idx = threadIdx.x;
+  int iblock = blockIdx.x;
+  int ilane = idx % 32;
+  int iwarp = idx / 32;
+
+  uint64_t irow = iblock * kNumWarpPerBlock + iwarp;
+
+  int my_valid_row_end_exclusive = valid_row_range ? valid_row_range[0] : num_row;
+  if (irow >= my_valid_row_end_exclusive) {
+    return;
+  }
+
+  using T = __nv_bfloat162;
+
+  float scale = scale_ptr[0];
+
+  const auto *gate_row_ptr = gate_up_ptr + irow * num_col * 2;
+  const auto *up_row_ptr = gate_row_ptr + num_col;
+  auto *out_row_ptr = out_ptr + irow * num_col;
+
+  if constexpr (kUsePDL) {
+    cudaGridDependencySynchronize();
+  }
+
+  for (int icol = ilane * 8; icol < num_col; icol += 32 * 8) {
     auto gate = to<float>(load<T, 4>(gate_row_ptr + icol));
     auto up = to<float>(load<T, 4>(up_row_ptr + icol));
 
@@ -395,11 +453,6 @@ void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_u
   int intermediate_size = num_col / 2;
   constexpr bool kUsePDL = true;
 
-  dim3 block(128);
-  int num_col_block = (intermediate_size / 8 + block.x - 1) / block.x;
-  cutlass::FastDivmod block1D22D(num_col_block);
-  dim3 grid(num_row * num_col_block);
-
   cudaLaunchAttribute attribute[1];
   attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attribute[0].val.programmaticStreamSerializationAllowed = 1;
@@ -407,26 +460,63 @@ void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_u
   // Set the attribute in a kernel launch configuration
   cudaLaunchConfig_t config{};
 
-  // Base launch configuration
-  config.gridDim = grid;
-  config.blockDim = block;
-  config.dynamicSmemBytes = 0;
-  config.stream = stream;
+  if (intermediate_size >= 1024) {
+    dim3 block(128);
+    int num_col_block = (intermediate_size / 8 + block.x - 1) / block.x;
+    cutlass::FastDivmod block1D22D(num_col_block);
+    dim3 grid(num_row * num_col_block);
 
-  // Add special attribute for PDL
-  config.attrs = attribute;
-  config.numAttrs = 1;
+    // Base launch configuration
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
 
-  if (use_bf16_mul) {
-    constexpr bool kUseBFloat16PrecisionMultiply = true;
-    auto kernel = kernels::act_mul_and_quant_kernel<kUseBFloat16PrecisionMultiply, kUsePDL>;
-    cudaLaunchKernelEx(&config, kernel, out_ptr, gate_up_ptr, scale_ptr, valid_row_range, num_row,
-                       intermediate_size, block1D22D);
+    // Add special attribute for PDL
+    config.attrs = attribute;
+    config.numAttrs = 1;
+
+    if (use_bf16_mul) {
+      constexpr bool kUseBFloat16PrecisionMultiply = true;
+      auto kernel = kernels::act_mul_and_quant_kernel<kUseBFloat16PrecisionMultiply, kUsePDL>;
+      cudaLaunchKernelEx(&config, kernel, out_ptr, gate_up_ptr, scale_ptr, valid_row_range, num_row,
+                         intermediate_size, block1D22D);
+    } else {
+      constexpr bool kUseBFloat16PrecisionMultiply = false;
+      auto kernel = kernels::act_mul_and_quant_kernel<kUseBFloat16PrecisionMultiply, kUsePDL>;
+      cudaLaunchKernelEx(&config, kernel, out_ptr, gate_up_ptr, scale_ptr, valid_row_range, num_row,
+                         intermediate_size, block1D22D);
+    }
   } else {
-    constexpr bool kUseBFloat16PrecisionMultiply = false;
-    auto kernel = kernels::act_mul_and_quant_kernel<kUseBFloat16PrecisionMultiply, kUsePDL>;
-    cudaLaunchKernelEx(&config, kernel, out_ptr, gate_up_ptr, scale_ptr, valid_row_range, num_row,
-                       intermediate_size, block1D22D);
+    constexpr int kNumWarpPerBlock = 4;
+    dim3 block(32 * kNumWarpPerBlock);
+    dim3 grid((num_row + kNumWarpPerBlock - 1) / kNumWarpPerBlock);
+
+    // Base launch configuration
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+
+    // Add special attribute for PDL
+    config.attrs = attribute;
+    config.numAttrs = 1;
+
+    if (use_bf16_mul) {
+      constexpr bool kUseBFloat16PrecisionMultiply = true;
+      auto kernel =
+          kernels::act_mul_and_quant_warp_per_row_kernel<kNumWarpPerBlock,
+                                                         kUseBFloat16PrecisionMultiply, kUsePDL>;
+      cudaLaunchKernelEx(&config, kernel, out_ptr, gate_up_ptr, scale_ptr, valid_row_range, num_row,
+                         intermediate_size);
+    } else {
+      constexpr bool kUseBFloat16PrecisionMultiply = false;
+      auto kernel =
+          kernels::act_mul_and_quant_warp_per_row_kernel<kNumWarpPerBlock,
+                                                         kUseBFloat16PrecisionMultiply, kUsePDL>;
+      cudaLaunchKernelEx(&config, kernel, out_ptr, gate_up_ptr, scale_ptr, valid_row_range, num_row,
+                         intermediate_size);
+    }
   }
 }
 
