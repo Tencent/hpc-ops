@@ -52,8 +52,9 @@ void launch_warp_spec_with_kvcache_blocksparse_fp8_dim128(
 
   using TiledMmaQK = SM90_64x64x32_F32E4M3E4M3_SS_TN<>;
   using TiledMmaPV = SM90_64x128x32_F32E4M3E4M3_RS_TN<>;
-  using Config = AttentionKVCachePrefillFp8Config<Tin, Tout, TiledMmaQK, TiledMmaPV, 128, 128, 128,
-                                                  128, kBlockSize, 2, 2, 1, 128, 128, 128, 128>;
+  using Config = AttentionKVCachePrefillQTokenKVTenorFp8Config<Tin, Tout, TiledMmaQK, TiledMmaPV,
+                                                               128, 128, 128, 128, kBlockSize, 2, 2,
+                                                               1, 128, 128, 128, 128>;
 
   Config config;
   auto [tma_q, tma_k, tma_v, tma_y, tma_qs] = config.get_tma(Q, K, V, Y, QS);

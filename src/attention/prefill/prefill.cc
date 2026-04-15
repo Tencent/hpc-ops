@@ -71,7 +71,7 @@ void attention_with_kvcache_prefill_bf16_async(
   }
 }
 
-void attention_with_kvcache_prefill_fp8_async(
+void attention_with_kvcache_prefill_Qpertoken_KVpertensor_fp8_async(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
@@ -79,11 +79,26 @@ void attention_with_kvcache_prefill_fp8_async(
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
     int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV,
     cudaStream_t stream) {
-  prefill::warp_spec_with_kvcache_fp8_dim128_async(
+  prefill::warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128_async(
       y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
       block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
       max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks, block_size,
       num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+}
+
+void attention_with_kvcache_prefill_QKpertoken_Vpertensor_fp8_async(
+    void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
+    const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
+    const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
+    void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
+    int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
+    int block_size, int scale_block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK,
+    int ldV, int ldKS, cudaStream_t stream) {
+  prefill::warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128_async(
+      y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
+      block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
+      max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks, block_size,
+      scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, ldKS, stream);
 }
 
 void mla_prefill_bf16_async(void *y_ptr, const void *q_ptr, const void *kv_ptr,
@@ -91,8 +106,6 @@ void mla_prefill_bf16_async(void *y_ptr, const void *q_ptr, const void *kv_ptr,
                             int num_batch, int total_seq_q, int max_seq_q, int num_dim_qk,
                             int num_dim_v, int num_head_q, int num_head_kv, int ldY, int ldQ,
                             int ldKV, cudaStream_t stream) {
-  constexpr int kTileM = 64;
-  int max_total_blocks = (max_seq_q + kTileM - 1) / kTileM * num_batch * num_head_q;
   prefill::warp_spec_mla_async(y_ptr, q_ptr, kv_ptr, seqlens_q_ptr, cu_seqlens_q_ptr, tmas_ptr,
                                num_batch, total_seq_q, max_seq_q, num_dim_qk, num_dim_v, num_head_q,
                                num_head_kv, ldY, ldQ, ldKV, stream);

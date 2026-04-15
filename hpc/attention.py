@@ -146,6 +146,7 @@ def attention_with_kvcache_prefill_fp8(
     block_ids: Tensor,
     seqlens_kvcache: Tensor,
     max_seqlens_q: int,
+    quant_type: QuantType = QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
     output: Tensor = None,
 ) -> Tensor:
     """Computes attention prefill using fp8 precision.
@@ -171,8 +172,12 @@ def attention_with_kvcache_prefill_fp8(
             Shape: [num_batch, num_head_q, max_seqlens_q_pad]
             Dtype: float32
         kscale: K fp8 quant scale. Per Tensor Fp8 Quant.
-            Shape: [1]
-            Dtype: float32
+            Shape: depends on `quant_type`:
+                   - If `quant_type == QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR`:
+                       Shape: [1]
+                   - If `quant_type == QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD`:
+                       Shape: [num_blocks, scale_block_size, num_head_kv, num_dim_scale]
+            Dtype: float32/fp8
         vscale: V fp8 quant scale. Per Tensor Fp8 Quant.
             Shape: [1]
             Dtype: float32
@@ -188,6 +193,14 @@ def attention_with_kvcache_prefill_fp8(
         max_seqlens_q: max seqlens amang all batchs
             Shape: scalar
             Dtype: int
+        quant_type: Type of quantization scheme for attention computation.
+            Defaults to QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR.
+        output: Optional output tensor to store the attention result.
+            If provided, must be a bf16 tensor with appropriate shape
+            (typically [total_seq, num_head_q, num_dim_v]).
+            The result will be written into this tensor and the same tensor
+            will be returned. If None, a new tensor is allocated and returned.
+            Dtype: bf16
 
     Returns:
         Tensor: Attention output tensor in bfloat16 format on CUDA device
@@ -214,6 +227,7 @@ def attention_with_kvcache_prefill_fp8(
         block_ids,
         seqlens_kvcache,
         max_seqlens_q,
+        quant_type.value,
         output,
     )
 
@@ -676,6 +690,7 @@ def attention_with_kvcache_prefill_fp8_fake(
     block_ids,
     seqlens_kvcache,
     max_seqlens_q,
+    quant_type,
     output,
 ):
     return torch.empty(
