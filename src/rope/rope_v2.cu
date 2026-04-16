@@ -343,18 +343,18 @@ __global__ void rope_norm_store_kv_kernel(
   }
 }
 
-template <int kQuantPolicy, int kWarpsPerBlock, int kNumQHeads, int kNumKVHeads, int kQKHeadDim,
-          int kVHeadDim, int kNormPolicy>
+template <int kQuantPolicy, bool kIsPrefill, int kWarpsPerBlock, int kNumQHeads, int kNumKVHeads,
+          int kQKHeadDim, int kVHeadDim, int kNormPolicy>
 __global__ void rope_norm_store_kv_fp8_kernel(
     __nv_fp8_e4m3 *out_q_ptr, __nv_fp8_e4m3 *kcache_ptr, __nv_fp8_e4m3 *vcache_ptr,
     __nv_fp8_e4m3 *out_k_ptr, __nv_fp8_e4m3 *out_v_ptr, int32_t *split_k_flag_ptr,
     float *q_scale_ptr, const __nv_bfloat16 *in_qkv_ptr, const float *cos_sin_ptr,
     const int *num_seqlen_per_req_ptr, const int *q_index_ptr, const int *kvcache_indices_ptr,
-    const float *q_norm_weight_ptr, const float *k_norm_weight_ptr, const float *k_scale_ptr,
+    const float *q_norm_weight_ptr, const float *k_norm_weight_ptr, float *k_scale_ptr,
     const float *v_scale_ptr, const float *q_scale_inv_ptr, float upper_max, int max_seqlen_aligned,
-    int kcache_block_offset, int vcache_block_offset, int num_batch, int max_num_kv_block_per_batch,
-    cutlass::FastDivmod kv_block_size_divider, int num_rows, int num_compute_blocks,
-    bool is_prefill) {
+    int kcache_block_offset, int k_scale_block_offset, int vcache_block_offset, int num_batch,
+    int max_num_kv_block_per_batch, cutlass::FastDivmod kv_block_size_divider, int num_rows,
+    int num_compute_blocks) {
   using DType = __nv_bfloat16;
   using QType = __nv_fp8_e4m3;
 
@@ -523,12 +523,12 @@ __global__ void rope_norm_store_kv_fp8_kernel(
 
     // Q quantization
     float q_mult;
-    if constexpr (kQuantPolicy == 1) {
+    if constexpr (kQuantPolicy == 0 || kQuantPolicy == 1) {
       // dqskv: dynamic per-token per-head
       float max_abs = warp_abs_max<kNumItemPerThread>(data);
       float q_scale_val = max_abs / upper_max;
       if (ilane == 0) {
-        if (is_prefill) {
+        if constexpr (kIsPrefill) {
           // Prefill layout: [batch_id, q_head, tok_in_chunk]
           int tok_in_chunk = irow - q_index_ptr[batch_id];
           q_scale_ptr[batch_id * kNumQHeads * max_seqlen_aligned + q_head * max_seqlen_aligned +
@@ -556,7 +556,6 @@ __global__ void rope_norm_store_kv_fp8_kernel(
   }
 
   // ========= Process K heads =========
-  float k_scale_inv = __frcp_rn(k_scale_ptr[0]);
 #pragma unroll
   for (int kv_head = 0; kv_head < kNumKVHeads; ++kv_head) {
     const DType *k_src = qkv_row + kNumQHeads * kQKHeadDim + kv_head * kQKHeadDim;
@@ -598,19 +597,40 @@ __global__ void rope_norm_store_kv_fp8_kernel(
                        ? out_k_ptr + irow * kNumKVHeads * kQKHeadDim + kv_head * kQKHeadDim
                        : k_cache_row_start + kv_head * kQKHeadDim;
 
+    // K quantization
+    float k_mult;
+    if constexpr (kQuantPolicy == 0) {
+      // Dynamic per-token per-head quantization
+      float max_abs = warp_abs_max<kNumItemPerThread>(data);
+      float k_scale_val = max_abs / upper_max;
+      if (ilane == 0) {
+        // k_scale layout: [num_block, R, num_head, L]
+        // where L = head_dim * sizeof(kv_type) / sizeof(float), R = block_size / L
+        constexpr int L = kQKHeadDim * sizeof(QType) / sizeof(float);
+        int r = block_row / L;
+        int l = block_row % L;
+        k_scale_ptr[phys_block_id * k_scale_block_offset + r * kNumKVHeads * L + kv_head * L + l] =
+            k_scale_val;
+      }
+      k_mult = __frcp_rn(k_scale_val);
+    } else if constexpr (kQuantPolicy == 1 || kQuantPolicy == 2) {
+      // Static per-tensor quantization
+      k_mult = __frcp_rn(k_scale_ptr[0]);
+    }
+
 #pragma unroll
     for (int r = 0; r < kNumRoundsHalf; ++r) {
       int i = r * kWarpSize + ilane;
       if (i < kQKHeadDim / 2) {
-        k_dst[i] = QType(data[r * 2] * k_scale_inv);
-        k_dst[i + kQKHeadDim / 2] = QType(data[r * 2 + 1] * k_scale_inv);
+        k_dst[i] = QType(data[r * 2] * k_mult);
+        k_dst[i + kQKHeadDim / 2] = QType(data[r * 2 + 1] * k_mult);
       }
     }
   }
 
   // ========= Process V heads (no RoPE, bf16→fp8) =========
   {
-    float v_scale_inv = __frcp_rn(v_scale_ptr[0]);
+    float v_mult;
     using LoadDType = __nv_bfloat162;
     using PackQType = __nv_fp8x4_e4m3;
     constexpr int kNumVElemPerRow = kNumKVHeads * kVHeadDim;
@@ -627,11 +647,19 @@ __global__ void rope_norm_store_kv_fp8_kernel(
     for (int r = 0; r < kNumLoadRound; ++r) {
       int ioffset = (r * kWarpSize + ilane) * kItemPerThread;
       if (ioffset < kNumVElemPerRow) {
+        if constexpr (kQuantPolicy == 0) {
+          // Per-head scale
+          int v_head = ioffset / kVHeadDim;
+          v_mult = __frcp_rn(v_scale_ptr[v_head]);
+        } else if constexpr (kQuantPolicy == 1 || kQuantPolicy == 2) {
+          // Per-tensor scale
+          v_mult = __frcp_rn(v_scale_ptr[0]);
+        }
         auto vec_bf162 = load<LoadDType, kItemPerThread / 2>(v_src + ioffset);
         auto vec_float = to<float>(vec_bf162);
 #pragma unroll
         for (int i = 0; i < size(vec_float); i++) {
-          vec_float[i] = vec_float[i] * v_scale_inv;
+          vec_float[i] = vec_float[i] * v_mult;
         }
         store(v_dst + ioffset, to<PackQType>(vec_float));
       }
@@ -711,18 +739,18 @@ void rope_norm_store_kv_async(__nv_bfloat16 *out_q_ptr, __nv_bfloat16 *kcache_pt
   }
 }
 
-// Launch helper – dispatches kQuantPolicy + kNormPolicy at compile time
+// Launch helper – dispatches kQuantPolicy + kNormPolicy + kIsPrefill at compile time
 template <int kNumQHeads, int kNumKVHeads, int kQKHeadDim, int kVHeadDim>
 void launch_rope_norm_store_kv_fp8(
     __nv_fp8_e4m3 *out_q_ptr, __nv_fp8_e4m3 *kcache_ptr, __nv_fp8_e4m3 *vcache_ptr,
     __nv_fp8_e4m3 *out_k_ptr, __nv_fp8_e4m3 *out_v_ptr, int32_t *split_k_flag_ptr,
     float *q_scale_ptr, const __nv_bfloat16 *in_qkv_ptr, const float *cos_sin_ptr,
     const int *num_seqlen_per_req_ptr, const int *q_index_ptr, const int *kvcache_indices_ptr,
-    const float *q_norm_weight_ptr, const float *k_norm_weight_ptr, const float *k_scale_ptr,
+    const float *q_norm_weight_ptr, const float *k_norm_weight_ptr, float *k_scale_ptr,
     const float *v_scale_ptr, const float *q_scale_inv_ptr, float upper_max, int max_seqlen_aligned,
-    int kcache_block_offset, int vcache_block_offset, int num_batch, int max_num_kv_block_per_batch,
-    cutlass::FastDivmod kv_block_size_divider, int num_rows, int qk_norm_policy, int quant_policy,
-    bool is_prefill, cudaStream_t stream) {
+    int kcache_block_offset, int k_scale_block_offset, int vcache_block_offset, int num_batch,
+    int max_num_kv_block_per_batch, cutlass::FastDivmod kv_block_size_divider, int num_rows,
+    int qk_norm_policy, int quant_policy, bool is_prefill, cudaStream_t stream) {
   constexpr int kWarpsPerBlock = 4;
   constexpr int kWarpSize = 32;
 
@@ -730,30 +758,40 @@ void launch_rope_norm_store_kv_fp8(
   dim3 block(kWarpsPerBlock * kWarpSize);
   dim3 grid(num_compute_blocks + num_batch);
 
-  auto launch = [&](auto quant_tag, auto norm_tag) {
+  auto launch = [&](auto quant_tag, auto norm_tag, auto prefill_tag) {
     constexpr int kQP = decltype(quant_tag)::value;
     constexpr int kNP = decltype(norm_tag)::value;
-    kernels::rope_norm_store_kv_fp8_kernel<kQP, kWarpsPerBlock, kNumQHeads, kNumKVHeads, kQKHeadDim,
-                                           kVHeadDim, kNP><<<grid, block, 0, stream>>>(
+    constexpr bool kIP = decltype(prefill_tag)::value;
+    kernels::rope_norm_store_kv_fp8_kernel<kQP, kIP, kWarpsPerBlock, kNumQHeads, kNumKVHeads,
+                                           kQKHeadDim, kVHeadDim, kNP><<<grid, block, 0, stream>>>(
         out_q_ptr, kcache_ptr, vcache_ptr, out_k_ptr, out_v_ptr, split_k_flag_ptr, q_scale_ptr,
         in_qkv_ptr, cos_sin_ptr, num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr,
         q_norm_weight_ptr, k_norm_weight_ptr, k_scale_ptr, v_scale_ptr, q_scale_inv_ptr, upper_max,
-        max_seqlen_aligned, kcache_block_offset, vcache_block_offset, num_batch,
-        max_num_kv_block_per_batch, kv_block_size_divider, num_rows, num_compute_blocks,
-        is_prefill);
+        max_seqlen_aligned, kcache_block_offset, k_scale_block_offset, vcache_block_offset,
+        num_batch, max_num_kv_block_per_batch, kv_block_size_divider, num_rows, num_compute_blocks);
+  };
+
+  auto dispatch_prefill = [&](auto quant_tag, auto norm_tag) {
+    if (is_prefill) {
+      launch(quant_tag, norm_tag, std::true_type{});
+    } else {
+      launch(quant_tag, norm_tag, std::false_type{});
+    }
   };
 
   auto dispatch_norm = [&](auto quant_tag) {
     if (qk_norm_policy == 1) {
-      launch(quant_tag, std::integral_constant<int, 1>{});
+      dispatch_prefill(quant_tag, std::integral_constant<int, 1>{});
     } else if (qk_norm_policy == 2) {
-      launch(quant_tag, std::integral_constant<int, 2>{});
+      dispatch_prefill(quant_tag, std::integral_constant<int, 2>{});
     } else {
-      launch(quant_tag, std::integral_constant<int, 0>{});
+      dispatch_prefill(quant_tag, std::integral_constant<int, 0>{});
     }
   };
 
-  if (quant_policy == 1) {
+  if (quant_policy == 0) {
+    dispatch_norm(std::integral_constant<int, 0>{});
+  } else if (quant_policy == 1) {
     dispatch_norm(std::integral_constant<int, 1>{});
   } else {
     dispatch_norm(std::integral_constant<int, 2>{});
@@ -765,30 +803,48 @@ void rope_norm_store_kv_fp8_async(
     __nv_fp8_e4m3 *out_k_ptr, __nv_fp8_e4m3 *out_v_ptr, int32_t *split_k_flag_ptr,
     float *q_scale_ptr, const __nv_bfloat16 *in_qkv_ptr, const float *cos_sin_ptr,
     const int *num_seqlen_per_req_ptr, const int *q_index_ptr, const int *kvcache_indices_ptr,
-    const float *q_norm_weight_ptr, const float *k_norm_weight_ptr, const float *k_scale_ptr,
+    const float *q_norm_weight_ptr, const float *k_norm_weight_ptr, float *k_scale_ptr,
     const float *v_scale_ptr, const float *q_scale_inv_ptr, float upper_max, int max_seqlens,
-    int kcache_block_offset, int vcache_block_offset, int num_batch, int max_num_kv_block_per_batch,
-    int kv_block_size, int num_rows, int num_q_heads, int num_kv_heads, int qk_head_dim,
-    int v_head_dim, bool is_prefill, int qk_norm_policy, int quant_policy, cudaStream_t stream) {
+    int kcache_block_offset, int k_scale_block_offset, int vcache_block_offset, int num_batch,
+    int max_num_kv_block_per_batch, int kv_block_size, int num_rows, int num_q_heads,
+    int num_kv_heads, int qk_head_dim, int v_head_dim, bool is_prefill, int qk_norm_policy,
+    int quant_policy, cudaStream_t stream) {
   cutlass::FastDivmod kv_block_size_divider(kv_block_size);
   int max_seqlen_aligned = ((max_seqlens + 127) / 128) * 128;
 
-  if (num_q_heads == 8 && num_kv_heads == 1 && qk_head_dim == 128 && v_head_dim == 128) {
-    launch_rope_norm_store_kv_fp8<8, 1, 128, 128>(
-        out_q_ptr, kcache_ptr, vcache_ptr, out_k_ptr, out_v_ptr, split_k_flag_ptr, q_scale_ptr,
-        in_qkv_ptr, cos_sin_ptr, num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr,
-        q_norm_weight_ptr, k_norm_weight_ptr, k_scale_ptr, v_scale_ptr, q_scale_inv_ptr, upper_max,
-        max_seqlen_aligned, kcache_block_offset, vcache_block_offset, num_batch,
-        max_num_kv_block_per_batch, kv_block_size_divider, num_rows, qk_norm_policy, quant_policy,
-        is_prefill, stream);
-  } else if (num_q_heads == 64 && num_kv_heads == 8 && qk_head_dim == 128 && v_head_dim == 128) {
-    launch_rope_norm_store_kv_fp8<64, 8, 128, 128>(
-        out_q_ptr, kcache_ptr, vcache_ptr, out_k_ptr, out_v_ptr, split_k_flag_ptr, q_scale_ptr,
-        in_qkv_ptr, cos_sin_ptr, num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr,
-        q_norm_weight_ptr, k_norm_weight_ptr, k_scale_ptr, v_scale_ptr, q_scale_inv_ptr, upper_max,
-        max_seqlen_aligned, kcache_block_offset, vcache_block_offset, num_batch,
-        max_num_kv_block_per_batch, kv_block_size_divider, num_rows, qk_norm_policy, quant_policy,
-        is_prefill, stream);
+  if (qk_head_dim == 128 && v_head_dim == 128) {
+    constexpr int kQKHeadDim = 128;
+    constexpr int kVHeadDim = 128;
+    auto dispatch_heads = [&](auto q_heads, auto kv_heads) {
+      constexpr int kNumQHeads = decltype(q_heads)::value;
+      constexpr int kNumKVHeads = decltype(kv_heads)::value;
+      launch_rope_norm_store_kv_fp8<kNumQHeads, kNumKVHeads, kQKHeadDim, kVHeadDim>(
+          out_q_ptr, kcache_ptr, vcache_ptr, out_k_ptr, out_v_ptr, split_k_flag_ptr, q_scale_ptr,
+          in_qkv_ptr, cos_sin_ptr, num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr,
+          q_norm_weight_ptr, k_norm_weight_ptr, k_scale_ptr, v_scale_ptr, q_scale_inv_ptr,
+          upper_max, max_seqlen_aligned, kcache_block_offset, k_scale_block_offset,
+          vcache_block_offset, num_batch, max_num_kv_block_per_batch, kv_block_size_divider,
+          num_rows, qk_norm_policy, quant_policy, is_prefill, stream);
+    };
+    if (num_q_heads == 8 && num_kv_heads == 1) {
+      dispatch_heads(std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
+    } else if (num_q_heads == 16 && num_kv_heads == 2) {
+      dispatch_heads(std::integral_constant<int, 16>{}, std::integral_constant<int, 2>{});
+    } else if (num_q_heads == 32 && num_kv_heads == 4) {
+      dispatch_heads(std::integral_constant<int, 32>{}, std::integral_constant<int, 4>{});
+    } else if (num_q_heads == 64 && num_kv_heads == 8) {
+      dispatch_heads(std::integral_constant<int, 64>{}, std::integral_constant<int, 8>{});
+    } else if (num_q_heads == 4 && num_kv_heads == 1) {
+      // for hy v2
+      dispatch_heads(std::integral_constant<int, 4>{}, std::integral_constant<int, 1>{});
+    } else {
+      throw std::invalid_argument(
+          "rope_norm_store_kv_fp8_async: unsupported config, got: q_heads=" +
+          std::to_string(num_q_heads) + ", kv_heads=" + std::to_string(num_kv_heads) +
+          ", qk_head_dim=" + std::to_string(qk_head_dim) +
+          ", v_head_dim=" + std::to_string(v_head_dim));
+    }
+
   } else {
     throw std::invalid_argument("rope_norm_store_kv_fp8_async: unsupported config, got: q_heads=" +
                                 std::to_string(num_q_heads) +

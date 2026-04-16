@@ -2,6 +2,7 @@ from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
+from .attention import QuantType
 
 
 def rope_norm_blocked_kvcache(
@@ -419,7 +420,7 @@ def rope_norm_store_kv_fp8(
     is_prefill: bool,
     k_scale: Tensor,
     v_scale: Tensor,
-    quant_policy: int,
+    quant_policy: QuantType = QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
     max_seqlens: int = 0,
     upper_max: Optional[float] = None,
     q_scale_inv: Optional[Tensor] = None,
@@ -460,17 +461,27 @@ def rope_norm_store_kv_fp8(
         is_prefill: Whether to run in prefill mode (True) or decode mode (False).
             Shape: scalar
             Dtype: bool
-        k_scale: Static quantization scale for K. Per-tensor.
-            Shape: [1]
-            Dtype: float32
-        v_scale: Static quantization scale for V. Per-tensor.
-            Shape: [1]
-            Dtype: float32
-        quant_policy: Q quantization mode. K/V always use static scaling.
+        k_scale: Quantization scale for K.
+            - quant_policy 0: Per-head per-token output tensor, written by kernel.
+              Shape: [num_blocks, R, num_kv_heads, L] where L=qk_head_dim*sizeof(fp8)/sizeof(float), R=block_size/L.
+              Dtype: float32
+            - quant_policy 1/2: Static per-tensor input scale.
+              Shape: [1]
+              Dtype: float32
+        v_scale: Quantization scale for V.
+            - quant_policy 0: Per-head input scale.
+              Shape: [num_kv_heads]
+              Dtype: float32
+            - quant_policy 1/2: Static per-tensor input scale.
+              Shape: [1]
+              Dtype: float32
+        quant_policy: Q quantization mode.
             Shape: scalar
             Dtype: int
-            - 1: dqskv — dynamic per-token per-head quantization; scale computed by the kernel
-                 and written to the returned q_scale tensor.
+            - 0: Dynamic per-token per-head quantization for Q and K; per-head for V.
+                 Q/K scales computed by kernel; V scale provided by caller.
+            - 1: dqskv — dynamic per-token per-head Q quantization; K/V use static scaling.
+                 Q scale computed by the kernel and written to the returned q_scale tensor.
             - 2: sqskv — static quantization; uses the caller-supplied q_scale_inv.
         max_seqlens: Maximum sequence length in the batch. Used to size the q_scale allocation
             in prefill mode (padded to a multiple of 128).
@@ -531,7 +542,7 @@ def rope_norm_store_kv_fp8(
         is_prefill,
         k_scale,
         v_scale,
-        quant_policy,
+        quant_policy.value,
         max_seqlens,
         upper_max,
         q_scale_inv,
@@ -742,7 +753,7 @@ def rope_norm_store_kv_fp8_fake(
         device=qkv.device,
     )
 
-    if quant_policy == 1:  # dq skv
+    if quant_policy.value == 0 or quant_policy.value == 1:  # dq skv
         if is_prefill:
             aligned = ((max_seqlens + 127) // 128) * 128
             q_scale = torch.empty(

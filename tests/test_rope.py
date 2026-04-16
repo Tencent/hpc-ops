@@ -19,6 +19,54 @@ import hpc
 from utils import allclose
 
 
+def apply_rotary_pos_emb_neox_reference(x, cos_sin):
+    """
+    Reference implementation of RoPE (neox version) in Python.
+
+    Args:
+        x: [num_tokens, num_heads, head_dim]
+        cos_sin: [num_tokens, head_dim] where first half is cos, second half is sin
+
+    Returns:
+        output: [num_tokens, num_heads, head_dim]
+    """
+    num_tokens, num_heads, head_dim = x.shape
+    half_dim = head_dim // 2
+
+    # Split x into two halves
+    x1 = x[..., :half_dim]  # [num_tokens, num_heads, half_dim]
+    x2 = x[..., half_dim:]  # [num_tokens, num_heads, half_dim]
+
+    # Extract cos and sin from cos_sin tensor
+    cos_half = cos_sin[:, :half_dim].unsqueeze(1)  # [num_tokens, 1, half_dim]
+    sin_half = cos_sin[:, half_dim:].unsqueeze(1)  # [num_tokens, 1, half_dim]
+
+    # Apply rotation (neox version)
+    o1 = x1 * cos_half - x2 * sin_half
+    o2 = x2 * cos_half + x1 * sin_half
+
+    # Concatenate
+    output = torch.cat([o1, o2], dim=-1)
+    return output
+
+
+def apply_rms_norm_reference(x, weight, eps=1e-6):
+    """
+    Reference implementation of RMS normalization.
+
+    Args:
+        x: [num_tokens, num_heads, head_dim]
+        weight: [head_dim]
+        eps: epsilon for numerical stability
+
+    Returns:
+        output: [num_tokens, num_heads, head_dim]
+    """
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x_normed = x * torch.rsqrt(variance + eps)
+    return x_normed * weight
+
+
 def generate_cos_sin_cache(max_position, head_dim, base=10000.0):
     """Generate RoPE cos/sin cache."""
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
@@ -31,6 +79,40 @@ def generate_cos_sin_cache(max_position, head_dim, base=10000.0):
     # Concatenate cos and sin: [max_position, head_dim]
     cos_sin = torch.cat([cos, sin], dim=-1)
     return cos_sin
+
+
+def sample_and_extract_qkv(req_length, qkv):
+
+    device = qkv.device
+    req_length = torch.tensor(req_length).to(device)
+    batch_size = req_length.size(0)
+
+    # rand a ratio
+    rand_factors = torch.rand(batch_size, device=device)
+    q_length = (rand_factors * req_length).long() + 1
+    q_length = torch.min(q_length, req_length)
+
+    # ensure not larger
+    req_cumsum = torch.cumsum(req_length, dim=0)
+
+    slices = []
+
+    for i in range(batch_size):
+        curr_original_end = req_cumsum[i].item()
+        curr_new_len = q_length[i].item()
+        slice_start = curr_original_end - curr_new_len
+        slice_end = curr_original_end
+        slices.append(qkv[slice_start:slice_end])
+
+    qkv_new = torch.cat(slices, dim=0)
+
+    q_cumsum = torch.cumsum(q_length, dim=0)
+
+    # add a zero
+    zero_pad = torch.tensor([0], device=device, dtype=q_cumsum.dtype)
+    q_index = torch.cat((zero_pad, q_cumsum), dim=0)
+
+    return q_index.to(torch.int32), qkv_new
 
 
 def generate_kv_block_indices(kcache, req_length: list):
@@ -59,33 +141,6 @@ def generate_kv_block_indices(kcache, req_length: list):
     return kv_indices
 
 
-def apply_rms_norm_reference(x, weight, eps=1e-6):
-    variance = x.pow(2).mean(dim=-1, keepdim=True)
-    x_normed = x * torch.rsqrt(variance + eps)
-    return x_normed * weight
-
-
-def apply_rotary_pos_emb_neox_reference(x, cos_sin):
-    num_tokens, num_heads, head_dim = x.shape
-    half_dim = head_dim // 2
-
-    # Split x into two halves
-    x1 = x[..., :half_dim]  # [num_tokens, num_heads, half_dim]
-    x2 = x[..., half_dim:]  # [num_tokens, num_heads, half_dim]
-
-    # Extract cos and sin from cos_sin tensor
-    cos_half = cos_sin[:, :half_dim].unsqueeze(1)  # [num_tokens, 1, half_dim]
-    sin_half = cos_sin[:, half_dim:].unsqueeze(1)  # [num_tokens, 1, half_dim]
-
-    # Apply rotation (neox version)
-    o1 = x1 * cos_half - x2 * sin_half
-    o2 = x2 * cos_half + x1 * sin_half
-
-    # Concatenate
-    output = torch.cat([o1, o2], dim=-1)
-    return output
-
-
 def prepare_prefill_input(
     num_req,
     req_length,
@@ -99,6 +154,9 @@ def prepare_prefill_input(
     dtype=torch.bfloat16,
     device="cuda",
 ):
+    # seed = 42
+    # torch.manual_seed(seed)
+    # torch.cuda.manual_seed_all(seed)
 
     if req_length is None:
         req_length = torch.randint(20, 200, (num_req,)).tolist()
@@ -140,61 +198,6 @@ def prepare_prefill_input(
     )
 
 
-def prepare_decode_input(
-    num_req,
-    req_length,
-    num_q_heads,
-    num_kv_heads,
-    qk_head_dim,
-    v_head_dim,
-    kv_block_size,
-    max_num_kv_blocks,
-    max_rope_position,
-    dtype=torch.bfloat16,
-    device="cuda",
-):
-    if req_length is None:
-        req_length = torch.randint(20, 200, (num_req,)).tolist()
-    if isinstance(req_length, int):
-        req_length = [req_length] * num_req
-    # input req length is the existing length, not the new length, we add 1 here for kvcache update
-    req_length = [x + 1 for x in req_length]
-    total_rows = num_req
-    qkv = torch.randn(
-        total_rows,
-        num_q_heads * qk_head_dim + num_kv_heads * qk_head_dim + num_kv_heads * v_head_dim,
-        dtype=dtype,
-        device=device,
-    )
-    cos_sin = generate_cos_sin_cache(max_rope_position, qk_head_dim).to(
-        dtype=torch.float32, device=device
-    )
-    kcache = torch.randn(
-        max_num_kv_blocks, kv_block_size, num_kv_heads, qk_head_dim, dtype=dtype, device=device
-    )
-    vcache = torch.randn(
-        max_num_kv_blocks, kv_block_size, num_kv_heads, v_head_dim, dtype=dtype, device=device
-    )
-
-    kv_indices = generate_kv_block_indices(kcache, req_length).cuda()
-
-    q_norm_weight = torch.randn(qk_head_dim, dtype=torch.float32, device=device)
-    k_norm_weight = torch.randn(qk_head_dim, dtype=torch.float32, device=device)
-
-    num_seqlen_per_req = torch.tensor(req_length, dtype=torch.int32, device=device)
-
-    return (
-        qkv,
-        num_seqlen_per_req,
-        cos_sin,
-        kcache,
-        vcache,
-        kv_indices,
-        q_norm_weight,
-        k_norm_weight,
-    )
-
-
 def torch_rope_norm_blocked_prefill(
     kcache,
     vcache,
@@ -208,7 +211,6 @@ def torch_rope_norm_blocked_prefill(
     q_norm_weight=None,
     k_norm_weight=None,
     qk_norm_policy=1,
-    clear_kv_tail=False,
 ):
     """Test RoPE prefill mode with PyTorch reference implementation."""
     assert is_prefill
@@ -275,15 +277,68 @@ def torch_rope_norm_blocked_prefill(
             kcache[cache_block_idx, pos_in_block, :, :] = k_ref[token_idx, :, :].to(dtype)
             # Update V cache
             vcache[cache_block_idx, pos_in_block, :, :] = v_ref[token_idx, :, :].to(dtype)
-            # Clear rows [pos_in_block+1, kv_block_size) for last token of each request
-            if clear_kv_tail and pos_in_seq == seq_len - 1 and pos_in_block + 1 < kv_block_size:
-                kcache[cache_block_idx, pos_in_block + 1 :, :, :] = 0
-                vcache[cache_block_idx, pos_in_block + 1 :, :, :] = 0
             token_idx += 1
 
     out_q = q_ref.to(dtype)
     out_k = k_ref.to(dtype)
+    # out_qkv = torch.cat([out_q, out_k, out_v], dim=1)
     return out_q, out_k, kcache, vcache
+
+
+def prepare_decode_input(
+    num_req,
+    req_length,
+    num_q_heads,
+    num_kv_heads,
+    qk_head_dim,
+    v_head_dim,
+    kv_block_size,
+    max_num_kv_blocks,
+    max_rope_position,
+    dtype=torch.bfloat16,
+    device="cuda",
+):
+    if req_length is None:
+        req_length = torch.randint(20, 200, (num_req,)).tolist()
+    if isinstance(req_length, int):
+        req_length = [req_length] * num_req
+    # input req length is the existing length, not the new length, we add 1 here for kvcache update
+    req_length = [x + 1 for x in req_length]
+    # in decode, every req has length 1
+    total_rows = num_req
+    qkv = torch.randn(
+        total_rows,
+        num_q_heads * qk_head_dim + num_kv_heads * qk_head_dim + num_kv_heads * v_head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    cos_sin = generate_cos_sin_cache(max_rope_position, qk_head_dim).to(
+        dtype=torch.float32, device=device
+    )
+    kcache = torch.randn(
+        max_num_kv_blocks, kv_block_size, num_kv_heads, qk_head_dim, dtype=dtype, device=device
+    )
+    vcache = torch.randn(
+        max_num_kv_blocks, kv_block_size, num_kv_heads, v_head_dim, dtype=dtype, device=device
+    )
+
+    kv_indices = generate_kv_block_indices(kcache, req_length).cuda()
+
+    q_norm_weight = torch.randn(qk_head_dim, dtype=torch.float32, device=device)
+    k_norm_weight = torch.randn(qk_head_dim, dtype=torch.float32, device=device)
+
+    num_seqlen_per_req = torch.tensor(req_length, dtype=torch.int32, device=device)
+
+    return (
+        qkv,
+        num_seqlen_per_req,
+        cos_sin,
+        kcache,
+        vcache,
+        kv_indices,
+        q_norm_weight,
+        k_norm_weight,
+    )
 
 
 def torch_rope_norm_blocked_decode(
@@ -299,7 +354,6 @@ def torch_rope_norm_blocked_decode(
     q_norm_weight=None,
     k_norm_weight=None,
     qk_norm_policy=1,
-    clear_kv_tail=False,
 ):
     """Test RoPE decode mode with PyTorch reference implementation."""
     assert not is_prefill
@@ -357,17 +411,9 @@ def torch_rope_norm_blocked_decode(
         # Update V cache
         vcache[cache_block_idx, pos_in_block, :, :] = v_ref[token_idx, :, :].to(dtype)
 
-        # Clear KV cache tail rows
-        if clear_kv_tail:
-            # New unified clearing: always clear [pos_in_block+1, kv_block_size)
-            if pos_in_block + 1 < kv_block_size:
-                kcache[cache_block_idx, pos_in_block + 1 :, :, :] = 0
-                vcache[cache_block_idx, pos_in_block + 1 :, :, :] = 0
-        else:
-            # Old behavior: clear only when pos_in_block == 0
-            if pos_in_block == 0:
-                kcache[cache_block_idx, 1:, :, :] = 0
-                vcache[cache_block_idx, 1:, :, :] = 0
+        if pos_in_block == 0:
+            kcache[cache_block_idx, 1:, :, :] = 0
+            vcache[cache_block_idx, 1:, :, :] = 0
 
         token_idx += 1
 
@@ -375,40 +421,6 @@ def torch_rope_norm_blocked_decode(
     out_k = k_ref.to(dtype)
     # out_qkv = torch.cat([out_q, out_k, out_v], dim=1)
     return out_q, out_k, kcache, vcache
-
-
-def sample_and_extract_qkv(req_length, qkv):
-
-    device = qkv.device
-    req_length = torch.tensor(req_length).to(device)
-    batch_size = req_length.size(0)
-
-    # rand a ratio
-    rand_factors = torch.rand(batch_size, device=device)
-    q_length = (rand_factors * req_length).long() + 1
-    q_length = torch.min(q_length, req_length)
-
-    # ensure not larger
-    req_cumsum = torch.cumsum(req_length, dim=0)
-
-    slices = []
-
-    for i in range(batch_size):
-        curr_original_end = req_cumsum[i].item()
-        curr_new_len = q_length[i].item()
-        slice_start = curr_original_end - curr_new_len
-        slice_end = curr_original_end
-        slices.append(qkv[slice_start:slice_end])
-
-    qkv_new = torch.cat(slices, dim=0)
-
-    q_cumsum = torch.cumsum(q_length, dim=0)
-
-    # add a zero
-    zero_pad = torch.tensor([0], device=device, dtype=q_cumsum.dtype)
-    q_index = torch.cat((zero_pad, q_cumsum), dim=0)
-
-    return q_index.to(torch.int32), qkv_new
 
 
 @pytest.mark.parametrize("num_req", [7])
@@ -883,626 +895,173 @@ def test_rope_norm_blocked_decode_fp8(
     assert allclose(torch_out_q, q_bf16, atol=0.5)
 
 
-@pytest.mark.parametrize("num_req", [7])
-@pytest.mark.parametrize(
-    "num_q_heads,num_kv_heads,qk_head_dim",
-    [(8, 1, 128), (64, 8, 128)],
-)
-@pytest.mark.parametrize("qk_norm_policy", [1])
-def test_rope_norm_store_kv_prefill(
-    num_req, num_q_heads, num_kv_heads, qk_head_dim, qk_norm_policy
+##############################################################################
+#  New Rope Test
+##############################################################################
+
+
+def generate_cos_sin_cache(max_position, head_dim, base=10000.0):
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    t = torch.arange(max_position).float()
+    freqs = torch.outer(t, inv_freq)
+    return torch.cat([freqs.cos(), freqs.sin()], dim=-1)
+
+
+def generate_kv_block_indices(kcache, req_length):
+    num_req = len(req_length)
+    kv_block_size = kcache.shape[1]
+    num_blocks_per_req = [(l + kv_block_size - 1) // kv_block_size for l in req_length]
+    shuffled = torch.randperm(kcache.shape[0])
+    kv_idx = torch.ones(num_req, max(num_blocks_per_req) + 4, dtype=torch.int32) * -1
+    offset = 0
+    for i in range(num_req):
+        n = num_blocks_per_req[i]
+        kv_idx[i, :n] = shuffled[offset : offset + n]
+        offset += n
+    return kv_idx
+
+
+def apply_rms_norm_reference(x, weight, eps=1e-6):
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
+
+
+def apply_rotary_pos_emb_neox_reference(x, cos_sin):
+    h = x.shape[-1] // 2
+    x1, x2 = x[..., :h], x[..., h:]
+    c = cos_sin[:, :h].unsqueeze(1)
+    s = cos_sin[:, h:].unsqueeze(1)
+    return torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1)
+
+
+def rope_norm_ref(
+    kcache,
+    vcache,
+    qkv,
+    cos_sin,
+    num_seqlen_per_req,
+    q_index,
+    kv_indices,
+    q_norm_weight,
+    k_norm_weight,
+    qk_norm_policy,
 ):
-    req_length = torch.randint(20, 200, (num_req,)).tolist()
-    v_head_dim = qk_head_dim
-    kv_block_size = 64
-    max_num_kv_blocks = 1024
-    max_rope_position = 2048
-    dtype = torch.bfloat16
-    (
-        qkv,
-        num_seqlen_per_req,
-        cos_sin,
-        kcache,
-        vcache,
-        kv_indices,
-        q_norm_weight,
-        k_norm_weight,
-    ) = prepare_prefill_input(
-        num_req,
-        req_length,
-        num_q_heads,
-        num_kv_heads,
-        qk_head_dim,
-        v_head_dim,
-        kv_block_size,
-        max_num_kv_blocks,
-        max_rope_position,
-        dtype,
-    )
-    q_index, qkv_new = sample_and_extract_qkv(req_length, qkv)
+    """Unified PyTorch reference: RoPE + optional RMSNorm + paged KV write.
 
-    qkv_ref = qkv_new.clone()
-    kcache_ref = kcache.clone()
-    vcache_ref = vcache.clone()
-
-    my_out_q = hpc.rope_norm_store_kv(
-        kcache,
-        vcache,
-        qkv_new,
-        cos_sin,
-        num_seqlen_per_req,
-        q_index,
-        kv_indices,
-        True,
-        q_norm_weight=q_norm_weight if qk_norm_policy > 0 else None,
-        k_norm_weight=k_norm_weight if qk_norm_policy > 0 else None,
-        qk_norm_policy=qk_norm_policy,
-    )
-
-    torch_out_q, torch_out_k, torch_kcache, torch_vcache = torch_rope_norm_blocked_prefill(
-        kcache_ref,
-        vcache_ref,
-        qkv_ref,
-        cos_sin,
-        num_seqlen_per_req,
-        q_index,
-        kv_indices,
-        is_prefill=True,
-        use_qknorm=(qk_norm_policy > 0),
-        q_norm_weight=q_norm_weight,
-        k_norm_weight=k_norm_weight,
-        qk_norm_policy=qk_norm_policy,
-        clear_kv_tail=True,
-    )
-
-    assert allclose(torch_out_q, my_out_q, atol=8e-2)
-    assert allclose(torch_kcache, kcache, atol=8e-2)
-    assert allclose(torch_vcache, vcache, atol=8e-2)
-
-
-def pad_decode_inputs_to_align8(qkv, num_seqlen_per_req, q_index, kv_indices):
-    """Pad decode inputs so total rows and num_batch are aligned to 8.
-    Simulates CUDA graph padding: extra batches have q_index[i+1]-q_index[i]=0
-    and num_seqlen_per_req[i]=0.
+    Handles prefill, decode (mtp=0), and MTP decode (mtp>=1) uniformly via q_index.
     """
-    num_rows = qkv.shape[0]
-    num_batch = num_seqlen_per_req.shape[0]
-    hidden = qkv.shape[1]
+    dtype = qkv.dtype
+    num_kv = kcache.shape[2]
+    v_dim = vcache.shape[3]
+    qk_dim = kcache.shape[3]
+    num_q = (qkv.shape[1] - num_kv * qk_dim - num_kv * v_dim) // qk_dim
+    num_req = num_seqlen_per_req.shape[0]
+    q_lens = (q_index[1:] - q_index[:-1]).tolist()
+    num_rows = q_index[-1].item()
+    blk = kcache.shape[1]
 
-    padded_batch = (num_batch + 7) // 8 * 8
-    pad_batch = padded_batch - num_batch
-    padded_rows = (num_rows + 7) // 8 * 8
-    pad_rows = padded_rows - num_rows
+    q = qkv[:, : num_q * qk_dim].to(torch.float32).view(num_rows, num_q, qk_dim)
+    k = (
+        qkv[:, num_q * qk_dim : (num_q + num_kv) * qk_dim]
+        .to(torch.float32)
+        .view(num_rows, num_kv, qk_dim)
+    )
+    v = qkv[:, (num_q + num_kv) * qk_dim :].view(num_rows, num_kv, v_dim)
 
-    if pad_rows > 0:
-        qkv = torch.cat([qkv, torch.zeros(pad_rows, hidden, dtype=qkv.dtype, device=qkv.device)])
+    # per-token cos/sin indexed by absolute position
+    cs = torch.zeros(num_rows, qk_dim, dtype=torch.float32, device=qkv.device)
+    off = 0
+    for i in range(num_req):
+        sl = num_seqlen_per_req[i].item()
+        ql = q_lens[i]
+        if ql > 0:
+            cs[off : off + ql] = cos_sin[sl - ql : sl]
+        off += ql
 
-    if pad_batch > 0:
-        num_seqlen_per_req = torch.cat(
-            [
-                num_seqlen_per_req,
-                torch.zeros(
-                    pad_batch, dtype=num_seqlen_per_req.dtype, device=num_seqlen_per_req.device
-                ),
-            ]
+    if qk_norm_policy == 2:
+        q = apply_rms_norm_reference(q, q_norm_weight)
+        k = apply_rms_norm_reference(k, k_norm_weight)
+    q = apply_rotary_pos_emb_neox_reference(q, cs)
+    k = apply_rotary_pos_emb_neox_reference(k, cs)
+    if qk_norm_policy == 1:
+        q = apply_rms_norm_reference(q, q_norm_weight)
+        k = apply_rms_norm_reference(k, k_norm_weight)
+
+    # write into paged KV cache; clear tail of last used slot per request
+    tok = 0
+    for ri in range(num_req):
+        sl = num_seqlen_per_req[ri].item()
+        ql = q_lens[ri]
+        for pos in range(sl - ql, sl):
+            bi, pb = pos // blk, pos % blk
+            cb = kv_indices[ri, bi].item()
+            kcache[cb, pb] = k[tok].to(dtype)
+            vcache[cb, pb] = v[tok].to(dtype)
+            if pos == sl - 1 and pb + 1 < blk:
+                kcache[cb, pb + 1 :] = 0
+                vcache[cb, pb + 1 :] = 0
+            tok += 1
+
+    return q.to(dtype)
+
+
+def pad_decode_inputs_to_align8(qkv, num_seqlen, q_index, kv_indices):
+    """Pad decode batch/rows to a multiple of 8 (simulates CUDA-graph padding)."""
+    nr = qkv.shape[0]
+    nb = num_seqlen.shape[0]
+    pb = (nb + 7) // 8 * 8
+    pr = (nr + 7) // 8 * 8
+
+    if pr > nr:
+        qkv = torch.cat(
+            [qkv, torch.zeros(pr - nr, qkv.shape[1], dtype=qkv.dtype, device=qkv.device)]
         )
-
-    # q_index: original ends at num_rows, padding batches have 0 tokens each,
-    # but we assign all pad_rows to the first padding batch so q_index covers padded_rows
-    last_val = q_index[-1]  # == num_rows
-    if pad_batch > 0:
-        pad_q = torch.full((pad_batch,), padded_rows, dtype=q_index.dtype, device=q_index.device)
-        q_index = torch.cat([q_index, pad_q])
-
-    if pad_batch > 0:
+    if pb > nb:
+        num_seqlen = torch.cat(
+            [num_seqlen, torch.zeros(pb - nb, dtype=num_seqlen.dtype, device=num_seqlen.device)]
+        )
+        q_index = torch.cat(
+            [q_index, torch.full((pb - nb,), pr, dtype=q_index.dtype, device=q_index.device)]
+        )
         kv_indices = torch.cat(
             [
                 kv_indices,
                 torch.zeros(
-                    pad_batch, kv_indices.shape[1], dtype=kv_indices.dtype, device=kv_indices.device
+                    pb - nb, kv_indices.shape[1], dtype=kv_indices.dtype, device=kv_indices.device
                 ),
             ]
         )
 
-    return qkv, num_seqlen_per_req, q_index, kv_indices, num_rows
+    return qkv, num_seqlen, q_index, kv_indices, nr
 
 
-@pytest.mark.parametrize("num_req", [8])
-@pytest.mark.parametrize(
-    "num_q_heads,num_kv_heads,qk_head_dim",
-    [(8, 1, 128), (64, 8, 128)],
-)
-@pytest.mark.parametrize("qk_norm_policy", [1])
-def test_rope_norm_store_kv_decode(num_req, num_q_heads, num_kv_heads, qk_head_dim, qk_norm_policy):
-    req_length = torch.randint(20, 200, (num_req,)).tolist()
-    v_head_dim = qk_head_dim
-    kv_block_size = 64
-    max_num_kv_blocks = 1024
-    max_rope_position = 2048
-    dtype = torch.bfloat16
-    (
-        qkv,
-        num_seqlen_per_req,
-        cos_sin,
-        kcache,
-        vcache,
-        kv_indices,
-        q_norm_weight,
-        k_norm_weight,
-    ) = prepare_decode_input(
-        num_req,
-        req_length,
-        num_q_heads,
-        num_kv_heads,
-        qk_head_dim,
-        v_head_dim,
-        kv_block_size,
-        max_num_kv_blocks,
-        max_rope_position,
-        dtype,
-    )
-
-    q_index_decode = torch.arange(num_req + 1, dtype=torch.int32, device=qkv.device)
-
-    # Pad to align-8 (simulates CUDA graph padding)
-    qkv, num_seqlen_per_req, q_index_decode, kv_indices, real_rows = pad_decode_inputs_to_align8(
-        qkv, num_seqlen_per_req, q_index_decode, kv_indices
-    )
-
-    qkv_ref = qkv[:real_rows].clone()
-    kcache_ref = kcache.clone()
-    vcache_ref = vcache.clone()
-    q_index_ref = torch.arange(num_req + 1, dtype=torch.int32, device=qkv.device)
-
-    my_out_q = hpc.rope_norm_store_kv(
-        kcache,
-        vcache,
-        qkv,
-        cos_sin,
-        num_seqlen_per_req,
-        q_index_decode,
-        kv_indices,
-        False,  # is prefill
-        q_norm_weight=q_norm_weight if qk_norm_policy > 0 else None,
-        k_norm_weight=k_norm_weight if qk_norm_policy > 0 else None,
-        qk_norm_policy=qk_norm_policy,
-    )
-
-    torch_out_q, torch_out_k, torch_kcache, torch_vcache = torch_rope_norm_blocked_decode(
-        kcache_ref,
-        vcache_ref,
-        qkv_ref,
-        cos_sin,
-        num_seqlen_per_req[:num_req],
-        q_index_ref,
-        kv_indices[:num_req],
-        is_prefill=False,
-        use_qknorm=(qk_norm_policy > 0),
-        q_norm_weight=q_norm_weight,
-        k_norm_weight=k_norm_weight,
-        qk_norm_policy=qk_norm_policy,
-        clear_kv_tail=True,
-    )
-
-    assert allclose(torch_out_q, my_out_q[:real_rows], atol=5e-2)
-    assert allclose(torch_kcache, kcache, atol=5e-2)
-    assert allclose(torch_vcache, vcache, atol=5e-2)
-
-
-@pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
-@pytest.mark.parametrize("num_req", [7])
-@pytest.mark.parametrize(
-    "num_q_heads,num_kv_heads,qk_head_dim",
-    [(8, 1, 128), (64, 8, 128)],
-)
-@pytest.mark.parametrize("qk_norm_policy", [1, 2])
-def test_rope_norm_store_kv_fp8_prefill_dqskv(
-    num_req, num_q_heads, num_kv_heads, qk_head_dim, qk_norm_policy
-):
-    req_length = torch.randint(20, 200, (num_req,)).tolist()
-    v_head_dim = qk_head_dim
-    kv_block_size = 64
-    max_num_kv_blocks = 1024
-    max_rope_position = 2048
-    dtype = torch.bfloat16
-    (
-        qkv,
-        num_seqlen_per_req,
-        cos_sin,
-        kcache,
-        vcache,
-        kv_indices,
-        q_norm_weight,
-        k_norm_weight,
-    ) = prepare_prefill_input(
-        num_req,
-        req_length,
-        num_q_heads,
-        num_kv_heads,
-        qk_head_dim,
-        v_head_dim,
-        kv_block_size,
-        max_num_kv_blocks,
-        max_rope_position,
-        dtype,
-    )
-    q_index, qkv_new = sample_and_extract_qkv(req_length, qkv)
-
-    qkv_ref = qkv_new.clone()
-    kcache_ref = kcache.clone()
-    vcache_ref = vcache.clone()
-
-    k_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv_new.device)
-    v_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv_new.device)
-    kcache_fp8 = kcache.to(torch.float8_e4m3fn)
-    vcache_fp8 = vcache.to(torch.float8_e4m3fn)
-
-    seqlens = q_index[1:] - q_index[:-1]
-    max_seqlens = seqlens.max().item()
-
-    q_fp8, q_scale, split_k_flag = hpc.rope_norm_store_kv_fp8(
-        key_cache=kcache_fp8,
-        value_cache=vcache_fp8,
-        qkv=qkv_new,
-        cos_sin=cos_sin,
-        num_seqlen_per_req=num_seqlen_per_req,
-        q_index=q_index,
-        kvcache_indices=kv_indices,
-        is_prefill=True,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        quant_policy=1,  # 1 for dqskv , 2 for sqskv
-        max_seqlens=max_seqlens,
-        q_norm_weight=q_norm_weight if qk_norm_policy > 0 else None,
-        k_norm_weight=k_norm_weight if qk_norm_policy > 0 else None,
-        qk_norm_policy=qk_norm_policy,  # 0 for no norm, 1 for rope first, 2 for norm first
-    )
-
-    mask = torch.arange(q_scale.shape[2]).expand(
-        q_scale.shape[0], q_scale.shape[2]
-    ).cuda() < seqlens.unsqueeze(1)
-    qk_scale_normal = q_scale.permute(0, 2, 1)[mask].cuda()
-    q_bf16 = (q_fp8.to(torch.bfloat16) * qk_scale_normal[:, :, None]).to(torch.bfloat16)
-
-    torch_out_q, _, _, _ = torch_rope_norm_blocked_prefill(
-        kcache_ref,
-        vcache_ref,
-        qkv_ref,
-        cos_sin,
-        num_seqlen_per_req,
-        q_index,
-        kv_indices,
-        is_prefill=True,
-        use_qknorm=(qk_norm_policy > 0),
-        q_norm_weight=q_norm_weight,
-        k_norm_weight=k_norm_weight,
-        qk_norm_policy=qk_norm_policy,
-        clear_kv_tail=True,
-    )
-
-    assert allclose(torch_out_q, q_bf16, atol=0.5)
-
-
-@pytest.mark.parametrize("num_req", [8])
-@pytest.mark.parametrize(
-    "num_q_heads,num_kv_heads,qk_head_dim",
-    [(8, 1, 128), (64, 8, 128)],
-)
-@pytest.mark.parametrize("qk_norm_policy", [0, 1])
-def test_rope_norm_store_kv_fp8_decode_dqskv(
-    num_req, num_q_heads, num_kv_heads, qk_head_dim, qk_norm_policy
-):
-    req_length = torch.randint(20, 200, (num_req,)).tolist()
-    v_head_dim = qk_head_dim
-    kv_block_size = 64
-    max_num_kv_blocks = 1024
-    max_rope_position = 2048
-    dtype = torch.bfloat16
-    (
-        qkv,
-        num_seqlen_per_req,
-        cos_sin,
-        kcache,
-        vcache,
-        kv_indices,
-        q_norm_weight,
-        k_norm_weight,
-    ) = prepare_decode_input(
-        num_req,
-        req_length,
-        num_q_heads,
-        num_kv_heads,
-        qk_head_dim,
-        v_head_dim,
-        kv_block_size,
-        max_num_kv_blocks,
-        max_rope_position,
-        dtype,
-    )
-
-    q_index_decode = torch.arange(num_req + 1, dtype=torch.int32, device=qkv.device)
-
-    # Pad to align-8
-    qkv, num_seqlen_per_req, q_index_decode, kv_indices, real_rows = pad_decode_inputs_to_align8(
-        qkv, num_seqlen_per_req, q_index_decode, kv_indices
-    )
-
-    qkv_ref = qkv[:real_rows].clone()
-    kcache_ref = kcache.clone()
-    vcache_ref = vcache.clone()
-    q_index_ref = torch.arange(num_req + 1, dtype=torch.int32, device=qkv.device)
-
-    k_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv.device)
-    v_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv.device)
-    kcache_fp8 = kcache.to(torch.float8_e4m3fn)
-    vcache_fp8 = vcache.to(torch.float8_e4m3fn)
-
-    q_fp8, q_scale, split_k_flag = hpc.rope_norm_store_kv_fp8(
-        key_cache=kcache_fp8,
-        value_cache=vcache_fp8,
-        qkv=qkv,
-        cos_sin=cos_sin,
-        num_seqlen_per_req=num_seqlen_per_req,
-        q_index=q_index_decode,
-        kvcache_indices=kv_indices,
-        is_prefill=False,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        quant_policy=1,
-        max_seqlens=1,
-        q_norm_weight=q_norm_weight if qk_norm_policy > 0 else None,
-        k_norm_weight=k_norm_weight if qk_norm_policy > 0 else None,
-        qk_norm_policy=qk_norm_policy,
-    )
-
-    q_bf16 = (q_fp8[:real_rows].to(torch.bfloat16) * q_scale[:real_rows, :, None]).to(
-        torch.bfloat16
-    )
-
-    torch_out_q, _, _, _ = torch_rope_norm_blocked_decode(
-        kcache_ref,
-        vcache_ref,
-        qkv_ref,
-        cos_sin,
-        num_seqlen_per_req[:num_req],
-        q_index_ref,
-        kv_indices[:num_req],
-        is_prefill=False,
-        use_qknorm=(qk_norm_policy > 0),
-        q_norm_weight=q_norm_weight,
-        k_norm_weight=k_norm_weight,
-        qk_norm_policy=qk_norm_policy,
-        clear_kv_tail=True,
-    )
-
-    assert allclose(torch_out_q, q_bf16, atol=0.5)
-
-
-@pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
-@pytest.mark.parametrize("num_req", [7])
-@pytest.mark.parametrize(
-    "num_q_heads,num_kv_heads,qk_head_dim",
-    [(8, 1, 128), (64, 8, 128)],
-)
-@pytest.mark.parametrize("qk_norm_policy", [0, 2])
-def test_rope_norm_store_kv_fp8_prefill_sqskv(
-    num_req, num_q_heads, num_kv_heads, qk_head_dim, qk_norm_policy
-):
-    req_length = torch.randint(20, 200, (num_req,)).tolist()
-    v_head_dim = qk_head_dim
-    kv_block_size = 64
-    max_num_kv_blocks = 1024
-    max_rope_position = 2048
-    dtype = torch.bfloat16
-    (
-        qkv,
-        num_seqlen_per_req,
-        cos_sin,
-        kcache,
-        vcache,
-        kv_indices,
-        q_norm_weight,
-        k_norm_weight,
-    ) = prepare_prefill_input(
-        num_req,
-        req_length,
-        num_q_heads,
-        num_kv_heads,
-        qk_head_dim,
-        v_head_dim,
-        kv_block_size,
-        max_num_kv_blocks,
-        max_rope_position,
-        dtype,
-    )
-    q_index, qkv_new = sample_and_extract_qkv(req_length, qkv)
-
-    qkv_ref = qkv_new.clone()
-    kcache_ref = kcache.clone()
-    vcache_ref = vcache.clone()
-
-    k_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv_new.device)
-    v_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv_new.device)
-    kcache_fp8 = kcache.to(torch.float8_e4m3fn)
-    vcache_fp8 = vcache.to(torch.float8_e4m3fn)
-
-    seqlens = q_index[1:] - q_index[:-1]
-    max_seqlens = seqlens.max().item()
-
-    q_scale_val = 2
-    q_scale_inv = torch.tensor([1 / q_scale_val], dtype=torch.float32, device=qkv_new.device)
-
-    q_fp8, q_scale, split_k_flag = hpc.rope_norm_store_kv_fp8(
-        key_cache=kcache_fp8,
-        value_cache=vcache_fp8,
-        qkv=qkv_new,
-        cos_sin=cos_sin,
-        num_seqlen_per_req=num_seqlen_per_req,
-        q_index=q_index,
-        kvcache_indices=kv_indices,
-        is_prefill=True,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        quant_policy=2,
-        max_seqlens=max_seqlens,
-        q_scale_inv=q_scale_inv,
-        q_norm_weight=q_norm_weight if qk_norm_policy > 0 else None,
-        k_norm_weight=k_norm_weight if qk_norm_policy > 0 else None,
-        qk_norm_policy=qk_norm_policy,
-    )
-
-    assert q_scale is None
-    q_bf16 = (q_fp8.to(torch.float32) * q_scale_val).to(torch.bfloat16)
-
-    torch_out_q, _, _, _ = torch_rope_norm_blocked_prefill(
-        kcache_ref,
-        vcache_ref,
-        qkv_ref,
-        cos_sin,
-        num_seqlen_per_req,
-        q_index,
-        kv_indices,
-        is_prefill=True,
-        use_qknorm=(qk_norm_policy > 0),
-        q_norm_weight=q_norm_weight,
-        k_norm_weight=k_norm_weight,
-        qk_norm_policy=qk_norm_policy,
-        clear_kv_tail=True,
-    )
-
-    assert allclose(torch_out_q, q_bf16, atol=0.5)
-
-
-@pytest.mark.parametrize("num_req", [8])
-@pytest.mark.parametrize(
-    "num_q_heads,num_kv_heads,qk_head_dim",
-    [(8, 1, 128), (64, 8, 128)],
-)
-@pytest.mark.parametrize("qk_norm_policy", [0, 1, 2])
-def test_rope_norm_store_kv_fp8_decode_sqskv(
-    num_req, num_q_heads, num_kv_heads, qk_head_dim, qk_norm_policy
-):
-    req_length = torch.randint(20, 200, (num_req,)).tolist()
-    v_head_dim = qk_head_dim
-    kv_block_size = 64
-    max_num_kv_blocks = 1024
-    max_rope_position = 2048
-    dtype = torch.bfloat16
-    (
-        qkv,
-        num_seqlen_per_req,
-        cos_sin,
-        kcache,
-        vcache,
-        kv_indices,
-        q_norm_weight,
-        k_norm_weight,
-    ) = prepare_decode_input(
-        num_req,
-        req_length,
-        num_q_heads,
-        num_kv_heads,
-        qk_head_dim,
-        v_head_dim,
-        kv_block_size,
-        max_num_kv_blocks,
-        max_rope_position,
-        dtype,
-    )
-
-    q_index_decode = torch.arange(num_req + 1, dtype=torch.int32, device=qkv.device)
-
-    # Pad to align-8
-    qkv, num_seqlen_per_req, q_index_decode, kv_indices, real_rows = pad_decode_inputs_to_align8(
-        qkv, num_seqlen_per_req, q_index_decode, kv_indices
-    )
-
-    qkv_ref = qkv[:real_rows].clone()
-    kcache_ref = kcache.clone()
-    vcache_ref = vcache.clone()
-    q_index_ref = torch.arange(num_req + 1, dtype=torch.int32, device=qkv.device)
-
-    k_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv.device)
-    v_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv.device)
-    kcache_fp8 = kcache.to(torch.float8_e4m3fn)
-    vcache_fp8 = vcache.to(torch.float8_e4m3fn)
-
-    q_scale_val = 2
-    q_scale_inv = torch.tensor([1 / q_scale_val], dtype=torch.float32, device=qkv.device)
-
-    q_fp8, q_scale, split_k_flag = hpc.rope_norm_store_kv_fp8(
-        key_cache=kcache_fp8,
-        value_cache=vcache_fp8,
-        qkv=qkv,
-        cos_sin=cos_sin,
-        num_seqlen_per_req=num_seqlen_per_req,
-        q_index=q_index_decode,
-        kvcache_indices=kv_indices,
-        is_prefill=False,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        quant_policy=2,
-        max_seqlens=1,
-        q_scale_inv=q_scale_inv,
-        q_norm_weight=q_norm_weight if qk_norm_policy > 0 else None,
-        k_norm_weight=k_norm_weight if qk_norm_policy > 0 else None,
-        qk_norm_policy=qk_norm_policy,
-    )
-
-    assert q_scale is None
-    q_bf16 = (q_fp8[:real_rows].to(torch.float32) * q_scale_val).to(torch.bfloat16)
-
-    torch_out_q, _, _, _ = torch_rope_norm_blocked_decode(
-        kcache_ref,
-        vcache_ref,
-        qkv_ref,
-        cos_sin,
-        num_seqlen_per_req[:num_req],
-        q_index_ref,
-        kv_indices[:num_req],
-        is_prefill=False,
-        use_qknorm=(qk_norm_policy > 0),
-        q_norm_weight=q_norm_weight,
-        k_norm_weight=k_norm_weight,
-        qk_norm_policy=qk_norm_policy,
-        clear_kv_tail=True,
-    )
-
-    assert allclose(torch_out_q, q_bf16, atol=0.5)
-
-
-def prepare_mtp_decode_input(
+def prepare_inputs(
     num_req,
-    req_length,
-    mtp_steps,
+    is_prefill,
+    mtp,
     num_q_heads,
     num_kv_heads,
     qk_head_dim,
-    v_head_dim,
-    kv_block_size,
-    max_num_kv_blocks,
-    max_rope_position,
+    v_head_dim=None,
+    kv_block_size=64,
+    max_num_kv_blocks=1024,
+    max_rope_position=2048,
     dtype=torch.bfloat16,
     device="cuda",
 ):
-    """Prepare decode input with MTP (multi-token prediction).
+    """Build all tensors required for rope_norm_store_kv[_fp8] tests.
 
-    Each request contributes `mtp_steps` rows instead of 1.
-    req_length[i] is the existing kv length (before this decode step).
-    The new tokens occupy positions [req_length[i], req_length[i] + mtp_steps).
+    For prefill (is_prefill=True):  variable Q tokens per request (random suffix sampling).
+    For decode  (is_prefill=False): tokens_per_req = mtp+1, batch padded to align-8.
+
+    Returns:
+        qkv, num_seqlen, q_index, kcache, vcache, kv_indices,
+        q_norm_weight, k_norm_weight, cos_sin,
+        real_rows   -- None for prefill; for decode = unpadded row count
     """
-    if req_length is None:
-        req_length = torch.randint(20, 200, (num_req,)).tolist()
-    if isinstance(req_length, int):
-        req_length = [req_length] * num_req
-    updated_req_length = [x + mtp_steps for x in req_length]
-    total_rows = num_req * mtp_steps
-    qkv = torch.randn(
-        total_rows,
-        num_q_heads * qk_head_dim + num_kv_heads * qk_head_dim + num_kv_heads * v_head_dim,
-        dtype=dtype,
-        device=device,
-    )
+    if v_head_dim is None:
+        v_head_dim = qk_head_dim
+    hidden = num_q_heads * qk_head_dim + num_kv_heads * qk_head_dim + num_kv_heads * v_head_dim
+
     cos_sin = generate_cos_sin_cache(max_rope_position, qk_head_dim).to(
         dtype=torch.float32, device=device
     )
@@ -1512,221 +1071,241 @@ def prepare_mtp_decode_input(
     vcache = torch.randn(
         max_num_kv_blocks, kv_block_size, num_kv_heads, v_head_dim, dtype=dtype, device=device
     )
-    kv_indices = generate_kv_block_indices(kcache, updated_req_length).to(device)
-    q_norm_weight = torch.randn(qk_head_dim, dtype=torch.float32, device=device)
-    k_norm_weight = torch.randn(qk_head_dim, dtype=torch.float32, device=device)
-    num_seqlen_per_req = torch.tensor(updated_req_length, dtype=torch.int32, device=device)
-    q_lengths = [mtp_steps] * num_req
-    q_cumsum = torch.cumsum(torch.tensor(q_lengths, device=device), dim=0)
-    q_index = torch.cat((torch.tensor([0], device=device, dtype=q_cumsum.dtype), q_cumsum)).to(
-        torch.int32
-    )
+    q_norm_w = torch.randn(qk_head_dim, dtype=torch.float32, device=device)
+    k_norm_w = torch.randn(qk_head_dim, dtype=torch.float32, device=device)
+
+    if is_prefill:
+        req_len = torch.randint(20, 200, (num_req,)).tolist()
+        qkv_full = torch.randn(sum(req_len), hidden, dtype=dtype, device=device)
+        # sample a random-length suffix from each request's token sequence
+        req_len_t = torch.tensor(req_len, device=device)
+        q_len_t = torch.min((torch.rand(num_req, device=device) * req_len_t).long() + 1, req_len_t)
+        cumsum = torch.cumsum(req_len_t, dim=0)
+        qkv = torch.cat([qkv_full[cumsum[i] - q_len_t[i] : cumsum[i]] for i in range(num_req)])
+        q_index = torch.cat(
+            [torch.zeros(1, device=device, dtype=torch.int64), torch.cumsum(q_len_t, 0)]
+        ).to(torch.int32)
+        num_seqlen = torch.tensor(req_len, dtype=torch.int32, device=device)
+        kv_indices = generate_kv_block_indices(kcache, req_len).to(device)
+        real_rows = None
+    else:
+        tpr = mtp + 1  # tokens per request
+        exist_len = torch.randint(20, 200, (num_req,)).tolist()
+        upd_len = [x + tpr for x in exist_len]
+        qkv_raw = torch.randn(num_req * tpr, hidden, dtype=dtype, device=device)
+        q_idx_raw = torch.arange(0, (num_req + 1) * tpr, tpr, device=device, dtype=torch.int32)
+        num_seqlen_raw = torch.tensor(upd_len, dtype=torch.int32, device=device)
+        kv_idx_raw = generate_kv_block_indices(kcache, upd_len).to(device)
+        qkv, num_seqlen, q_index, kv_indices, real_rows = pad_decode_inputs_to_align8(
+            qkv_raw, num_seqlen_raw, q_idx_raw, kv_idx_raw
+        )
+
     return (
         qkv,
-        num_seqlen_per_req,
+        num_seqlen,
         q_index,
-        cos_sin,
         kcache,
         vcache,
         kv_indices,
-        q_norm_weight,
-        k_norm_weight,
-    )
-
-
-@pytest.mark.parametrize("num_req", [8])
-@pytest.mark.parametrize(
-    "num_q_heads,num_kv_heads,qk_head_dim",
-    [(8, 1, 128), (64, 8, 128)],
-)
-@pytest.mark.parametrize("qk_norm_policy", [0, 1, 2])
-@pytest.mark.parametrize("mtp_steps", [1, 2])
-def test_rope_norm_store_kv_mtp_decode(
-    num_req, num_q_heads, num_kv_heads, qk_head_dim, qk_norm_policy, mtp_steps
-):
-    """MTP decode: each request has mtp_steps tokens (not just 1)."""
-    req_length = torch.randint(20, 200, (num_req,)).tolist()
-    v_head_dim = qk_head_dim
-    kv_block_size = 64
-    max_num_kv_blocks = 1024
-    max_rope_position = 2048
-    dtype = torch.bfloat16
-    (
-        qkv,
-        num_seqlen_per_req,
-        q_index,
+        q_norm_w,
+        k_norm_w,
         cos_sin,
-        kcache,
-        vcache,
-        kv_indices,
-        q_norm_weight,
-        k_norm_weight,
-    ) = prepare_mtp_decode_input(
-        num_req,
-        req_length,
-        mtp_steps,
-        num_q_heads,
-        num_kv_heads,
-        qk_head_dim,
-        v_head_dim,
-        kv_block_size,
-        max_num_kv_blocks,
-        max_rope_position,
-        dtype,
-    )
-    # Pad to align-8
-    qkv, num_seqlen_per_req, q_index, kv_indices, real_rows = pad_decode_inputs_to_align8(
-        qkv, num_seqlen_per_req, q_index, kv_indices
+        real_rows,
     )
 
-    qkv_ref = qkv[:real_rows].clone()
-    kcache_ref = kcache.clone()
-    vcache_ref = vcache.clone()
-    q_index_ref = torch.cat(
-        (
-            torch.tensor([0], device=qkv.device, dtype=torch.int32),
-            torch.cumsum(torch.tensor([mtp_steps] * num_req, device=qkv.device), dim=0).to(
-                torch.int32
-            ),
-        )
-    )
 
-    my_out_q = hpc.rope_norm_store_kv(
-        kcache,
-        vcache,
-        qkv,
-        cos_sin,
-        num_seqlen_per_req,
-        q_index,
-        kv_indices,
-        False,
-        q_norm_weight=q_norm_weight if qk_norm_policy > 0 else None,
-        k_norm_weight=k_norm_weight if qk_norm_policy > 0 else None,
-        qk_norm_policy=qk_norm_policy,
-    )
-
-    # Use prefill reference (handles multi-token per request correctly)
-    torch_out_q, torch_out_k, torch_kcache, torch_vcache = torch_rope_norm_blocked_prefill(
-        kcache_ref,
-        vcache_ref,
-        qkv_ref,
-        cos_sin,
-        num_seqlen_per_req[:num_req],
-        q_index_ref,
-        kv_indices[:num_req],
-        is_prefill=True,
-        use_qknorm=(qk_norm_policy > 0),
-        q_norm_weight=q_norm_weight,
-        k_norm_weight=k_norm_weight,
-        qk_norm_policy=qk_norm_policy,
-        clear_kv_tail=True,
-    )
-
-    assert allclose(torch_out_q, my_out_q[:real_rows], atol=5e-2)
-    assert allclose(torch_kcache, kcache, atol=5e-2)
-    assert allclose(torch_vcache, vcache, atol=5e-2)
-
-
+# skip sanitizer because the unused q_out will not be touched in test mode but will be cleared in sanitizer mode
 @pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
-@pytest.mark.parametrize("num_req", [8])
-@pytest.mark.parametrize(
-    "num_q_heads,num_kv_heads,qk_head_dim",
-    [(8, 1, 128), (64, 8, 128)],
-)
+@pytest.mark.parametrize("num_q_heads,num_kv_heads,qk_head_dim", [(8, 1, 128), (64, 8, 128)])
 @pytest.mark.parametrize("qk_norm_policy", [0, 1, 2])
-@pytest.mark.parametrize("mtp_steps", [1, 2])
-def test_rope_norm_store_kv_fp8_mtp_decode_dqskv(
-    num_req, num_q_heads, num_kv_heads, qk_head_dim, qk_norm_policy, mtp_steps
+@pytest.mark.parametrize("num_req", [7, 16])
+@pytest.mark.parametrize("is_prefill,mtp", [(True, None), (False, 0), (False, 1)])
+def test_rope_norm_store_kv(
+    num_q_heads, num_kv_heads, qk_head_dim, qk_norm_policy, num_req, is_prefill, mtp
 ):
-    """MTP decode + FP8 dqskv."""
-    req_length = torch.randint(20, 200, (num_req,)).tolist()
-    v_head_dim = qk_head_dim
-    kv_block_size = 64
-    max_num_kv_blocks = 1024
-    max_rope_position = 2048
-    dtype = torch.bfloat16
-    (
-        qkv,
-        num_seqlen_per_req,
-        q_index,
-        cos_sin,
+    """Test rope_norm_store_kv: prefill / decode (mtp=0) / MTP decode (mtp=1)
+    across all qk_norm_policy values and GQA/MQA head configs.
+    num_req=7 exercises align-8 padding in decode.
+    """
+    qkv, num_seqlen, q_index, kcache, vcache, kv_indices, q_norm_w, k_norm_w, cos_sin, real_rows = (
+        prepare_inputs(num_req, is_prefill, mtp, num_q_heads, num_kv_heads, qk_head_dim)
+    )
+    kcache_ref, vcache_ref = kcache.clone(), vcache.clone()
+
+    out_q = hpc.rope_norm_store_kv(
         kcache,
         vcache,
+        qkv,
+        cos_sin,
+        num_seqlen,
+        q_index,
         kv_indices,
-        q_norm_weight,
-        k_norm_weight,
-    ) = prepare_mtp_decode_input(
-        num_req,
-        req_length,
-        mtp_steps,
-        num_q_heads,
-        num_kv_heads,
-        qk_head_dim,
-        v_head_dim,
-        kv_block_size,
-        max_num_kv_blocks,
-        max_rope_position,
-        dtype,
-    )
-    # Pad to align-8
-    qkv, num_seqlen_per_req, q_index, kv_indices, real_rows = pad_decode_inputs_to_align8(
-        qkv, num_seqlen_per_req, q_index, kv_indices
+        is_prefill,
+        q_norm_weight=q_norm_w if qk_norm_policy > 0 else None,
+        k_norm_weight=k_norm_w if qk_norm_policy > 0 else None,
+        qk_norm_policy=qk_norm_policy,
     )
 
-    qkv_ref = qkv[:real_rows].clone()
-    kcache_ref = kcache.clone()
-    vcache_ref = vcache.clone()
-    q_index_ref = torch.cat(
-        (
-            torch.tensor([0], device=qkv.device, dtype=torch.int32),
-            torch.cumsum(torch.tensor([mtp_steps] * num_req, device=qkv.device), dim=0).to(
-                torch.int32
-            ),
-        )
+    # Pass unpadded views to reference (padding entries have seqlen=0 and must be skipped)
+    if real_rows is not None:
+        qkv_r, ns_r = qkv[:real_rows], num_seqlen[:num_req]
+        qi_r, ki_r = q_index[: num_req + 1], kv_indices[:num_req]
+    else:
+        qkv_r, ns_r, qi_r, ki_r = qkv, num_seqlen, q_index, kv_indices
+
+    ref_q = rope_norm_ref(
+        kcache_ref, vcache_ref, qkv_r, cos_sin, ns_r, qi_r, ki_r, q_norm_w, k_norm_w, qk_norm_policy
     )
 
-    k_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv.device)
-    v_scale = torch.tensor([0.1], dtype=torch.float32, device=qkv.device)
+    rows = real_rows if real_rows is not None else out_q.shape[0]
+    assert allclose(ref_q, out_q[:rows], atol=8e-2)
+    assert allclose(kcache_ref, kcache, atol=8e-2)
+    assert allclose(vcache_ref, vcache, atol=8e-2)
+
+
+# skip sanitizer because the unused q_out will not be touched in test mode but will be cleared in sanitizer mode
+@pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
+@pytest.mark.parametrize("num_q_heads,num_kv_heads,qk_head_dim", [(8, 1, 128), (64, 8, 128)])
+@pytest.mark.parametrize("qk_norm_policy", [0, 1, 2])
+@pytest.mark.parametrize("quant_policy", [0, 1, 2])  # 0=dqksv, 1=dqskv, 2=sqskv
+@pytest.mark.parametrize("num_req", [7, 16])
+@pytest.mark.parametrize("is_prefill,mtp", [(True, None), (False, 0), (False, 1)])
+def test_rope_norm_store_kv_fp8(
+    num_q_heads,
+    num_kv_heads,
+    qk_head_dim,
+    qk_norm_policy,
+    quant_policy,
+    num_req,
+    is_prefill,
+    mtp,
+):
+    """Test rope_norm_store_kv_fp8: all mode/quant/norm combinations.
+    num_req=7 exercises align-8 padding in decode.
+    """
+    qkv, num_seqlen, q_index, kcache, vcache, kv_indices, q_norm_w, k_norm_w, cos_sin, real_rows = (
+        prepare_inputs(num_req, is_prefill, mtp, num_q_heads, num_kv_heads, qk_head_dim)
+    )
+    kcache_ref, vcache_ref = kcache.clone(), vcache.clone()
+
+    kv_block_size = kcache.shape[1]
+    num_blocks = kcache.shape[0]
+    device = qkv.device
+
+    if quant_policy == 0:
+        # Dynamic per-head per-token: k_scale is [num_blocks, R, num_kv_heads, L] (output)
+        L = qk_head_dim * 1 // 4  # sizeof(fp8) / sizeof(float)
+        R = kv_block_size // L
+        k_scale = torch.zeros(num_blocks, R, num_kv_heads, L, dtype=torch.float32, device=device)
+        # Per-head v_scale
+        v_scale = torch.rand(num_kv_heads, dtype=torch.float32, device=device) * 0.2 + 0.05
+    else:
+        k_scale = torch.tensor([0.1], dtype=torch.float32, device=device)
+        v_scale = torch.tensor([0.1], dtype=torch.float32, device=device)
+
+    q_scale_val = 2.0
+    q_scale_inv = torch.tensor([1.0 / q_scale_val], dtype=torch.float32, device=device)
+
     kcache_fp8 = kcache.to(torch.float8_e4m3fn)
     vcache_fp8 = vcache.to(torch.float8_e4m3fn)
 
-    q_fp8, q_scale, split_k_flag = hpc.rope_norm_store_kv_fp8(
+    if is_prefill:
+        max_seqlens = int((q_index[1:] - q_index[:-1]).max().item())
+    else:
+        max_seqlens = mtp + 1  # tokens per request in decode
+
+    q_fp8, q_scale_out, split_k_flag = hpc.rope_norm_store_kv_fp8(
         key_cache=kcache_fp8,
         value_cache=vcache_fp8,
         qkv=qkv,
         cos_sin=cos_sin,
-        num_seqlen_per_req=num_seqlen_per_req,
+        num_seqlen_per_req=num_seqlen,
         q_index=q_index,
         kvcache_indices=kv_indices,
-        is_prefill=False,
+        is_prefill=is_prefill,
         k_scale=k_scale,
         v_scale=v_scale,
-        quant_policy=1,
-        max_seqlens=mtp_steps,
-        q_norm_weight=q_norm_weight if qk_norm_policy > 0 else None,
-        k_norm_weight=k_norm_weight if qk_norm_policy > 0 else None,
+        quant_policy=hpc.QuantType(quant_policy),
+        max_seqlens=max_seqlens,
+        q_scale_inv=q_scale_inv if quant_policy == 2 else None,
+        q_norm_weight=q_norm_w if qk_norm_policy > 0 else None,
+        k_norm_weight=k_norm_w if qk_norm_policy > 0 else None,
         qk_norm_policy=qk_norm_policy,
     )
 
-    # q_scale for decode is [num_rows, num_q_heads]
-    q_bf16 = (q_fp8[:real_rows].to(torch.bfloat16) * q_scale[:real_rows, :, None]).to(
-        torch.bfloat16
-    )
+    assert split_k_flag.shape == (num_seqlen.shape[0], num_kv_heads)
+    assert split_k_flag.dtype == torch.int32
 
-    torch_out_q, _, _, _ = torch_rope_norm_blocked_prefill(
-        kcache_ref,
-        vcache_ref,
-        qkv_ref,
-        cos_sin,
-        num_seqlen_per_req[:num_req],
-        q_index_ref,
-        kv_indices[:num_req],
-        is_prefill=True,
-        use_qknorm=(qk_norm_policy > 0),
-        q_norm_weight=q_norm_weight,
-        k_norm_weight=k_norm_weight,
-        qk_norm_policy=qk_norm_policy,
-        clear_kv_tail=True,
-    )
+    if (
+        quant_policy == 0 or quant_policy == 1
+    ):  # dynamic Q: kernel computes per-token per-head scale
+        if is_prefill:
+            pad128 = ((max_seqlens + 127) // 128) * 128
+            assert q_scale_out.shape == (num_seqlen.shape[0], num_q_heads, pad128)
+            # dequant: select valid per-token scales via sequence-length mask
+            seqlens = (q_index[1:] - q_index[:-1]).to(device)
+            mask = torch.arange(pad128, device=device).expand(
+                num_seqlen.shape[0], pad128
+            ) < seqlens.unsqueeze(1)
+            scale_flat = q_scale_out.permute(0, 2, 1)[mask]  # [total_real_rows, num_q_heads]
+            rows = int(q_index[-1].item())
+            q_bf16 = (q_fp8[:rows].to(torch.bfloat16) * scale_flat[:, :, None]).to(torch.bfloat16)
+        else:
+            assert q_scale_out.shape == (qkv.shape[0], num_q_heads)
+            rows = real_rows  # num_req * tokens_per_req (before padding)
+            q_bf16 = (q_fp8[:rows].to(torch.bfloat16) * q_scale_out[:rows, :, None]).to(
+                torch.bfloat16
+            )
+    else:  # sqskv: static scale supplied by caller; no dynamic scale tensor returned
+        assert q_scale_out is None
+        rows = real_rows if real_rows is not None else q_fp8.shape[0]
+        q_bf16 = (q_fp8[:rows].to(torch.float32) * q_scale_val).to(torch.bfloat16)
 
-    assert allclose(torch_out_q, q_bf16, atol=0.5)
+    if real_rows is not None:
+        qkv_r, ns_r = qkv[:real_rows], num_seqlen[:num_req]
+        qi_r, ki_r = q_index[: num_req + 1], kv_indices[:num_req]
+    else:
+        qkv_r, ns_r, qi_r, ki_r = qkv, num_seqlen, q_index, kv_indices
+
+    ref_q = rope_norm_ref(
+        kcache_ref, vcache_ref, qkv_r, cos_sin, ns_r, qi_r, ki_r, q_norm_w, k_norm_w, qk_norm_policy
+    )
+    assert allclose(ref_q, q_bf16, atol=0.8)
+
+    # ========= Verify KV cache for all quant policies =========
+    q_lens_r = (qi_r[1:] - qi_r[:-1]).tolist()
+    if quant_policy == 0:
+        L = qk_head_dim * 1 // 4
+    tok = 0
+    for ri in range(num_req):
+        sl = int(ns_r[ri].item())
+        ql = int(q_lens_r[ri])
+        for pos in range(sl - ql, sl):
+            bi, pb = pos // kv_block_size, pos % kv_block_size
+            cb = int(ki_r[ri, bi].item())
+            # V verification
+            for h in range(num_kv_heads):
+                v_fp8_vals = vcache_fp8[cb, pb, h, :].to(torch.float32)
+                v_ref_vals = vcache_ref[cb, pb, h, :].to(torch.float32)
+                if quant_policy == 0:
+                    v_dequant = v_fp8_vals * v_scale[h]
+                else:
+                    v_dequant = v_fp8_vals * v_scale[0]
+                assert allclose(
+                    v_ref_vals, v_dequant, atol=0.8
+                ), f"V mismatch at req={ri} pos={pos} head={h} policy={quant_policy}"
+            # K verification
+            for h in range(num_kv_heads):
+                k_fp8_vals = kcache_fp8[cb, pb, h, :].to(torch.float32)
+                k_ref_vals = kcache_ref[cb, pb, h, :].to(torch.float32)
+                if quant_policy == 0:
+                    r_idx = pb // L
+                    l_idx = pb % L
+                    k_s = k_scale[cb, r_idx, h, l_idx].item()
+                else:
+                    k_s = k_scale[0].item()
+                k_dequant = k_fp8_vals * k_s
+                assert allclose(
+                    k_ref_vals, k_dequant, atol=0.8
+                ), f"K mismatch at req={ri} pos={pos} head={h} policy={quant_policy}"
+            tok += 1

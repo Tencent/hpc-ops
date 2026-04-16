@@ -553,24 +553,20 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
     torch::Tensor &kcache, torch::Tensor &vcache, const torch::Tensor &qkv,
     const torch::Tensor &cos_sin, const torch::Tensor &num_seqlen_per_req,
     const torch::Tensor &q_index, const torch::Tensor &kvcache_indices, bool is_prefill,
-    const torch::Tensor &k_scale, const torch::Tensor &v_scale, int64_t quant_policy,
-    int64_t max_seqlens, std::optional<double> upper_max_double,
-    std::optional<torch::Tensor> q_scale_inv_opt, std::optional<torch::Tensor> q_norm_weight_opt,
-    std::optional<torch::Tensor> k_norm_weight_opt, std::optional<torch::Tensor> out_q_opt,
-    std::optional<torch::Tensor> out_k_opt, std::optional<torch::Tensor> out_v_opt,
-    int64_t qk_norm_policy) {
+    torch::Tensor &k_scale, const torch::Tensor &v_scale, int64_t quant_policy, int64_t max_seqlens,
+    std::optional<double> upper_max_double, std::optional<torch::Tensor> q_scale_inv_opt,
+    std::optional<torch::Tensor> q_norm_weight_opt, std::optional<torch::Tensor> k_norm_weight_opt,
+    std::optional<torch::Tensor> out_q_opt, std::optional<torch::Tensor> out_k_opt,
+    std::optional<torch::Tensor> out_v_opt, int64_t qk_norm_policy) {
   auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
   TORCH_CHECK(qkv.is_contiguous(), "qkv tensor must be contiguous");
   TORCH_CHECK(cos_sin.is_contiguous(), "cos_sin tensor must be contiguous");
   TORCH_CHECK(num_seqlen_per_req.is_contiguous(), "num_seqlen_per_req tensor must be contiguous");
   TORCH_CHECK(kvcache_indices.is_contiguous(), "kvcache_indices tensor must be contiguous");
-  TORCH_CHECK(k_scale.dim() == 1 && k_scale.size(0) == 1, "k_scale must contain 1 element");
-  TORCH_CHECK(v_scale.dim() == 1 && v_scale.size(0) == 1, "v_scale must contain 1 element");
-  TORCH_CHECK(quant_policy == 1 || quant_policy == 2, "quant_policy must be 1 or 2");
   TORCH_CHECK(qkv.scalar_type() == torch::kBFloat16, "qkv must be bfloat16");
   TORCH_CHECK(kcache.dtype().itemsize() == 1, "kcache must be 1-byte dtype");
   TORCH_CHECK(vcache.dtype().itemsize() == 1, "vcache must be 1-byte dtype");
-
+  TORCH_CHECK(quant_policy >= 0 && quant_policy <= 2, "quant_policy must be 0, 1 or 2");
   TORCH_CHECK(qk_norm_policy >= 0 && qk_norm_policy <= 2, "qk_norm_policy must be 0, 1 or 2");
 
   using DType = __nv_bfloat16;
@@ -588,6 +584,28 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
   int max_num_kv_block_per_batch = kvcache_indices.size(1);
   int kcache_block_offset = kcache.stride(0);
   int vcache_block_offset = vcache.stride(0);
+
+  // Validate scale tensor shapes based on quant_policy
+  int k_scale_block_offset = 0;
+  if (quant_policy == 0) {
+    // Dynamic per-head per-token: k_scale is [num_block, R, num_kv_heads, L] (output)
+    int L = qk_head_dim * static_cast<int>(sizeof(QType)) / static_cast<int>(sizeof(float));
+    int R = kv_block_size / L;
+    TORCH_CHECK(k_scale.dim() == 4, "k_scale must be 4D for quant_policy=0");
+    TORCH_CHECK(k_scale.size(1) == R, "k_scale dim 1 must equal block_size/L=", R, ", got ",
+                k_scale.size(1));
+    TORCH_CHECK(k_scale.size(2) == num_kv_heads,
+                "k_scale dim 2 must equal num_kv_heads=", num_kv_heads, ", got ", k_scale.size(2));
+    TORCH_CHECK(k_scale.size(3) == L, "k_scale dim 3 must equal L=", L, ", got ", k_scale.size(3));
+    // V scale: per-head [num_kv_heads]
+    TORCH_CHECK(v_scale.dim() == 1 && v_scale.size(0) == num_kv_heads,
+                "v_scale must be [num_kv_heads] for quant_policy=0");
+    k_scale_block_offset = k_scale.stride(0);
+  } else {
+    // Static per-tensor: k_scale and v_scale are [1]
+    TORCH_CHECK(k_scale.dim() == 1 && k_scale.size(0) == 1, "k_scale must contain 1 element");
+    TORCH_CHECK(v_scale.dim() == 1 && v_scale.size(0) == 1, "v_scale must contain 1 element");
+  }
 
   float upper_max = static_cast<float>(QType(1000.f));
   if (upper_max_double.has_value()) {
@@ -610,7 +628,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
   torch::Tensor q_scale;
   float *q_scale_ptr = nullptr;
   int max_seqlens_pad128 = 0;
-  if (quant_policy == 1) {
+  if (quant_policy == 0 || quant_policy == 1) {
     if (is_prefill) {
       max_seqlens_pad128 = ((max_seqlens + 127) / 128) * 128;
       q_scale = torch::empty({num_req, num_q_heads, max_seqlens_pad128},
@@ -666,10 +684,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
       reinterpret_cast<const DType *>(qkv.const_data_ptr()), cos_sin.const_data_ptr<float>(),
       num_seqlen_per_req.const_data_ptr<int>(), q_index.const_data_ptr<int>(),
       kvcache_indices.const_data_ptr<int>(), q_norm_weight_ptr, k_norm_weight_ptr,
-      k_scale.const_data_ptr<float>(), v_scale.const_data_ptr<float>(), q_scale_inv_ptr, upper_max,
-      max_seqlens, kcache_block_offset, vcache_block_offset, num_req, max_num_kv_block_per_batch,
-      kv_block_size, num_rows, num_q_heads, num_kv_heads, qk_head_dim, v_head_dim, is_prefill,
-      qk_norm_policy, quant_policy, stream);
+      k_scale.mutable_data_ptr<float>(), v_scale.const_data_ptr<float>(), q_scale_inv_ptr,
+      upper_max, max_seqlens, kcache_block_offset, k_scale_block_offset, vcache_block_offset,
+      num_req, max_num_kv_block_per_batch, kv_block_size, num_rows, num_q_heads, num_kv_heads,
+      qk_head_dim, v_head_dim, is_prefill, qk_norm_policy, quant_policy, stream);
 
   return std::make_tuple(out_q, q_scale, split_k_flag);
 }
@@ -723,7 +741,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "rope_norm_store_kv_fp8(Tensor! kcache, Tensor! vcache, Tensor qkv, "
       "Tensor cos_sin, Tensor num_seqlen_per_req, Tensor q_index, Tensor kvcache_indices, "
-      "bool is_prefill, Tensor k_scale, Tensor v_scale, "
+      "bool is_prefill, Tensor! k_scale, Tensor v_scale, "
       "int quant_policy, int max_seqlens, float? upper_max, Tensor? q_scale_inv, "
       "Tensor? q_norm_weight, Tensor? k_norm_weight, "
       "Tensor? out_q=None, Tensor? out_k=None, Tensor? out_v=None, int qk_norm_policy=0) -> "
