@@ -354,7 +354,8 @@ __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
 
 }  // namespace kernels
 
-template <int kTileM, int kTileN, int kTileK, int kStage, bool kUsePDL = false>
+template <int kTileM, int kTileN, int kTileK, int kStage, bool kUsePDL = false,
+          int kDownTileK = kTileK>
 void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
                              void *down_input_ptr, void *down_output_ptr, const void *x_ptr,
                              const void *topk_ids_ptr, void *topk_pos_ptr, void *seqlens_ptr,
@@ -381,6 +382,7 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
   auto Y_down = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(down_output_ptr)),
                             make_shape(k, m * num_topk), make_stride(Int<1>{}, k));
 
+  // gate_up TMA X
   auto slayout_x = tile_to_shape(GMMA::Layout_K_SW128_Atom<Tin>{},
                                  make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{}));
 
@@ -389,7 +391,19 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
 
   auto gata_up_tma_x = make_tma_copy(SM90_TMA_LOAD{}, X_gate_up, slayout_x(_, _, 0));
   auto gata_up_tma_y = make_tma_copy(SM90_TMA_STORE{}, Y_gate_up, cpbox_yt);
-  auto down_tma_x = make_tma_copy(SM90_TMA_LOAD{}, X_down, slayout_x(_, _, 0));
+
+  // down TMA X: use SW64 when kDownTileK <= 64, otherwise SW128
+  constexpr bool kDownUseSW64 = (kDownTileK <= 64);
+  auto down_slayout_x = [&]() {
+    if constexpr (kDownUseSW64) {
+      return tile_to_shape(GMMA::Layout_K_SW64_Atom<Tin>{},
+                           make_shape(Int<kTileM>{}, Int<kDownTileK>{}, Int<kStage>{}));
+    } else {
+      return tile_to_shape(GMMA::Layout_K_SW128_Atom<Tin>{},
+                           make_shape(Int<kTileM>{}, Int<kDownTileK>{}, Int<kStage>{}));
+    }
+  }();
+  auto down_tma_x = make_tma_copy(SM90_TMA_LOAD{}, X_down, down_slayout_x(_, _, 0));
   auto down_tma_y = make_tma_copy(SM90_TMA_STORE{}, Y_down, cpbox_yt);
 
   auto *gate_up_tma_xy = static_cast<cute::TmaDescriptor *>(gate_up_tmas_ptr);
@@ -599,11 +613,21 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gate_up_output_ptr, v
   } else {
     constexpr int kTileM = 64;
     constexpr int kStage = 8;
-    launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
-        gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
-        topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
-        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
-        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
+    // use kTileK=64 + SW64 for down TMA when K is small
+    if (intermediate_size / 2 <= 192) {
+      constexpr int kDownTileK = 64;
+      launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL, kDownTileK>(
+          gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr,
+          topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr,
+          tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+          intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
+    } else {
+      launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL>(
+          gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr,
+          topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr,
+          tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+          intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
+    }
   }
 }
 
