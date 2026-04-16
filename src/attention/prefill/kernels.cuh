@@ -1387,6 +1387,14 @@ __global__ void __launch_bounds__(384, 1)
               }
             }
           }
+        } else {
+#pragma unroll
+          for (int im = 0; im < kM; ++im) {
+#pragma unroll
+            for (int in = 0; in < kN; ++in) {
+              tAttr_mn(im, in) *= tQS[im];
+            }
+          }
         }
 
         auto tYr_mn = retile_fragment(tYr);
@@ -1878,6 +1886,14 @@ __global__ void __launch_bounds__(384, 1)
               } else {
                 tAttr_mn(im, in) *= tQS[im] * tKS[in];
               }
+            }
+          }
+        } else {
+#pragma unroll
+          for (int im = 0; im < kM; ++im) {
+#pragma unroll
+            for (int in = 0; in < kN; ++in) {
+              tAttr_mn(im, in) *= tQS[im] * tKS[in];
             }
           }
         }
@@ -2387,6 +2403,14 @@ __global__ void __launch_bounds__(384, 1)
               } else {
                 tAttr_mn(im, in) *= tQS[im];
               }
+            }
+          }
+        } else {
+#pragma unroll
+          for (int im = 0; im < kM; ++im) {
+#pragma unroll
+            for (int in = 0; in < kN; ++in) {
+              tAttr_mn(im, in) *= tQS[im];
             }
           }
         }
