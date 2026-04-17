@@ -301,6 +301,92 @@ def fuse_moe_blockwise(
     )
 
 
+def fuse_moe_groupwise_w4a8(
+    x: Tensor,
+    gate_up_weight: Tensor,
+    gate_up_scale: Tensor,
+    down_weight: Tensor,
+    down_scale: Tensor,
+    act_and_mul_scale: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    group_size: int,
+    rank_ep: int,
+    num_expert_total: int,
+    use_hadamard: bool,
+    shared_output: Tensor = None,
+    output: Tensor = None,
+) -> Tensor:
+    """Performs Mixture of Experts (MoE) forward operation with weight int4 and activation fp8 precision.
+
+    It only supports static groupwise quantization of weights and static per tensor quantization inputs, with a group size of 64/128.
+
+    This function executes the MoE computation with all matrix multiplications
+    performed in weight int4 and activation fp8 precision for improved performance and memory efficiency.
+    The gate and up projections are fused into a single matrix multiplication.
+
+    Args:
+        x: Input activation tensor
+            Shape: [num_tokens, hidden_size]
+            Dtype: fp8
+        gate_up_weight: Combined weight tensor for gate and up projections
+            Shape: [num_expert_local, intermediate_size * 2, hidden_size // 2]
+            Dtype: int8
+        gate_up_scale: Scaling factors for gate-up projection outputs, which combine input scale with weight scale, and should be pad to 16 bytes.
+            Shape: [num_expert_local, intermediate_size * 2, (hidden_size // group_size + 7) // 8 * 8]
+            Dtype: bfloat16
+        down_weight: Weight tensor for down projection
+            Shape: [num_expert_local, hidden_size, intermediate_size // 2]
+            Dtype: int8
+        down_scale: Scaling factors for down projection outputs, which combine input scale with weight scale, and should be pad to 16 bytes.
+            Shape: [num_expert_local, hidden_size, (intermediate_size // group_size + 7) // 8 * 8]
+            Dtype: bfloat16
+        act_and_mul_scale: Scaling factor for activation and multiplication
+            Shape: [1]
+            Dtype: float32
+        topk_ids: Token indices assigned to each expert
+            Shape: [num_tokens, num_topk]
+            Dtype: int32
+        topk_scale: Weighting factors for each token-expert assignment
+            Shape: [num_tokens, num_topk]
+            Dtype: float32
+        group_size: group size of weight groupwise quant, only support 64/128
+            Dtype: int32
+        rank_ep: Expert parallel rank (for distributed training)
+            Dtype: int32
+        num_expert_total: the total number of expert
+            Dtype: int32
+        use_hadamard: if use hadamard transform for activation output and down projection weight
+            Dtype: bool
+        shared_output: output for shared experts, default is None
+            Shape: [num_tokens, hidden_size]
+            Dtype: bfloat16
+        output: specify output tensor.
+            Shape: [num_tokens, hidden_size]
+            Dtype: bfloat16
+    Returns:
+        torch.Tensor: Output tensor after MoE computation
+            Shape: [num_tokens, hidden_size]
+            Dtype: bfloat16
+    """
+    return torch.ops.hpc.fuse_moe_groupwise_w4a8(
+        x,
+        gate_up_weight,
+        gate_up_scale,
+        down_weight,
+        down_scale,
+        act_and_mul_scale,
+        topk_ids,
+        topk_scale,
+        group_size,
+        rank_ep,
+        num_expert_total,
+        use_hadamard,
+        shared_output,
+        output,
+    )
+
+
 @torch.library.register_fake("hpc::count_and_gather")
 def count_and_gather_fake(
     x, topk_ids, num_expert, rank_ep, intermediate_size, num_seq_per_group_avg
