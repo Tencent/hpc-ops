@@ -406,6 +406,7 @@ def attention_decode_fp8(
     new_kv_included: bool = False,
     quant_type: QuantType = QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
     splitk: bool = True,
+    task_map: Tensor = None,
     split_flag: Tensor = None,
     output: Tensor = None,
 ) -> Tensor:
@@ -477,6 +478,7 @@ def attention_decode_fp8(
         new_kv_included,
         quant_type.value,
         splitk,
+        task_map,
         split_flag,
         output,
     )
@@ -689,6 +691,143 @@ def mla_prefill_bf16(
     return torch.ops.hpc.mla_prefill_bf16(
         q, kv, seqlens_q, cu_seqlens_q, num_dim_qk, num_dim_v, max_seqlens_q, output
     )
+
+
+def get_attention_decode_task_workspace(
+    max_num_batch: int, max_seqlen: int, num_head_kv: int, min_process_len: int = 1024
+):
+    """Allocate task map for attention decode.
+    Args:
+        max_num_batch: max batch size decode will process
+        max_seqlen: max seqlen of service support.
+        num_head_kv:
+        min_process_len: each sm will process at_least 'min_process_len' token.
+
+    Returns:
+        Tensor: Shape [task_map_byte_size], Dtype: int8.
+    """
+
+    kTileN = 128
+    num_sm_count = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+    num_sm_count = num_sm_count // num_head_kv
+
+    task_info_byte_size = 32
+    max_num_tasks = max_num_batch * (max_seqlen + kTileN - 1) // kTileN
+    max_num_tiles_per_sm = max(
+        (max_num_tasks + num_sm_count - 1) // num_sm_count, min_process_len // kTileN
+    )
+    max_num_tasks = max_num_tiles_per_sm * num_sm_count
+    finish_tasks = num_sm_count
+    num_tile_per_sm_store_task = 1
+    int_size = 4
+    max_num_batch_pad = (
+        (max_num_batch * int_size + task_info_byte_size - 1)
+        // task_info_byte_size
+        * task_info_byte_size
+    )
+
+    num_sm_count_pad = (
+        (num_sm_count + task_info_byte_size - 1) // task_info_byte_size * task_info_byte_size
+    )
+
+    sched_need_byte_size = (
+        max_num_tasks + finish_tasks + num_tile_per_sm_store_task
+    ) * task_info_byte_size + max_num_batch_pad
+    workspace_byte_size = sched_need_byte_size + 2 * num_sm_count_pad
+    workspace = torch.zeros(
+        workspace_byte_size,
+        dtype=torch.int8,
+        device="cuda",
+    )
+
+    workspace.view(torch.int32)[1] = num_head_kv
+    workspace.view(torch.int32)[2] = max_num_batch
+    workspace.view(torch.int32)[3] = sched_need_byte_size
+
+    return workspace
+
+
+def assign_attention_decode_task(
+    num_seq_kvcache: Tensor,
+    task_map: Tensor,
+    num_head_kv: int,
+    mtp: int,
+    new_kv_included: bool,
+    min_process_len: int = 1024,
+) -> Tensor:
+    """Computes attention decode task map.
+
+    Args:
+        num_seq_kvcache: number tokens in kvcache before cur iteration.
+            Shape: [num_batch]
+            Dtype: int32
+        task_map: task_map for store output
+            Shape: [task_map_byte_size]
+            Dtype: int8
+        num_head_kv: num_head_kv.
+            Shape: scalar
+            Dtype: int32
+        mtp: number draft tokens.
+            Shape: scalar
+            Dtype: int32
+        new_kv_included: the seqlen in num_seq_kvcache include new kv or not.
+            Shape: scalar
+            Dtype: bool
+        min_process_len: each sm will process at_least 'min_process_len' token.
+            Shape: scalar
+            Dtype: int
+    """
+    if num_seq_kvcache.device.type == "cpu":
+        task_map_host = torch.ops.hpc.assign_attention_decode_task(
+            num_seq_kvcache, num_head_kv, mtp, new_kv_included, min_process_len, None
+        )
+        task_map[:4].copy_(task_map_host.reshape(-1)[:4], non_blocking=True)
+        task_map[32 : task_map_host.numel()].copy_(
+            task_map_host.reshape(-1)[32:], non_blocking=True
+        )
+        return task_map
+    else:
+        return torch.ops.hpc.assign_attention_decode_task(
+            num_seq_kvcache, num_head_kv, mtp, new_kv_included, min_process_len, task_map
+        )
+
+
+def print_attention_decode_task(task_map: Tensor) -> None:
+    task = task_map.view(torch.int32).reshape(-1, 8).cpu()
+    num_tile_per_sm = task[0][0]
+    num_head_kv = task[0][1]
+    num_sm_count = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+    num_sm_count = num_sm_count // num_head_kv
+
+    print(
+        f"\n[Decode Attn Task Map]: num_tile_per_sm({task[0][0]}), num_chunks:{task[num_sm_count * num_tile_per_sm + 1:]}\n"
+    )
+
+    idx = 0
+    num_task_per_sm = torch.zeros(num_sm_count)
+    seqlen_per_sm = torch.zeros(num_sm_count)
+    for ism in range(num_sm_count):
+        print(f"#######SM{ism}########")
+        for itask in range(num_tile_per_sm):
+            i = ism * num_tile_per_sm + itask
+            if task[i + 1][0] < 0:
+                break
+            print(
+                f"task:{idx}, ibatch:{task[i + 1][0]}, ichunk:{task[i + 1][1]}, iseq_start:{task[i + 1][2]}, seqkv:{task[i + 1][3]}, num_seqkvcache:{task[i + 1][4]}, num_tile_kv:{task[i + 1][5]}, num_tile_full:{task[i + 1][6]}, is_casual_chunk:{task[i + 1][7]}\n"
+            )
+            idx += 1
+            num_task_per_sm[ism] += 1
+            seqlen_per_sm[ism] += task[i + 1][3]
+
+    print(f"Summary:")
+    for ism in range(num_sm_count):
+        print(f"SM:{ism}, num_tasks:{num_task_per_sm[ism]}, total_seq:{seqlen_per_sm[ism]}")
 
 
 @torch.library.register_fake("hpc::attention_prefill_bf16")

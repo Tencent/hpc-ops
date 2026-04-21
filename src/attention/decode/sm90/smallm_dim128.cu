@@ -7,8 +7,8 @@
 #include <iostream>
 
 #include "cute/tensor.hpp"
+#include "src/attention/decode/sm90/smallm_kernels.cuh"
 #include "src/attention/decode/smallm_dim128.h"
-#include "src/attention/decode/smallm_kernels.cuh"
 
 namespace hpc {
 namespace attention {

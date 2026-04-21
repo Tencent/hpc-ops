@@ -1,7 +1,7 @@
 // Copyright 2025 hpc-ops authors
 
-#ifndef SRC_ATTENTION_DECODE_SMALLM_SPLITK_COMBINE_KERNELS_CUH_
-#define SRC_ATTENTION_DECODE_SMALLM_SPLITK_COMBINE_KERNELS_CUH_
+#ifndef SRC_ATTENTION_DECODE_SM90_SMALLM_SPLITK_COMBINE_KERNELS_CUH_
+#define SRC_ATTENTION_DECODE_SM90_SMALLM_SPLITK_COMBINE_KERNELS_CUH_
 
 #include <cuda.h>
 #include <stdio.h>
@@ -107,4 +107,4 @@ __global__ void attention_decode_bf16_smallm_splitk_combine_kernel(
 }  // namespace attention
 }  // namespace hpc
 
-#endif  // SRC_ATTENTION_DECODE_SMALLM_SPLITK_COMBINE_KERNELS_CUH_
+#endif  // SRC_ATTENTION_DECODE_SM90_SMALLM_SPLITK_COMBINE_KERNELS_CUH_

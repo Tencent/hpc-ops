@@ -1,7 +1,7 @@
 // Copyright 2025 hpc-ops authors
 
-#ifndef SRC_ATTENTION_DECODE_UTIL_KERNELS_CUH_
-#define SRC_ATTENTION_DECODE_UTIL_KERNELS_CUH_
+#ifndef SRC_ATTENTION_DECODE_SM90_UTIL_KERNELS_CUH_
+#define SRC_ATTENTION_DECODE_SM90_UTIL_KERNELS_CUH_
 
 #include <cuda.h>
 #include <stdio.h>
@@ -740,4 +740,4 @@ __device__ __forceinline__ auto make_tiled_copy_Y_interleave(R2SCopyAtom const& 
 }  // namespace attention
 }  // namespace hpc
 
-#endif  // SRC_ATTENTION_DECODE_UTIL_KERNELS_CUH_
+#endif  // SRC_ATTENTION_DECODE_SM90_UTIL_KERNELS_CUH_

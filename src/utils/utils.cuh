@@ -415,8 +415,10 @@ __device__ __forceinline__ constexpr auto retile_fragment(Tensor &&tensor) {
 
   constexpr int R = decltype(tensor.layout())::rank;
   static_assert(R >= 3, "rank must geater than or equal to 3");
+  constexpr int R0 = decltype(flatten(select<0>(tensor.layout())))::rank;
+  constexpr int RA = R0 > 3 ? R0 : 3;
 
-  auto thr_vmk = append<3>(flatten(select<0>(tensor.layout())));
+  auto thr_vmk = append<RA>(flatten(select<0>(tensor.layout())));
   auto tile_mk = take<1, R>(tensor.layout());
 
   auto m_layout =
@@ -727,6 +729,14 @@ __device__ __forceinline__ T *map_shared_rank(T *smem_ptr, int dst_rank) {
   void *p;
   asm volatile("cvta.shared::cluster.u64 %0, %1;\n\t" : "=l"(p) : "l"(smem64));
   return reinterpret_cast<T *>(p);
+}
+
+__device__ __forceinline__ void fence_tmem_after_thread_sync() {
+  asm volatile("tcgen05.fence::after_thread_sync;\n");
+}
+
+__device__ __forceinline__ void fence_tmem_before_thread_sync() {
+  asm volatile("tcgen05.fence::before_thread_sync;\n");
 }
 
 }  // namespace hpc

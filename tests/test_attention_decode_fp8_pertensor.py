@@ -88,16 +88,7 @@ except Exception as e:
     gt_attention_func = naive_attn_with_paged_kvcache_func
 
 
-@pytest.mark.parametrize("num_batch", [1, 16, 200])
-@pytest.mark.parametrize("num_seq_q", [1, 2, 3])
-@pytest.mark.parametrize("max_seq_kv", [1024, 4096])
-@pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("kv_head_q_head", [(2, 8), (4, 32)])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("new_kv_included", [True])
-@pytest.mark.parametrize("use_output", [False])
-@pytest.mark.parametrize("splitk", [True])
-def test_attention_decode_fp8(
+def attention_decode_fp8_test_func(
     num_batch,
     num_seq_q,
     max_seq_kv,
@@ -107,6 +98,8 @@ def test_attention_decode_fp8(
     new_kv_included,
     use_output,
     splitk,
+    use_dynamic_sched,
+    kvcache_shape,
 ):
     torch.manual_seed(10086)
     torch.cuda.manual_seed(10086)
@@ -144,6 +137,48 @@ def test_attention_decode_fp8(
 
     print(num_seq_kvcache)
 
+    task_map = None
+    if use_dynamic_sched:
+        task_map_for_cpu = hpc.get_attention_decode_task_workspace(
+            num_batch, max_seq_kv + num_seq_q, num_head_kv, min_process_len=1024
+        )
+        task_map_for_cuda = hpc.get_attention_decode_task_workspace(
+            num_batch, max_seq_kv + num_seq_q, num_head_kv, min_process_len=1024
+        )
+
+        hpc.assign_attention_decode_task(
+            num_seq_kvcache.cpu() + num_seq_q,
+            task_map_for_cpu,
+            num_head_kv,
+            num_seq_q,
+            new_kv_included,
+            min_process_len=1024,
+        )
+
+        hpc.assign_attention_decode_task(
+            num_seq_kvcache + num_seq_q,
+            task_map_for_cuda,
+            num_head_kv,
+            num_seq_q,
+            new_kv_included,
+            min_process_len=1024,
+        )
+
+        num_sm_count = (
+            torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+            // num_head_kv
+        )
+
+        sched_need_byte_size = (task_map_for_cpu.view(torch.int32)[0] * num_sm_count + 1) * 32 + (
+            num_batch * 4 + 31
+        ) // 32 * 32
+        assert torch.allclose(
+            task_map_for_cpu[:sched_need_byte_size], task_map_for_cuda[:sched_need_byte_size]
+        )
+
+        task_map = task_map_for_cuda
+        # hpc.print_attention_decode_task(task_map)
+
     nblocks = (num_seq_kvcache + num_seq_q + block_size - 1) // block_size
     total_blocks = sum(nblocks)
     kvcache = (
@@ -158,6 +193,10 @@ def test_attention_decode_fp8(
         )
         / math.sqrt(num_dim_qk)
     ).to(T)
+
+    if kvcache_shape == "HND":
+        kvcache = kvcache.permute(0, 1, 3, 2, 4).contiguous().permute(0, 1, 3, 2, 4)
+
     packed_block_ids = torch.randperm(max_num_blocks)[:total_blocks].to(torch.int32).cuda()
 
     max_num_block2 = max(nblocks)
@@ -206,9 +245,11 @@ def test_attention_decode_fp8(
             QS,
             KS,
             VS,
+            mtp=num_seq_q - 1,
             new_kv_included=new_kv_included,
             quant_type=hpc.QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
             splitk=splitk,
+            task_map=task_map,
             output=my,
         )
     else:
@@ -226,6 +267,7 @@ def test_attention_decode_fp8(
                 new_kv_included=new_kv_included,
                 quant_type=hpc.QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
                 splitk=splitk,
+                task_map=task_map,
             )
 
     print("\ngt\n")
@@ -247,3 +289,83 @@ def test_attention_decode_fp8(
     assert gt.device == my.device
     assert gt.dtype == my.dtype
     assert gt.shape == my.shape
+
+
+@pytest.mark.skipif(torch.cuda.get_device_capability()[0] != 9, reason="skip on non sm90!")
+@pytest.mark.parametrize("num_batch", [1, 16, 200])
+@pytest.mark.parametrize("num_seq_q", [1, 2, 3])
+@pytest.mark.parametrize("max_seq_kv", [1024, 4096])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("kv_head_q_head", [(2, 8), (4, 32)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("new_kv_included", [True])
+@pytest.mark.parametrize("use_output", [False])
+@pytest.mark.parametrize("splitk", [True])
+@pytest.mark.parametrize("use_dynamic_sched", [False])
+@pytest.mark.parametrize("kvcache_shape", ["NHD", "HND"])
+def test_attn_fp8_sm90(
+    num_batch,
+    num_seq_q,
+    max_seq_kv,
+    block_size,
+    kv_head_q_head,
+    head_dim,
+    new_kv_included,
+    use_output,
+    splitk,
+    use_dynamic_sched,
+    kvcache_shape,
+):
+    attention_decode_fp8_test_func(
+        num_batch,
+        num_seq_q,
+        max_seq_kv,
+        block_size,
+        kv_head_q_head,
+        head_dim,
+        new_kv_included,
+        use_output,
+        splitk,
+        use_dynamic_sched,
+        kvcache_shape,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.get_device_capability()[0] != 10, reason="skip on non sm100!")
+@pytest.mark.parametrize("num_batch", [1, 16, 200])
+@pytest.mark.parametrize("num_seq_q", [1, 2, 3])
+@pytest.mark.parametrize("max_seq_kv", [1024, 4096])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("kv_head_q_head", [(1, 8), (4, 32)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("new_kv_included", [True])
+@pytest.mark.parametrize("use_output", [False])
+@pytest.mark.parametrize("splitk", [True])
+@pytest.mark.parametrize("use_dynamic_sched", [True, False])
+@pytest.mark.parametrize("kvcache_shape", ["NHD", "HND"])
+def test_attn_fp8_sm100(
+    num_batch,
+    num_seq_q,
+    max_seq_kv,
+    block_size,
+    kv_head_q_head,
+    head_dim,
+    new_kv_included,
+    use_output,
+    splitk,
+    use_dynamic_sched,
+    kvcache_shape,
+):
+    attention_decode_fp8_test_func(
+        num_batch,
+        num_seq_q,
+        max_seq_kv,
+        block_size,
+        kv_head_q_head,
+        head_dim,
+        new_kv_included,
+        use_output,
+        splitk,
+        use_dynamic_sched,
+        kvcache_shape,
+    )

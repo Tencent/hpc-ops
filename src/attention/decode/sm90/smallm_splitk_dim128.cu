@@ -7,9 +7,9 @@
 #include <iostream>
 
 #include "cute/tensor.hpp"
+#include "src/attention/decode/sm90/smallm_splitk_combine_kernels.cuh"
+#include "src/attention/decode/sm90/smallm_splitk_kernels.cuh"
 #include "src/attention/decode/smallm_dim128.h"
-#include "src/attention/decode/smallm_splitk_combine_kernels.cuh"
-#include "src/attention/decode/smallm_splitk_kernels.cuh"
 
 namespace hpc {
 namespace attention {
@@ -34,8 +34,9 @@ void launch_attention_decode_bf16_dim128_smallm_splitk(
     void *vcache_ptr, const int *block_ids_ptr, const int *num_seq_kvcache_ptr, int *split_flag_ptr,
     bool new_kv_included, int num_batch, int num_seq_q, int num_head_q, int num_head_k,
     int num_head_v, int heads_per_group, int num_dim_qk, int num_dim_v, int num_kvcache_blocks,
-    int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV,
-    cudaStream_t stream) {
+    int block_size, int num_seq_max_blocks, int ldY, int ldQ, int64_t kcache_block_stride,
+    int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
+    int64_t vcache_token_stride, int64_t vcache_head_stride, cudaStream_t stream) {
   using namespace cute;  // NOLINT
   constexpr int kStage = 2;
   constexpr int kHeadsPerGroup = 8;
@@ -48,13 +49,15 @@ void launch_attention_decode_bf16_dim128_smallm_splitk(
       make_shape(heads_per_group, num_dim_qk, num_head_k, num_seq_q, num_batch),
       make_stride(num_dim_qk, Int<1>{}, heads_per_group * num_dim_qk, ldQ, ldQ * num_seq_q));
 
-  auto K = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(kcache_ptr)),
-                       make_shape(kBlockSize, num_dim_qk, num_head_k, num_kvcache_blocks),
-                       make_stride(num_dim_qk * num_head_k, Int<1>{}, num_dim_qk, ldK));
+  auto K = make_tensor(
+      make_gmem_ptr(reinterpret_cast<const Tin *>(kcache_ptr)),
+      make_shape(kBlockSize, num_dim_qk, num_head_k, num_kvcache_blocks),
+      make_stride(kcache_token_stride, Int<1>{}, kcache_head_stride, kcache_block_stride));
 
-  auto V = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(vcache_ptr)),
-                       make_shape(num_dim_v, kBlockSize, num_head_v, num_kvcache_blocks),
-                       make_stride(Int<1>{}, num_head_v * num_dim_v, num_dim_v, ldV));
+  auto V = make_tensor(
+      make_gmem_ptr(reinterpret_cast<const Tin *>(vcache_ptr)),
+      make_shape(num_dim_v, kBlockSize, num_head_v, num_kvcache_blocks),
+      make_stride(Int<1>{}, vcache_token_stride, vcache_head_stride, vcache_block_stride));
 
   auto Y = make_tensor(
       make_gmem_ptr(reinterpret_cast<const Tout *>(y_ptr)),
@@ -143,14 +146,14 @@ void launch_attention_decode_bf16_dim128_smallm_splitk(
       num_kvcache_blocks, num_seq_max_blocks, one_over_dk_log2e);
 }
 
-bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr, const void *q_ptr,
-                                void *kcache_ptr, void *vcache_ptr, const int *block_ids_ptr,
-                                const int *num_seq_kvcache_ptr, int *split_flag_ptr,
-                                bool new_kv_included, int splitk, int num_batch, int num_seq_q,
-                                int num_head_q, int num_head_k, int num_head_v, int num_dim_qk,
-                                int num_dim_v, int num_kvcache_blocks, int block_size,
-                                int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV,
-                                cudaStream_t stream) {
+bool smallm_splitk_dim128_async(
+    void *y_ptr, void *lse_ptr, void *splitk_out_ptr, const void *q_ptr, void *kcache_ptr,
+    void *vcache_ptr, const int *block_ids_ptr, const int *num_seq_kvcache_ptr, int *split_flag_ptr,
+    bool new_kv_included, int splitk, int num_batch, int num_seq_q, int num_head_q, int num_head_k,
+    int num_head_v, int num_dim_qk, int num_dim_v, int num_kvcache_blocks, int block_size,
+    int num_seq_max_blocks, int ldY, int ldQ, int64_t kcache_block_stride,
+    int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
+    int64_t vcache_token_stride, int64_t vcache_head_stride, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   constexpr int kTileN = 64;
@@ -179,7 +182,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       } else if (block_size == 64) {
         constexpr int kBlockSize = 64;
         launch_attention_decode_bf16_dim128_smallm_splitk<kTileM, kTileN, kTileK, kTileV,
@@ -187,7 +192,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       }
     } else if (num_seq_q == 2) {
       constexpr int kTileM = 16;
@@ -198,7 +205,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       } else if (block_size == 64) {
         constexpr int kBlockSize = 64;
         launch_attention_decode_bf16_dim128_smallm_splitk<kTileM, kTileN, kTileK, kTileV,
@@ -206,7 +215,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       }
     } else if (num_seq_q == 3) {
       constexpr int kTileM = 24;
@@ -217,7 +228,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       } else if (block_size == 64) {
         constexpr int kBlockSize = 64;
         launch_attention_decode_bf16_dim128_smallm_splitk<kTileM, kTileN, kTileK, kTileV,
@@ -225,7 +238,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       }
     }
   } else if (splitk == 4) {
@@ -240,7 +255,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       } else if (block_size == 64) {
         constexpr int kBlockSize = 64;
         launch_attention_decode_bf16_dim128_smallm_splitk<kTileM, kTileN, kTileK, kTileV,
@@ -248,7 +265,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       }
     } else if (num_seq_q == 2) {
       constexpr int kTileM = 16;
@@ -259,7 +278,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       } else if (block_size == 64) {
         constexpr int kBlockSize = 64;
         launch_attention_decode_bf16_dim128_smallm_splitk<kTileM, kTileN, kTileK, kTileV,
@@ -267,7 +288,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       }
     } else if (num_seq_q == 3) {
       constexpr int kTileM = 24;
@@ -278,7 +301,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       } else if (block_size == 64) {
         constexpr int kBlockSize = 64;
         launch_attention_decode_bf16_dim128_smallm_splitk<kTileM, kTileN, kTileK, kTileV,
@@ -286,7 +311,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       }
     }
   } else if (splitk == 16) {
@@ -301,7 +328,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       } else if (block_size == 64) {
         constexpr int kBlockSize = 64;
         launch_attention_decode_bf16_dim128_smallm_splitk<kTileM, kTileN, kTileK, kTileV,
@@ -309,7 +338,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       }
     } else if (num_seq_q == 2) {
       constexpr int kTileM = 16;
@@ -320,7 +351,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       } else if (block_size == 64) {
         constexpr int kBlockSize = 64;
         launch_attention_decode_bf16_dim128_smallm_splitk<kTileM, kTileN, kTileK, kTileV,
@@ -328,7 +361,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       }
     } else if (num_seq_q == 3) {
       constexpr int kTileM = 24;
@@ -339,7 +374,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       } else if (block_size == 64) {
         constexpr int kBlockSize = 64;
         launch_attention_decode_bf16_dim128_smallm_splitk<kTileM, kTileN, kTileK, kTileV,
@@ -347,7 +384,9 @@ bool smallm_splitk_dim128_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr
             y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
             num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
             num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
-            block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+            block_size, num_seq_max_blocks, ldY, ldQ, kcache_block_stride, kcache_token_stride,
+            kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+            stream);
       }
     }
   }
