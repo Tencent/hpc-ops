@@ -76,6 +76,7 @@ except Exception as e:
     gt_attention_func = naive_attn_with_kvcache_func
 
 
+@pytest.mark.parametrize("kv_layout", ["nhd", "hnd"])
 @pytest.mark.parametrize("num_batch", [1, 2, 4, 8])
 @pytest.mark.parametrize("num_seq_q", [100, 500, 1000, 1500])
 @pytest.mark.parametrize("num_seq_kv", [1500, 3000])
@@ -86,6 +87,7 @@ except Exception as e:
 @pytest.mark.parametrize("num_dim_v", [128])
 @pytest.mark.parametrize("use_output", [True])
 def test_attention_with_kvcache_prefill_bf16(
+    kv_layout,
     num_batch,
     num_seq_q,
     num_seq_kv,
@@ -128,6 +130,12 @@ def test_attention_with_kvcache_prefill_bf16(
     kvcache = torch.randn(
         max_num_blocks, 2, block_size, num_head_kv, num_dim_qk, dtype=T, device="cuda"
     )
+    if kv_layout == "hnd":
+        kcache = kvcache[:, 0].transpose(1, 2).contiguous().transpose(1, 2)
+        vcache = kvcache[:, 1].transpose(1, 2).contiguous().transpose(1, 2)
+    else:
+        kcache = kvcache[:, 0]
+        vcache = kvcache[:, 1]
     packed_block_ids = torch.randperm(max_num_blocks)[:total_kvcache_blocks].to(torch.int32).cuda()
 
     cu_blocks = 0
@@ -141,8 +149,8 @@ def test_attention_with_kvcache_prefill_bf16(
     for i in range(1):
         gt = gt_attention_func(
             q=Q,
-            k_cache=kvcache[:, 0, :, :],
-            v_cache=kvcache[:, 1, :, :],
+            k_cache=kcache,
+            v_cache=vcache,
             cache_seqlens=seqlens_kvcache,
             page_table=block_ids,
             causal=True,
@@ -152,8 +160,8 @@ def test_attention_with_kvcache_prefill_bf16(
             my = torch.empty_like(Q.reshape(-1, num_head_q, num_dim_qk))
             hpc.attention_with_kvcache_prefill_bf16(
                 Q.reshape(-1, num_head_q, num_dim_qk),
-                kvcache[:, 0, :, :, :],
-                kvcache[:, 1, :, :, :],
+                kcache,
+                vcache,
                 cu_seqlens_q,
                 block_ids,
                 seqlens_kvcache,
@@ -163,8 +171,8 @@ def test_attention_with_kvcache_prefill_bf16(
         else:
             my = hpc.attention_with_kvcache_prefill_bf16(
                 Q.reshape(-1, num_head_q, num_dim_qk),
-                kvcache[:, 0, :, :, :],
-                kvcache[:, 1, :, :, :],
+                kcache,
+                vcache,
                 cu_seqlens_q,
                 block_ids,
                 seqlens_kvcache,

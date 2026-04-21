@@ -23,8 +23,8 @@ void launch_warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128(
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
     void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
-    int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV,
-    cudaStream_t stream) {
+    int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV,
+    int ldV1, int ldV2, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   using Tin = cute::float_e4m3_t;
@@ -35,10 +35,10 @@ void launch_warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128(
                        make_stride(ldQ, Int<1>{}, num_dim_qk));
   auto K = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(kcache_ptr)),
                        make_shape(kBlockSize, num_dim_qk, num_head_kv, num_kvcache_blocks),
-                       make_stride(num_dim_qk * num_head_kv, Int<1>{}, num_dim_qk, ldK));
+                       make_stride(ldK1, Int<1>{}, ldK2, ldK));
   auto V = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(vcache_ptr)),
                        make_shape(num_dim_v, kBlockSize, num_head_kv, num_kvcache_blocks),
-                       make_stride(Int<1>{}, num_head_kv * num_dim_v, num_dim_v, ldV));
+                       make_stride(Int<1>{}, ldV1, ldV2, ldV));
   auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<const Tout *>(y_ptr)),
                        make_shape(max_seq_q, num_dim_v, num_head_q),
                        make_stride(ldY, Int<1>{}, num_dim_v));
@@ -105,7 +105,8 @@ void launch_warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128(
     void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
     int block_size, int scale_block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK,
-    int ldV, int ldKS, cudaStream_t stream) {
+    int ldK1, int ldK2, int ldV, int ldV1, int ldV2, int ldKS, int ldKS1, int ldKS2,
+    cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   using Tin = cute::float_e4m3_t;
@@ -126,10 +127,10 @@ void launch_warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128(
                        make_stride(ldQ, Int<1>{}, num_dim_qk));
   auto K = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(kcache_ptr)),
                        make_shape(kBlockSize, num_dim_qk, num_head_kv, num_kvcache_blocks),
-                       make_stride(num_dim_qk * num_head_kv, Int<1>{}, num_dim_qk, ldK));
+                       make_stride(ldK1, Int<1>{}, ldK2, ldK));
   auto V = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(vcache_ptr)),
                        make_shape(num_dim_v, kBlockSize, num_head_kv, num_kvcache_blocks),
-                       make_stride(Int<1>{}, num_head_kv * num_dim_v, num_dim_v, ldV));
+                       make_stride(Int<1>{}, ldV1, ldV2, ldV));
   auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<const Tout *>(y_ptr)),
                        make_shape(max_seq_q, num_dim_v, num_head_q),
                        make_stride(ldY, Int<1>{}, num_dim_v));
@@ -138,7 +139,7 @@ void launch_warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128(
                         make_stride(Int<1>{}, max_seq_q_pad, num_head_q * max_seq_q_pad));
   auto KS = make_tensor(make_gmem_ptr(reinterpret_cast<const float *>(kscale_ptr)),
                         make_shape(kScaleBlockSize, num_dim_scale, num_head_kv, num_scale_blocks),
-                        make_stride(num_dim_scale * num_head_kv, Int<1>{}, num_dim_scale, ldKS));
+                        make_stride(ldKS1, Int<1>{}, ldKS2, ldKS));
 
   auto *tma_qy = static_cast<cute::TmaDescriptor *>(tmas_ptr);
   constexpr float kLog2e = 1.4426950408889634f;
@@ -198,22 +199,22 @@ void warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128_async(
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
     void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
-    int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV,
-    cudaStream_t stream) {
+    int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV,
+    int ldV1, int ldV2, cudaStream_t stream) {
   if (block_size == 32) {
     constexpr int kBlockSize = 32;
     launch_warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128<kBlockSize>(
         y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
         block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
         max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
-        block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+        block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1, ldV2, stream);
   } else if (block_size == 64) {
     constexpr int kBlockSize = 64;
     launch_warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128<kBlockSize>(
         y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
         block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
         max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
-        block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+        block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1, ldV2, stream);
   }
 }
 
@@ -224,21 +225,24 @@ void warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128_async(
     void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
     int block_size, int scale_block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK,
-    int ldV, int ldKS, cudaStream_t stream) {
+    int ldK1, int ldK2, int ldV, int ldV1, int ldV2, int ldKS, int ldKS1, int ldKS2,
+    cudaStream_t stream) {
   if (block_size == 32) {
     constexpr int kBlockSize = 32;
     launch_warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128<kBlockSize>(
         y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
         block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
         max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
-        block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, ldKS, stream);
+        block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1,
+        ldV2, ldKS, ldKS1, ldKS2, stream);
   } else if (block_size == 64) {
     constexpr int kBlockSize = 64;
     launch_warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128<kBlockSize>(
         y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
         block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
         max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
-        block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, ldKS, stream);
+        block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1,
+        ldV2, ldKS, ldKS1, ldKS2, stream);
   }
 }
 

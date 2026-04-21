@@ -128,15 +128,20 @@ torch::Tensor attention_with_kvcache_prefill_bf16_entry(
   using T = __nv_bfloat16;
   auto *y_ptr = reinterpret_cast<T *>(y.mutable_data_ptr());
 
-  int ldQ = q.stride(0);       // num_head_q * num_dim_qk;
-  int ldK = kcache.stride(0);  // num_head_kv * num_dim_qk;
-  int ldV = vcache.stride(0);  // num_head_kv * num_dim_v;
-  int ldY = y.stride(0);       // num_head_q * num_dim_v;
+  int ldQ = q.stride(0);  // num_head_q * num_dim_qk;
+  int ldK = kcache.stride(0);
+  int ldK1 = kcache.stride(1);
+  int ldK2 = kcache.stride(2);
+  int ldV = vcache.stride(0);
+  int ldV1 = vcache.stride(1);
+  int ldV2 = vcache.stride(2);
+  int ldY = y.stride(0);  // num_head_q * num_dim_v;
 
   attention_with_kvcache_prefill_bf16_async(
       y_ptr, q_ptr, kcache_ptr, vcache_ptr, cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr,
       tmas_ptr, num_batch, total_seq_q, max_seqlens_q, num_dim_qk, num_dim_v, num_head_q,
-      num_head_kv, num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+      num_head_kv, num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2,
+      ldV, ldV1, ldV2, stream);
 
   return y;
 }
@@ -211,7 +216,11 @@ torch::Tensor attention_with_kvcache_prefill_fp8_entry(
 
   int ldQ = q.stride(0);
   int ldK = kcache.stride(0);
+  int ldK1 = kcache.stride(1);
+  int ldK2 = kcache.stride(2);
   int ldV = vcache.stride(0);
+  int ldV1 = vcache.stride(1);
+  int ldV2 = vcache.stride(2);
   int ldY = y.stride(0);
 
   if (quant_type == 1) {
@@ -219,20 +228,27 @@ torch::Tensor attention_with_kvcache_prefill_fp8_entry(
         y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
         block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seqlens_q,
         max_seqlens_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
-        block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+        block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1, ldV2, stream);
   } else if (quant_type == 0) {
     int ldKS = 0;
+    int ldKS1 = 0;
+    int ldKS2 = 0;
     if (kscale.dtype().itemsize() == 4) {
       ldKS = kscale.stride(0);
+      ldKS1 = kscale.stride(1);
+      ldKS2 = kscale.stride(2);
     } else if (kscale.dtype().itemsize() == 1) {
       ldKS = kscale.stride(0) / sizeof(float);
+      ldKS1 = kscale.stride(1) / sizeof(float);
+      ldKS2 = kscale.stride(2) / sizeof(float);
     }
     int scale_block_size = kscale.size(1);
     attention_with_kvcache_prefill_QKpertoken_Vpertensor_fp8_async(
         y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
         block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seqlens_q,
         max_seqlens_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
-        block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, ldKS, stream);
+        block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1,
+        ldV2, ldKS, ldKS1, ldKS2, stream);
   }
 
   return y;
@@ -328,17 +344,21 @@ torch::Tensor attention_with_kvcache_blocksparse_prefill_fp8_entry(
   using T = __nv_bfloat16;
   auto *y_ptr = reinterpret_cast<T *>(y.mutable_data_ptr());
 
-  int ldQ = q.stride(0);       // num_head_q * num_dim_qk;
-  int ldK = kcache.stride(0);  // num_head_kv * num_dim_qk;
-  int ldV = vcache.stride(0);  // num_head_kv * num_dim_v;
-  int ldY = y.stride(0);       // num_head_q * num_dim_v;
+  int ldQ = q.stride(0);  // num_head_q * num_dim_qk;
+  int ldK = kcache.stride(0);
+  int ldK1 = kcache.stride(1);
+  int ldK2 = kcache.stride(2);
+  int ldV = vcache.stride(0);
+  int ldV1 = vcache.stride(1);
+  int ldV2 = vcache.stride(2);
+  int ldY = y.stride(0);  // num_head_q * num_dim_v;
 
   attention_with_kvcache_blocksparse_prefill_fp8_async(
       y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
       block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seqlens_q,
       max_seqlens_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
-      block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, block_mask_ptr, num_tile_kv_in_mask,
-      stream);
+      block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1, ldV2, block_mask_ptr,
+      num_tile_kv_in_mask, stream);
 
   return y;
 }

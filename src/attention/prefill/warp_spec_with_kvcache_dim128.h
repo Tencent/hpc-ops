@@ -17,7 +17,8 @@ void warp_spec_with_kvcache_dim128_async(void *y_ptr, const void *q_ptr, const v
                                          int max_seq_q, int num_dim_qk, int num_dim_v,
                                          int num_head_q, int num_head_kv, int num_kvcache_blocks,
                                          int block_size, int num_seq_max_blocks, int ldY, int ldQ,
-                                         int ldK, int ldV, cudaStream_t stream);
+                                         int ldK, int ldK1, int ldK2, int ldV, int ldV1, int ldV2,
+                                         cudaStream_t stream);
 
 }  // namespace prefill
 }  // namespace attention

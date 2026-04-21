@@ -113,7 +113,9 @@ def naive_attn_with_kvcache_sparse(
 @pytest.mark.parametrize("num_head_q,num_head_kv", [(4, 1)])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("skip_ratio", [0.0, 0.5])
+@pytest.mark.parametrize("kv_layout", ["nhd", "hnd"])
 def test_kvcache_blocksparse_prefill_fp8(
+    kv_layout,
     num_batch,
     num_seq,
     num_head_q,
@@ -154,6 +156,12 @@ def test_kvcache_blocksparse_prefill_fp8(
     kvcache = torch.randn(
         max_num_blocks, 2, block_size, num_head_kv, head_dim, dtype=T_bf16, device=device
     ).to(T_fp8)
+    if kv_layout == "hnd":
+        kcache = kvcache[:, 0].transpose(1, 2).contiguous().transpose(1, 2)
+        vcache = kvcache[:, 1].transpose(1, 2).contiguous().transpose(1, 2)
+    else:
+        kcache = kvcache[:, 0]
+        vcache = kvcache[:, 1]
     packed_ids = torch.randperm(max_num_blocks, device=device)[:total_kb].to(torch.int32)
     block_ids = torch.empty(num_batch, max_kb, dtype=torch.int32, device=device)
     cu = 0
@@ -175,8 +183,8 @@ def test_kvcache_blocksparse_prefill_fp8(
     # Reference
     gt = naive_attn_with_kvcache_sparse(
         Q,
-        kvcache[:, 0],
-        kvcache[:, 1],
+        kcache,
+        vcache,
         qscale * kscale,
         vscale,
         seqlens_kvcache,
@@ -189,8 +197,8 @@ def test_kvcache_blocksparse_prefill_fp8(
     q_flat = Q.reshape(-1, num_head_q, head_dim)
     my = hpc.attention_with_kvcache_blocksparse_prefill_fp8(
         q_flat,
-        kvcache[:, 0],
-        kvcache[:, 1],
+        kcache,
+        vcache,
         qscale,
         kscale,
         vscale,

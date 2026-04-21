@@ -16,8 +16,8 @@ void warp_spec_with_kvcache_blocksparse_fp8_dim128_async(
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
     void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
-    int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldV,
-    const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream);
+    int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV,
+    int ldV1, int ldV2, const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream);
 
 }  // namespace prefill
 }  // namespace attention

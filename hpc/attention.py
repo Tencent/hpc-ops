@@ -77,23 +77,31 @@ def attention_with_kvcache_prefill_bf16(
     max_seqlens_q: int,
     output: Tensor = None,
 ) -> Tensor:
-    """Computes attention prefill using bfloat16 precision.
+    """Computes paged KV-cache attention prefill in bfloat16.
 
-    This function performs the attention prefill computation using custom hardware
-    operations optimized for bfloat16 data type. The prefill stage processes all
-    input tokens simultaneously to generate the initial attention context, which
-    is typically used during the first forward pass of autoregressive models.
+    This interface supports both NHD-contiguous and HND-backed KV cache layouts
+    through tensor strides while keeping the same logical tensor shape.
+    In other words, the cache tensors should still be passed as
+    ``[num_blocks, block_size, num_head_kv, num_dim]``, and layout selection is
+    expressed by stride metadata (for example, via
+    ``transpose(1, 2).contiguous().transpose(1, 2)``).
 
     Args:
         q: Query tensor for attention computation
             Shape: [total_seq, num_head_q, num_dim_qk]
             Dtype: bfloat16
-        kcache: Key tensor for attention computation in paged format.
-                 Constrainst the unused slots in last block of vcache for each request to be set zeros.
+        kcache: Paged key cache tensor.
+            Logical shape must be ``[num_blocks, block_size, num_head_kv, num_dim_qk]``.
+            Both standard contiguous (NHD-like) and stride-transformed HND-backed
+            views are supported.
+            Unused slots in each request's last cache block should be zero-padded.
             Shape: [num_blocks, block_size, num_head_kv, num_dim_qk]
             Dtype: bfloat16
-        vcache: Value tensor for attention computation in paged format.
-                 Constrainst the unused slots in last block of vcache for each request to be set zeros.
+        vcache: Paged value cache tensor.
+            Logical shape must be ``[num_blocks, block_size, num_head_kv, num_dim_v]``.
+            Both standard contiguous (NHD-like) and stride-transformed HND-backed
+            views are supported.
+            Unused slots in each request's last cache block should be zero-padded.
             Shape: [num_blocks, block_size, num_head_kv, num_dim_v]
             Dtype: bfloat16
         cu_seqlens_q: start_seq_q for each batch
@@ -118,8 +126,10 @@ def attention_with_kvcache_prefill_bf16(
         RuntimeError: If the shapes or dtypes do not satisfy the constraints above.
 
     Note:
-        - All input tensors must be on CUDA device and in bfloat16 format
-        - The query and key tensors must have the same embedding dimension (num_dim_qk)
+        - All input tensors must be on CUDA.
+        - ``q``/``kcache`` head dimensions must match on ``num_dim_qk``.
+        - ``kcache``/``vcache`` may be non-contiguous as long as logical shape is
+          preserved and strides encode the desired KV layout (NHD/HND).
         - total_seq = sum(seqlens_q[ibatch] for ibatch in range(num_batch))
     """
 
@@ -149,35 +159,43 @@ def attention_with_kvcache_prefill_fp8(
     quant_type: QuantType = QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
     output: Tensor = None,
 ) -> Tensor:
-    """Computes attention prefill using fp8 precision.
+    """Computes paged KV-cache attention prefill with FP8 KV tensors.
 
-    This function performs the attention prefill computation using custom hardware
-    operations optimized for fp8 data type. The prefill stage processes all
-    input tokens simultaneously to generate the initial attention context, which
-    is typically used during the first forward pass of autoregressive models.
+    This interface supports both NHD-contiguous and HND-backed KV cache layouts
+    through tensor strides while keeping the same logical tensor shape.
+    Layout selection is represented by cache tensor strides, not by changing
+    tensor rank or shape.
 
     Args:
         q: Query tensor for attention computation
             Shape: [total_seq, num_head_q, num_dim_qk]
             Dtype: fp8
-        kcache: Key tensor for attention computation in paged format.
-                 Constrainst the unused slots in last block of vcache for each request to be set zeros.
+        kcache: Paged key cache tensor.
+            Logical shape must be ``[num_blocks, block_size, num_head_kv, num_dim_qk]``.
+            Both standard contiguous (NHD-like) and stride-transformed HND-backed
+            views are supported.
+            Unused slots in each request's last cache block should be zero-padded.
             Shape: [num_blocks, block_size, num_head_kv, num_dim_qk]
             Dtype: fp8
-        vcache: Value tensor for attention computation in paged format.
-                 Constrainst the unused slots in last block of vcache for each request to be set zeros.
+        vcache: Paged value cache tensor.
+            Logical shape must be ``[num_blocks, block_size, num_head_kv, num_dim_v]``.
+            Both standard contiguous (NHD-like) and stride-transformed HND-backed
+            views are supported.
+            Unused slots in each request's last cache block should be zero-padded.
             Shape: [num_blocks, block_size, num_head_kv, num_dim_v]
             Dtype: fp8
         qscale: QK fp8 quant scale. Per Token Per Head Fp8 Quant.
             Shape: [num_batch, num_head_q, max_seqlens_q_pad]
             Dtype: float32
-        kscale: K fp8 quant scale. Per Tensor Fp8 Quant.
+        kscale: K fp8 quant scale tensor.
             Shape: depends on `quant_type`:
                    - If `quant_type == QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR`:
                        Shape: [1]
                    - If `quant_type == QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD`:
                        Shape: [num_blocks, scale_block_size, num_head_kv, num_dim_scale]
             Dtype: float32/fp8
+            For per-token/per-head K scale mode, stride-transformed layouts are
+            also accepted as long as the logical shape above is preserved.
         vscale: V fp8 quant scale. Per Tensor Fp8 Quant.
             Shape: [1]
             Dtype: float32
@@ -211,8 +229,9 @@ def attention_with_kvcache_prefill_fp8(
         RuntimeError: If the shapes or dtypes do not satisfy the constraints above.
 
     Note:
-        - All input tensors must be on CUDA device and in bfloat16 format
-        - The query and key tensors must have the same embedding dimension (num_dim_qk)
+        - All input tensors must be on CUDA.
+        - ``kcache``/``vcache`` may be non-contiguous as long as logical shape is
+          preserved and strides encode the desired KV layout (NHD/HND).
         - total_seq = sum(seqlens_q[ibatch] for ibatch in range(num_batch))
     """
 
@@ -259,8 +278,16 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
 
     Args:
         q: Query tensor. Shape: [total_seq, num_head_q, num_dim_qk], Dtype: fp8_e4m3
-        kcache: Paged K cache. Shape: [num_blocks, block_size, num_head_kv, num_dim_qk], Dtype: fp8
-        vcache: Paged V cache. Shape: [num_blocks, block_size, num_head_kv, num_dim_v], Dtype: fp8
+        kcache: Paged K cache.
+            Logical shape: [num_blocks, block_size, num_head_kv, num_dim_qk].
+            Both contiguous NHD-like and stride-transformed HND-backed layouts
+            are supported.
+            Dtype: fp8.
+        vcache: Paged V cache.
+            Logical shape: [num_blocks, block_size, num_head_kv, num_dim_v].
+            Both contiguous NHD-like and stride-transformed HND-backed layouts
+            are supported.
+            Dtype: fp8.
         qscale: Per-token per-head Q dequant scale. Shape: [num_batch, num_head_q, max_seq_q_pad],
             Dtype: float32
         kscale: Per-tensor K dequant scale. Shape: [1], Dtype: float32

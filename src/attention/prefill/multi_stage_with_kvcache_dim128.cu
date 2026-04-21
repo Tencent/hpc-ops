@@ -22,7 +22,8 @@ void launch_multi_stage_with_kvcache_dim128(
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
     void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int num_dim_qk, int num_dim_v,
     int num_head_q, int num_head_kv, int num_kvcache_blocks, int block_size, int num_seq_max_blocks,
-    int ldY, int ldQ, int ldK, int ldV, cudaStream_t stream) {
+    int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV, int ldV1, int ldV2,
+    cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   using Tin = cute::bfloat16_t;
@@ -33,10 +34,10 @@ void launch_multi_stage_with_kvcache_dim128(
                        make_stride(ldQ, Int<1>{}, num_dim_qk));
   auto K = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(kcache_ptr)),
                        make_shape(kBlockSize, num_dim_qk, num_head_kv, num_kvcache_blocks),
-                       make_stride(num_dim_qk * num_head_kv, Int<1>{}, num_dim_qk, ldK));
+                       make_stride(ldK1, Int<1>{}, ldK2, ldK));
   auto V = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(vcache_ptr)),
                        make_shape(num_dim_v, kBlockSize, num_head_kv, num_kvcache_blocks),
-                       make_stride(Int<1>{}, num_head_kv * num_dim_v, num_dim_v, ldV));
+                       make_stride(Int<1>{}, ldV1, ldV2, ldV));
   auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<const Tout *>(y_ptr)),
                        make_shape(max_seq_q, num_dim_v, num_head_q),
                        make_stride(ldY, Int<1>{}, num_dim_v));
@@ -90,19 +91,22 @@ void multi_stage_with_kvcache_dim128_async(
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
     void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int num_dim_qk, int num_dim_v,
     int num_head_q, int num_head_kv, int num_kvcache_blocks, int block_size, int num_seq_max_blocks,
-    int ldY, int ldQ, int ldK, int ldV, cudaStream_t stream) {
+    int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV, int ldV1, int ldV2,
+    cudaStream_t stream) {
   if (block_size == 32) {
     constexpr int kBlockSize = 32;
     launch_multi_stage_with_kvcache_dim128<kBlockSize>(
         y_ptr, q_ptr, kcache_ptr, vcache_ptr, cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr,
         tmas_ptr, num_batch, total_seq_q, max_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
-        num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+        num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1,
+        ldV2, stream);
   } else if (block_size == 64) {
     constexpr int kBlockSize = 64;
     launch_multi_stage_with_kvcache_dim128<kBlockSize>(
         y_ptr, q_ptr, kcache_ptr, vcache_ptr, cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr,
         tmas_ptr, num_batch, total_seq_q, max_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
-        num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldV, stream);
+        num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1,
+        ldV2, stream);
   }
 }
 
