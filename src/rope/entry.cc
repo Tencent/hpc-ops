@@ -496,9 +496,13 @@ torch::Tensor rope_norm_store_kv_entry(
   int num_q_heads =
       (hidden_size - num_kv_heads * qk_head_dim - num_kv_heads * v_head_dim) / qk_head_dim;
   int kv_block_size = kcache.size(1);
-  int max_num_kv_block_per_batch = kvcache_indices.size(1);
-  int kcache_block_offset = kcache.stride(0);
-  int vcache_block_offset = vcache.stride(0);
+
+  TORCH_CHECK(kvcache_indices.stride(1) == 1,
+              "kvcache_indices dim-1 must be contiguous (stride(1)==1)");
+
+  Strides4D kc_strides{kcache.stride(0), kcache.stride(1), kcache.stride(2)};
+  Strides4D vc_strides{vcache.stride(0), vcache.stride(1), vcache.stride(2)};
+  Strides2D ki_strides{kvcache_indices.stride(0)};
 
   // Create output tensors
   using DType = __nv_bfloat16;
@@ -541,10 +545,9 @@ torch::Tensor rope_norm_store_kv_entry(
       reinterpret_cast<DType *>(vcache.mutable_data_ptr()), out_k_ptr, out_v_ptr,
       reinterpret_cast<const DType *>(qkv.const_data_ptr()), cos_sin.const_data_ptr<float>(),
       num_seqlen_per_req.const_data_ptr<int>(), q_index.const_data_ptr<int>(),
-      kvcache_indices.const_data_ptr<int>(), q_norm_weight_ptr, k_norm_weight_ptr,
-      kcache_block_offset, vcache_block_offset, num_req, max_num_kv_block_per_batch, kv_block_size,
-      num_rows, num_q_heads, num_kv_heads, qk_head_dim, v_head_dim, is_prefill, qk_norm_policy,
-      stream);
+      kvcache_indices.const_data_ptr<int>(), q_norm_weight_ptr, k_norm_weight_ptr, kc_strides,
+      vc_strides, ki_strides, num_req, kv_block_size, num_rows, num_q_heads, num_kv_heads,
+      qk_head_dim, v_head_dim, is_prefill, qk_norm_policy, stream);
 
   return out_q;
 }
@@ -562,7 +565,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
   TORCH_CHECK(qkv.is_contiguous(), "qkv tensor must be contiguous");
   TORCH_CHECK(cos_sin.is_contiguous(), "cos_sin tensor must be contiguous");
   TORCH_CHECK(num_seqlen_per_req.is_contiguous(), "num_seqlen_per_req tensor must be contiguous");
-  TORCH_CHECK(kvcache_indices.is_contiguous(), "kvcache_indices tensor must be contiguous");
+  TORCH_CHECK(kvcache_indices.stride(1) == 1, "kvcache_indices must stride(1) == 1");
   TORCH_CHECK(qkv.scalar_type() == torch::kBFloat16, "qkv must be bfloat16");
   TORCH_CHECK(kcache.dtype().itemsize() == 1, "kcache must be 1-byte dtype");
   TORCH_CHECK(vcache.dtype().itemsize() == 1, "vcache must be 1-byte dtype");
@@ -581,12 +584,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
   int num_q_heads =
       (hidden_size - num_kv_heads * qk_head_dim - num_kv_heads * v_head_dim) / qk_head_dim;
   int kv_block_size = kcache.size(1);
-  int max_num_kv_block_per_batch = kvcache_indices.size(1);
-  int kcache_block_offset = kcache.stride(0);
-  int vcache_block_offset = vcache.stride(0);
+
+  Strides4D kc_strides{kcache.stride(0), kcache.stride(1), kcache.stride(2)};
+  Strides4D vc_strides{vcache.stride(0), vcache.stride(1), vcache.stride(2)};
+  Strides2D ki_strides{kvcache_indices.stride(0)};
 
   // Validate scale tensor shapes based on quant_policy
-  int k_scale_block_offset = 0;
+  Strides4D ks_strides{0, 0, 0};
   if (quant_policy == 0) {
     // Dynamic per-head per-token: k_scale is [num_block, R, num_kv_heads, L] (output)
     int L = qk_head_dim * static_cast<int>(sizeof(QType)) / static_cast<int>(sizeof(float));
@@ -600,7 +604,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
     // V scale: per-head [num_kv_heads]
     TORCH_CHECK(v_scale.dim() == 1 && v_scale.size(0) == num_kv_heads,
                 "v_scale must be [num_kv_heads] for quant_policy=0");
-    k_scale_block_offset = k_scale.stride(0);
+    ks_strides = Strides4D{k_scale.stride(0), k_scale.stride(1), k_scale.stride(2)};
   } else {
     // Static per-tensor: k_scale and v_scale are [1]
     TORCH_CHECK(k_scale.dim() == 1 && k_scale.size(0) == 1, "k_scale must contain 1 element");
@@ -685,9 +689,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
       num_seqlen_per_req.const_data_ptr<int>(), q_index.const_data_ptr<int>(),
       kvcache_indices.const_data_ptr<int>(), q_norm_weight_ptr, k_norm_weight_ptr,
       k_scale.mutable_data_ptr<float>(), v_scale.const_data_ptr<float>(), q_scale_inv_ptr,
-      upper_max, max_seqlens, kcache_block_offset, k_scale_block_offset, vcache_block_offset,
-      num_req, max_num_kv_block_per_batch, kv_block_size, num_rows, num_q_heads, num_kv_heads,
-      qk_head_dim, v_head_dim, is_prefill, qk_norm_policy, quant_policy, stream);
+      upper_max, max_seqlens, kc_strides, ks_strides, vc_strides, ki_strides, num_req,
+      kv_block_size, num_rows, num_q_heads, num_kv_heads, qk_head_dim, v_head_dim, is_prefill,
+      qk_norm_policy, quant_policy, stream);
 
   return std::make_tuple(out_q, q_scale, split_k_flag);
 }

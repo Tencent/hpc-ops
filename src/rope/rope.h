@@ -51,16 +51,29 @@ bool rope_interleave_bf16_async(void *y_ptr, void *x_ptr, const void *cos_sin_ca
 }  // namespace rope
 
 namespace rope_v2 {
+
+struct Strides4D {
+  int64_t s0;
+  int64_t s1;
+  int64_t s2;
+  static constexpr int64_t s3 = 1;
+};
+
+struct Strides2D {
+  int64_t s0;
+  static constexpr int64_t s1 = 1;
+};
+
 void rope_norm_store_kv_async(__nv_bfloat16 *out_q_ptr, __nv_bfloat16 *kcache_ptr,
                               __nv_bfloat16 *vcache_ptr, __nv_bfloat16 *out_k_ptr,
                               __nv_bfloat16 *out_v_ptr, const __nv_bfloat16 *in_qkv_ptr,
                               const float *cos_sin_ptr, const int *num_seqlen_per_req_ptr,
                               const int *q_index_ptr, const int *kvcache_indices_ptr,
                               const float *q_norm_weight_ptr, const float *k_norm_weight_ptr,
-                              int kcache_block_offset, int vcache_block_offset, int num_batch,
-                              int max_num_kv_block_per_batch, int kv_block_size, int num_rows,
-                              int num_q_heads, int num_kv_heads, int qk_head_dim, int v_head_dim,
-                              bool is_prefill, int qk_norm_policy, cudaStream_t stream);
+                              Strides4D kc_strides, Strides4D vc_strides, Strides2D ki_strides,
+                              int num_batch, int kv_block_size, int num_rows, int num_q_heads,
+                              int num_kv_heads, int qk_head_dim, int v_head_dim, bool is_prefill,
+                              int qk_norm_policy, cudaStream_t stream);
 void rope_norm_store_kv_fp8_async(
     __nv_fp8_e4m3 *out_q_ptr, __nv_fp8_e4m3 *kcache_ptr, __nv_fp8_e4m3 *vcache_ptr,
     __nv_fp8_e4m3 *out_k_ptr, __nv_fp8_e4m3 *out_v_ptr, int32_t *split_k_flag_ptr,
@@ -68,10 +81,10 @@ void rope_norm_store_kv_fp8_async(
     const int *num_seqlen_per_req_ptr, const int *q_index_ptr, const int *kvcache_indices_ptr,
     const float *q_norm_weight_ptr, const float *k_norm_weight_ptr, float *k_scale_ptr,
     const float *v_scale_ptr, const float *q_scale_inv_ptr, float upper_max, int max_seqlens,
-    int kcache_block_offset, int k_scale_block_offset, int vcache_block_offset, int num_batch,
-    int max_num_kv_block_per_batch, int kv_block_size, int num_rows, int num_q_heads,
-    int num_kv_heads, int qk_head_dim, int v_head_dim, bool is_prefill, int qk_norm_policy,
-    int quant_policy, cudaStream_t stream);
+    Strides4D kc_strides, Strides4D ks_strides, Strides4D vc_strides, Strides2D ki_strides,
+    int num_batch, int kv_block_size, int num_rows, int num_q_heads, int num_kv_heads,
+    int qk_head_dim, int v_head_dim, bool is_prefill, int qk_norm_policy, int quant_policy,
+    cudaStream_t stream);
 }  // namespace rope_v2
 }  // namespace hpc
 
