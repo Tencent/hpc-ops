@@ -77,11 +77,21 @@ test:$(PY_TEST)
 	  python3 -m pytest -v --no-header --disable-warnings $$test || exit 1; \
 	done
 
-sanitizer:$(PY_TEST)
+sanitizer-all:$(PY_TEST)
 	@rm -rf /dev/shm/tmp_hpc_*
 	@for test in $^; do \
 	  PYTORCH_NO_CUDA_MEMORY_CACHING=1 SANITIZER_CHECK=synccheck,memcheck,racecheck NV_SANITIZER_INJECTION_PORT_BASE=1111 python3 -m pytest -s -v --no-header --disable-warnings $$test || exit 1; \
 	done
+
+sanitizer:
+	@SELECTED="$$(python3 tools/select_sanitizer_tests.py)"; \
+	if [ -z "$$SELECTED" ]; then \
+	  echo "[sanitizer-incremental] SKIP: no affected tests selected"; \
+	else \
+	  echo "[sanitizer-incremental] selected tests:"; \
+	  echo "$$SELECTED" | sed 's/^/  + /'; \
+	  $(MAKE) --no-print-directory sanitizer-all PY_TEST="$$(echo $$SELECTED | tr '\n' ' ')"; \
+	fi
 
 clean:
 	rm -rf build dist hpc_ops.egg-info hpc.egg-info .pytest_cache tests/__pycache__ site __pycache__

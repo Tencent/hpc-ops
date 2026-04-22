@@ -188,5 +188,119 @@ stages:
           distribution: dist/hpc*.whl
         retry-times: 2
 
+- name: stage-2
+  label:
+  - Build
+  jobs:
+    job_4Xn:
+      name: Test
+      mutex:
+        label: singleton
+        queue-length: 5
+      runs-on:
+        pool-name: agentless
+      steps:
+      - name: download-code.tar.gz
+        id: ""
+        uses: JobScriptExecutionA@1.*
+        with:
+          envId:
+          - dpzbvgzp
+          account: reedlauliu
+          shellScriptContent: |-
+            #!/bin/bash
+            set -xe
+            echo ${{BK_CI_PROJECT_NAME}}
+            echo ${{BK_CI_PIPELINE_ID}}
+            echo ${{BK_CI_BUILD_ID}}
+            echo ${{BK_CI_BUILD_NUM}}
+            echo ${{BK_CI_BUILD_TASK_ID}}
+
+            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
+            sudo mkdir -p ${workpath}
+            cd ${workpath}
+
+            sudo curl -L -O --user reedlauliu:063d7d21ae494ce73636f0f767a15ec5 "https://bkrepo.woa.com/generic/ds-opt/pipeline/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}/code.tar.gz"
+          operatorType: PIPELINE_AUTHORIZER
+      - name: untar-code
+        uses: JobScriptExecutionA@1.*
+        with:
+          envId:
+          - dpzbvgzp
+          account: reedlauliu
+          shellScriptContent: |-
+            #!/bin/bash
+            set -xe
+
+            echo ${{BK_CI_PROJECT_NAME}}
+            echo ${{BK_CI_PIPELINE_ID}}
+            echo ${{BK_CI_BUILD_ID}}
+            echo ${{BK_CI_BUILD_NUM}}
+            echo ${{BK_CI_BUILD_TASK_ID}}
+
+            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
+            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && tar -xvf ./code.tar.gz"
+      - name: make
+        uses: JobScriptExecutionA@1.*
+        with:
+          envId:
+          - dpzbvgzp
+          account: reedlauliu
+          shellScriptContent: |-
+            #!/bin/bash
+
+            set -xe
+
+            echo ${{BK_CI_PROJECT_NAME}}
+            echo ${{BK_CI_PIPELINE_ID}}
+            echo ${{BK_CI_BUILD_ID}}
+            echo ${{BK_CI_BUILD_NUM}}
+            echo ${{BK_CI_BUILD_TASK_ID}}
+
+            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
+            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make"
+      - name: pytest
+        id: yST
+        uses: JobScriptExecutionA@1.*
+        with:
+          envId:
+          - dpzbvgzp
+          account: reedlauliu
+          shellScriptContent: |-
+            #!/bin/bash
+
+            set -xe
+
+            echo ${{BK_CI_PROJECT_NAME}}
+            echo ${{BK_CI_PIPELINE_ID}}
+            echo ${{BK_CI_BUILD_ID}}
+            echo ${{BK_CI_BUILD_NUM}}
+            echo ${{BK_CI_BUILD_TASK_ID}}
+
+            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
+            sudo docker exec -t hpc-ops-cicd bash -c "pkill -9 python3 || true"
+            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make test"
+      - name: compute-sanitizer
+        id: rL0
+        uses: JobScriptExecutionA@1.*
+        with:
+          envId:
+          - dpzbvgzp
+          scriptTimeout: "18000"
+          account: reedlauliu
+          shellScriptContent: |-
+            #!/bin/bash
+            set -xe
+
+            echo ${{BK_CI_PROJECT_NAME}}
+            echo ${{BK_CI_PIPELINE_ID}}
+            echo ${{BK_CI_BUILD_ID}}
+            echo ${{BK_CI_BUILD_NUM}}
+            echo ${{BK_CI_BUILD_TASK_ID}}
+
+            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
+            sudo docker exec -t hpc-ops-cicd bash -c "pkill -9 python3 || true"
+            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make sanitizer-all"
+
 concurrency: {}
 syntax-dialect: INHERIT
