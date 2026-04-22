@@ -123,6 +123,9 @@ def test_kvcache_blocksparse_prefill_fp8(
     head_dim,
     skip_ratio,
 ):
+    torch.manual_seed(10086)
+    torch.cuda.manual_seed(10086)
+
     T_bf16 = torch.bfloat16
     T_fp8 = torch.float8_e4m3fn
     device = "cuda"
@@ -288,6 +291,9 @@ def test_blocksparse_prefill_fp8(
     dim_v,
     skip_ratio,
 ):
+    torch.manual_seed(10086)
+    torch.cuda.manual_seed(10086)
+
     T_fp8 = torch.float8_e4m3fn
     device = "cuda"
     total_tokens = num_batch * num_seq

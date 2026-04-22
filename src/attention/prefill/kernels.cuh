@@ -2048,6 +2048,8 @@ __global__ void __launch_bounds__(384, 1)
 
   __shared__ uint64_t readable_q;
   __shared__ uint64_t writable_q;
+  __shared__ uint64_t readable_list;
+  __shared__ uint64_t writable_list;
   __shared__ uint64_t readable_k[kStage];
   __shared__ uint64_t writable_k[kStage];
   __shared__ uint64_t readable_v[kStage];
@@ -2136,6 +2138,8 @@ __global__ void __launch_bounds__(384, 1)
   if (is_leader_in_block) {
     initialize_barrier(readable_q, 1);
     initialize_barrier(writable_q, 2);
+    initialize_barrier(readable_list, 1);
+    initialize_barrier(writable_list, 256);
 #pragma unroll
     for (int i = 0; i < kStage; ++i) {
       initialize_barrier(readable_k[i], 1);
@@ -2169,8 +2173,9 @@ __global__ void __launch_bounds__(384, 1)
     int is_leader_in_load = ((iwarp == 0) && elected);
 
     if (is_leader_in_load) {
-      int phase = 1;    // start with ok
-      int phase_q = 1;  // start with ok
+      int phase = 1;         // start with ok
+      int phase_q = 1;       // start with ok
+      int phase_list_w = 1;  // start with ok
       int ismem_write = __shfl_sync(0xFFFFFFFF, 0, 0);
 
       while (true) {
@@ -2209,17 +2214,22 @@ __global__ void __launch_bounds__(384, 1)
         // Build active tile list in SMEM (parallel with TMA Q in flight)
         int num_tile_active = num_tile_kv;
         if constexpr (kHasMask) {
+          wait_barrier(writable_list, phase_list_w);
+          phase_list_w ^= 1;
+
           int block_mask_offset = ibatch * (num_head_q * max_num_tile_m * num_tile_kv_in_mask) +
                                   ihead_q * (max_num_tile_m * num_tile_kv_in_mask) +
                                   itile_m * num_tile_kv_in_mask;
           int num_tile_with_mask = min(num_tile_kv, num_tile_kv_in_mask);
           num_tile_active = 0;
+
           for (int i = 0; i < num_tile_with_mask; i++) {
             if (block_mask_ptr[block_mask_offset + i]) shm_active_tiles[num_tile_active++] = i;
           }
           if (num_tile_with_mask < num_tile_kv)
             shm_active_tiles[num_tile_active++] = num_tile_with_mask;
           *shm_num_active = num_tile_active;
+          arrive_barrier(readable_list);
         }
 
         set_barrier_transaction_bytes(
@@ -2308,6 +2318,7 @@ __global__ void __launch_bounds__(384, 1)
     int ismem_read = 0;
     int phase = 0;
     int phase_q = 0;
+    int phase_list = 0;
 
     float tQS[kM];
     float kscale = kscale_ptr[0];
@@ -2342,6 +2353,8 @@ __global__ void __launch_bounds__(384, 1)
 
       int num_tile_active;
       if constexpr (kHasMask) {
+        wait_barrier(readable_list, phase_list);
+        phase_list ^= 1;
         num_tile_active = *shm_num_active;
       } else {
         num_tile_active = num_tile_kv;
@@ -2388,6 +2401,9 @@ __global__ void __launch_bounds__(384, 1)
             arrive_barrier(writable_q);
           }
           phase_q ^= 1;
+          if constexpr (kHasMask) {
+            arrive_barrier(writable_list);
+          }
         }
 
         if (itile_seq_kv >= num_tile_full) {
@@ -3202,6 +3218,8 @@ __global__ void __launch_bounds__(384, 1)
 
   __shared__ uint64_t readable_q;
   __shared__ uint64_t writable_q;
+  __shared__ uint64_t readable_list;
+  __shared__ uint64_t writable_list;
   __shared__ uint64_t readable_k[kStage];
   __shared__ uint64_t writable_k[kStage];
   __shared__ uint64_t readable_v[kStage];
@@ -3284,6 +3302,8 @@ __global__ void __launch_bounds__(384, 1)
   if (is_leader_in_block) {
     initialize_barrier(readable_q, 1);
     initialize_barrier(writable_q, 2);
+    initialize_barrier(readable_list, 1);
+    initialize_barrier(writable_list, 256);
 #pragma unroll
     for (int i = 0; i < kStage; ++i) {
       initialize_barrier(readable_k[i], 1);
@@ -3316,8 +3336,9 @@ __global__ void __launch_bounds__(384, 1)
     int is_leader_in_load = ((iwarp == 0) && elected);
 
     if (is_leader_in_load) {
-      int phase = 1;    // start with ok
-      int phase_q = 1;  // start with ok
+      int phase = 1;         // start with ok
+      int phase_q = 1;       // start with ok
+      int phase_list_w = 1;  // start with ok
       int ismem_write = __shfl_sync(0xFFFFFFFF, 0, 0);
 
       while (true) {
@@ -3353,17 +3374,22 @@ __global__ void __launch_bounds__(384, 1)
         // Build active tile list in SMEM (parallel with TMA Q in flight)
         int num_tile_active = num_tile_kv;
         if constexpr (kHasMask) {
+          wait_barrier(writable_list, phase_list_w);
+          phase_list_w ^= 1;
+
           int block_mask_offset = ibatch * (num_head_q * max_num_tile_m * num_tile_kv_in_mask) +
                                   ihead_q * (max_num_tile_m * num_tile_kv_in_mask) +
                                   itile_m * num_tile_kv_in_mask;
           int num_tile_with_mask = min(num_tile_kv, num_tile_kv_in_mask);
           num_tile_active = 0;
+
           for (int i = 0; i < num_tile_with_mask; i++) {
             if (block_mask_ptr[block_mask_offset + i]) shm_active_tiles[num_tile_active++] = i;
           }
           if (num_tile_with_mask < num_tile_kv)
             shm_active_tiles[num_tile_active++] = num_tile_with_mask;
           *shm_num_active = num_tile_active;
+          arrive_barrier(readable_list);
         }
 
         set_barrier_transaction_bytes(readable_q, sizeof(Tin) * cosize(SLayoutQ{}));
@@ -3432,6 +3458,7 @@ __global__ void __launch_bounds__(384, 1)
     int ismem_read = 0;
     int phase = 0;
     int phase_q = 0;
+    int phase_list = 0;
 
     while (true) {
       if (iblock >= max_total_blocks) {
@@ -3462,6 +3489,8 @@ __global__ void __launch_bounds__(384, 1)
 
       int num_tile_active;
       if constexpr (kHasMask) {
+        wait_barrier(readable_list, phase_list);
+        phase_list ^= 1;
         num_tile_active = *shm_num_active;
       } else {
         num_tile_active = num_tile_kv;
@@ -3504,6 +3533,9 @@ __global__ void __launch_bounds__(384, 1)
             arrive_barrier(writable_q);
           }
           phase_q ^= 1;
+          if constexpr (kHasMask) {
+            arrive_barrier(writable_list);
+          }
         }
 
         if (itile_seq_kv >= num_tile_full) {

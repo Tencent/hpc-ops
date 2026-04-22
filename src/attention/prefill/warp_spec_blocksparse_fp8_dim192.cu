@@ -51,7 +51,12 @@ void launch_warp_spec_blocksparse_fp8_dim192(
                                            2, 1, 64, 64, 128, 128>;
 
   Config config;
-  auto [tma_q, tma_k, tma_v, tma_y] = config.get_tma(Q, K, V, Y);
+  // Use std::get to dodge a GCC 13 tuple_element bug on fp8+dim192 TiledCopy types.
+  auto tmas = config.get_tma(Q, K, V, Y);
+  auto tma_q = std::get<0>(tmas);
+  auto tma_k = std::get<1>(tmas);
+  auto tma_v = std::get<2>(tmas);
+  auto tma_y = std::get<3>(tmas);
 
   // 0. update tma
   {
