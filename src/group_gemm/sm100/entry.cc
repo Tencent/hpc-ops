@@ -7,7 +7,7 @@
 
 #include <tuple>
 
-#include "src/group_gemm/group_gemm.h"
+#include "src/group_gemm/sm100/group_gemm.h"
 #include "src/utils/utils.h"
 
 namespace hpc {
@@ -82,9 +82,10 @@ torch::Tensor group_gemm_fp8_entry(const torch::Tensor &x, const torch::Tensor &
   auto *tiles_ptr = tiles.mutable_data_ptr();
   auto *cu_tiles_ptr = cu_tiles.mutable_data_ptr();
 
-  group_gemm_fp8_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, yscale_ptr, tmas_ptr,
-                       tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k,
-                       num_seq_per_group_avg, update_tma, false, stream);
+  group_gemm_cp_async_fp8_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, yscale_ptr,
+                                tmas_ptr, tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves,
+                                num_group, m, n, k, num_seq_per_group_avg, update_tma, false,
+                                stream);
 
   return y;
 }

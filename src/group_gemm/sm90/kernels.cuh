@@ -1,7 +1,7 @@
 // Copyright 2025 hpc-ops authors
 
-#ifndef SRC_GROUP_GEMM_KERNELS_CUH_
-#define SRC_GROUP_GEMM_KERNELS_CUH_
+#ifndef SRC_GROUP_GEMM_SM90_KERNELS_CUH_
+#define SRC_GROUP_GEMM_SM90_KERNELS_CUH_
 
 #include <cuda.h>
 #include <stdio.h>
@@ -917,4 +917,4 @@ __global__ void __launch_bounds__(384, 1)
 }  // namespace group_gemm
 }  // namespace hpc
 
-#endif  // SRC_GROUP_GEMM_KERNELS_CUH_
+#endif  // SRC_GROUP_GEMM_SM90_KERNELS_CUH_

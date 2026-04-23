@@ -69,7 +69,8 @@ __global__ void act_mul_and_quant_kernel(__nv_fp8_e4m3 *out_ptr, const __nv_bflo
   }
 }
 
-template <int kNumWarpPerBlock, bool kUseBFloat16PrecisionMultiply = true, bool kUsePDL = false>
+template <int kNumWarpPerBlock, int kRowPerWarp = 1, bool kUseBFloat16PrecisionMultiply = true,
+          bool kUsePDL = false>
 __global__ void act_mul_and_quant_warp_per_row_kernel(__nv_fp8_e4m3 *out_ptr,
                                                       const __nv_bfloat16 *gate_up_ptr,
                                                       const float *scale_ptr,
@@ -80,47 +81,52 @@ __global__ void act_mul_and_quant_warp_per_row_kernel(__nv_fp8_e4m3 *out_ptr,
   int ilane = idx % 32;
   int iwarp = idx / 32;
 
-  uint64_t irow = iblock * kNumWarpPerBlock + iwarp;
-
   int my_valid_row_end_exclusive = valid_row_range ? valid_row_range[0] : num_row;
-  if (irow >= my_valid_row_end_exclusive) {
-    return;
-  }
-
   using T = __nv_bfloat162;
 
   float scale = scale_ptr[0];
-
-  const auto *gate_row_ptr = gate_up_ptr + irow * num_col * 2;
-  const auto *up_row_ptr = gate_row_ptr + num_col;
-  auto *out_row_ptr = out_ptr + irow * num_col;
 
   if constexpr (kUsePDL) {
     cudaGridDependencySynchronize();
   }
 
-  for (int icol = ilane * 8; icol < num_col; icol += 32 * 8) {
-    auto gate = to<float>(load<T, 4>(gate_row_ptr + icol));
-    auto up = to<float>(load<T, 4>(up_row_ptr + icol));
-
-    vec_t<float, 8> out;
+  // Each warp now processes kRowPerWarp rows, collapsing the 128000-block
+  // grid to 128000/kRowPerWarp blocks (launch + PDL overhead savings).
 #pragma unroll
-    for (int i = 0; i < size(out); ++i) {
-      auto g = gate[i];
-      auto m = [&] {
-        if constexpr (kUseBFloat16PrecisionMultiply) {
-          auto u = __float2bfloat16_rn(up[i]);
-          return __bfloat162float(__float2bfloat16_rn(silu(g)) * u);
-        } else {
-          auto u = up[i];
-          return silu(g) * u;
-        }
-      }();
-      out[i] = m * scale;
+  for (int irow_off = 0; irow_off < kRowPerWarp; ++irow_off) {
+    uint64_t irow = (uint64_t)iblock * kNumWarpPerBlock * kRowPerWarp +
+                    (uint64_t)iwarp * kRowPerWarp + irow_off;
+    if (irow >= (uint64_t)my_valid_row_end_exclusive) {
+      continue;
     }
 
-    auto out_fp8 = to<__nv_fp8x4_e4m3>(out);
-    store(out_row_ptr + icol, out_fp8);
+    const auto *gate_row_ptr = gate_up_ptr + irow * num_col * 2;
+    const auto *up_row_ptr = gate_row_ptr + num_col;
+    auto *out_row_ptr = out_ptr + irow * num_col;
+
+    for (int icol = ilane * 8; icol < num_col; icol += 32 * 8) {
+      auto gate = to<float>(load<T, 4>(gate_row_ptr + icol));
+      auto up = to<float>(load<T, 4>(up_row_ptr + icol));
+
+      vec_t<float, 8> out;
+#pragma unroll
+      for (int i = 0; i < size(out); ++i) {
+        auto g = gate[i];
+        auto m = [&] {
+          if constexpr (kUseBFloat16PrecisionMultiply) {
+            auto u = __float2bfloat16_rn(up[i]);
+            return __bfloat162float(__float2bfloat16_rn(silu(g)) * u);
+          } else {
+            auto u = up[i];
+            return silu(g) * u;
+          }
+        }();
+        out[i] = m * scale;
+      }
+
+      auto out_fp8 = to<__nv_fp8x4_e4m3>(out);
+      store(out_row_ptr + icol, out_fp8);
+    }
   }
   if constexpr (kUsePDL) {
     cudaTriggerProgrammaticLaunchCompletion();
@@ -488,34 +494,76 @@ void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_u
                          intermediate_size, block1D22D);
     }
   } else {
+    // Scale down the grid by `kRowPerWarp` so we launch fewer blocks; each
+    // warp still emits the same per-row access pattern but now handles
+    // kRowPerWarp rows sequentially.  2D sweep over
+    //   intermediate ∈ {64, 128, 192, 256, 512, 768}
+    //   num_row     ∈ {384 .. 512000}
+    // on L20A (SM100) showed:
+    //   * intermediate ≤ 256 → K=2 wins (tiny perf loss at small num_row,
+    //     ~1.5× speedup vs K=1 at large num_row, >5 TB/s bw).
+    //   * intermediate ∈ [512, 1024) → K=1 wins (each warp already has
+    //     ≥16 vec of work, further row-serialisation saturates ILP and
+    //     hurts L2 locality).
     constexpr int kNumWarpPerBlock = 4;
-    dim3 block(32 * kNumWarpPerBlock);
-    dim3 grid((num_row + kNumWarpPerBlock - 1) / kNumWarpPerBlock);
+    if (intermediate_size <= 256) {
+      constexpr int kRowPerWarp = 2;
+      constexpr int kRowPerBlock = kNumWarpPerBlock * kRowPerWarp;
+      dim3 block(32 * kNumWarpPerBlock);
+      dim3 grid((num_row + kRowPerBlock - 1) / kRowPerBlock);
 
-    // Base launch configuration
-    config.gridDim = grid;
-    config.blockDim = block;
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
+      config.gridDim = grid;
+      config.blockDim = block;
+      config.dynamicSmemBytes = 0;
+      config.stream = stream;
+      config.attrs = attribute;
+      config.numAttrs = 1;
 
-    // Add special attribute for PDL
-    config.attrs = attribute;
-    config.numAttrs = 1;
-
-    if (use_bf16_mul) {
-      constexpr bool kUseBFloat16PrecisionMultiply = true;
-      auto kernel =
-          kernels::act_mul_and_quant_warp_per_row_kernel<kNumWarpPerBlock,
-                                                         kUseBFloat16PrecisionMultiply, kUsePDL>;
-      cudaLaunchKernelEx(&config, kernel, out_ptr, gate_up_ptr, scale_ptr, valid_row_range, num_row,
-                         intermediate_size);
+      if (use_bf16_mul) {
+        constexpr bool kUseBFloat16PrecisionMultiply = true;
+        auto kernel =
+            kernels::act_mul_and_quant_warp_per_row_kernel<kNumWarpPerBlock, kRowPerWarp,
+                                                           kUseBFloat16PrecisionMultiply, kUsePDL>;
+        cudaLaunchKernelEx(&config, kernel, out_ptr, gate_up_ptr, scale_ptr, valid_row_range,
+                           num_row, intermediate_size);
+      } else {
+        constexpr bool kUseBFloat16PrecisionMultiply = false;
+        auto kernel =
+            kernels::act_mul_and_quant_warp_per_row_kernel<kNumWarpPerBlock, kRowPerWarp,
+                                                           kUseBFloat16PrecisionMultiply, kUsePDL>;
+        cudaLaunchKernelEx(&config, kernel, out_ptr, gate_up_ptr, scale_ptr, valid_row_range,
+                           num_row, intermediate_size);
+      }
     } else {
-      constexpr bool kUseBFloat16PrecisionMultiply = false;
-      auto kernel =
-          kernels::act_mul_and_quant_warp_per_row_kernel<kNumWarpPerBlock,
-                                                         kUseBFloat16PrecisionMultiply, kUsePDL>;
-      cudaLaunchKernelEx(&config, kernel, out_ptr, gate_up_ptr, scale_ptr, valid_row_range, num_row,
-                         intermediate_size);
+      // intermediate in [257, 1023]: per-warp workload is already high,
+      // K=1 gives best ILP and L2 locality.
+      constexpr int kRowPerWarp = 1;
+      constexpr int kRowPerBlock = kNumWarpPerBlock * kRowPerWarp;
+      dim3 block(32 * kNumWarpPerBlock);
+      dim3 grid((num_row + kRowPerBlock - 1) / kRowPerBlock);
+
+      config.gridDim = grid;
+      config.blockDim = block;
+      config.dynamicSmemBytes = 0;
+      config.stream = stream;
+      config.attrs = attribute;
+      config.numAttrs = 1;
+
+      if (use_bf16_mul) {
+        constexpr bool kUseBFloat16PrecisionMultiply = true;
+        auto kernel =
+            kernels::act_mul_and_quant_warp_per_row_kernel<kNumWarpPerBlock, kRowPerWarp,
+                                                           kUseBFloat16PrecisionMultiply, kUsePDL>;
+        cudaLaunchKernelEx(&config, kernel, out_ptr, gate_up_ptr, scale_ptr, valid_row_range,
+                           num_row, intermediate_size);
+      } else {
+        constexpr bool kUseBFloat16PrecisionMultiply = false;
+        auto kernel =
+            kernels::act_mul_and_quant_warp_per_row_kernel<kNumWarpPerBlock, kRowPerWarp,
+                                                           kUseBFloat16PrecisionMultiply, kUsePDL>;
+        cudaLaunchKernelEx(&config, kernel, out_ptr, gate_up_ptr, scale_ptr, valid_row_range,
+                           num_row, intermediate_size);
+      }
     }
   }
 }

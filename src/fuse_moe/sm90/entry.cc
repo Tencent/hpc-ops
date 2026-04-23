@@ -7,7 +7,7 @@
 
 #include <tuple>
 
-#include "src/fuse_moe/fuse_moe.h"
+#include "src/fuse_moe/sm90/fuse_moe.h"
 #include "src/utils/utils.h"
 
 namespace hpc {

@@ -42,8 +42,8 @@ def test_count_and_gather(hidden_size, intermediate_size, num_expert, eprank):
                 unique_values, counts = torch.unique(
                     topk_ids.flatten(), return_counts=True, sorted=True
                 )
-                (y, yg, topk_pos, seqlens, cu_seqlens, tiles, cu_tiles, tmas) = (
-                    hpc.count_and_gather(x, topk_ids, num_expert, eprank, intermediate_size)
+                y, yg, topk_pos, seqlens, cu_seqlens, tiles, cu_tiles, tmas = hpc.count_and_gather(
+                    x, topk_ids, num_expert, eprank, intermediate_size
                 )
 
                 torch.cuda.synchronize()

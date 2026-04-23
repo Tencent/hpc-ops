@@ -6,9 +6,9 @@
 #include <cub/cub.cuh>
 
 #include "cute/tensor.hpp"
-#include "src/group_gemm/config.h"
-#include "src/group_gemm/group_gemm.h"
-#include "src/group_gemm/kernels.cuh"
+#include "src/group_gemm/sm90/config.h"
+#include "src/group_gemm/sm90/group_gemm.h"
+#include "src/group_gemm/sm90/kernels.cuh"
 
 namespace hpc {
 namespace group_gemm {

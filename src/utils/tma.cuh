@@ -9,8 +9,6 @@ namespace hpc {
 
 __device__ __forceinline__ void tma_descriptor_replace_shapes_in_shared_mem(
     cute::TmaDescriptor &smem_desc, cute::array<uint32_t, 5> const &prob_shape) {
-#if (__CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 3))
-#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
   uint32_t smem_int_desc = cute::cast_smem_ptr_to_uint(&smem_desc);
   uint64_t const smem_int64_desc = 0;
   asm volatile("cvt.u64.u32 %0, %1;" ::"l"(smem_int64_desc), "r"(smem_int_desc));
@@ -29,8 +27,6 @@ __device__ __forceinline__ void tma_descriptor_replace_shapes_in_shared_mem(
   asm volatile(
       "tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], 4, %1;" ::"l"(smem_int64_desc),
       "r"(prob_shape[4]));
-#endif
-#endif
 }
 
 template <typename Tma, typename GTensor, bool kUpdateShape = true>

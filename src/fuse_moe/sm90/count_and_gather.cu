@@ -7,7 +7,7 @@
 
 #include "cute/tensor.hpp"
 #include "cutlass/arch/reg_reconfig.h"
-#include "src/fuse_moe/fuse_moe.h"
+#include "src/fuse_moe/sm90/fuse_moe.h"
 #include "src/utils/tma.cuh"
 #include "src/utils/utils.cuh"
 #include "src/utils/utils.h"

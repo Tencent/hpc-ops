@@ -1,13 +1,13 @@
 // Copyright 2025 hpc-ops authors
 
-#ifndef SRC_FUSE_MOE_FUSE_MOE_H_
-#define SRC_FUSE_MOE_FUSE_MOE_H_
+#ifndef SRC_FUSE_MOE_SM90_FUSE_MOE_H_
+#define SRC_FUSE_MOE_SM90_FUSE_MOE_H_
 
 #include <cuda_runtime_api.h>
 #include <stdint.h>
 
 #include "src/activation/activation.h"
-#include "src/group_gemm/group_gemm.h"
+#include "src/group_gemm/sm90/group_gemm.h"
 #include "src/hadamard/hadamard.h"
 
 namespace hpc {
@@ -78,4 +78,4 @@ void fuse_moe_groupwise_w4a8_async(void *output_ptr, const void *input_ptr, void
 }  // namespace fuse_moe
 }  // namespace hpc
 
-#endif  // SRC_FUSE_MOE_FUSE_MOE_H_
+#endif  // SRC_FUSE_MOE_SM90_FUSE_MOE_H_

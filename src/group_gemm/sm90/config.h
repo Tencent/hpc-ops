@@ -1,7 +1,7 @@
 // Copyright 2025 hpc-ops authors
 
-#ifndef SRC_GROUP_GEMM_CONFIG_H_
-#define SRC_GROUP_GEMM_CONFIG_H_
+#ifndef SRC_GROUP_GEMM_SM90_CONFIG_H_
+#define SRC_GROUP_GEMM_SM90_CONFIG_H_
 
 #include "cute/tensor.hpp"
 
@@ -168,4 +168,4 @@ struct GroupGEMMBlockWiseFp8Config {
 }  // namespace group_gemm
 }  // namespace hpc
 
-#endif  // SRC_GROUP_GEMM_CONFIG_H_
+#endif  // SRC_GROUP_GEMM_SM90_CONFIG_H_

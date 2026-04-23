@@ -6,7 +6,7 @@
 #include <cub/cub.cuh>
 
 #include "cute/tensor.hpp"
-#include "src/fuse_moe/fuse_moe.h"
+#include "src/fuse_moe/sm100/fuse_moe.h"
 #include "src/utils/utils.cuh"
 
 namespace hpc {

@@ -6,7 +6,7 @@
 #include <algorithm>
 
 #include "cute/tensor.hpp"
-#include "src/fuse_moe/fuse_moe.h"
+#include "src/fuse_moe/sm90/fuse_moe.h"
 
 namespace hpc {
 namespace fuse_moe {
@@ -41,8 +41,9 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
                                    seqlens_ptr, cu_seqlens_ptr, gate_up_scale_ptr, gate_up_tmas_ptr,
                                    tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr, num_gateup_waves,
                                    num_expert_local, total_num_seq, intermediate_size, hidden_size,
-                                   num_seq_per_group_avg, false, use_pdl, stream);
-  // 2. call act and mul ??? EP seq_len
+                                   // num_seq_per_group_avg, false, use_pdl, stream);
+                                   num_seq_per_group_avg, true, use_pdl, stream);
+  // 2. call act and mul
   const int *valid_row_range_ptr =
       (int *)cu_seqlens_ptr + num_expert_local;  // get last number as valid row
   activation::act_mul_and_quant_async((T2 *)down_input_ptr, (const T1 *)gate_up_output_ptr,
@@ -53,7 +54,8 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
   group_gemm::group_gemm_fp8_async(
       down_output_ptr, down_input_ptr, down_weight_ptr, seqlens_ptr, cu_seqlens_ptr, down_scale_ptr,
       down_tmas_ptr, tiles_ptr, cu_tiles_ptr, down_task_map_ptr, num_down_waves, num_expert_local,
-      total_num_seq, hidden_size, intermediate_size / 2, num_seq_per_group_avg, false, use_pdl,
+      // total_num_seq, hidden_size, intermediate_size / 2, num_seq_per_group_avg, false, use_pdl,
+      total_num_seq, hidden_size, intermediate_size / 2, num_seq_per_group_avg, true, use_pdl,
       stream);
 
   // 4. call reduce //delete total_num_seq

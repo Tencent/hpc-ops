@@ -13,7 +13,7 @@
 #include "cutlass/layout/layout.h"
 #include "cutlass/numeric_conversion.h"
 #include "cutlass/numeric_types.h"
-#include "src/group_gemm/group_gemm.h"
+#include "src/group_gemm/sm90/group_gemm.h"
 #include "src/utils/utils.cuh"
 
 namespace hpc {
