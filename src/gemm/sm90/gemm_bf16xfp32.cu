@@ -84,7 +84,7 @@ template <typename Tin, typename TY, typename Tout, typename TiledMma, typename 
           typename TmaWH, typename TmaWL, typename TmaY, int kTileM, int kTileN, int kTileK,
           int kStage, int kWarpGroupN, typename SLayoutX, typename SLayoutW, typename SLayoutY,
           int kBlockSwizzle, int kSplitK>
-__global__ void __launch_bounds__(384, 1)
+__global__ void __launch_bounds__(128 * (kWarpGroupN + 1), 1)
     gemm_bf16xfp32_kernel(const __grid_constant__ TmaX tma_x, const __grid_constant__ TmaWH tma_wh,
                           const __grid_constant__ TmaWL tma_wl, const __grid_constant__ TmaY tma_y,
                           Tout *y_ptr, float *splitk_y_ptr, int *split_flag_ptr, int m, int n,
@@ -144,7 +144,7 @@ __global__ void __launch_bounds__(384, 1)
 #pragma unroll
     for (int i = 0; i < kStage; ++i) {
       initialize_barrier(readable_x[i], 1);
-      initialize_barrier(writable_x[i], 2);
+      initialize_barrier(writable_x[i], kWarpGroupN);
     }
 #pragma unroll
     for (int istage = 0; istage < kStage; ++istage) {
@@ -194,30 +194,24 @@ __global__ void __launch_bounds__(384, 1)
           cute::copy(tma_x.with(readable_x[ismem_write]), tXg(_, itile_m, itile_k),
                      tXs(_, 0, 0, ismem_write));
           set_barrier_transaction_bytes(readable_x[ismem_write], kTransactionBytesX);
-
-          // load wg0 b low
-          wait_barrier(writable_w[ismem_write][0][kWLIdx], phase);
-          cute::copy(tma_wl.with(readable_w[ismem_write][0][kWLIdx]), tWLg(_, 2 * itile_n, itile_k),
-                     tWLs(_, 0, 0, 0, kWLIdx, ismem_write));
-          set_barrier_transaction_bytes(readable_w[ismem_write][0][kWLIdx], kTransactionBytesW);
-
-          // load wg1 b low
-          wait_barrier(writable_w[ismem_write][1][kWLIdx], phase);
-          cute::copy(tma_wl.with(readable_w[ismem_write][1][kWLIdx]),
-                     tWLg(_, 2 * itile_n + 1, itile_k), tWLs(_, 0, 0, 1, kWLIdx, ismem_write));
-          set_barrier_transaction_bytes(readable_w[ismem_write][1][kWLIdx], kTransactionBytesW);
-
-          // load wg0 b high
-          wait_barrier(writable_w[ismem_write][0][kWHIdx], phase);
-          cute::copy(tma_wh.with(readable_w[ismem_write][0][kWHIdx]), tWHg(_, 2 * itile_n, itile_k),
-                     tWHs(_, 0, 0, 0, kWHIdx, ismem_write));
-          set_barrier_transaction_bytes(readable_w[ismem_write][0][kWHIdx], kTransactionBytesW);
-
-          // load wg1 b high
-          wait_barrier(writable_w[ismem_write][1][kWHIdx], phase);
-          cute::copy(tma_wh.with(readable_w[ismem_write][1][kWHIdx]),
-                     tWHg(_, 2 * itile_n + 1, itile_k), tWHs(_, 0, 0, 1, kWHIdx, ismem_write));
-          set_barrier_transaction_bytes(readable_w[ismem_write][1][kWHIdx], kTransactionBytesW);
+          // load wgX low
+#pragma unroll
+          for (int wg = 0; wg < kWarpGroupN; ++wg) {
+            wait_barrier(writable_w[ismem_write][wg][kWLIdx], phase);
+            cute::copy(tma_wl.with(readable_w[ismem_write][wg][kWLIdx]),
+                       tWLg(_, kWarpGroupN * itile_n + wg, itile_k),
+                       tWLs(_, 0, 0, wg, kWLIdx, ismem_write));
+            set_barrier_transaction_bytes(readable_w[ismem_write][wg][kWLIdx], kTransactionBytesW);
+          }
+          // load wgX high
+#pragma unroll
+          for (int wg = 0; wg < kWarpGroupN; ++wg) {
+            wait_barrier(writable_w[ismem_write][wg][kWHIdx], phase);
+            cute::copy(tma_wh.with(readable_w[ismem_write][wg][kWHIdx]),
+                       tWHg(_, kWarpGroupN * itile_n + wg, itile_k),
+                       tWHs(_, 0, 0, wg, kWHIdx, ismem_write));
+            set_barrier_transaction_bytes(readable_w[ismem_write][wg][kWHIdx], kTransactionBytesW);
+          }
 
           ++ismem_write;
           if (ismem_write == kStage) {
@@ -365,7 +359,7 @@ __global__ void __launch_bounds__(384, 1)
         auto tYg = btma_y.partition_D(gYY);  // (TMA, TMA_M, TMA_N)
 
         cute::copy(tma_y, tYs(_, 0, 0, iwarpgroup),
-                   tYg(_, 2 * itile_n + iwarpgroup, itile_m, ichunk));
+                   tYg(_, kWarpGroupN * itile_n + iwarpgroup, itile_m, ichunk));
         tma_store_arrive();
       }
     }
@@ -480,68 +474,82 @@ void launch_gemm_bf16xfp32_kernel(void *y_ptr, void *splitk_y_ptr, void *split_f
       scale, swizzle_divider, flat_divider, reduce_flat_divider);
 }
 
+// template config
+template <int kTileM_, int kTileN_, int kTileK_, int kStage_, int kWGN_, int kSplitK_>
+struct LaunchCfg {
+  static constexpr int kTileM = kTileM_;
+  static constexpr int kTileN = kTileN_;
+  static constexpr int kTileK = kTileK_;
+  static constexpr int kStage = kStage_;
+  static constexpr int kWGN = kWGN_;
+  static constexpr int kSplitK = kSplitK_;
+};
+
 bool gemm_bf16xfp32_async(void *y_ptr, void *splitk_y_ptr, void *split_flag_ptr, const void *x_ptr,
                           const void *w_high_ptr, const void *w_low_ptr, int m, int n, int k,
                           float scale, bool use_fp32_output, int splitk, cudaStream_t stream) {
-  if (use_fp32_output) {
-    if (m > 128) {
-      constexpr int kSplitK = 1;
-      launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, float, 64, 64, 64, 2, 2, kSplitK>(
-          y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
-          stream);
+  using bf16 = cute::bfloat16_t;
+
+  auto launch = [&](auto cfg_tag) {
+    using Cfg = decltype(cfg_tag);
+    if (use_fp32_output) {
+      launch_gemm_bf16xfp32_kernel<bf16, float, Cfg::kTileM, Cfg::kTileN, Cfg::kTileK, Cfg::kStage,
+                                   Cfg::kWGN, Cfg::kSplitK>(y_ptr, splitk_y_ptr, split_flag_ptr,
+                                                            x_ptr, w_high_ptr, w_low_ptr, m, n, k,
+                                                            scale, stream);
     } else {
-      if (splitk == 8) {
-        constexpr int kSplitK = 8;
-        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, float, 16, 64, 128, 3, 2, kSplitK>(
-            y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
-            stream);
-      } else if (splitk == 4) {
-        constexpr int kSplitK = 4;
-        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, float, 16, 64, 128, 3, 2, kSplitK>(
-            y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
-            stream);
-      } else if (splitk == 2) {
-        constexpr int kSplitK = 2;
-        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, float, 16, 64, 128, 3, 2, kSplitK>(
-            y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
-            stream);
-      } else {
-        constexpr int kSplitK = 1;
-        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, float, 16, 64, 128, 3, 2, kSplitK>(
-            y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
-            stream);
-      }
+      launch_gemm_bf16xfp32_kernel<bf16, bf16, Cfg::kTileM, Cfg::kTileN, Cfg::kTileK, Cfg::kStage,
+                                   Cfg::kWGN, Cfg::kSplitK>(y_ptr, splitk_y_ptr, split_flag_ptr,
+                                                            x_ptr, w_high_ptr, w_low_ptr, m, n, k,
+                                                            scale, stream);
     }
-  } else {
-    if (m > 128) {
-      constexpr int kSplitK = 1;
-      launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, cute::bfloat16_t, 64, 64, 64, 2, 2, kSplitK>(
-          y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n, k, scale,
-          stream);
+  };
+
+  // config: n = 192
+  if (n == 192) {
+    if (m <= 32) {
+      launch(LaunchCfg<16, 64, 128, 3, 2, 8>{});
+    } else if (m <= 48) {
+      launch(LaunchCfg<16, 64, 128, 3, 1, 8>{});
+    } else if (m <= 64) {
+      launch(LaunchCfg<16, 64, 128, 3, 2, 8>{});
+    } else if (m <= 96) {
+      launch(LaunchCfg<16, 64, 128, 3, 1, 4>{});
+    } else if (m <= 144) {
+      launch(LaunchCfg<16, 64, 128, 3, 2, 4>{});
+    } else if (m <= 208) {
+      launch(LaunchCfg<16, 64, 128, 3, 1, 2>{});
+    } else if (m <= 304) {
+      launch(LaunchCfg<16, 64, 128, 3, 2, 2>{});
+    } else if (m <= 416) {
+      launch(LaunchCfg<16, 64, 128, 3, 1, 1>{});
+    } else if (m <= 624) {
+      launch(LaunchCfg<16, 64, 128, 3, 2, 1>{});
+    } else if (m <= 832) {
+      launch(LaunchCfg<64, 64, 64, 3, 1, 2>{});
+    } else if (m <= 1024) {
+      launch(LaunchCfg<16, 64, 128, 3, 2, 1>{});
+    } else if (m <= 2048) {
+      launch(LaunchCfg<64, 64, 64, 5, 1, 4>{});
     } else {
-      if (splitk == 8) {
-        constexpr int kSplitK = 8;
-        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, cute::bfloat16_t, 16, 64, 128, 3, 2,
-                                     kSplitK>(y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr,
-                                              w_high_ptr, w_low_ptr, m, n, k, scale, stream);
-      } else if (splitk == 4) {
-        constexpr int kSplitK = 4;
-        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, cute::bfloat16_t, 16, 64, 128, 3, 2,
-                                     kSplitK>(y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr,
-                                              w_high_ptr, w_low_ptr, m, n, k, scale, stream);
-      } else if (splitk == 2) {
-        constexpr int kSplitK = 2;
-        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, cute::bfloat16_t, 16, 64, 128, 3, 2,
-                                     kSplitK>(y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr,
-                                              w_high_ptr, w_low_ptr, m, n, k, scale, stream);
-      } else {
-        constexpr int kSplitK = 1;
-        launch_gemm_bf16xfp32_kernel<cute::bfloat16_t, cute::bfloat16_t, 16, 64, 128, 3, 2,
-                                     kSplitK>(y_ptr, splitk_y_ptr, split_flag_ptr, x_ptr,
-                                              w_high_ptr, w_low_ptr, m, n, k, scale, stream);
-      }
+      launch(LaunchCfg<64, 64, 64, 3, 1, 1>{});
     }
+    return true;
   }
+
+  // fallback
+  if (m > 128) {
+    launch(LaunchCfg<64, 64, 64, 2, 2, 1>{});
+  } else if (splitk == 8) {
+    launch(LaunchCfg<16, 64, 128, 3, 2, 8>{});
+  } else if (splitk == 4) {
+    launch(LaunchCfg<16, 64, 128, 3, 2, 4>{});
+  } else if (splitk == 2) {
+    launch(LaunchCfg<16, 64, 128, 3, 2, 2>{});
+  } else {
+    launch(LaunchCfg<16, 64, 128, 3, 2, 1>{});
+  }
+
   return true;
 }
 

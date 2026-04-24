@@ -44,16 +44,13 @@ def gemm_blockwise(
     return torch.ops.hpc.gemm_blockwise(x, weight, x_scale, w_scale, trans_xscale, bias)
 
 
-def get_gemm_bf16xfp32_workspace(max_weight_hidden_size: int) -> Tensor:
-    kTileM = 16
-    kTileN = 128
+def get_gemm_bf16xfp32_workspace(max_weight_hidden_size: int, max_tokens: int = 131072) -> Tensor:
 
-    max_splitk_m = 32
-    return torch.zeros(
-        (max_splitk_m // kTileM, (max_weight_hidden_size + kTileN - 1) // kTileN),
-        dtype=torch.int32,
-        device="cuda",
-    )
+    min_tile_m = 16
+    min_tile_n = 64
+    nm_max = (max_tokens + min_tile_m - 1) // min_tile_m
+    nn_max = (max_weight_hidden_size + min_tile_n - 1) // min_tile_n
+    return torch.zeros((nm_max, nn_max), dtype=torch.int32, device="cuda")
 
 
 def gemm_bf16xfp32(
