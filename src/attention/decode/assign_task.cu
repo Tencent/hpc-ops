@@ -126,6 +126,12 @@ __global__ void assign_attention_decode_task_kernel(int* task_map_ptr, const int
 
     int num_seqkv = num_seqkvs[ibatch];
 
+    if (num_seqkv <= 0) {
+      ibatch++;
+      task_map_chunk_ptr[ibatch] = 0;
+      continue;
+    }
+
     if (num_chunks == kMaxSplitK - 1) {
       add_tiles = num_tile;
     }
@@ -270,6 +276,12 @@ std::pair<std::vector<TaskScheduleInfo>, std::vector<int>> assign_attention_deco
       int add_tiles = std::min(num_tile, bucket);
 
       int num_seqkv = num_seqkvs[ibatch];
+
+      if (num_seqkv <= 0) {
+        ibatch++;
+        num_chunks[ibatch] = 0;
+        continue;
+      }
 
       if (num_chunks[ibatch] == kMaxSplitK - 1) {
         add_tiles = num_tile;
