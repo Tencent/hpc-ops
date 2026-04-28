@@ -953,15 +953,12 @@ __global__ void __launch_bounds__(384, 1)
 
       iblock += gridDim.x;
 
-      auto tDr = make_tensor_like(tCr);
-      clear(tDr);
-
       int ntile_k = size<2>(tAg);
+      tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
 #pragma unroll 1
       for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
         wait_barrier(readable[ismem_read], phase);
 
-        tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
         // mma
         warpgroup_fence_operand(tCr);
         warpgroup_arrive();
@@ -979,11 +976,6 @@ __global__ void __launch_bounds__(384, 1)
           arrive_barrier(writable[ismem_read]);
         }
 
-#pragma unroll
-        for (int i = 0; i < size(tCr); ++i) {
-          tDr(i) = tCr(i) + tDr(i);
-        }
-
         ++ismem_read;
         if (ismem_read == kStage) {
           phase ^= 1;
@@ -996,7 +988,7 @@ __global__ void __launch_bounds__(384, 1)
 
 #pragma unroll
       for (int i = 0; i < size(tCr); ++i) {
-        tCrh(i) = (Tout)(tDr(i));
+        tCrh(i) = (Tout)(tCr(i));
       }
 
       // Epilogue
