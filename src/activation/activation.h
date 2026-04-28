@@ -38,6 +38,10 @@ void masked_act_mul_and_blockwise_quant_async(__nv_fp8_e4m3 *output_ptr, float *
                                               int num_intermediate_size, int num_tokens_per_expert,
                                               cudaStream_t stream);
 
+void act_mul_bf16_async(__nv_bfloat16 *y_ptr, const __nv_bfloat16 *x_ptr,
+                        const int *valid_row_range, const int num_row, const int num_col,
+                        cudaStream_t stream);
+
 }  // namespace activation
 }  // namespace hpc
 

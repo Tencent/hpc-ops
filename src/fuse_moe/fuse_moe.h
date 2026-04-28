@@ -20,6 +20,14 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gata_up_output_ptr, v
                             int num_topk, int num_expert, int rank_ep, int num_seq_per_group_avg,
                             cudaStream_t stream);
 
+void count_and_gather_bf16_async(void *gate_up_input_ptr, void *gate_up_output_ptr,
+                                 void *down_input_ptr, void *down_output_ptr, const void *x_ptr,
+                                 const void *topk_ids_ptr, void *topk_pos_ptr, void *seqlens_ptr,
+                                 void *cu_seqlens_ptr, void *gate_up_tmas_ptr, void *down_tmas_ptr,
+                                 void *tiles_ptr, void *cu_tiles_ptr, int num_seq, int hidden_size,
+                                 int intermediate_size, int num_topk, int num_expert, int rank_ep,
+                                 int num_seq_per_group_avg, cudaStream_t stream);
+
 void blockwise_count_and_gather_async(
     const void *input_ptr, const void *input_scale_ptr, void *gate_up_input_ptr,
     void *gate_up_output_ptr, void *gate_up_input_scale_ptr, void *down_input_ptr,
@@ -55,6 +63,15 @@ void fuse_moe_blockwise_fp8_async(
     int intermediate_size, int num_topk, int num_expert_total, int num_expert_local,
     int gate_up_weight_scale_lastdim_pad4, int down_weight_scale_lastdim_pad4, int rank_ep,
     cudaStream_t stream);
+
+void fuse_moe_bf16_async(
+    void *output_ptr, const void *input_ptr, void *gate_up_input_ptr, void *gate_up_output_ptr,
+    const void *gate_up_weight_ptr, void *gate_up_tmas_ptr, void *down_input_ptr,
+    void *down_output_ptr, const void *down_weight_ptr, void *down_tmas_ptr,
+    const void *topk_ids_ptr, const void *topk_scale_ptr, void *topk_pos_ptr, void *seqlens_ptr,
+    void *cu_seqlens_ptr, void *tiles_ptr, void *cu_tiles_ptr, const void *shared_output_ptr,
+    int num_seq, int hidden_size, int intermediate_size, int num_topk, int num_expert_total,
+    int num_expert_local, int rank_ep, cudaStream_t stream);
 
 }  // namespace fuse_moe
 }  // namespace hpc
