@@ -20,6 +20,18 @@ variables:
     props:
       label: branch
       type: vuex-input
+  RUN_FULL_SANITIZER:
+    value: "false"
+    allow-modify-at-startup: true
+    props:
+      label: Run full compute-sanitizer
+      type: selector
+      options:
+        - id: "true"
+          description: "true"
+        - id: "false"
+          description: "false"
+      description: "true = full, false = incremental, default false"
 stages:
 - name: stage-1
   label:
@@ -318,8 +330,8 @@ stages:
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
             sudo docker exec -t hpc-ops-cicd bash -c "pkill -9 python3 || true"
             sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make test"
-      - name: compute-sanitizer
-        id: rL0
+      - name: compute-sanitizer (incremental)
+        if: variables.RUN_FULL_SANITIZER == 'false'
         uses: JobScriptExecutionA@1.*
         with:
           envId:
@@ -339,6 +351,27 @@ stages:
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
             sudo docker exec -t hpc-ops-cicd bash -c "pkill -9 python3 || true"
             sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && (git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git fetch origin master --depth=200 || true) && make sanitizer"
+      - name: compute-sanitizer (full)
+        if: variables.RUN_FULL_SANITIZER == 'true'
+        uses: JobScriptExecutionA@1.*
+        with:
+          envId:
+          - dpzbvgzp
+          scriptTimeout: "36000"
+          account: reedlauliu
+          shellScriptContent: |-
+            #!/bin/bash
+            set -xe
+
+            echo ${{BK_CI_PROJECT_NAME}}
+            echo ${{BK_CI_PIPELINE_ID}}
+            echo ${{BK_CI_BUILD_ID}}
+            echo ${{BK_CI_BUILD_NUM}}
+            echo ${{BK_CI_BUILD_TASK_ID}}
+
+            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
+            sudo docker exec -t hpc-ops-cicd bash -c "pkill -9 python3 || true"
+            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make sanitizer-all"
 finally:
   job_SCd:
     name: clean temp file
