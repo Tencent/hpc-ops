@@ -90,7 +90,7 @@ void launch_warp_spec_blocksparse_fp8_dim192(
 
     dim3 block(384);
     dim3 grid(get_sm_count());
-    auto kernel = kernels::attention_blocksparse_prefill_fp8_warp_specialization_kernel<
+    auto kernel = kernels::attention_blocksparse_prefill_fp8_dim192_warp_specialization_kernel<
         decltype(config), decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y),
         kHasMask>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);

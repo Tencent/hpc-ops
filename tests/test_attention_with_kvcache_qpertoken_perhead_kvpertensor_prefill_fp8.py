@@ -51,22 +51,9 @@ def naive_attn_with_kvcache_func(
             .repeat_interleave(num_group, dim=0)
         ).float()
 
-        BKS = (
-            kscale[blk_ids, :, :, :]
-            # .view(torch.float32)
-            .permute(0, 1, 3, 2)
-            .reshape(-1, num_head_kv)
-            .transpose(0, 1)[:, :num_seq_kv]
-            .repeat_interleave(num_group, dim=0)
-        ).float()
-
         scale = qscale[i, :, :].unsqueeze(-1)[:, :num_seq_q, :]
 
-        scores = BQ @ BK.transpose(-1, -2)
-        scores = (
-            scores / math.sqrt(num_dim_qk) * scale * BKS.unsqueeze(1)
-        )  # * qscale[i][:, None, None]
-
+        scores = torch.matmul(BQ, BK.transpose(-2, -1)) * scale * kscale[0] / math.sqrt(num_dim_qk)
         if causal:
             causal_mask = (
                 torch.tril(torch.ones(num_seq_kv, num_seq_kv, device=q.device, dtype=torch.bool))[
@@ -81,11 +68,7 @@ def naive_attn_with_kvcache_func(
         scores = scores.masked_fill(~causal_mask, float("-inf"))
         attn_weights = F.softmax(scores, dim=-1)
 
-        # output[i] = (torch.matmul(attn_weights, BV)* vscale[0]).transpose(1, 2)
-        output[i] = (
-            torch.matmul(attn_weights, BV)
-            * vscale[:, None, None].repeat_interleave(num_group, dim=0)
-        ).transpose(1, 2)
+        output[i] = torch.matmul(attn_weights, BV).transpose(1, 2) * vscale[0]
 
     return output
 
@@ -100,16 +83,16 @@ except Exception as e:
 
 
 @pytest.mark.parametrize("kv_layout", ["nhd", "hnd"])
-@pytest.mark.parametrize("num_batch", [1])
-@pytest.mark.parametrize("num_seq_q", [3904])
+@pytest.mark.parametrize("num_batch", [4])
+@pytest.mark.parametrize("num_seq_q", [100, 500, 1000, 1500, 3904])
 @pytest.mark.parametrize("num_seq_kv", [3904])
 @pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("num_head_q", [8])
-@pytest.mark.parametrize("num_head_kv", [2])
+@pytest.mark.parametrize("num_head_q", [4])
+@pytest.mark.parametrize("num_head_kv", [1])
 @pytest.mark.parametrize("num_dim_qk", [128])
 @pytest.mark.parametrize("num_dim_v", [128])
 @pytest.mark.parametrize("use_output", [False])
-def test_attention_with_kvcache_QKpertoken_Vpertensor_prefill_fp8(
+def test_attention_with_kvcache_prefill_fp8(
     kv_layout,
     num_batch,
     num_seq_q,
@@ -122,10 +105,10 @@ def test_attention_with_kvcache_QKpertoken_Vpertensor_prefill_fp8(
     use_output,
 ):
 
+    torch.manual_seed(10086)
+    torch.cuda.manual_seed(10086)
     T = torch.bfloat16
     T1 = torch.float8_e4m3fn
-
-    torch.cuda.manual_seed(10086)
 
     num_seq_q_pad = (num_seq_q + 127) // 128 * 128
 
@@ -149,9 +132,9 @@ def test_attention_with_kvcache_QKpertoken_Vpertensor_prefill_fp8(
         / 10
     )
 
-    # kscale = torch.randn((1), dtype=torch.float32, device="cuda").abs() * 10
-    vscale = torch.abs(torch.ones((num_head_kv), dtype=torch.float32, device="cuda"))
-    print("vscale:", vscale)
+    kscale = torch.randn((1), dtype=torch.float32, device="cuda").abs() * 10
+    print(f"kscale={kscale}")
+    vscale = torch.randn((1), dtype=torch.float32, device="cuda")
 
     seqlens_q = torch.full((num_batch,), num_seq_q, dtype=torch.int32, device="cuda")
     seqlens_kvcache = torch.full((num_batch,), num_seq_kv, dtype=torch.int32, device="cuda")
@@ -188,17 +171,13 @@ def test_attention_with_kvcache_QKpertoken_Vpertensor_prefill_fp8(
         ]
         cu_blocks += kvcache_blocks[i]
 
-    kscale = torch.abs(
-        torch.randn((max_num_blocks, 2, num_head_kv, 32), dtype=torch.float32, device="cuda")
-    ).view(torch.float8_e4m3fn)
-
-    for i in range(1):
+    for i in range(10):
         gt = gt_attention_func(
             q=Q,
             k_cache=kcache,
             v_cache=vcache,
             qscale=qscale,
-            kscale=kscale.view(torch.float32),
+            kscale=kscale,
             vscale=vscale,
             cache_seqlens=seqlens_kvcache,
             page_table=block_ids,
@@ -218,7 +197,7 @@ def test_attention_with_kvcache_QKpertoken_Vpertensor_prefill_fp8(
                 block_ids,
                 seqlens_kvcache,
                 max_seqlens_q,
-                quant_type=hpc.QuantType.QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD,
+                quant_type=hpc.QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
                 output=my,
             )
         else:
@@ -233,7 +212,7 @@ def test_attention_with_kvcache_QKpertoken_Vpertensor_prefill_fp8(
                 block_ids,
                 seqlens_kvcache,
                 max_seqlens_q,
-                quant_type=hpc.QuantType.QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD,
+                quant_type=hpc.QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
             )
     gt = gt.reshape(-1, num_head_q, num_dim_v)
 
@@ -241,5 +220,7 @@ def test_attention_with_kvcache_QKpertoken_Vpertensor_prefill_fp8(
     print(gt[:, 0, :])
     print("\nmy\n")
     print(my[:, 0, :])
+    print("\n diff \n")
+    print((gt - my)[:64, 0, :1])
 
     assert allclose(gt, my, atol=0.1)

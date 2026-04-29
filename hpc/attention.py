@@ -262,6 +262,7 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
     block_ids: Tensor,
     seqlens_kvcache: Tensor,
     max_seqlens_q: int,
+    quant_type: QuantType = QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
     block_mask: Optional[Tensor] = None,
     output: Tensor = None,
 ) -> Tensor:
@@ -290,12 +291,30 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
             Dtype: fp8.
         qscale: Per-token per-head Q dequant scale. Shape: [num_batch, num_head_q, max_seq_q_pad],
             Dtype: float32
-        kscale: Per-tensor K dequant scale. Shape: [1], Dtype: float32
-        vscale: Per-tensor V dequant scale. Shape: [1], Dtype: float32
+        kscale: K fp8 quant scale tensor.
+            Shape: depends on `quant_type`:
+                   - If `quant_type == QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR`:
+                       Shape: [1]
+                   - If `quant_type == QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD`:
+                       Shape: [num_blocks, scale_block_size, num_head_kv, num_dim_scale]
+            Dtype: float32/fp8
+            For per-token/per-head K scale mode, stride-transformed layouts are
+            also accepted as long as the logical shape above is preserved.
+        vscale: V fp8 quant scale.
+            Shape: depends on `quant_type`:
+                   - If `quant_type == QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR`:
+                       Shape: [1] (per-tensor)
+                   - If `quant_type == QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD`:
+                       Shape: [num_head_kv] (per-head)
+            Dtype: float32
         cu_seqlens_q: Cumulative Q lengths. Shape: [num_batch + 1], Dtype: int32
         block_ids: Page table. Shape: [num_batch, max_blocks], Dtype: int32
         seqlens_kvcache: KV cache lengths. Shape: [num_batch], Dtype: int32
         max_seqlens_q: Max Q sequence length (scalar).
+        quant_type: Type of quantization scheme for attention computation.
+            Defaults to QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR (legacy). Pass
+            QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD for the new dense-aligned
+            layout (K per-token-group per-head per-dim-group, V per-head).
         block_mask: Optional bool mask for KV tiles. True = compute, False = skip.
             Shape: [num_batch, num_head_q, max_tile_m, num_tile_kv_in_mask], Dtype: uint8.
         output: Optional pre-allocated output tensor.
@@ -314,6 +333,7 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
         block_ids,
         seqlens_kvcache,
         max_seqlens_q,
+        quant_type.value,
         block_mask,
         output,
     )
@@ -620,7 +640,7 @@ def sparse_mla_with_kvcache_bf16(
     )
 
 
-def attention_blocksparse_prefill_fp8(
+def attention_blocksparse_prefill_fp8_dim192(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -635,7 +655,7 @@ def attention_blocksparse_prefill_fp8(
     block_mask: Optional[Tensor] = None,
     output: Tensor = None,
 ) -> Tensor:
-    """Unified dense / block-sparse attention prefill with FP8 varlen QKV.
+    """Dim192 dense / block-sparse attention prefill with FP8 varlen QKV.
 
     Supports MLA dim_qk=192, dim_v=128. When `block_mask` is None, dispatches
     to the dense-compatible `kHasMask=False` path. When provided, only KV tiles
@@ -661,7 +681,7 @@ def attention_blocksparse_prefill_fp8(
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
-    return torch.ops.hpc.attention_blocksparse_prefill_fp8(
+    return torch.ops.hpc.attention_blocksparse_prefill_fp8_dim192(
         q,
         k,
         v,
@@ -876,6 +896,7 @@ def attention_with_kvcache_blocksparse_prefill_fp8_fake(
     block_ids,
     seqlens_kvcache,
     max_seqlens_q,
+    quant_type,
     block_mask=None,
     output=None,
 ):
@@ -884,8 +905,8 @@ def attention_with_kvcache_blocksparse_prefill_fp8_fake(
     )
 
 
-@torch.library.register_fake("hpc::attention_blocksparse_prefill_fp8")
-def attention_blocksparse_prefill_fp8_fake(
+@torch.library.register_fake("hpc::attention_blocksparse_prefill_fp8_dim192")
+def attention_blocksparse_prefill_fp8_dim192_fake(
     q,
     k,
     v,

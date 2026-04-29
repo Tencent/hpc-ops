@@ -24,7 +24,7 @@ void attention_with_kvcache_prefill_bf16_async(
     int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV, int ldV1, int ldV2,
     cudaStream_t stream);
 
-void attention_with_kvcache_prefill_Qpertoken_KVpertensor_fp8_async(
+void attention_with_kvcache_prefill_qpertoken_perhead_kvpertensor_fp8_async(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
@@ -33,7 +33,7 @@ void attention_with_kvcache_prefill_Qpertoken_KVpertensor_fp8_async(
     int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV,
     int ldV1, int ldV2, cudaStream_t stream);
 
-void attention_with_kvcache_prefill_QKpertoken_Vpertensor_fp8_async(
+void attention_with_kvcache_prefill_qkpertoken_perhead_vperhead_fp8_async(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
@@ -49,7 +49,7 @@ void mla_prefill_bf16_async(void *y_ptr, const void *q_ptr, const void *kv_ptr,
                             int num_dim_v, int num_head_q, int num_head_kv, int ldY, int ldQ,
                             int ldKV, cudaStream_t stream);
 
-void attention_with_kvcache_blocksparse_prefill_fp8_async(
+void attention_with_kvcache_blocksparse_prefill_qpertoken_perhead_kvpertensor_fp8_async(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
@@ -58,7 +58,17 @@ void attention_with_kvcache_blocksparse_prefill_fp8_async(
     int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV,
     int ldV1, int ldV2, const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream);
 
-void attention_blocksparse_prefill_fp8_async(
+void attention_with_kvcache_blocksparse_prefill_qkpertoken_perhead_vperhead_fp8_async(
+    void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
+    const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
+    const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
+    void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
+    int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
+    int block_size, int scale_block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK,
+    int ldK1, int ldK2, int ldV, int ldV1, int ldV2, int ldKS, int ldKS1, int ldKS2,
+    const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream);
+
+void attention_blocksparse_prefill_fp8_dim192_async(
     void *y_ptr, const void *q_ptr, const void *k_ptr, const void *v_ptr,
     const void *cu_seqlens_q_ptr, const void *cu_seqlens_kv_ptr, void *tmas_ptr, int num_batch,
     int total_seq_q, int max_seq_q, int max_seq_kv, int num_dim_qk, int num_dim_v, int num_head_q,

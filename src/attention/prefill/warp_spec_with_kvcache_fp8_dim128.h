@@ -10,7 +10,7 @@ namespace hpc {
 namespace attention {
 namespace prefill {
 
-void warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128_async(
+void warp_spec_with_kvcache_qpertoken_perhead_kvpertensor_fp8_dim128_async(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
@@ -19,7 +19,7 @@ void warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128_async(
     int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV,
     int ldV1, int ldV2, cudaStream_t stream);
 
-void warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128_async(
+void warp_spec_with_kvcache_qkpertoken_perhead_vperhead_fp8_dim128_async(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,

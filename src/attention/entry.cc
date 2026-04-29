@@ -96,6 +96,9 @@ torch::Tensor attention_with_kvcache_prefill_bf16_entry(
 
   int num_head_kv = kcache.size(2);
   int num_dim_v = vcache.size(3);
+  TORCH_CHECK(num_dim_qk == 128 && num_dim_v == 128,
+              "attention_with_kvcache_prefill_bf16: expected dim_qk=128 and dim_v=128, got dim_qk=",
+              num_dim_qk, " dim_v=", num_dim_v);
 
   int num_seq_max_blocks = block_ids.size(1);
 
@@ -177,6 +180,9 @@ torch::Tensor attention_with_kvcache_prefill_fp8_entry(
 
   int num_head_kv = kcache.size(2);
   int num_dim_v = vcache.size(3);
+  TORCH_CHECK(num_dim_qk == 128 && num_dim_v == 128,
+              "attention_with_kvcache_prefill_fp8: expected dim_qk=128 and dim_v=128, got dim_qk=",
+              num_dim_qk, " dim_v=", num_dim_v);
 
   int num_seq_max_blocks = block_ids.size(1);
 
@@ -224,7 +230,7 @@ torch::Tensor attention_with_kvcache_prefill_fp8_entry(
   int ldY = y.stride(0);
 
   if (quant_type == 1) {
-    attention_with_kvcache_prefill_Qpertoken_KVpertensor_fp8_async(
+    attention_with_kvcache_prefill_qpertoken_perhead_kvpertensor_fp8_async(
         y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
         block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seqlens_q,
         max_seqlens_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
@@ -243,7 +249,7 @@ torch::Tensor attention_with_kvcache_prefill_fp8_entry(
       ldKS2 = kscale.stride(2) / sizeof(float);
     }
     int scale_block_size = kscale.size(1);
-    attention_with_kvcache_prefill_QKpertoken_Vpertensor_fp8_async(
+    attention_with_kvcache_prefill_qkpertoken_perhead_vperhead_fp8_async(
         y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
         block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seqlens_q,
         max_seqlens_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
@@ -258,7 +264,7 @@ torch::Tensor attention_with_kvcache_blocksparse_prefill_fp8_entry(
     const torch::Tensor &q, const torch::Tensor &kcache, const torch::Tensor &vcache,
     const torch::Tensor &qscale, const torch::Tensor &kscale, const torch::Tensor &vscale,
     const torch::Tensor &cu_seqlens_q, const torch::Tensor block_ids,
-    const torch::Tensor seqlens_kvcache, int64_t max_seqlens_q,
+    const torch::Tensor seqlens_kvcache, int64_t max_seqlens_q, int64_t quant_type,
     std::optional<torch::Tensor> block_mask, std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
   TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
@@ -270,6 +276,9 @@ torch::Tensor attention_with_kvcache_blocksparse_prefill_fp8_entry(
   TORCH_CHECK(cu_seqlens_q.device().is_cuda(), "cu_seqlens_q tensor must be cuda");
   TORCH_CHECK(block_ids.device().is_cuda(), "block_ids tensor must be cuda");
   TORCH_CHECK(seqlens_kvcache.device().is_cuda(), "seqlens_kvcache tensor must be cuda");
+  TORCH_CHECK((quant_type == 0 || quant_type == 1), "quant_type only support 0/1");
+  TORCH_CHECK((kscale.dtype().itemsize() == 4 || kscale.dtype().itemsize() == 1),
+              "kscale dtype must be float or fp8");
 
   bool has_block_mask = block_mask.has_value();
 
@@ -284,6 +293,11 @@ torch::Tensor attention_with_kvcache_blocksparse_prefill_fp8_entry(
 
   int num_head_kv = kcache.size(2);
   int num_dim_v = vcache.size(3);
+  TORCH_CHECK(
+      num_dim_qk == 128 && num_dim_v == 128,
+      "attention_with_kvcache_blocksparse_prefill_fp8: expected dim_qk=128 and dim_v=128, got "
+      "dim_qk=",
+      num_dim_qk, " dim_v=", num_dim_v);
 
   int num_seq_max_blocks = block_ids.size(1);
 
@@ -353,17 +367,39 @@ torch::Tensor attention_with_kvcache_blocksparse_prefill_fp8_entry(
   int ldV2 = vcache.stride(2);
   int ldY = y.stride(0);  // num_head_q * num_dim_v;
 
-  attention_with_kvcache_blocksparse_prefill_fp8_async(
-      y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
-      block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seqlens_q,
-      max_seqlens_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
-      block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1, ldV2, block_mask_ptr,
-      num_tile_kv_in_mask, stream);
+  if (quant_type == 1) {
+    attention_with_kvcache_blocksparse_prefill_qpertoken_perhead_kvpertensor_fp8_async(
+        y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
+        block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seqlens_q,
+        max_seqlens_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
+        block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1, ldV2, block_mask_ptr,
+        num_tile_kv_in_mask, stream);
+  } else if (quant_type == 0) {
+    int ldKS = 0;
+    int ldKS1 = 0;
+    int ldKS2 = 0;
+    if (kscale.dtype().itemsize() == 4) {
+      ldKS = kscale.stride(0);
+      ldKS1 = kscale.stride(1);
+      ldKS2 = kscale.stride(2);
+    } else if (kscale.dtype().itemsize() == 1) {
+      ldKS = kscale.stride(0) / sizeof(float);
+      ldKS1 = kscale.stride(1) / sizeof(float);
+      ldKS2 = kscale.stride(2) / sizeof(float);
+    }
+    int scale_block_size = kscale.size(1);
+    attention_with_kvcache_blocksparse_prefill_qkpertoken_perhead_vperhead_fp8_async(
+        y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
+        block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seqlens_q,
+        max_seqlens_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
+        block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1,
+        ldV2, ldKS, ldKS1, ldKS2, block_mask_ptr, num_tile_kv_in_mask, stream);
+  }
 
   return y;
 }
 
-torch::Tensor attention_blocksparse_prefill_fp8_entry(
+torch::Tensor attention_blocksparse_prefill_fp8_dim192_entry(
     const torch::Tensor &q, const torch::Tensor &k, const torch::Tensor &v,
     const torch::Tensor &cu_seqlens_q, const torch::Tensor &cu_seqlens_kv, int64_t max_seqlens_q,
     int64_t max_seqlens_kv, std::optional<torch::Tensor> block_mask, const torch::Tensor &q_scale,
@@ -405,6 +441,10 @@ torch::Tensor attention_blocksparse_prefill_fp8_entry(
 
   int num_head_kv = k.size(1);
   int num_dim_v = v.size(2);
+  TORCH_CHECK(
+      num_dim_qk == 192 && num_dim_v == 128,
+      "attention_blocksparse_prefill_fp8_dim192: expected dim_qk=192 and dim_v=128, got dim_qk=",
+      num_dim_qk, " dim_v=", num_dim_v);
 
   int num_batch = cu_seqlens_q.size(0) - 1;
 
@@ -463,7 +503,7 @@ torch::Tensor attention_blocksparse_prefill_fp8_entry(
   int ldV = v.stride(0);
   int ldY = y.stride(0);
 
-  attention_blocksparse_prefill_fp8_async(
+  attention_blocksparse_prefill_fp8_dim192_async(
       y_ptr, q_ptr, k_ptr, v_ptr, cu_seqlens_q_ptr, cu_seqlens_kv_ptr, tmas_ptr, num_batch,
       total_seq_q, max_seqlens_q, max_seqlens_kv, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
       ldY, ldQ, ldK, ldV, block_mask_ptr, num_tile_kv_in_mask, softmax_qkscale, vscale, stream);
@@ -863,20 +903,20 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "attention_with_kvcache_blocksparse_prefill_fp8(Tensor q, Tensor kcache, Tensor vcache,"
       "Tensor qscale, Tensor kscale, Tensor vscale, Tensor cu_seqlens_q,"
-      "Tensor block_ids, Tensor num_seq_kvcache, int max_seqlens_q,"
+      "Tensor block_ids, Tensor num_seq_kvcache, int max_seqlens_q, int quant_type,"
       "Tensor? block_mask,"
       "Tensor? output) -> (Tensor)");
   m.impl("attention_with_kvcache_blocksparse_prefill_fp8", torch::kCUDA,
          &hpc::attention::attention_with_kvcache_blocksparse_prefill_fp8_entry);
 
   m.def(
-      "attention_blocksparse_prefill_fp8(Tensor q, Tensor k, Tensor v,"
+      "attention_blocksparse_prefill_fp8_dim192(Tensor q, Tensor k, Tensor v,"
       "Tensor cu_seqlens_q, Tensor cu_seqlens_kv,"
       "int max_seqlens_q, int max_seqlens_kv,"
       "Tensor? block_mask, Tensor q_scale, Tensor k_scale, Tensor v_scale,"
       "float softmax_scale, Tensor? output) -> (Tensor)");
-  m.impl("attention_blocksparse_prefill_fp8", torch::kCUDA,
-         &hpc::attention::attention_blocksparse_prefill_fp8_entry);
+  m.impl("attention_blocksparse_prefill_fp8_dim192", torch::kCUDA,
+         &hpc::attention::attention_blocksparse_prefill_fp8_dim192_entry);
 
   m.def(
       "attention_decode_bf16(Tensor q, Tensor! kcache, Tensor! vcache, Tensor block_ids, Tensor "

@@ -17,7 +17,7 @@ namespace attention {
 namespace prefill {
 
 template <int kBlockSize>
-void launch_warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128(
+void launch_warp_spec_with_kvcache_qpertoken_perhead_kvpertensor_fp8_dim128(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
@@ -84,7 +84,7 @@ void launch_warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128(
     dim3 block(384);
     dim3 grid(get_sm_count());
     auto kernel = kernels::
-        attention_with_kvcache_Qpertoken_KVpertensor_prefill_fp8_warp_specialization_kernel<
+        attention_with_kvcache_qpertoken_perhead_kvpertensor_prefill_fp8_warp_specialization_kernel<
             decltype(config), decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y),
             decltype(tma_qs)>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
@@ -98,7 +98,7 @@ void launch_warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128(
 }
 
 template <int kBlockSize>
-void launch_warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128(
+void launch_warp_spec_with_kvcache_qkpertoken_perhead_vperhead_fp8_dim128(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
@@ -155,7 +155,7 @@ void launch_warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128(
   Config config;
   auto [tma_q, tma_k, tma_v, tma_y, tma_qs, tma_ks] = config.get_tma(Q, K, V, Y, QS, KS);
 
-  // 0. update tmakTileS
+  // 0. update tma
   {
     vec_t<cute::TmaDescriptor, 2> td_qy{
         *tma_q.get_tma_descriptor(),
@@ -180,7 +180,7 @@ void launch_warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128(
     dim3 block(384);
     dim3 grid(get_sm_count());
     auto kernel = kernels::
-        attention_with_kvcache_QKpertoken_Vpertensor_prefill_fp8_warp_specialization_kernel<
+        attention_with_kvcache_qkpertoken_perhead_vperhead_prefill_fp8_warp_specialization_kernel<
             decltype(config), decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y),
             decltype(tma_qs), decltype(tma_ks)>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
@@ -193,7 +193,7 @@ void launch_warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128(
   }
 }
 
-void warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128_async(
+void warp_spec_with_kvcache_qpertoken_perhead_kvpertensor_fp8_dim128_async(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
@@ -203,14 +203,14 @@ void warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128_async(
     int ldV1, int ldV2, cudaStream_t stream) {
   if (block_size == 32) {
     constexpr int kBlockSize = 32;
-    launch_warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128<kBlockSize>(
+    launch_warp_spec_with_kvcache_qpertoken_perhead_kvpertensor_fp8_dim128<kBlockSize>(
         y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
         block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
         max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
         block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1, ldV2, stream);
   } else if (block_size == 64) {
     constexpr int kBlockSize = 64;
-    launch_warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128<kBlockSize>(
+    launch_warp_spec_with_kvcache_qpertoken_perhead_kvpertensor_fp8_dim128<kBlockSize>(
         y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
         block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
         max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
@@ -218,7 +218,7 @@ void warp_spec_with_kvcache_Qpertoken_KVpertensor_fp8_dim128_async(
   }
 }
 
-void warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128_async(
+void warp_spec_with_kvcache_qkpertoken_perhead_vperhead_fp8_dim128_async(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
@@ -229,7 +229,7 @@ void warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128_async(
     cudaStream_t stream) {
   if (block_size == 32) {
     constexpr int kBlockSize = 32;
-    launch_warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128<kBlockSize>(
+    launch_warp_spec_with_kvcache_qkpertoken_perhead_vperhead_fp8_dim128<kBlockSize>(
         y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
         block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
         max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
@@ -237,7 +237,7 @@ void warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128_async(
         ldV2, ldKS, ldKS1, ldKS2, stream);
   } else if (block_size == 64) {
     constexpr int kBlockSize = 64;
-    launch_warp_spec_with_kvcache_QKpertoken_Vpertensor_fp8_dim128<kBlockSize>(
+    launch_warp_spec_with_kvcache_qkpertoken_perhead_vperhead_fp8_dim128<kBlockSize>(
         y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
         block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
         max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks,
