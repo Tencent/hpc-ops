@@ -1094,32 +1094,50 @@ __global__ void __launch_bounds__(384, 1)
 
       int ntile_k = size<2>(tAg);
       tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+
+      // Pipelined K-loop: keep 1 WGMMA batch in flight (wait<1> instead of
+      // wait<0> per iter). The writable barrier of stage k is released only
+      // after wait<1> in iter k+1, so the MMA of iter k+1 can overlap with
+      // the producer's reload of stage k. The accumulator tCr only needs to
+      // be fenced once before the first WGMMA and once after the last drain.
+      int prev_ismem_read = 0;
+      warpgroup_fence_operand(tCr);
 #pragma unroll 1
       for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
         wait_barrier(readable[ismem_read], phase);
 
         // mma
-        warpgroup_fence_operand(tCr);
         warpgroup_arrive();
 #pragma unroll
         for (int ik = 0; ik < size<2>(tAr); ++ik) {
           cute::gemm(tiled_mma, tBr(_, _, ik, ismem_read), tAr(_, _, ik, ismem_read), tCr(_, _, _));
           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
         }
-
         warpgroup_commit_batch();
-        warpgroup_wait<0>();
-        warpgroup_fence_operand(tCr);
 
-        if (elected_idx_in_warpgroup) {
-          arrive_barrier(writable[ismem_read]);
+        if (itile_k >= 1) {
+          // Previous batch is now done; release the stage it consumed so
+          // the producer can refill it while the current batch is still
+          // in flight.
+          warpgroup_wait<1>();
+          if (elected_idx_in_warpgroup) {
+            arrive_barrier(writable[prev_ismem_read]);
+          }
         }
 
+        prev_ismem_read = ismem_read;
         ++ismem_read;
         if (ismem_read == kStage) {
           phase ^= 1;
           ismem_read = 0;
         }
+      }
+
+      // Drain the last in-flight batch and release its stage.
+      warpgroup_wait<0>();
+      warpgroup_fence_operand(tCr);
+      if (elected_idx_in_warpgroup) {
+        arrive_barrier(writable[prev_ismem_read]);
       }
 
       // float32 -> bfloat16
