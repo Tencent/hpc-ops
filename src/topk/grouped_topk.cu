@@ -15,6 +15,13 @@ namespace topk {
 
 namespace kernels {
 
+__device__ bool is_float_nan_fast(float f) {
+  const uint32_t u = *reinterpret_cast<const uint32_t*>(&f);
+  const uint32_t exponent = u & 0x7F800000;
+  const uint32_t mantissa = u & 0x007FFFFF;
+  return (exponent == 0x7F800000) && (mantissa != 0);
+}
+
 template <bool kUseGroup, bool kReNorm>
 __global__ void grouped_topk_kernel(float* topk_weights_ptr, int* topk_ids_ptr,
                                     const float* scores_ptr, const float* bias_ptr, float scale,
@@ -37,7 +44,7 @@ __global__ void grouped_topk_kernel(float* topk_weights_ptr, int* topk_ids_ptr,
     // 1. sigmoid
 #pragma unroll
     for (int i = 0; i < 4; i++) {
-      scores[i] = sigmoid(scores[i]);
+      scores[i] = sigmoid(is_float_nan_fast(scores[i]) ? 0.f : scores[i]);
     }
 
     // 2. add bias
@@ -69,7 +76,7 @@ __global__ void grouped_topk_kernel(float* topk_weights_ptr, int* topk_ids_ptr,
       for (int i = 0; i < num_experts; i += 4) {
         auto other_score = load<float, 4>(smem_scores + i);
         for (int j = 0; j < 4; j++) {
-          if (other_score[j] > score || (score == other_score[j] && (i + j > idx))) {
+          if (other_score[j] > score || (score == other_score[j] && (i + j < idx))) {
             count++;
           }
         }

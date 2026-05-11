@@ -91,19 +91,21 @@ def test_grouped_topk(
     dtype: torch.dtype,
 ):
     torch.cuda.manual_seed(10086)
-    gating_output = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+    gating_output = torch.empty((num_tokens, num_experts), dtype=dtype, device="cuda")
 
     e_score_correction_bias = torch.randn((num_experts,), dtype=torch.float32, device="cuda")
 
     gt_topk_weights, gt_topk_ids = grouped_topk(
-        gating_output=gating_output,
+        gating_output=gating_output.where(~gating_output.isnan(), torch.zeros_like(gating_output)),
         topk=topk,
         renormalize=renormalize,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
         scoring_func=scoring_func,
         routed_scaling_factor=routed_scaling_factor,
-        e_score_correction_bias=e_score_correction_bias,
+        e_score_correction_bias=e_score_correction_bias.where(
+            ~e_score_correction_bias.isnan(), torch.zeros_like(e_score_correction_bias)
+        ),
     )
 
     my_topk_weights, my_topk_ids = hpc.grouped_topk(
