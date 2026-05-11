@@ -20,6 +20,8 @@ from utils import allclose
 @pytest.mark.parametrize("use_fp32_output", [True, False])
 @pytest.mark.parametrize("use_split_flag", [True, False])
 def test_gemm_bf16xfp32_sm90(m, n, k, use_fp32_output, use_split_flag):
+    torch.manual_seed(10086)
+    torch.cuda.manual_seed(10086)
     dtype = torch.bfloat16
 
     x = torch.randn((m, k), dtype=torch.float, device="cuda").to(dtype)
@@ -53,6 +55,8 @@ def test_gemm_bf16xfp32_sm90(m, n, k, use_fp32_output, use_split_flag):
 @pytest.mark.parametrize("use_fp32_output", [True, False])
 @pytest.mark.parametrize("use_splitk", [True, False])
 def test_gemm_bf16xfp32_sm100(m, n, k, use_fp32_output, use_splitk):
+    torch.manual_seed(10086)
+    torch.cuda.manual_seed(10086)
     dtype = torch.bfloat16
 
     x = torch.randn((m, k), dtype=torch.float, device="cuda").to(dtype)

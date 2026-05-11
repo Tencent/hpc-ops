@@ -123,6 +123,26 @@ __device__ __forceinline__ constexpr auto to(const vec_t<T, N> &v) {
       o[i] = __nv_fp8x4_e4m3(*reinterpret_cast<const float4 *>(&v[4 * i]));
     }
     return o;
+  } else if constexpr (std::is_same_v<T, __nv_fp8x4_e4m3> && std::is_same_v<U, float>) {
+    using V = vec_t<float, N * 4>;
+    V o;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+      auto y = static_cast<float4>(v[i]);
+      o[i * 4 + 0] = y.x;
+      o[i * 4 + 1] = y.y;
+      o[i * 4 + 2] = y.z;
+      o[i * 4 + 3] = y.w;
+    }
+    return o;
+  } else if constexpr (std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<U, float>) {
+    using V = vec_t<float, N>;
+    V o;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+      o[i] = static_cast<float>(v[i]);
+    }
+    return o;
   } else if constexpr (std::is_same_v<T, __nv_bfloat162> && std::is_same_v<U, __nv_fp8x4_e4m3>) {
     static_assert(N % 2 == 0, "N % 2 must be 0");
     using V = vec_t<__nv_fp8x4_e4m3, N / 2>;
