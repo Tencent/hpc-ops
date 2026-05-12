@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdio>
 
+#include "cutlass/arch/barrier.h"
 #include "cutlass/arch/cache_operation.h"
 #include "cutlass/arch/memory.h"
 #include "cutlass/arch/mma.h"
@@ -15,6 +16,7 @@
 #include "cutlass/numeric_types.h"
 #include "src/group_gemm/sm90/group_gemm.h"
 #include "src/utils/utils.cuh"
+#include "src/utils/utils.h"
 
 namespace hpc {
 namespace group_gemm {
@@ -52,7 +54,7 @@ constexpr int kScalesPerAccess =
     128 / cutlass::sizeof_bits<Ts>::value;  // each thread once load 16B = 8 bf16
 // real size is 2 * kThreadsPerBlock * 16 = 2 * 128 * 16B = 4KB
 // for avoid bank conflict, set shm like tensor which shape is [2 * 16, 8 + 1] and dtype is float4
-constexpr int kSharedMemorySize = 2 * 16 * (8 + 1) * 16;
+constexpr int kScaleSharedMemorySize = 2 * 16 * (8 + 1) * 16;
 constexpr int kScaleInterleaveBlockSizeMMode =
     2;  // one thread is 16B, four threads per row , so fold 2 row into one row for 128B cache
         // line in load share memory.
@@ -89,9 +91,6 @@ __device__ cutlass::Array<cutlass::half_t, 8> convert_interleaved_int4_to_fp16(u
 
   cutlass::Array<cutlass::half_t, 8> res;
 
-  // #pragma unroll
-  //   for (int i = 0; i < groupwise_w4a8_mma::kElementsPerAccess / 8; ++i) {
-  // uint32_t src_reg = *(reinterpret_cast<const uint32_t *>(&src) + i);
   uint32_t *r = reinterpret_cast<uint32_t *>(&res);
 
   asm volatile(
@@ -134,27 +133,343 @@ __device__ cutlass::Array<cutlass::half_t, 8> convert_interleaved_int4_to_fp16(u
   return res;
 }
 
-template <int kGroupSize>
-__global__ void group_gemm_groupwise_w4a8_mma_kernel(
+__device__ __forceinline__ void get_next_tile_horizon(const int *pad_seqlens_ptr, int block_idx,
+                                                      int num_group, int &group_idx, int &m_idx,
+                                                      int &ntile_idx, int &sum_m_idx,
+                                                      cutlass::FastDivmod flat_divider) {
+  int total_tilem_idx;
+  flat_divider(total_tilem_idx, ntile_idx, block_idx);
+  for (int i = group_idx; i < num_group; ++i) {
+    int pad_num_m = pad_seqlens_ptr[i];
+    sum_m_idx += pad_num_m;
+    if (total_tilem_idx * groupwise_w4a8_mma::kTileM < sum_m_idx) {
+      group_idx = i;
+      sum_m_idx -= pad_num_m;
+      m_idx = total_tilem_idx * groupwise_w4a8_mma::kTileM - sum_m_idx;
+      return;
+    }
+  }
+  group_idx = -1;
+}
+
+template <int kGroupSize, bool kUseTaskMap>
+__global__ void group_gemm_groupwise_w4a8_mma_k192_kernel(
     groupwise_w4a8_mma::Tout *y_ptr, const groupwise_w4a8_mma::Tx *x_ptr,
     const groupwise_w4a8_mma::Tw *weight_ptr, const int32_t *seqlens_ptr,
-    const int32_t *cu_seqlens_ptr, const groupwise_w4a8_mma::Ts *yscale_ptr, int n, int k) {
+    const int32_t *cu_seqlens_ptr, const groupwise_w4a8_mma::Ts *yscale_ptr,
+    const int32_t *tile_ptr, const int32_t *cu_tile_ptr, const int4 *task_map_ptr, int num_group,
+    int n, cutlass::FastDivmod flat_divider) {
+  using namespace groupwise_w4a8_mma;  // NOLINT
+  constexpr int k = 192;
+
+  extern __shared__ uint8_t shm_data[] alignas(16);  // scale aligned 16
+
+  int *shm_seqlens = nullptr;
+  int *shm_cu_seqlens = nullptr;
+  int *shm_pad_seqlens = nullptr;
+  int4 *shm_tasks = nullptr;
+
+  cudaGridDependencySynchronize();
+
+  int idx = threadIdx.y * blockDim.x + threadIdx.x;
+  if constexpr (kUseTaskMap) {
+    shm_tasks = reinterpret_cast<int4 *>(shm_data + kScaleSharedMemorySize);
+    int total_tiles = cu_tile_ptr[num_group] * ((n + kTileN - 1) / kTileN) + gridDim.x;
+    int tile_idx = blockIdx.x + gridDim.x * idx;
+    int iwave = 0;
+    while (tile_idx < total_tiles) {
+      int4 task = task_map_ptr[tile_idx];
+      shm_tasks[iwave * kThreadsPerBlock + idx] = task;
+      tile_idx += gridDim.x * kThreadsPerBlock;
+      ++iwave;
+    }
+  } else {
+    shm_seqlens = reinterpret_cast<int *>(shm_data + kScaleSharedMemorySize);
+    shm_cu_seqlens = shm_seqlens + num_group + 1;
+    shm_pad_seqlens = shm_cu_seqlens + num_group;
+
+    for (int i = idx; i < num_group; i += kThreadsPerBlock) {
+      shm_seqlens[i] = seqlens_ptr[i];
+      shm_cu_seqlens[i] = cu_seqlens_ptr[i];
+    }
+    for (int i = idx; i < num_group; i += kThreadsPerBlock) {
+      shm_pad_seqlens[i] = (shm_seqlens[i] + kTileM - 1) / kTileM * kTileM;
+    }
+  }
+
+  __syncthreads();
+
+  int wave_idx = 0;
+  int block_idx = blockIdx.x;
+  int group_idx = 0;
+  int sum_m_idx = 0;
+  while (true) {
+    int m_idx = 0;
+    int ntile_idx = 0;
+    int m;
+    int64_t m_offset;
+    if constexpr (kUseTaskMap) {
+      int4 task = shm_tasks[wave_idx];
+      group_idx = task.z;
+      if (group_idx < 0) {
+        break;
+      }
+      m_idx = task.x * kTileM;
+      ntile_idx = task.y;
+      m = seqlens_ptr[group_idx];
+      m_offset = static_cast<int64_t>(cu_seqlens_ptr[group_idx]);
+      ++wave_idx;
+    } else {
+      get_next_tile_horizon(shm_pad_seqlens, block_idx, num_group, group_idx, m_idx, ntile_idx,
+                            sum_m_idx, flat_divider);
+      if (group_idx < 0) {
+        break;
+      }
+      m = shm_seqlens[group_idx];
+      m_offset = static_cast<int64_t>(shm_cu_seqlens[group_idx]);
+      block_idx += gridDim.x;
+    }
+
+    // block base ptr
+    auto const *x_row_ptr = x_ptr + m_offset * k;
+    int64_t n_offset = static_cast<int64_t>(group_idx * n + ntile_idx * kTileN);
+    auto const *weight_row_ptr = weight_ptr + n_offset * k / kPackedElements;
+    constexpr int pad_s_k =
+        (k / kGroupSize + kScalesPerAccess - 1) / kScalesPerAccess * kScalesPerAccess;
+    auto const *yscale_row_ptr = yscale_ptr + n_offset * pad_s_k;
+
+    // thread base ptr
+    int row_idx = threadIdx.y;
+    int col_idx = threadIdx.x;
+    int x_m_idx = m_idx + row_idx % 8;  // each warp load same x tile
+    x_row_ptr += col_idx * kElementsPerAccess;
+    if (x_m_idx < m) {
+      x_row_ptr += x_m_idx * k;
+    }
+
+    weight_row_ptr += (row_idx / kInterleaveBlockSizeMMode * kInterleaveBlockSizeMMode * k +
+                       row_idx % kInterleaveBlockSizeMMode * kInterleaveBlockSizeKMode +
+                       col_idx * kElementsPerAccess) /
+                      kPackedElements;  // each warp load diff w tile
+
+    // scale is small, so just load 64B cache line, do not k mode interleave
+    yscale_row_ptr += row_idx * pad_s_k + col_idx * kScalesPerAccess;
+
+    // each thread in one row store diff scale
+    auto *shm_scale_row_store_ptr =
+        shm_data + row_idx / kScaleInterleaveBlockSizeMMode * (8 + 1) * 16 +
+        row_idx % kScaleInterleaveBlockSizeMMode * 4 * 16 + col_idx * 16;
+
+    // fragment
+    FragmentArrayC frag_mma_c;
+    frag_mma_c.clear();
+
+    constexpr int kUnroll_ = 3;
+    cutlass::Array<FragmentA, kUnroll_> frag_array_A_row0;
+    cutlass::Array<FragmentA, kUnroll_> frag_array_A_row1;
+    cutlass::Array<FragmentB, kUnroll_> frag_array_B;
+
+    if (col_idx == 0) {
+      cutlass::arch::cp_async<16, cutlass::arch::CacheOperation::Global>(
+          shm_scale_row_store_ptr, reinterpret_cast<uint8_t const *>(yscale_row_ptr));
+      cutlass::arch::cp_async<16, cutlass::arch::CacheOperation::Global>(
+          shm_scale_row_store_ptr + kScaleSharedMemorySize / 2,
+          reinterpret_cast<uint8_t const *>(yscale_row_ptr + kTileN / 2 * pad_s_k));
+    }
+
+    // each thread in one row load same scale
+    Ts *shm_scale_row0_load_ptr =
+        reinterpret_cast<Ts *>(shm_data + row_idx / kScaleInterleaveBlockSizeMMode * (8 + 1) * 16 +
+                               row_idx % kScaleInterleaveBlockSizeMMode * 4 * 16);
+
+    FragmentArrayC frag_mma_accum[kUnroll_];
+#pragma unroll
+    for (int i = 0; i < kUnroll_; ++i) {
+      frag_mma_accum[i].clear();
+    }
+
+    cutlass::NumericArrayConverter<cutlass::half_t, Tx, 4, Round> srcB_converter;
+    MMA_16x8x16_F32F16F16 mma_op;
+
+#pragma unroll
+    for (int unroll_idx = 0; unroll_idx < kUnroll_; ++unroll_idx) {
+      int k_offset = unroll_idx * kTileK;
+      // swapAB
+      // fetch fragment A from weight matrix
+      cutlass::arch::global_load<FragmentA, sizeof(FragmentA),
+                                 cutlass::arch::CacheOperation::LastUse>(
+          frag_array_A_row0[unroll_idx],
+          (weight_row_ptr + k_offset * kInterleaveBlockSizeMMode / kPackedElements), true);
+      cutlass::arch::global_load<FragmentA, sizeof(FragmentA),
+                                 cutlass::arch::CacheOperation::LastUse>(
+          frag_array_A_row1[unroll_idx],
+          (weight_row_ptr + k_offset * kInterleaveBlockSizeMMode / kPackedElements +
+           kTileN / 2 / kPackedElements * k),
+          true);
+
+      // fetch fragment B from x matrix
+      cutlass::arch::global_load<FragmentB, sizeof(FragmentB),
+                                 cutlass::arch::CacheOperation::Always>(
+          frag_array_B[unroll_idx], (x_row_ptr + k_offset), true);
+    }
+
+#pragma unroll
+    for (int unroll_idx = 0; unroll_idx < kUnroll_; ++unroll_idx) {
+      for (int i = 0; i < 2; ++i) {
+        cutlass::Array<cutlass::half_t, 8> fragA_compute_row0 = convert_interleaved_int4_to_fp16(
+            *(reinterpret_cast<uint32_t *>(&frag_array_A_row0[unroll_idx]) + i));
+        cutlass::Array<cutlass::half_t, 8> fragA_compute_row1 = convert_interleaved_int4_to_fp16(
+            *(reinterpret_cast<uint32_t *>(&frag_array_A_row1[unroll_idx]) + i));
+        for (int j = 0; j < 2; ++j) {
+          cutlass::Array<cutlass::half_t, 4> frag_mma_b = srcB_converter(
+              *(reinterpret_cast<cutlass::Array<Tx, 4> *>(&frag_array_B[unroll_idx]) + 2 * i + j));
+          cutlass::Array<cutlass::half_t, 8> frag_mma_a;
+
+          uint32_t *mma_2xfp16_A = reinterpret_cast<uint32_t *>(&frag_mma_a);
+
+          uint32_t const *frag_2xfp16_A_row0 =
+              reinterpret_cast<uint32_t const *>(&(fragA_compute_row0.data()[j * 4]));
+          uint32_t const *frag_2xfp16_A_row1 =
+              reinterpret_cast<uint32_t const *>(&(fragA_compute_row1.data()[j * 4]));
+
+          mma_2xfp16_A[0] = frag_2xfp16_A_row0[0];
+          mma_2xfp16_A[1] = frag_2xfp16_A_row1[0];
+          mma_2xfp16_A[2] = frag_2xfp16_A_row0[1];
+          mma_2xfp16_A[3] = frag_2xfp16_A_row1[1];
+
+          mma_op(frag_mma_accum[unroll_idx], frag_mma_a, frag_mma_b, frag_mma_accum[unroll_idx]);
+        }
+      }
+    }
+
+    cutlass::arch::cp_async_fence();
+    cutlass::arch::cp_async_wait<0>();
+    // each warp only use scale which load by the warp
+    __syncwarp();
+
+    for (int unroll_idx = 0; unroll_idx < kUnroll_; ++unroll_idx) {
+      Ts SFA_row0 = *(shm_scale_row0_load_ptr);
+      Ts SFA_row1 = *(shm_scale_row0_load_ptr + kScaleSharedMemorySize / 4);
+      ++shm_scale_row0_load_ptr;
+
+      frag_mma_c[0] += frag_mma_accum[unroll_idx][0] * float(SFA_row0);
+      frag_mma_c[1] += frag_mma_accum[unroll_idx][1] * float(SFA_row0);
+      frag_mma_c[2] += frag_mma_accum[unroll_idx][2] * float(SFA_row1);
+      frag_mma_c[3] += frag_mma_accum[unroll_idx][3] * float(SFA_row1);
+    }
+
+    // This prevents certain threads from executing too quickly—entering the next loop
+    // and copying the scale into shared memory，while other threads are still reading
+    // the scale from the previous iteration, thereby avoiding a read-write race condition.
+    __syncwarp();
+
+    // Epilogue: convert float mma output to bfloat16
+    cutlass::NumericArrayConverter<Tout, float, 4, Round> output_converter;
+    int y_m_idx = m_idx + col_idx * 2;
+    if (y_m_idx < m) {
+      // block base ptr
+      auto *y_row_ptr = y_ptr + m_offset * n + ntile_idx * kTileN;
+      // thread base ptr
+      // swap ab
+      y_row_ptr += y_m_idx * n + row_idx * 2;
+      FragmentArrayOut frag_out = output_converter(frag_mma_c);
+      vec_t<__nv_bfloat16, 2> vec;
+      vec[0] = static_cast<Tout>(frag_out[0]);
+      vec[1] = static_cast<Tout>(frag_out[2]);
+      store(y_row_ptr, vec);
+      if (y_m_idx + 1 < m) {
+        vec[0] = static_cast<Tout>(frag_out[1]);
+        vec[1] = static_cast<Tout>(frag_out[3]);
+        store(y_row_ptr + n, vec);
+      }
+    }
+  }
+
+  cudaTriggerProgrammaticLaunchCompletion();
+}
+
+template <int kGroupSize, bool kUseTaskMap>
+__global__ void __launch_bounds__(128, 1)
+    group_gemm_groupwise_w4a8_mma_kernel(groupwise_w4a8_mma::Tout *y_ptr,
+                                         const groupwise_w4a8_mma::Tx *x_ptr,
+                                         const groupwise_w4a8_mma::Tw *weight_ptr,
+                                         const int32_t *seqlens_ptr, const int32_t *cu_seqlens_ptr,
+                                         const groupwise_w4a8_mma::Ts *yscale_ptr,
+                                         const int32_t *tile_ptr, const int32_t *cu_tile_ptr,
+                                         const int4 *task_map_ptr, int num_group, int n, int k,
+                                         cutlass::FastDivmod flat_divider) {
   using namespace groupwise_w4a8_mma;  // NOLINT
 
   extern __shared__ uint8_t shm_data[] alignas(16);  // scale aligned 16
 
-  int group_idx = blockIdx.y;
+  int *shm_seqlens = nullptr;
+  int *shm_cu_seqlens = nullptr;
+  int *shm_pad_seqlens = nullptr;
+  int4 *shm_tasks = nullptr;
 
   cudaGridDependencySynchronize();
 
-  int m = seqlens_ptr[group_idx];
-  int64_t m_offset = static_cast<int64_t>(cu_seqlens_ptr[group_idx]);
+  int idx = threadIdx.y * blockDim.x + threadIdx.x;
+  if constexpr (kUseTaskMap) {
+    shm_tasks = reinterpret_cast<int4 *>(shm_data + kScaleSharedMemorySize);
+    int total_tiles = cu_tile_ptr[num_group] * ((n + kTileN - 1) / kTileN) + gridDim.x;
+    int tile_idx = blockIdx.x + gridDim.x * idx;
+    int iwave = 0;
+    while (tile_idx < total_tiles) {
+      int4 task = task_map_ptr[tile_idx];
+      shm_tasks[iwave * kThreadsPerBlock + idx] = task;
+      tile_idx += gridDim.x * kThreadsPerBlock;
+      ++iwave;
+    }
+  } else {
+    shm_seqlens = reinterpret_cast<int *>(shm_data + kScaleSharedMemorySize);
+    shm_cu_seqlens = shm_seqlens + num_group + 1;
+    shm_pad_seqlens = shm_cu_seqlens + num_group;
 
-#pragma unroll 1
-  for (int mtile_idx = 0; mtile_idx < m; mtile_idx += kTileM) {
+    for (int i = idx; i < num_group; i += kThreadsPerBlock) {
+      shm_seqlens[i] = seqlens_ptr[i];
+      shm_cu_seqlens[i] = cu_seqlens_ptr[i];
+    }
+    for (int i = idx; i < num_group; i += kThreadsPerBlock) {
+      shm_pad_seqlens[i] = (shm_seqlens[i] + kTileM - 1) / kTileM * kTileM;
+    }
+  }
+
+  __syncthreads();
+
+  int wave_idx = 0;
+  int block_idx = blockIdx.x;
+  int group_idx = 0;
+  int sum_m_idx = 0;
+  while (true) {
+    int m_idx = 0;
+    int ntile_idx = 0;
+    int m;
+    int64_t m_offset;
+    if constexpr (kUseTaskMap) {
+      int4 task = shm_tasks[wave_idx];
+      group_idx = task.z;
+      if (group_idx < 0) {
+        break;
+      }
+      m_idx = task.x * kTileM;
+      ntile_idx = task.y;
+      m = seqlens_ptr[group_idx];
+      m_offset = static_cast<int64_t>(cu_seqlens_ptr[group_idx]);
+      ++wave_idx;
+    } else {
+      get_next_tile_horizon(shm_pad_seqlens, block_idx, num_group, group_idx, m_idx, ntile_idx,
+                            sum_m_idx, flat_divider);
+      if (group_idx < 0) {
+        break;
+      }
+      m = shm_seqlens[group_idx];
+      m_offset = static_cast<int64_t>(shm_cu_seqlens[group_idx]);
+      block_idx += gridDim.x;
+    }
+
     // block base ptr
     auto const *x_row_ptr = x_ptr + m_offset * k;
-    int ntile_idx = blockIdx.x;
     int64_t n_offset = static_cast<int64_t>(group_idx * n + ntile_idx * kTileN);
     auto const *weight_row_ptr = weight_ptr + n_offset * k / kPackedElements;
     int pad_s_k = (k / kGroupSize + kScalesPerAccess - 1) / kScalesPerAccess * kScalesPerAccess;
@@ -163,7 +478,7 @@ __global__ void group_gemm_groupwise_w4a8_mma_kernel(
     // thread base ptr
     int row_idx = threadIdx.y;
     int col_idx = threadIdx.x;
-    int x_m_idx = mtile_idx + row_idx % 8;  // each warp load same x tile
+    int x_m_idx = m_idx + row_idx % 8;  // each warp load same x tile
     x_row_ptr += col_idx * kElementsPerAccess;
     if (x_m_idx < m) {
       x_row_ptr += x_m_idx * k;
@@ -205,7 +520,7 @@ __global__ void group_gemm_groupwise_w4a8_mma_kernel(
             shm_scale_row_store_ptr,
             reinterpret_cast<uint8_t const *>(yscale_row_ptr + k_scale_offset));
         cutlass::arch::cp_async<16, cutlass::arch::CacheOperation::Global>(
-            shm_scale_row_store_ptr + kSharedMemorySize / 2,
+            shm_scale_row_store_ptr + kScaleSharedMemorySize / 2,
             reinterpret_cast<uint8_t const *>(yscale_row_ptr + k_scale_offset +
                                               kTileN / 2 * pad_s_k));
       }
@@ -298,7 +613,7 @@ __global__ void group_gemm_groupwise_w4a8_mma_kernel(
         }
 
         Ts SFA_row0 = *(shm_scale_row0_load_ptr);
-        Ts SFA_row1 = *(shm_scale_row0_load_ptr + kSharedMemorySize / 4);
+        Ts SFA_row1 = *(shm_scale_row0_load_ptr + kScaleSharedMemorySize / 4);
         ++shm_scale_row0_load_ptr;
 
         frag_mma_c[0] += frag_mma_accum[0][0] * float(SFA_row0);
@@ -308,7 +623,7 @@ __global__ void group_gemm_groupwise_w4a8_mma_kernel(
 
         if constexpr (kGroupSize == 64) {
           Ts SFA_row0 = *(shm_scale_row0_load_ptr);
-          Ts SFA_row1 = *(shm_scale_row0_load_ptr + kSharedMemorySize / 4);
+          Ts SFA_row1 = *(shm_scale_row0_load_ptr + kScaleSharedMemorySize / 4);
           ++shm_scale_row0_load_ptr;
 
           frag_mma_c[0] += frag_mma_accum[1][0] * float(SFA_row0);
@@ -317,11 +632,16 @@ __global__ void group_gemm_groupwise_w4a8_mma_kernel(
           frag_mma_c[3] += frag_mma_accum[1][3] * float(SFA_row1);
         }
       }
+
+      // This prevents certain threads from executing too quickly—entering the next loop
+      // and copying the scale into shared memory，while other threads are still reading
+      // the scale from the previous iteration, thereby avoiding a read-write race condition.
+      __syncwarp();
     }
 
     // Epilogue: convert float mma output to bfloat16
     cutlass::NumericArrayConverter<Tout, float, 4, Round> output_converter;
-    int y_m_idx = mtile_idx + col_idx * 2;
+    int y_m_idx = m_idx + col_idx * 2;
     if (y_m_idx < m) {
       // block base ptr
       auto *y_row_ptr = y_ptr + m_offset * n + ntile_idx * kTileN;
@@ -347,75 +667,112 @@ __global__ void group_gemm_groupwise_w4a8_mma_kernel(
 
 void group_gemm_groupwise_w4a8_mma_async(void *y_ptr, const void *x_ptr, const void *weight_ptr,
                                          const void *seqlens_ptr, const void *cu_seqlens_ptr,
-                                         const void *yscale_ptr, int num_group, int m, int n, int k,
-                                         int group_size, cudaStream_t stream) {
+                                         const void *yscale_ptr, void *tiles_ptr,
+                                         void *cu_tiles_ptr, void *task_map_ptr, int num_waves,
+                                         int num_group, int m, int n, int k, int group_size,
+                                         cudaStream_t stream) {
   using namespace groupwise_w4a8_mma;  // NOLINT
 
-  dim3 grid(n / kTileN, num_group);  // n must be divided by kTileN
+  bool use_task_map = (task_map_ptr != nullptr);
+
+  int num_sm = get_sm_count();
+  dim3 grid(num_sm * 7);
   dim3 block(kThreadPerRow, kThreadsPerBlock / kThreadPerRow);
 
+  cudaLaunchAttribute attribute[1];
+  attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attribute[0].val.programmaticStreamSerializationAllowed = 1;
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = grid;
+  config.blockDim = block;
+  int shm_size = kScaleSharedMemorySize;  // scale
+  if (use_task_map) {
+    shm_size += sizeof(int4) * num_waves;
+  } else {
+    shm_size += sizeof(int) *
+                (num_group + num_group + 1 + num_group);  // seqlens + cu_seqlens + pad_seqlens;
+  }
+
+  config.dynamicSmemBytes = shm_size;
+  config.stream = stream;
+  config.attrs = attribute;
+  config.numAttrs = 1;
+
+  int num_tile_n = (n + kTileN - 1) / kTileN;
+  cutlass::FastDivmod flat_divider(num_tile_n);
+
   if (group_size == 128) {
-    // pdl attr
-    cudaLaunchAttribute attribute[1];
-    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attribute[0].val.programmaticStreamSerializationAllowed = 1;
-
-    // Set the attribute in a kernel launch configuration
-    cudaLaunchConfig_t config{};
-
-    // Base launch configuration
-    config.gridDim = grid;
-    config.blockDim = block;
-    config.dynamicSmemBytes = kSharedMemorySize;
-    config.stream = stream;
-
-    // Add special attribute for PDL
-    config.attrs = attribute;
-    config.numAttrs = 1;
-
-    auto kernel = kernels::group_gemm_groupwise_w4a8_mma_kernel<128>;
-
-    cudaLaunchKernelEx(
-        &config, kernel, reinterpret_cast<Tout *>(y_ptr), reinterpret_cast<const Tx *>(x_ptr),
-        reinterpret_cast<const Tw *>(weight_ptr), reinterpret_cast<const int32_t *>(seqlens_ptr),
-        reinterpret_cast<const int32_t *>(cu_seqlens_ptr), reinterpret_cast<const Ts *>(yscale_ptr),
-        n, k);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      printf("kernel launch error: %s - %s\n", cudaGetErrorName(err), cudaGetErrorString(err));
+    if (use_task_map) {
+      auto kernel = kernels::group_gemm_groupwise_w4a8_mma_kernel<128, true>;
+      cudaLaunchKernelEx(
+          &config, kernel, reinterpret_cast<Tout *>(y_ptr), reinterpret_cast<const Tx *>(x_ptr),
+          reinterpret_cast<const Tw *>(weight_ptr), reinterpret_cast<const int32_t *>(seqlens_ptr),
+          reinterpret_cast<const int32_t *>(cu_seqlens_ptr),
+          reinterpret_cast<const Ts *>(yscale_ptr), reinterpret_cast<const int32_t *>(tiles_ptr),
+          reinterpret_cast<const int32_t *>(cu_tiles_ptr),
+          reinterpret_cast<const int4 *>(task_map_ptr), num_group, n, k, flat_divider);
+    } else {
+      auto kernel = kernels::group_gemm_groupwise_w4a8_mma_kernel<128, false>;
+      cudaLaunchKernelEx(
+          &config, kernel, reinterpret_cast<Tout *>(y_ptr), reinterpret_cast<const Tx *>(x_ptr),
+          reinterpret_cast<const Tw *>(weight_ptr), reinterpret_cast<const int32_t *>(seqlens_ptr),
+          reinterpret_cast<const int32_t *>(cu_seqlens_ptr),
+          reinterpret_cast<const Ts *>(yscale_ptr), reinterpret_cast<const int32_t *>(tiles_ptr),
+          reinterpret_cast<const int32_t *>(cu_tiles_ptr),
+          reinterpret_cast<const int4 *>(task_map_ptr), num_group, n, k, flat_divider);
     }
   } else if (group_size == 64) {
-    // pdl attr
-    cudaLaunchAttribute attribute[1];
-    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attribute[0].val.programmaticStreamSerializationAllowed = 1;
-
-    // Set the attribute in a kernel launch configuration
-    cudaLaunchConfig_t config{};
-
-    // Base launch configuration
-    config.gridDim = grid;
-    config.blockDim = block;
-    config.dynamicSmemBytes = kSharedMemorySize;
-    config.stream = stream;
-
-    // Add special attribute for PDL
-    config.attrs = attribute;
-    config.numAttrs = 1;
-
-    auto kernel = kernels::group_gemm_groupwise_w4a8_mma_kernel<64>;
-
-    cudaLaunchKernelEx(
-        &config, kernel, reinterpret_cast<Tout *>(y_ptr), reinterpret_cast<const Tx *>(x_ptr),
-        reinterpret_cast<const Tw *>(weight_ptr), reinterpret_cast<const int32_t *>(seqlens_ptr),
-        reinterpret_cast<const int32_t *>(cu_seqlens_ptr), reinterpret_cast<const Ts *>(yscale_ptr),
-        n, k);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      printf("kernel launch error: %s - %s\n", cudaGetErrorName(err), cudaGetErrorString(err));
+    if (use_task_map) {
+      if (k == 192) {
+        auto kernel = kernels::group_gemm_groupwise_w4a8_mma_k192_kernel<64, true>;
+        cudaLaunchKernelEx(
+            &config, kernel, reinterpret_cast<Tout *>(y_ptr), reinterpret_cast<const Tx *>(x_ptr),
+            reinterpret_cast<const Tw *>(weight_ptr),
+            reinterpret_cast<const int32_t *>(seqlens_ptr),
+            reinterpret_cast<const int32_t *>(cu_seqlens_ptr),
+            reinterpret_cast<const Ts *>(yscale_ptr), reinterpret_cast<const int32_t *>(tiles_ptr),
+            reinterpret_cast<const int32_t *>(cu_tiles_ptr),
+            reinterpret_cast<const int4 *>(task_map_ptr), num_group, n, flat_divider);
+      } else {
+        auto kernel = kernels::group_gemm_groupwise_w4a8_mma_kernel<64, true>;
+        cudaLaunchKernelEx(
+            &config, kernel, reinterpret_cast<Tout *>(y_ptr), reinterpret_cast<const Tx *>(x_ptr),
+            reinterpret_cast<const Tw *>(weight_ptr),
+            reinterpret_cast<const int32_t *>(seqlens_ptr),
+            reinterpret_cast<const int32_t *>(cu_seqlens_ptr),
+            reinterpret_cast<const Ts *>(yscale_ptr), reinterpret_cast<const int32_t *>(tiles_ptr),
+            reinterpret_cast<const int32_t *>(cu_tiles_ptr),
+            reinterpret_cast<const int4 *>(task_map_ptr), num_group, n, k, flat_divider);
+      }
+    } else {
+      if (k == 192) {
+        auto kernel = kernels::group_gemm_groupwise_w4a8_mma_k192_kernel<64, false>;
+        cudaLaunchKernelEx(
+            &config, kernel, reinterpret_cast<Tout *>(y_ptr), reinterpret_cast<const Tx *>(x_ptr),
+            reinterpret_cast<const Tw *>(weight_ptr),
+            reinterpret_cast<const int32_t *>(seqlens_ptr),
+            reinterpret_cast<const int32_t *>(cu_seqlens_ptr),
+            reinterpret_cast<const Ts *>(yscale_ptr), reinterpret_cast<const int32_t *>(tiles_ptr),
+            reinterpret_cast<const int32_t *>(cu_tiles_ptr),
+            reinterpret_cast<const int4 *>(task_map_ptr), num_group, n, flat_divider);
+      } else {
+        auto kernel = kernels::group_gemm_groupwise_w4a8_mma_kernel<64, false>;
+        cudaLaunchKernelEx(
+            &config, kernel, reinterpret_cast<Tout *>(y_ptr), reinterpret_cast<const Tx *>(x_ptr),
+            reinterpret_cast<const Tw *>(weight_ptr),
+            reinterpret_cast<const int32_t *>(seqlens_ptr),
+            reinterpret_cast<const int32_t *>(cu_seqlens_ptr),
+            reinterpret_cast<const Ts *>(yscale_ptr), reinterpret_cast<const int32_t *>(tiles_ptr),
+            reinterpret_cast<const int32_t *>(cu_tiles_ptr),
+            reinterpret_cast<const int4 *>(task_map_ptr), num_group, n, k, flat_divider);
+      }
     }
+  }
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    printf("kernel launch error: %s - %s\n", cudaGetErrorName(err), cudaGetErrorString(err));
   }
 }
 

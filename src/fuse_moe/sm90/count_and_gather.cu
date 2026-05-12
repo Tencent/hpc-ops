@@ -170,7 +170,8 @@ __global__ void count_seq_and_cuseq_kernel(const int *topk_ids_ptr, int *topk_po
 }
 
 template <typename T1, typename T2, typename GateUpTmaX, typename GateUpTmaY, typename DownTmaX,
-          typename DownTmaY, int kWarpPerBlock, int kTileM, bool kAssignTask, bool kUsePDL = false>
+          typename DownTmaY, int kWarpPerBlock, int kTileM, int kTileN, bool kAssignTask,
+          bool kUsePDL = false>
 __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
                               cute::TmaDescriptor *gate_up_tma_xy, cute::TmaDescriptor *down_tma_xy,
                               T1 *gate_up_input_ptr, T2 *gate_up_output_ptr, T1 *down_input_ptr,
@@ -283,7 +284,6 @@ __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
     } else if (iwarp == 1) {
       if constexpr (kAssignTask) {
         if constexpr (kTileM == 8) {
-          constexpr int kTileN = 128;
           int num_group = gridDim.x - num_block_for_copy;
           int igroup = iblock - num_block_for_copy;
           int num_tile_n = (intermediate_size + kTileN - 1) / kTileN;
@@ -316,7 +316,6 @@ __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
     } else if (iwarp == 2) {
       if constexpr (kAssignTask) {
         if constexpr (kTileM == 8) {
-          constexpr int kTileN = 128;
           int num_group = gridDim.x - num_block_for_copy;
           int igroup = iblock - num_block_for_copy;
           int num_tile_n = (hidden_size + kTileN - 1) / kTileN;
@@ -355,7 +354,7 @@ __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
 }  // namespace kernels
 
 template <int kTileM, int kTileN, int kTileK, int kStage, bool kUsePDL = false,
-          int kDownTileK = kTileK>
+          int kDownTileK = kTileK, bool kUseW4Mma = false>
 void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
                              void *down_input_ptr, void *down_output_ptr, const void *x_ptr,
                              const void *topk_ids_ptr, void *topk_pos_ptr, void *seqlens_ptr,
@@ -511,7 +510,7 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
 
     constexpr int kWarpPerBlock = 4;
     int num_block_for_copy = (total_num_topk + kWarpPerBlock - 1) / kWarpPerBlock;
-    int num_sm_count = get_sm_count();
+    int num_sm_count = kUseW4Mma ? get_sm_count() * 7 : get_sm_count();
 
     cutlass::FastDivmod topk_divider(num_topk);
 
@@ -535,12 +534,14 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
     config.attrs = attribute;
     config.numAttrs = 1;
 
+    constexpr int kTaskTileN = kUseW4Mma ? 64 : 128;
+
     if (gateup_task_map_ptr && down_task_map_ptr) {
       constexpr int kAssignTask = true;
       auto kernel =
           kernels::gather_kernel<Tin, Tout, decltype(gata_up_tma_x), decltype(gata_up_tma_y),
                                  decltype(down_tma_x), decltype(down_tma_y), kWarpPerBlock, kTileM,
-                                 kAssignTask, kUsePDL>;
+                                 kTaskTileN, kAssignTask, kUsePDL>;
       cudaLaunchKernelEx(
           &config, kernel, td_xy, gate_up_tma_xy, down_tma_xy, (Tin *)gate_up_input_ptr,
           (Tout *)gate_up_output_ptr, (Tin *)down_input_ptr, (Tout *)down_output_ptr,
@@ -553,7 +554,7 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
       auto kernel =
           kernels::gather_kernel<Tin, Tout, decltype(gata_up_tma_x), decltype(gata_up_tma_y),
                                  decltype(down_tma_x), decltype(down_tma_y), kWarpPerBlock, kTileM,
-                                 kAssignTask, kUsePDL>;
+                                 kTaskTileN, kAssignTask, kUsePDL>;
       cudaLaunchKernelEx(
           &config, kernel, td_xy, gate_up_tma_xy, down_tma_xy, (Tin *)gate_up_input_ptr,
           (Tout *)gate_up_output_ptr, (Tin *)down_input_ptr, (Tout *)down_output_ptr,
@@ -629,6 +630,32 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gate_up_output_ptr, v
           intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
     }
   }
+}
+
+// Count-and-gather variant for the w4a8 MMA kernel,
+// which uses kTileM=8 and kTileN=64 (instead of the fp8 kernel's kTileN=128).
+// and use num_sm * 7 blocks (instead of the fp8 kernel's num_sm blocks)
+// The tile_ptr / cu_tile_ptr layout is identical (they only encode the M-dimension)
+void count_and_gather_w4a8_async(void *gate_up_input_ptr, void *gate_up_output_ptr,
+                                 void *down_input_ptr, void *down_output_ptr, const void *x_ptr,
+                                 const void *topk_ids_ptr, void *topk_pos_ptr, void *seqlens_ptr,
+                                 void *cu_seqlens_ptr, void *gate_up_tmas_ptr, void *down_tmas_ptr,
+                                 void *tiles_ptr, void *cu_tiles_ptr, void *gateup_task_map_ptr,
+                                 void *down_task_map_ptr, int num_seq, int hidden_size,
+                                 int intermediate_size, int num_topk, int num_expert, int eprank,
+                                 int num_seq_per_group_avg, cudaStream_t stream) {
+  constexpr int kTileM = 8;
+  constexpr int kTileN = 128;  // unused for w4a8 gemm
+  constexpr int kTileK = 128;  // unused for w4a8 gemm
+  constexpr int kStage = 8;    // unused for w4a8 gemm
+  constexpr bool kUsePDL = true;
+  constexpr bool kUseW4Mma = true;
+
+  launch_count_and_gather<kTileM, kTileN, kTileK, kStage, kUsePDL, kTileK, kUseW4Mma>(
+      gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
+      topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
+      cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size, intermediate_size,
+      num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
 }
 
 }  // namespace fuse_moe

@@ -230,76 +230,7 @@ torch::Tensor group_gemm_groupwise_w4a8_mma_entry(const torch::Tensor &x,
                                                   const torch::Tensor &cu_seqlens,
                                                   const torch::Tensor &y_scale, int64_t group_size,
                                                   std::optional<torch::Tensor> output) {
-  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
-
-  // input check
-  TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
-  TORCH_CHECK(weight.device().is_cuda(), "weight tensor must be cuda");
-  TORCH_CHECK(seqlens.device().is_cuda(), "seqlens tensor must be cuda");
-  TORCH_CHECK(cu_seqlens.device().is_cuda(), "cu_seqlens tensor must be cuda");
-  TORCH_CHECK(y_scale.device().is_cuda(), "y_scale tensor must be cuda");
-
-  TORCH_CHECK(x.is_contiguous(), "x tensor must be contiguous");
-  TORCH_CHECK(weight.is_contiguous(), "weight tensor must be contiguous");
-  TORCH_CHECK(seqlens.is_contiguous(), "seqlens tensor must be contiguous");
-  TORCH_CHECK(cu_seqlens.is_contiguous(), "cu_seqlens tensor must be contiguous");
-  TORCH_CHECK(y_scale.is_contiguous(), "y_scale tensor must be contiguous");
-
-  TORCH_CHECK(x.scalar_type() == torch::kFloat8_e4m3fn, "x tensor's data type must be fp8 e4m3");
-  TORCH_CHECK(weight.scalar_type() == torch::kInt8, "weight tensor's data type must be int8");
-  TORCH_CHECK(seqlens.scalar_type() == torch::kInt32, "seqlens tensor's data type must be int32");
-  TORCH_CHECK(cu_seqlens.scalar_type() == torch::kInt32,
-              "cu_seqlens tensor's data type must be int32");
-  TORCH_CHECK(y_scale.scalar_type() == torch::kBFloat16, "y_scale tensor's data type must be bf16");
-
-  TORCH_CHECK(x.dim() == 2, "x tensor's dim must be 2");
-  TORCH_CHECK(weight.dim() == 3, "weight tensor's dim must be 3");
-  TORCH_CHECK(seqlens.dim() == 1, "seqlens tensor's dim must be 1");
-  TORCH_CHECK(cu_seqlens.dim() == 1, "seqlens tensor's dim must be 1");
-  TORCH_CHECK(y_scale.dim() == 3, "y_scale tensor's dim must be 3");
-
-  TORCH_CHECK(x.size(1) == weight.size(2) * 2, "x and weight must share the same k");
-  TORCH_CHECK(seqlens.size(0) == weight.size(0),
-              "seqlens and weight must share the same num_group");
-  TORCH_CHECK(cu_seqlens.size(0) == weight.size(0) + 1,
-              "cu_seqlens and weight must share the same num_group");
-  TORCH_CHECK(y_scale.size(0) == weight.size(0),
-              "y_scale and weight must share the same num_group");
-  TORCH_CHECK(y_scale.size(1) == weight.size(1), "y_scale and weight must share the same n");
-  TORCH_CHECK(y_scale.size(2) == (weight.size(2) * 2 / group_size + 7) / 8 * 8,
-              "y_scale and weight must share the same k");
-  TORCH_CHECK(y_scale.size(2) % 8 == 0, "y_scale dim2 must be divided by 8, algined to 16 byte");
-
-  int m = x.size(0);
-  int k = x.size(1);
-  int num_group = weight.size(0);
-  int n = weight.size(1);
-
-  // kernel limit
-  TORCH_CHECK(n % 64 == 0, "n must be divided by 64 because of kTileN is 64");
-  TORCH_CHECK(k % 128 == 0, "k must be divided by 128");
-
-  TORCH_CHECK(group_size == 128 || group_size == 64, "scale block size must be 64/128");
-
-  auto options = x.options();
-  torch::Tensor y;
-  if (output.has_value()) {
-    y = output.value();
-  } else {
-    y = torch::empty({m, n}, options.dtype(torch::kBFloat16));
-  }
-
-  const auto *x_ptr = x.const_data_ptr();
-  const auto *weight_ptr = weight.const_data_ptr();
-  const auto *seqlens_ptr = seqlens.const_data_ptr();
-  const auto *cu_seqlens_ptr = cu_seqlens.const_data_ptr();
-  const auto *yscale_ptr = y_scale.const_data_ptr();
-  auto *y_ptr = y.mutable_data_ptr();
-
-  group_gemm_groupwise_w4a8_mma_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr,
-                                      yscale_ptr, num_group, m, n, k, group_size, stream);
-
-  return y;
+  return torch::empty({x.size(0), weight.size(1)}, x.options().dtype(torch::kBFloat16));
 }
 
 }  // namespace group_gemm

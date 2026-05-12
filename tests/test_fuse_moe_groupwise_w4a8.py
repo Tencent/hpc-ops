@@ -252,7 +252,8 @@ def naive_fuse_moe_groupwise_w4a8(
     topk_ids,
     topk_scale,
     rank_ep,
-    group_size,
+    gateup_group_size,
+    down_group_size,
     use_hadamard,
     shared_output=None,
 ):
@@ -264,7 +265,7 @@ def naive_fuse_moe_groupwise_w4a8(
 
     # gate_up_proj
     gate_up_output = naive_group_gemm_blockwise_w4a8(
-        gate_up_input, gate_up_weight, seqlens, cu_seqlens, gate_up_scale, group_size
+        gate_up_input, gate_up_weight, seqlens, cu_seqlens, gate_up_scale, gateup_group_size
     )
 
     # act_and_mul
@@ -275,7 +276,7 @@ def naive_fuse_moe_groupwise_w4a8(
 
     # down_proj
     down_output = naive_group_gemm_blockwise_w4a8(
-        down_input, down_weight, seqlens, cu_seqlens, down_scale, group_size
+        down_input, down_weight, seqlens, cu_seqlens, down_scale, down_group_size
     )
 
     # reduce
@@ -294,7 +295,8 @@ def half_fuse_moe_groupwise_w4a8(
     topk_ids,
     topk_scale,
     rank_ep,
-    group_size,
+    gateup_group_size,
+    down_group_size,
     use_hadamard,
     shared_output=None,
 ):
@@ -306,7 +308,7 @@ def half_fuse_moe_groupwise_w4a8(
 
     # gate_up_proj
     gate_up_output = hpc.group_gemm_groupwise_w4a8_mma(
-        gate_up_input, gate_up_weight, seqlens, cu_seqlens, gate_up_scale, group_size
+        gate_up_input, gate_up_weight, seqlens, cu_seqlens, gate_up_scale, gateup_group_size
     )
 
     # act_and_mul
@@ -317,7 +319,7 @@ def half_fuse_moe_groupwise_w4a8(
 
     # down_proj
     down_output = hpc.group_gemm_groupwise_w4a8_mma(
-        down_input, down_weight, seqlens, cu_seqlens, down_scale, group_size
+        down_input, down_weight, seqlens, cu_seqlens, down_scale, down_group_size
     )
 
     # reduce
@@ -328,10 +330,11 @@ def half_fuse_moe_groupwise_w4a8(
 
 @pytest.mark.parametrize("num_seq", [128])
 @pytest.mark.parametrize("num_topk", [8])
-@pytest.mark.parametrize("hidden_size", [512])
-@pytest.mark.parametrize("intermediate_size", [512])
-@pytest.mark.parametrize("num_expert", [128])
-@pytest.mark.parametrize("group_size", [128, 64])
+@pytest.mark.parametrize("hidden_size", [4096])
+@pytest.mark.parametrize("intermediate_size", [192])
+@pytest.mark.parametrize("num_expert", [192])
+@pytest.mark.parametrize("gateup_group_size", [128])
+@pytest.mark.parametrize("down_group_size", [64])
 @pytest.mark.parametrize("rank_ep", [0, 1])
 @pytest.mark.parametrize("size_ep", [1, 4, 8])
 @pytest.mark.parametrize("use_hadamard", [False, True])
@@ -343,7 +346,8 @@ def test_fuse_moe_groupwise_w4a8(
     hidden_size,
     intermediate_size,
     num_expert,
-    group_size,
+    gateup_group_size,
+    down_group_size,
     rank_ep,
     size_ep,
     use_hadamard,
@@ -376,7 +380,7 @@ def test_fuse_moe_groupwise_w4a8(
     affine_coeff = 0.005
     gate_up_scale = (
         torch.randn(
-            (num_expert // size_ep, intermediate_size * 2, hidden_size // group_size),
+            (num_expert // size_ep, intermediate_size * 2, hidden_size // gateup_group_size),
             dtype=torch.float,
             device="cuda",
         ).to(torch.bfloat16)
@@ -384,7 +388,7 @@ def test_fuse_moe_groupwise_w4a8(
     )
     down_scale = (
         torch.randn(
-            (num_expert // size_ep, hidden_size, intermediate_size // group_size),
+            (num_expert // size_ep, hidden_size, intermediate_size // down_group_size),
             dtype=torch.float,
             device="cuda",
         ).to(torch.bfloat16)
@@ -398,10 +402,12 @@ def test_fuse_moe_groupwise_w4a8(
         shared_output = None
 
     gate_up_weight_refomat, gate_up_scale_reformat = (
-        hpc.group_gemm_groupwise_w4a8_mma_weight_reformat(gate_up_weight, gate_up_scale, group_size)
+        hpc.group_gemm_groupwise_w4a8_mma_weight_reformat(
+            gate_up_weight, gate_up_scale, gateup_group_size
+        )
     )
     down_weight_refomat, down_scale_reformat = hpc.group_gemm_groupwise_w4a8_mma_weight_reformat(
-        down_weight, down_scale, group_size
+        down_weight, down_scale, down_group_size
     )
 
     if use_output:
@@ -415,7 +421,8 @@ def test_fuse_moe_groupwise_w4a8(
             act_and_mul_scale,
             topk_ids,
             topk_scale,
-            group_size,
+            gateup_group_size,
+            down_group_size,
             rank_ep,
             num_expert,
             use_hadamard,
@@ -442,7 +449,8 @@ def test_fuse_moe_groupwise_w4a8(
             act_and_mul_scale,
             topk_ids,
             topk_scale,
-            group_size,
+            gateup_group_size,
+            down_group_size,
             rank_ep,
             num_expert,
             use_hadamard,
@@ -459,7 +467,8 @@ def test_fuse_moe_groupwise_w4a8(
         #     topk_ids,
         #     topk_scale,
         #     rank_ep,
-        #     group_size,
+        #     gateup_group_size,
+        #     down_group_size,
         #     use_hadamard,
         #     shared_output=shared_output,
         # )
@@ -482,7 +491,8 @@ def test_fuse_moe_groupwise_w4a8(
         topk_ids,
         topk_scale,
         rank_ep,
-        group_size,
+        gateup_group_size,
+        down_group_size,
         use_hadamard,
         shared_output=shared_output,
     )

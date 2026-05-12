@@ -276,9 +276,12 @@ torch::Tensor group_gemm_groupwise_w4a8_mma_entry(const torch::Tensor &x,
 
   // kernel limit
   TORCH_CHECK(n % 64 == 0, "n must be divided by 64 because of kTileN is 64");
-  TORCH_CHECK(k % 128 == 0, "k must be divided by 128");
+  TORCH_CHECK(k % 128 == 0 || k == 192, "k must be divided by 128 or k is 192");
 
   TORCH_CHECK(group_size == 128 || group_size == 64, "scale block size must be 64/128");
+  if (k == 192) {
+    TORCH_CHECK(group_size == 64, "when k is 192, scale block size must be 64");
+  }
 
   auto options = x.options();
   torch::Tensor y;
@@ -296,7 +299,8 @@ torch::Tensor group_gemm_groupwise_w4a8_mma_entry(const torch::Tensor &x,
   auto *y_ptr = y.mutable_data_ptr();
 
   group_gemm_groupwise_w4a8_mma_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr,
-                                      yscale_ptr, num_group, m, n, k, group_size, stream);
+                                      yscale_ptr, nullptr, nullptr, nullptr, 0, num_group, m, n, k,
+                                      group_size, stream);
 
   return y;
 }

@@ -310,7 +310,8 @@ def fuse_moe_groupwise_w4a8(
     act_and_mul_scale: Tensor,
     topk_ids: Tensor,
     topk_scale: Tensor,
-    group_size: int,
+    gateup_group_size: int,
+    down_group_size: int,
     rank_ep: int,
     num_expert_total: int,
     use_hadamard: bool,
@@ -333,13 +334,13 @@ def fuse_moe_groupwise_w4a8(
             Shape: [num_expert_local, intermediate_size * 2, hidden_size // 2]
             Dtype: int8
         gate_up_scale: Scaling factors for gate-up projection outputs, which combine input scale with weight scale, and should be pad to 16 bytes.
-            Shape: [num_expert_local, intermediate_size * 2, (hidden_size // group_size + 7) // 8 * 8]
+            Shape: [num_expert_local, intermediate_size * 2, (hidden_size // gate_group_size + 7) // 8 * 8]
             Dtype: bfloat16
         down_weight: Weight tensor for down projection
             Shape: [num_expert_local, hidden_size, intermediate_size // 2]
             Dtype: int8
         down_scale: Scaling factors for down projection outputs, which combine input scale with weight scale, and should be pad to 16 bytes.
-            Shape: [num_expert_local, hidden_size, (intermediate_size // group_size + 7) // 8 * 8]
+            Shape: [num_expert_local, hidden_size, (intermediate_size // down_group_size + 7) // 8 * 8]
             Dtype: bfloat16
         act_and_mul_scale: Scaling factor for activation and multiplication
             Shape: [1]
@@ -350,7 +351,9 @@ def fuse_moe_groupwise_w4a8(
         topk_scale: Weighting factors for each token-expert assignment
             Shape: [num_tokens, num_topk]
             Dtype: float32
-        group_size: group size of weight groupwise quant, only support 64/128
+        gateup_group_size: group size of gate up weight groupwise quant, only support 64/128
+            Dtype: int32
+        down_group_size: group size of down weight groupwise quant, only support 64/128
             Dtype: int32
         rank_ep: Expert parallel rank (for distributed training)
             Dtype: int32
@@ -378,7 +381,8 @@ def fuse_moe_groupwise_w4a8(
         act_and_mul_scale,
         topk_ids,
         topk_scale,
-        group_size,
+        gateup_group_size,
+        down_group_size,
         rank_ep,
         num_expert_total,
         use_hadamard,

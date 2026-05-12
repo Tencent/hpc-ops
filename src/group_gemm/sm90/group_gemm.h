@@ -30,8 +30,10 @@ void reformat_x_scale_async(void *output_ptr, const void *xscale_ptr, const void
 
 void group_gemm_groupwise_w4a8_mma_async(void *y_ptr, const void *x_ptr, const void *weight_ptr,
                                          const void *seqlens_ptr, const void *cu_seqlens_ptr,
-                                         const void *yscale_ptr, int num_group, int m, int n, int k,
-                                         int group_size, cudaStream_t stream);
+                                         const void *yscale_ptr, void *tiles_ptr,
+                                         void *cu_tiles_ptr, void *task_map_ptr, int num_waves,
+                                         int num_group, int m, int n, int k, int group_size,
+                                         cudaStream_t stream);
 
 }  // namespace group_gemm
 }  // namespace hpc

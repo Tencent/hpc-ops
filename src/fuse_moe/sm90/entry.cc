@@ -473,9 +473,9 @@ torch::Tensor fuse_moe_groupwise_w4a8_entry(
     const torch::Tensor &x, const torch::Tensor &gate_up_weight, const torch::Tensor &gate_up_scale,
     const torch::Tensor &down_weight, const torch::Tensor &down_scale,
     const torch::Tensor &act_and_mul_scale, const torch::Tensor &topk_ids,
-    const torch::Tensor &topk_scale, int64_t group_size, int64_t rank_ep, int64_t num_expert_total,
-    bool use_hadamard, std::optional<torch::Tensor> shared_output,
-    std::optional<torch::Tensor> output) {
+    const torch::Tensor &topk_scale, int64_t gateup_group_size, int64_t down_group_size,
+    int64_t rank_ep, int64_t num_expert_total, bool use_hadamard,
+    std::optional<torch::Tensor> shared_output, std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
@@ -537,18 +537,29 @@ torch::Tensor fuse_moe_groupwise_w4a8_entry(
               "gate_up_weight and gate_up_scale must share the same num_expert");
   TORCH_CHECK(gate_up_weight.size(1) == gate_up_scale.size(1),
               "gate_up_weight and gate_up_scale must share the same n");
-  TORCH_CHECK((gate_up_weight.size(2) * 2 / group_size + 7) / 8 * 8 == gate_up_scale.size(2),
+  TORCH_CHECK((gate_up_weight.size(2) * 2 / gateup_group_size + 7) / 8 * 8 == gate_up_scale.size(2),
               "gate_up_weight and gate_up_scale must share the same k");
   TORCH_CHECK(down_weight.size(0) == down_scale.size(0),
               "down_weight and down_scale must share the same num_expert");
   TORCH_CHECK(down_weight.size(1) == down_scale.size(1),
               "down_weight and down_scale must share the same n");
-  TORCH_CHECK((down_weight.size(2) * 2 / group_size + 7) / 8 * 8 == down_scale.size(2),
+  TORCH_CHECK((down_weight.size(2) * 2 / down_group_size + 7) / 8 * 8 == down_scale.size(2),
               "down_weight and down_scale must share the same k");
 
-  TORCH_CHECK(gate_up_weight.size(2) * 2 % 128 == 0, "k of gate_up_weight must be divided by 128");
-  TORCH_CHECK(down_weight.size(2) * 2 % 128 == 0, "k of down_weight must be divided by 128");
-  TORCH_CHECK(group_size == 64 || group_size == 128, "only group_size == 64 / 128");
+  TORCH_CHECK(gate_up_weight.size(2) * 2 % 128 == 0 || gate_up_weight.size(2) * 2 == 192,
+              "k of gate_up_weight must be divided by 128 or k is 192");
+  TORCH_CHECK(down_weight.size(2) * 2 % 128 == 0 || down_weight.size(2) * 2 == 192,
+              "k of down_weight must be divided by 128 or k is 192");
+  TORCH_CHECK(gateup_group_size == 64 || gateup_group_size == 128,
+              "only support gateup_group_size == 64 / 128");
+  TORCH_CHECK(down_group_size == 64 || down_group_size == 128,
+              "only support down_group_size == 64 / 128");
+  if (gate_up_weight.size(2) * 2 == 192) {
+    TORCH_CHECK(gateup_group_size == 64, "group_size must be 64 when k is 192");
+  }
+  if (down_weight.size(2) * 2 == 192) {
+    TORCH_CHECK(down_group_size == 64, "group_size must be 64 when k is 192");
+  }
 
   const void *shared_output_ptr = nullptr;
   if (shared_output.has_value()) {
@@ -616,9 +627,8 @@ torch::Tensor fuse_moe_groupwise_w4a8_entry(
   auto *down_input_ptr = down_input.mutable_data_ptr();
   auto *down_output_ptr = down_output.mutable_data_ptr();
 
-  // TODO(landojiang): rewrite count_and_gather op and remove those tensor
-  // These tensors were created for the purpose of reusing the `count_and_gather` op,
-  // but they are not actually used.
+  // tiles / cu_tiles and TMA tensors are required by count_and_gather to
+  // produce a valid task_map for the w4a8 mma kernel.
   torch::Tensor tiles = torch::empty({num_expert}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
   torch::Tensor gate_up_tmas = torch::empty({num_expert * 2, 128}, options.dtype(torch::kInt8));
@@ -629,13 +639,34 @@ torch::Tensor fuse_moe_groupwise_w4a8_entry(
   auto *gate_up_tmas_ptr = gate_up_tmas.mutable_data_ptr();
   auto *down_tmas_ptr = down_tmas.mutable_data_ptr();
 
+  // Allocate task_map workspaces sized to the worst-case number of tiles the
+  // w4a8 mma kernel may visit, The kernel uses kTileM=8 and kTileN=64.
+  int num_sm = get_sm_count();
+  int num_block = num_sm * 7;
+  constexpr int kW4TileM = 8;
+  constexpr int kW4TileN = 64;
+  int num_gateup_tiles = ((num_seq + kW4TileM - 1) / kW4TileM) *
+                         ((intermediate_size + kW4TileN - 1) / kW4TileN) * num_expert;
+  int num_down_tiles = ((num_seq + kW4TileM - 1) / kW4TileM) *
+                       ((hidden_size + kW4TileN - 1) / kW4TileN) * num_expert;
+  int num_gateup_waves = (num_gateup_tiles + num_block - 1) / num_block + 1;
+  int num_down_waves = (num_down_tiles + num_block - 1) / num_block + 1;
+
+  torch::Tensor gate_up_task_map =
+      torch::empty({num_gateup_waves, num_block, 4}, options.dtype(torch::kInt32));
+  torch::Tensor down_task_map =
+      torch::empty({num_down_waves, num_block, 4}, options.dtype(torch::kInt32));
+  auto *gate_up_task_map_ptr = gate_up_task_map.mutable_data_ptr();
+  auto *down_task_map_ptr = down_task_map.mutable_data_ptr();
+
   fuse_moe_groupwise_w4a8_async(
       y_ptr, x_ptr, gate_up_input_ptr, gate_up_output_ptr, gate_up_weight_ptr, gate_up_scale_ptr,
       act_and_mul_scale_ptr, down_input_ptr, down_output_ptr, down_weight_ptr, down_scale_ptr,
       topk_ids_ptr, topk_scale_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr,
-      cu_tiles_ptr, gate_up_tmas_ptr, down_tmas_ptr, shared_output_ptr, num_seq, hidden_size,
-      intermediate_size, num_topk, group_size, num_expert_total, num_expert, rank_ep, use_hadamard,
-      stream);
+      cu_tiles_ptr, gate_up_tmas_ptr, down_tmas_ptr, gate_up_task_map_ptr, down_task_map_ptr,
+      shared_output_ptr, num_gateup_waves, num_down_waves, num_seq, hidden_size, intermediate_size,
+      num_topk, gateup_group_size, down_group_size, num_expert_total, num_expert, rank_ep,
+      use_hadamard, stream);
 
   if (output.has_value()) {
     return output.value();
@@ -678,7 +709,8 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "fuse_moe_groupwise_w4a8(Tensor x, Tensor gate_up_weight, Tensor gate_up_scale, Tensor "
       "down_weight, "
       "Tensor down_scale, Tensor act_and_mul_scale, Tensor topk_ids, Tensor topk_scale, int "
-      "group_size, int rank_ep, int num_expert_total, bool use_hadamard, "
+      "gateup_group_size, int down_group_size, int rank_ep, int num_expert_total, bool "
+      "use_hadamard, "
       "Tensor ? shared_output, "
       "Tensor ? output) -> (Tensor)");
   m.impl("fuse_moe_groupwise_w4a8", torch::kCUDA, &hpc::fuse_moe::fuse_moe_groupwise_w4a8_entry);

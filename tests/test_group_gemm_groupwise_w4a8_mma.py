@@ -79,8 +79,8 @@ def naive_group_gemm_blockwise_w4a8(
 @pytest.mark.parametrize(
     "num_group_n_k",
     [
-        [192, 512, 4096],  # hy3.0 tp8 gate up, k=384 pad to k=512
-        [192, 4096, 256],  # hy3.0 tp8 down, k=192 pad to k=256
+        [192, 384, 4096],  # hy3.0 tp8 gate up
+        [192, 4096, 192],  # hy3.0 tp8 down
         [96, 768, 4096],  # hy3.0 tp4ep2 gate up
         [96, 4096, 384],  # hy3.0 tp4ep2 down
     ],
@@ -92,7 +92,9 @@ def naive_group_gemm_blockwise_w4a8(
 def test_group_gemm(actual_m, m, num_group_n_k, group_size):
     num_group, n, k = num_group_n_k
 
-    assert k % 128 == 0
+    assert k % 128 == 0 or k == 192
+    if k == 192 and group_size == 128:
+        return  # if k = 192, group_size must be 64
 
     torch.cuda.manual_seed(10086)
 

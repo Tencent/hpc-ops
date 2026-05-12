@@ -120,18 +120,17 @@ void fuse_moe_blockwise_async(
                total_num_tokens, num_tokens, hidden_size, num_topk, use_pdl, stream);
 }
 
-void fuse_moe_groupwise_w4a8_async(void *output_ptr, const void *input_ptr, void *gate_up_input_ptr,
-                                   void *gate_up_output_ptr, const void *gate_up_weight_ptr,
-                                   const void *gate_up_scale_ptr, const void *act_and_mul_scale_ptr,
-                                   void *down_input_ptr, void *down_output_ptr,
-                                   const void *down_weight_ptr, const void *down_scale_ptr,
-                                   const void *topk_ids_ptr, const void *topk_scale_ptr,
-                                   void *topk_pos_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
-                                   void *tiles_ptr, void *cu_tiles_ptr, void *gate_up_tmas_ptr,
-                                   void *down_tmas_ptr, const void *shared_output_ptr, int num_seq,
-                                   int hidden_size, int intermediate_size, int num_topk,
-                                   int group_size, int num_expert_total, int num_expert_local,
-                                   int rank_ep, bool use_hadamard, cudaStream_t stream) {
+void fuse_moe_groupwise_w4a8_async(
+    void *output_ptr, const void *input_ptr, void *gate_up_input_ptr, void *gate_up_output_ptr,
+    const void *gate_up_weight_ptr, const void *gate_up_scale_ptr,
+    const void *act_and_mul_scale_ptr, void *down_input_ptr, void *down_output_ptr,
+    const void *down_weight_ptr, const void *down_scale_ptr, const void *topk_ids_ptr,
+    const void *topk_scale_ptr, void *topk_pos_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
+    void *tiles_ptr, void *cu_tiles_ptr, void *gate_up_tmas_ptr, void *down_tmas_ptr,
+    void *gate_up_task_map_ptr, void *down_task_map_ptr, const void *shared_output_ptr,
+    int num_gateup_waves, int num_down_waves, int num_seq, int hidden_size, int intermediate_size,
+    int num_topk, int gateup_group_size, int down_group_size, int num_expert_total,
+    int num_expert_local, int rank_ep, bool use_hadamard, cudaStream_t stream) {
   bool use_pdl = true;
 
   int total_num_seq = num_seq * num_topk;
@@ -140,18 +139,21 @@ void fuse_moe_groupwise_w4a8_async(void *output_ptr, const void *input_ptr, void
   using T1 = __nv_bfloat16;
   using T2 = __nv_fp8_e4m3;
 
-  // 0. call count_and_gather_async
-  count_and_gather_async(gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr,
-                         input_ptr, topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr,
-                         gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr, cu_tiles_ptr, nullptr, nullptr,
-                         num_seq, hidden_size, intermediate_size, num_topk, num_expert_local,
-                         rank_ep, num_seq_per_group_avg, stream);
+  // 0. call count_and_gather_async (w4a8 variant so the task_map encodes
+  //    itile_n for kTileN=64).
+  count_and_gather_w4a8_async(
+      gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, input_ptr,
+      topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr,
+      tiles_ptr, cu_tiles_ptr, gate_up_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+      intermediate_size, num_topk, num_expert_local, rank_ep, num_seq_per_group_avg, stream);
 
-  // 1. call gate_up linear
+  // 1. call gate_up linear. tile_ptr/cu_tile_ptr/task_map were produced by
+  //    count_and_gather above; the kernel uses task_map when non-null,
+  //    otherwise falls back to cu_tile_ptr for per-block work lookup.
   group_gemm::group_gemm_groupwise_w4a8_mma_async(
       gate_up_output_ptr, gate_up_input_ptr, gate_up_weight_ptr, seqlens_ptr, cu_seqlens_ptr,
-      gate_up_scale_ptr, num_expert_local, total_num_seq, intermediate_size, hidden_size,
-      group_size, stream);
+      gate_up_scale_ptr, tiles_ptr, cu_tiles_ptr, gate_up_task_map_ptr, num_gateup_waves,
+      num_expert_local, total_num_seq, intermediate_size, hidden_size, gateup_group_size, stream);
 
   // 2. call act and mul
   const int *valid_row_range_ptr =
@@ -170,7 +172,8 @@ void fuse_moe_groupwise_w4a8_async(void *output_ptr, const void *input_ptr, void
   // 3. call down linear
   group_gemm::group_gemm_groupwise_w4a8_mma_async(
       down_output_ptr, down_input_ptr, down_weight_ptr, seqlens_ptr, cu_seqlens_ptr, down_scale_ptr,
-      num_expert_local, total_num_seq, hidden_size, intermediate_size / 2, group_size, stream);
+      tiles_ptr, cu_tiles_ptr, down_task_map_ptr, num_down_waves, num_expert_local, total_num_seq,
+      hidden_size, intermediate_size / 2, down_group_size, stream);
 
   // 4. call reduce //delete total_num_seq
   reduce_async(output_ptr, down_output_ptr, topk_pos_ptr, topk_scale_ptr, shared_output_ptr,

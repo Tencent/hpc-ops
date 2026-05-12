@@ -22,6 +22,18 @@ void count_and_gather_async(void *gate_up_input_ptr, void *gate_up_output_ptr, v
                             int num_expert, int eprank, int num_seq_per_group_avg,
                             cudaStream_t stream);
 
+// Variant used by the w4a8 MMA path. Same behavior as count_and_gather_async
+// except the task_map entries encode itile_n for kTileN=64 (instead of 128),
+// so that the w4a8 mma kernel can consume them directly.
+void count_and_gather_w4a8_async(void *gate_up_input_ptr, void *gate_up_output_ptr,
+                                 void *down_input_ptr, void *down_output_ptr, const void *x_ptr,
+                                 const void *topk_ids_ptr, void *topk_pos_ptr, void *seqlens_ptr,
+                                 void *cu_seqlens_ptr, void *gate_up_tmas_ptr, void *down_tmas_ptr,
+                                 void *tiles_ptr, void *cu_tiles_ptr, void *gateup_task_map_ptr,
+                                 void *down_task_map_ptr, int num_seq, int hidden_size,
+                                 int intermediate_size, int num_topk, int num_expert, int eprank,
+                                 int num_seq_per_group_avg, cudaStream_t stream);
+
 void blockwise_count_and_gather_async(
     const void *input_ptr, const void *input_scale_ptr, void *gate_up_input_ptr,
     void *gate_up_output_ptr, void *gate_up_input_scale_ptr, void *down_input_ptr,
@@ -62,18 +74,17 @@ void fuse_moe_blockwise_async(
     int num_expert_local, int gate_up_weight_scale_lastdim_pad4, int down_weight_scale_lastdim_pad4,
     int rank_ep, cudaStream_t stream);
 
-void fuse_moe_groupwise_w4a8_async(void *output_ptr, const void *input_ptr, void *gate_up_input_ptr,
-                                   void *gate_up_output_ptr, const void *gate_up_weight_ptr,
-                                   const void *gate_up_scale_ptr, const void *act_and_mul_scale_ptr,
-                                   void *down_input_ptr, void *down_output_ptr,
-                                   const void *down_weight_ptr, const void *down_scale_ptr,
-                                   const void *topk_ids_ptr, const void *topk_scale_ptr,
-                                   void *topk_pos_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
-                                   void *tiles_ptr, void *cu_tiles_ptr, void *gate_up_tmas_ptr,
-                                   void *down_tmas_ptr, const void *shared_output_ptr, int num_seq,
-                                   int hidden_size, int intermediate_size, int num_topk,
-                                   int group_size, int num_expert_total, int num_expert_local,
-                                   int rank_ep, bool use_hadamard, cudaStream_t stream);
+void fuse_moe_groupwise_w4a8_async(
+    void *output_ptr, const void *input_ptr, void *gate_up_input_ptr, void *gate_up_output_ptr,
+    const void *gate_up_weight_ptr, const void *gate_up_scale_ptr,
+    const void *act_and_mul_scale_ptr, void *down_input_ptr, void *down_output_ptr,
+    const void *down_weight_ptr, const void *down_scale_ptr, const void *topk_ids_ptr,
+    const void *topk_scale_ptr, void *topk_pos_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
+    void *tiles_ptr, void *cu_tiles_ptr, void *gate_up_tmas_ptr, void *down_tmas_ptr,
+    void *gate_up_task_map_ptr, void *down_task_map_ptr, const void *shared_output_ptr,
+    int num_gateup_waves, int num_down_waves, int num_seq, int hidden_size, int intermediate_size,
+    int num_topk, int gateup_group_size, int down_group_size, int num_expert_total,
+    int num_expert_local, int rank_ep, bool use_hadamard, cudaStream_t stream);
 
 }  // namespace fuse_moe
 }  // namespace hpc

@@ -185,7 +185,7 @@ def group_gemm_groupwise_w4a8_mma_weight_reformat(
     k_half = weight.shape[2]
 
     assert m % 64 == 0, "m must be divided by 64"
-    assert k_half * 2 % 128 == 0, "k must be divided by 128"
+    assert k_half * 2 % 128 == 0 or k_half * 2 == 192, "k must be divided by 128 or k is 192"
     assert k_half * 2 // group_size == weight_scale.size(
         -1
     ), "weight and weight scale must have same k"

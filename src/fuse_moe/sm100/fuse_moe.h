@@ -58,19 +58,6 @@ void fuse_moe_blockwise_async(
     int num_expert_local, int gate_up_weight_scale_lastdim_pad4, int down_weight_scale_lastdim_pad4,
     int rank_ep, cudaStream_t stream);
 
-void fuse_moe_groupwise_w4a8_async(void *output_ptr, const void *input_ptr, void *gate_up_input_ptr,
-                                   void *gate_up_output_ptr, const void *gate_up_weight_ptr,
-                                   const void *gate_up_scale_ptr, const void *act_and_mul_scale_ptr,
-                                   void *down_input_ptr, void *down_output_ptr,
-                                   const void *down_weight_ptr, const void *down_scale_ptr,
-                                   const void *topk_ids_ptr, const void *topk_scale_ptr,
-                                   void *topk_pos_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
-                                   void *tiles_ptr, void *cu_tiles_ptr, void *gate_up_tmas_ptr,
-                                   void *down_tmas_ptr, const void *shared_output_ptr, int num_seq,
-                                   int hidden_size, int intermediate_size, int num_topk,
-                                   int group_size, int num_expert_total, int num_expert_local,
-                                   int rank_ep, bool use_hadamard, cudaStream_t stream);
-
 }  // namespace fuse_moe
 }  // namespace hpc
 
