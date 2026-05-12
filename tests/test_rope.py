@@ -4,6 +4,7 @@ Comprehensive test suite for RoPE operation with blocked KV cache.
 Tests both prefill and decoding modes, with and without QK normalization.
 """
 
+import math
 import os
 import sys
 from pathlib import Path
@@ -933,6 +934,23 @@ def apply_rotary_pos_emb_neox_reference(x, cos_sin):
     return torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1)
 
 
+def hadamard_matrix(n, device, dtype=torch.float32):
+    """Build an unscaled Hadamard matrix of size n (power of 2) by recursive doubling."""
+    H = torch.tensor([[1.0]], device=device, dtype=dtype)
+    size = 1
+    while size < n:
+        H = torch.cat([torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)], dim=0)
+        size *= 2
+    return H
+
+
+def apply_hadamard_per_head(x, head_dim):
+    """Apply normalized Hadamard transform along the last (head_dim) axis."""
+    H = hadamard_matrix(head_dim, x.device, dtype=torch.float32)
+    inv_sqrt = 1.0 / math.sqrt(head_dim)
+    return torch.matmul(x.to(torch.float32), H.t()) * inv_sqrt
+
+
 def rope_norm_ref(
     kcache,
     vcache,
@@ -944,6 +962,7 @@ def rope_norm_ref(
     q_norm_weight,
     k_norm_weight,
     qk_norm_policy,
+    apply_hadamard=False,
 ):
     """Unified PyTorch reference: RoPE + optional RMSNorm + paged KV write.
 
@@ -985,6 +1004,10 @@ def rope_norm_ref(
     if qk_norm_policy == 1:
         q = apply_rms_norm_reference(q, q_norm_weight)
         k = apply_rms_norm_reference(k, k_norm_weight)
+
+    if apply_hadamard:
+        q = apply_hadamard_per_head(q, qk_dim)
+        k = apply_hadamard_per_head(k, qk_dim)
 
     # write into paged KV cache; clear tail of last used slot per request
     tok = 0
@@ -1167,7 +1190,7 @@ def test_rope_norm_store_kv(
 @pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
 @pytest.mark.parametrize("num_q_heads,num_kv_heads,qk_head_dim", [(8, 1, 128), (64, 8, 128)])
 @pytest.mark.parametrize("qk_norm_policy", [0, 1, 2])
-@pytest.mark.parametrize("quant_policy", [0, 1, 2])  # 0=dqksv, 1=dqskv, 2=sqskv
+@pytest.mark.parametrize("quant_policy", [0, 1, 2, 3])  # 0=dqksv 1=dqskv 2=sqskv 3=sqskv+hadamard
 @pytest.mark.parametrize("num_req", [7, 16])
 @pytest.mark.parametrize("is_prefill,mtp", [(True, None), (False, 0), (False, 1)])
 def test_rope_norm_store_kv_fp8(
@@ -1192,7 +1215,7 @@ def test_rope_norm_store_kv_fp8(
     num_blocks = kcache.shape[0]
     device = qkv.device
 
-    if quant_policy == 0:
+    if quant_policy == 0 or quant_policy == 3:
         # Dynamic per-head per-token: k_scale is [num_blocks, R, num_kv_heads, L] (output)
         L = qk_head_dim * 1 // 4  # sizeof(fp8) / sizeof(float)
         R = kv_block_size // L
@@ -1214,6 +1237,8 @@ def test_rope_norm_store_kv_fp8(
     else:
         max_seqlens = mtp + 1  # tokens per request in decode
 
+    needs_q_scale_inv = quant_policy == 2
+
     q_fp8, q_scale_out, split_k_flag = hpc.rope_norm_store_kv_fp8(
         key_cache=kcache_fp8,
         value_cache=vcache_fp8,
@@ -1227,7 +1252,7 @@ def test_rope_norm_store_kv_fp8(
         v_scale=v_scale,
         quant_policy=hpc.QuantType(quant_policy),
         max_seqlens=max_seqlens,
-        q_scale_inv=q_scale_inv if quant_policy == 2 else None,
+        q_scale_inv=q_scale_inv if needs_q_scale_inv else None,
         q_norm_weight=q_norm_w if qk_norm_policy > 0 else None,
         k_norm_weight=k_norm_w if qk_norm_policy > 0 else None,
         qk_norm_policy=qk_norm_policy,
@@ -1237,7 +1262,7 @@ def test_rope_norm_store_kv_fp8(
     assert split_k_flag.dtype == torch.int32
 
     if (
-        quant_policy == 0 or quant_policy == 1
+        quant_policy == 0 or quant_policy == 1 or quant_policy == 3
     ):  # dynamic Q: kernel computes per-token per-head scale
         if is_prefill:
             pad128 = ((max_seqlens + 127) // 128) * 128
@@ -1256,7 +1281,7 @@ def test_rope_norm_store_kv_fp8(
             q_bf16 = (q_fp8[:rows].to(torch.bfloat16) * q_scale_out[:rows, :, None]).to(
                 torch.bfloat16
             )
-    else:  # sqskv: static scale supplied by caller; no dynamic scale tensor returned
+    else:  # sqskv (with or without hadamard): static scale supplied by caller
         assert q_scale_out is None
         rows = real_rows if real_rows is not None else q_fp8.shape[0]
         q_bf16 = (q_fp8[:rows].to(torch.float32) * q_scale_val).to(torch.bfloat16)
@@ -1268,13 +1293,23 @@ def test_rope_norm_store_kv_fp8(
         qkv_r, ns_r, qi_r, ki_r = qkv, num_seqlen, q_index, kv_indices
 
     ref_q = rope_norm_ref(
-        kcache_ref, vcache_ref, qkv_r, cos_sin, ns_r, qi_r, ki_r, q_norm_w, k_norm_w, qk_norm_policy
+        kcache_ref,
+        vcache_ref,
+        qkv_r,
+        cos_sin,
+        ns_r,
+        qi_r,
+        ki_r,
+        q_norm_w,
+        k_norm_w,
+        qk_norm_policy,
+        apply_hadamard=(quant_policy == 3),
     )
     assert allclose(ref_q, q_bf16, atol=0.8)
 
     # ========= Verify KV cache for all quant policies =========
     q_lens_r = (qi_r[1:] - qi_r[:-1]).tolist()
-    if quant_policy == 0:
+    if quant_policy == 0 or quant_policy == 3:
         L = qk_head_dim * 1 // 4
     tok = 0
     for ri in range(num_req):
@@ -1287,7 +1322,7 @@ def test_rope_norm_store_kv_fp8(
             for h in range(num_kv_heads):
                 v_fp8_vals = vcache_fp8[cb, pb, h, :].to(torch.float32)
                 v_ref_vals = vcache_ref[cb, pb, h, :].to(torch.float32)
-                if quant_policy == 0:
+                if quant_policy == 0 or quant_policy == 3:
                     v_dequant = v_fp8_vals * v_scale[h]
                 else:
                     v_dequant = v_fp8_vals * v_scale[0]
@@ -1298,7 +1333,7 @@ def test_rope_norm_store_kv_fp8(
             for h in range(num_kv_heads):
                 k_fp8_vals = kcache_fp8[cb, pb, h, :].to(torch.float32)
                 k_ref_vals = kcache_ref[cb, pb, h, :].to(torch.float32)
-                if quant_policy == 0:
+                if quant_policy == 0 or quant_policy == 3:
                     r_idx = pb // L
                     l_idx = pb % L
                     k_s = k_scale[cb, r_idx, h, l_idx].item()

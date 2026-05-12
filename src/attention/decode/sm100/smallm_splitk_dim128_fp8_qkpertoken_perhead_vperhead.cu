@@ -27,7 +27,7 @@ void launch_attention_decode_fp8_dim128_smallm_clc_qkpertoken_perhead_vperhead(
     int block_size, int num_seq_max_blocks, int qscale_pad_stride, int ldY, int ldQ,
     int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
-    cudaStream_t stream) {
+    const float *p_scale_ptr, const float *p_scale_inv_ptr, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   constexpr int kStageQ = 4;
@@ -142,13 +142,24 @@ void launch_attention_decode_fp8_dim128_smallm_clc_qkpertoken_perhead_vperhead(
   dim3 grid(num_head_k * num_batch);
   dim3 block(512);
 
-  auto kernel = kernels::attention_decode_fp8_1sm_smallm_clc_qkpertoken_perhead_vperhead_kernel<
-      Tout, Tin, kTileM, kTileN, kTileK, kTileV, kHeadsPerGroup, decltype(qk_tiled_mma),
-      decltype(sv_tiled_mma), decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y),
-      decltype(tma_ks), decltype(slayout_q), decltype(slayout_k), decltype(slayout_p),
-      decltype(slayout_s), decltype(slayout_v), decltype(slayout_y), decltype(slayout_ks),
-      kClusterM, kClusterN, kClusterK, kMmaSM, kBlockSize, kStageQ, kStageK, kStageP>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+  auto kernel_no_ps =
+      kernels::attention_decode_fp8_1sm_smallm_clc_qkpertoken_perhead_vperhead_kernel<
+          Tout, Tin, kTileM, kTileN, kTileK, kTileV, kHeadsPerGroup, decltype(qk_tiled_mma),
+          decltype(sv_tiled_mma), decltype(tma_q), decltype(tma_k), decltype(tma_v),
+          decltype(tma_y), decltype(tma_ks), decltype(slayout_q), decltype(slayout_k),
+          decltype(slayout_p), decltype(slayout_s), decltype(slayout_v), decltype(slayout_y),
+          decltype(slayout_ks), kClusterM, kClusterN, kClusterK, kMmaSM, kBlockSize, kStageQ,
+          kStageK, kStageP, false>;
+  auto kernel_with_ps =
+      kernels::attention_decode_fp8_1sm_smallm_clc_qkpertoken_perhead_vperhead_kernel<
+          Tout, Tin, kTileM, kTileN, kTileK, kTileV, kHeadsPerGroup, decltype(qk_tiled_mma),
+          decltype(sv_tiled_mma), decltype(tma_q), decltype(tma_k), decltype(tma_v),
+          decltype(tma_y), decltype(tma_ks), decltype(slayout_q), decltype(slayout_k),
+          decltype(slayout_p), decltype(slayout_s), decltype(slayout_v), decltype(slayout_y),
+          decltype(slayout_ks), kClusterM, kClusterN, kClusterK, kMmaSM, kBlockSize, kStageQ,
+          kStageK, kStageP, true>;
+  cudaFuncSetAttribute(kernel_no_ps, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+  cudaFuncSetAttribute(kernel_with_ps, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
   cudaLaunchConfig_t config;
   memset(&config, 0, sizeof(config));
@@ -168,12 +179,21 @@ void launch_attention_decode_fp8_dim128_smallm_clc_qkpertoken_perhead_vperhead(
 
   config.stream = stream;
 
-  cudaLaunchKernelEx(&config, kernel, tma_q, tma_k, tma_v, tma_y, tma_ks, block_ids_ptr,
-                     num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, new_kv_included,
-                     num_batch, num_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_k,
-                     num_head_v, heads_per_group, pad_heads_per_group, num_kvcache_blocks,
-                     num_seq_max_blocks, qscale_pad_stride, one_over_dk_log2e,
-                     splitk_head_kv_divider);
+  if (p_scale_ptr == nullptr) {
+    cudaLaunchKernelEx(&config, kernel_no_ps, tma_q, tma_k, tma_v, tma_y, tma_ks, block_ids_ptr,
+                       num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, new_kv_included,
+                       num_batch, num_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_k,
+                       num_head_v, heads_per_group, pad_heads_per_group, num_kvcache_blocks,
+                       num_seq_max_blocks, qscale_pad_stride, one_over_dk_log2e,
+                       splitk_head_kv_divider, (const float *)nullptr, (const float *)nullptr);
+  } else {
+    cudaLaunchKernelEx(&config, kernel_with_ps, tma_q, tma_k, tma_v, tma_y, tma_ks, block_ids_ptr,
+                       num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, new_kv_included,
+                       num_batch, num_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_k,
+                       num_head_v, heads_per_group, pad_heads_per_group, num_kvcache_blocks,
+                       num_seq_max_blocks, qscale_pad_stride, one_over_dk_log2e,
+                       splitk_head_kv_divider, p_scale_ptr, p_scale_inv_ptr);
+  }
 }
 
 template <int kTileM, int kTileN, int kTileK, int kTileV, int kBlockSize>
@@ -186,7 +206,7 @@ void launch_attention_decode_fp8_dim128_smallm_splitk_qkpertoken_perhead_vperhea
     int block_size, int num_seq_max_blocks, int qscale_pad_stride, int ldY, int ldQ,
     int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
-    cudaStream_t stream) {
+    const float *p_scale_ptr, const float *p_scale_inv_ptr, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   constexpr int kStageQ = 4;
@@ -306,13 +326,24 @@ void launch_attention_decode_fp8_dim128_smallm_splitk_qkpertoken_perhead_vperhea
   dim3 grid(num_head_k, num_sm_count / num_head_k);
   dim3 block(512);
 
-  auto kernel = kernels::attention_decode_fp8_1sm_smallm_splitk_qkpertoken_perhead_vperhead_kernel<
-      Tout, Tin, kTileM, kTileN, kTileK, kTileV, kHeadsPerGroup, decltype(qk_tiled_mma),
-      decltype(sv_tiled_mma), decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y),
-      decltype(tma_ks), decltype(slayout_q), decltype(slayout_k), decltype(slayout_p),
-      decltype(slayout_s), decltype(slayout_v), decltype(slayout_y), decltype(slayout_ks),
-      kClusterM, kClusterN, kClusterK, kMmaSM, kBlockSize, kStageQ, kStageK, kStageP>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+  auto kernel_no_ps =
+      kernels::attention_decode_fp8_1sm_smallm_splitk_qkpertoken_perhead_vperhead_kernel<
+          Tout, Tin, kTileM, kTileN, kTileK, kTileV, kHeadsPerGroup, decltype(qk_tiled_mma),
+          decltype(sv_tiled_mma), decltype(tma_q), decltype(tma_k), decltype(tma_v),
+          decltype(tma_y), decltype(tma_ks), decltype(slayout_q), decltype(slayout_k),
+          decltype(slayout_p), decltype(slayout_s), decltype(slayout_v), decltype(slayout_y),
+          decltype(slayout_ks), kClusterM, kClusterN, kClusterK, kMmaSM, kBlockSize, kStageQ,
+          kStageK, kStageP, false>;
+  auto kernel_with_ps =
+      kernels::attention_decode_fp8_1sm_smallm_splitk_qkpertoken_perhead_vperhead_kernel<
+          Tout, Tin, kTileM, kTileN, kTileK, kTileV, kHeadsPerGroup, decltype(qk_tiled_mma),
+          decltype(sv_tiled_mma), decltype(tma_q), decltype(tma_k), decltype(tma_v),
+          decltype(tma_y), decltype(tma_ks), decltype(slayout_q), decltype(slayout_k),
+          decltype(slayout_p), decltype(slayout_s), decltype(slayout_v), decltype(slayout_y),
+          decltype(slayout_ks), kClusterM, kClusterN, kClusterK, kMmaSM, kBlockSize, kStageQ,
+          kStageK, kStageP, true>;
+  cudaFuncSetAttribute(kernel_no_ps, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+  cudaFuncSetAttribute(kernel_with_ps, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
   cudaLaunchConfig_t config;
   memset(&config, 0, sizeof(config));
@@ -335,12 +366,23 @@ void launch_attention_decode_fp8_dim128_smallm_splitk_qkpertoken_perhead_vperhea
 
   config.stream = stream;
 
-  cudaLaunchKernelEx(
-      &config, kernel, tma_q, tma_k, tma_v, tma_y, tma_ks, reinterpret_cast<float *>(lse_ptr),
-      task_map_ptr, block_ids_ptr, num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
-      new_kv_included, num_batch, num_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_k,
-      num_head_v, heads_per_group, pad_heads_per_group, num_kvcache_blocks, num_seq_max_blocks,
-      qscale_pad_stride, one_over_dk_log2e, splitk_head_kv_divider);
+  if (p_scale_ptr == nullptr) {
+    cudaLaunchKernelEx(&config, kernel_no_ps, tma_q, tma_k, tma_v, tma_y, tma_ks,
+                       reinterpret_cast<float *>(lse_ptr), task_map_ptr, block_ids_ptr,
+                       num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, new_kv_included,
+                       num_batch, num_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_k,
+                       num_head_v, heads_per_group, pad_heads_per_group, num_kvcache_blocks,
+                       num_seq_max_blocks, qscale_pad_stride, one_over_dk_log2e,
+                       splitk_head_kv_divider, (const float *)nullptr, (const float *)nullptr);
+  } else {
+    cudaLaunchKernelEx(&config, kernel_with_ps, tma_q, tma_k, tma_v, tma_y, tma_ks,
+                       reinterpret_cast<float *>(lse_ptr), task_map_ptr, block_ids_ptr,
+                       num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, new_kv_included,
+                       num_batch, num_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_k,
+                       num_head_v, heads_per_group, pad_heads_per_group, num_kvcache_blocks,
+                       num_seq_max_blocks, qscale_pad_stride, one_over_dk_log2e,
+                       splitk_head_kv_divider, p_scale_ptr, p_scale_inv_ptr);
+  }
 }
 
 void launch_attention_decode_fp8_dim128_smallm_combine_qkpertoken_perhead_vperhead(
@@ -393,7 +435,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
     int num_kvcache_blocks, int block_size, int num_seq_max_blocks, int qscale_pad_stride, int ldY,
     int ldQ, int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
-    cudaStream_t stream) {
+    const float *p_scale_ptr, const float *p_scale_inv_ptr, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   constexpr int kTileN = 128;
@@ -427,7 +469,8 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
           new_kv_included, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
           heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
           num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride, kcache_token_stride,
-          kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
+          kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+          p_scale_ptr, p_scale_inv_ptr, stream);
       launch_attention_decode_fp8_dim128_smallm_combine_qkpertoken_perhead_vperhead(
           y_ptr, lse_ptr, splitk_out_ptr, task_map_ptr, num_batch, num_seq_q, num_head_q,
           num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, stream);
@@ -439,7 +482,8 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
           new_kv_included, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
           heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
           num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride, kcache_token_stride,
-          kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
+          kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride,
+          p_scale_ptr, p_scale_inv_ptr, stream);
     }
   };
 

@@ -2,6 +2,7 @@ from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
+
 from .attention import QuantType
 
 
@@ -483,6 +484,9 @@ def rope_norm_store_kv_fp8(
             - 1: dqskv — dynamic per-token per-head Q quantization; K/V use static scaling.
                  Q scale computed by the kernel and written to the returned q_scale tensor.
             - 2: sqskv — static quantization; uses the caller-supplied q_scale_inv.
+            - 3: Q,K per-head-per-token, V per head, additionally applies a per-head (head_dim=128)
+                 Hadamard rotation to Q and K after norm and before quantization.
+                 Only supports qk_head_dim == 128 for now.
         max_seqlens: Maximum sequence length in the batch. Used to size the q_scale allocation
             in prefill mode (padded to a multiple of 128).
             Shape: scalar
@@ -753,7 +757,7 @@ def rope_norm_store_kv_fp8_fake(
         device=qkv.device,
     )
 
-    if quant_policy.value == 0 or quant_policy.value == 1:  # dq skv
+    if quant_policy.value == 0 or quant_policy.value == 1 or quant_policy.value == 3:  # dq Q
         if is_prefill:
             aligned = ((max_seqlens + 127) // 128) * 128
             q_scale = torch.empty(

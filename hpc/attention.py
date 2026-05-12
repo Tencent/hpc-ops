@@ -1,15 +1,15 @@
+from enum import Enum
 from typing import Optional
 
 import torch
 from torch import Tensor
-
-from enum import Enum
 
 
 class QuantType(Enum):
     QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD = 0
     QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR = 1
     QPERTENSOR_KPERTENSOR_VPERTENSOR = 2
+    QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD_QKHADAMARD = 3
 
 
 def attention_prefill_bf16(
@@ -157,6 +157,8 @@ def attention_with_kvcache_prefill_fp8(
     seqlens_kvcache: Tensor,
     max_seqlens_q: int,
     quant_type: QuantType = QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
+    p_scale: Optional[Tensor] = None,
+    p_scale_inv: Optional[Tensor] = None,
     output: Tensor = None,
 ) -> Tensor:
     """Computes paged KV-cache attention prefill with FP8 KV tensors.
@@ -213,6 +215,13 @@ def attention_with_kvcache_prefill_fp8(
             Dtype: int
         quant_type: Type of quantization scheme for attention computation.
             Defaults to QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR.
+        p_scale: Optional per-q-head scale applied to softmax output P before
+            FP8 quantization. Shape: [num_head_q], Dtype: float32. Must be on
+            the same device as ``q`` and paired with ``p_scale_inv``. If None,
+            kernel runs the original path (no P scaling).
+        p_scale_inv: Caller-provided reciprocal of ``p_scale`` (kernel avoids
+            division). Shape: [num_head_q], Dtype: float32. Must be provided
+            together with ``p_scale``.
         output: Optional output tensor to store the attention result.
             If provided, must be a bf16 tensor with appropriate shape
             (typically [total_seq, num_head_q, num_dim_v]).
@@ -247,6 +256,8 @@ def attention_with_kvcache_prefill_fp8(
         seqlens_kvcache,
         max_seqlens_q,
         quant_type.value,
+        p_scale,
+        p_scale_inv,
         output,
     )
 
@@ -428,6 +439,8 @@ def attention_decode_fp8(
     splitk: bool = True,
     task_map: Tensor = None,
     split_flag: Tensor = None,
+    p_scale: Optional[Tensor] = None,
+    p_scale_inv: Optional[Tensor] = None,
     output: Tensor = None,
 ) -> Tensor:
     """Computes attention decode using bfloat16 precision.
@@ -500,6 +513,8 @@ def attention_decode_fp8(
         splitk,
         task_map,
         split_flag,
+        p_scale,
+        p_scale_inv,
         output,
     )
 
@@ -877,7 +892,9 @@ def attention_with_kvcache_prefill_fp8_fake(
     seqlens_kvcache,
     max_seqlens_q,
     quant_type,
-    output,
+    p_scale=None,
+    p_scale_inv=None,
+    output=None,
 ):
     return torch.empty(
         (q.size(0), q.size(1), vcache.size(-1)), dtype=torch.bfloat16, device=q.device
@@ -944,7 +961,9 @@ def attention_decode_fp8_fake(
     new_kv_included,
     splitk,
     split_flag,
-    output,
+    p_scale=None,
+    p_scale_inv=None,
+    output=None,
 ):
     return torch.empty_like(q)
 

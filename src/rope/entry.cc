@@ -569,7 +569,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
   TORCH_CHECK(qkv.scalar_type() == torch::kBFloat16, "qkv must be bfloat16");
   TORCH_CHECK(kcache.dtype().itemsize() == 1, "kcache must be 1-byte dtype");
   TORCH_CHECK(vcache.dtype().itemsize() == 1, "vcache must be 1-byte dtype");
-  TORCH_CHECK(quant_policy >= 0 && quant_policy <= 2, "quant_policy must be 0, 1 or 2");
+  TORCH_CHECK(quant_policy >= 0 && quant_policy <= 3, "quant_policy must be 0, 1, 2 or 3");
   TORCH_CHECK(qk_norm_policy >= 0 && qk_norm_policy <= 2, "qk_norm_policy must be 0, 1 or 2");
 
   using DType = __nv_bfloat16;
@@ -591,11 +591,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
 
   // Validate scale tensor shapes based on quant_policy
   Strides4D ks_strides{0, 0, 0};
-  if (quant_policy == 0) {
+  if (quant_policy == 0 || quant_policy == 3) {
     // Dynamic per-head per-token: k_scale is [num_block, R, num_kv_heads, L] (output)
     int L = qk_head_dim * static_cast<int>(sizeof(QType)) / static_cast<int>(sizeof(float));
     int R = kv_block_size / L;
-    TORCH_CHECK(k_scale.dim() == 4, "k_scale must be 4D for quant_policy=0");
+    TORCH_CHECK(k_scale.dim() == 4, "k_scale must be 4D for quant_policy=0 or quant_policy=3");
     TORCH_CHECK(k_scale.size(1) == R, "k_scale dim 1 must equal block_size/L=", R, ", got ",
                 k_scale.size(1));
     TORCH_CHECK(k_scale.size(2) == num_kv_heads,
@@ -603,7 +603,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
     TORCH_CHECK(k_scale.size(3) == L, "k_scale dim 3 must equal L=", L, ", got ", k_scale.size(3));
     // V scale: per-head [num_kv_heads]
     TORCH_CHECK(v_scale.dim() == 1 && v_scale.size(0) == num_kv_heads,
-                "v_scale must be [num_kv_heads] for quant_policy=0");
+                "v_scale must be [num_kv_heads] for quant_policy=0 or quant_policy=3");
     ks_strides = Strides4D{k_scale.stride(0), k_scale.stride(1), k_scale.stride(2)};
   } else {
     // Static per-tensor: k_scale and v_scale are [1]
@@ -632,7 +632,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
   torch::Tensor q_scale;
   float *q_scale_ptr = nullptr;
   int max_seqlens_pad128 = 0;
-  if (quant_policy == 0 || quant_policy == 1) {
+  if (quant_policy == 0 || quant_policy == 1 || quant_policy == 3) {
     if (is_prefill) {
       max_seqlens_pad128 = ((max_seqlens + 127) / 128) * 128;
       q_scale = torch::empty({num_req, num_q_heads, max_seqlens_pad128},
@@ -678,6 +678,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
     TORCH_CHECK(q_scale_inv_opt.has_value(), "q_scale_inv required for quant_policy=2");
     TORCH_CHECK(q_scale_inv_opt.value().scalar_type() == torch::kFloat);
     q_scale_inv_ptr = q_scale_inv_opt.value().const_data_ptr<float>();
+  }
+  if (quant_policy == 3) {
+    TORCH_CHECK(qk_head_dim == 128, "quant_policy=3 (dqksv+hadamard) requires qk_head_dim == 128");
   }
 
   rope_norm_store_kv_fp8_async(

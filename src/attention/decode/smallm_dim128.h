@@ -34,7 +34,7 @@ bool smallm_splitk_dim128_fp8_qpertoken_perhead_kvpertensor_async(
     int num_kvcache_blocks, int block_size, int num_seq_max_blocks, int qscale_pad_stride, int ldY,
     int ldQ, int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
-    cudaStream_t stream);
+    const float *p_scale_ptr, const float *p_scale_inv_ptr, cudaStream_t stream);
 
 bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
     void *y_ptr, void *lse_ptr, void *split_out_ptr, const int *task_map_ptr, const void *q_ptr,
@@ -45,7 +45,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
     int num_kvcache_blocks, int block_size, int num_seq_max_blocks, int qscale_pad_stride, int ldY,
     int ldQ, int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
-    cudaStream_t stream);
+    const float *p_scale_ptr, const float *p_scale_inv_ptr, cudaStream_t stream);
 
 }  // namespace decode
 }  // namespace attention

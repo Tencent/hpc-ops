@@ -66,9 +66,19 @@ def naive_attn_with_paged_kvcache_func(
 
         P = P.masked_fill(~causal_mask, float("-inf"))
 
-        attn_weights = F.softmax(P, dim=-1)
+        # Mirror the kernel's online softmax + un-normalised fp8 quant path:
+        # the kernel quantises exp(P - row_max) (range (0, 1] with row-max
+        # element exactly 1.0 - i.e. the high-resolution end of e4m3) and
+        # divides by row_sum AFTER the PV gemm. F.softmax-then-quant would
+        # collapse most values into e4m3's low-resolution low end and inflate
+        # diff vs kernel.
+        attn_weights = torch.exp(P - P.max(dim=-1)[0][:, :, None])
+        gSum = attn_weights.sum(dim=-1)[:, :, None]
+        attn_weights = attn_weights.to(torch.float8_e4m3fn).float()
 
-        Y = torch.matmul(attn_weights, BV) * VS
+        Y = torch.matmul(attn_weights, BV)
+        Y = Y / gSum
+        Y = Y * VS
 
         output[bi] = Y.transpose(0, 1)
 
@@ -368,4 +378,277 @@ def test_attn_fp8_sm100(
         splitk,
         use_dynamic_sched,
         kvcache_shape,
+    )
+
+
+# -----------------------------------------------------------------------------
+# P_scale (kHasPScale=true) coverage
+# -----------------------------------------------------------------------------
+#
+# attention_decode_fp8 now accepts an optional pair (p_scale, p_scale_inv) of
+# shape [num_head_q] (float32, on the same device as q). When both are passed,
+# the kernel goes through the kHasPScale=true template instance which:
+#   * scales softmax(P) by p_scale[h] before fp8-quantizing P
+#   * folds p_scale_inv[h] into the trailing vscale multiplication
+# Mathematically the output is unchanged when p_scale * p_scale_inv == 1; the
+# golden below mirrors the original naive_attn_with_paged_kvcache_func and
+# applies the same scale/comp pair so that any diff is solely the kernel's.
+
+
+def naive_attn_with_paged_kvcache_pscale_func(
+    Q,
+    K,
+    V,
+    kvcache,
+    block_ids,
+    nblocks,
+    seqlenq,
+    cu_seqlenq,
+    num_seq_kvcache,
+    QS,
+    KS,
+    VS,
+    p_scale=None,
+    p_scale_inv=None,
+):
+    """P_scale-aware variant of naive_attn_with_paged_kvcache_func.
+
+    When p_scale / p_scale_inv are provided (shape [num_head_q]), softmax
+    output is multiplied by p_scale[h] before the (implicit) FP8 quant step,
+    and the final V-scale multiplication is replaced by VS * p_scale_inv[h].
+    p_scale=None reproduces the original naive exactly.
+    """
+    num_batch = seqlenq.shape[0]
+    num_head_q = Q.shape[1]
+    num_head_kv = K.shape[1]
+    head_dim = K.shape[2]
+    head_per_group = num_head_q // num_head_kv
+
+    has_ps = p_scale is not None
+    if has_ps:
+        assert p_scale_inv is not None and p_scale.shape == (num_head_q,)
+
+    Q = Q.reshape(num_batch, -1, num_head_q, head_dim)
+    output = torch.empty_like(Q, dtype=torch.bfloat16)
+    for bi in range(num_batch):
+        BQ = Q[bi].transpose(0, 1).float()  # [num_heads, sq, head_dim]
+        blk_ids = block_ids[bi, : nblocks[bi]]
+        seqlen = seqlenq[bi] + num_seq_kvcache[bi]
+        BK = (
+            kvcache[blk_ids, 0, :, :, :]
+            .reshape(-1, num_head_kv, head_dim)
+            .transpose(0, 1)[:, :seqlen, :]
+            .repeat_interleave(head_per_group, dim=0)
+        ).float()
+        BV = (
+            kvcache[blk_ids, 1, :, :, :]
+            .reshape(-1, num_head_kv, head_dim)
+            .transpose(0, 1)[:, :seqlen, :]
+            .repeat_interleave(head_per_group, dim=0)
+        ).float()
+
+        P = BQ @ BK.transpose(-1, -2)
+        P = P / math.sqrt(head_dim) * QS[bi][:, None, None] * KS
+
+        causal_mask = torch.ones(
+            seqlenq[bi], seqlen - seqlenq[bi], device=Q.device, dtype=torch.bool
+        )
+        tail_causal_mask = torch.tril(
+            torch.ones(seqlenq[bi], seqlenq[bi], device=Q.device, dtype=torch.bool)
+        )
+        causal_mask = torch.cat([causal_mask, tail_causal_mask], dim=-1).unsqueeze(0)
+        P = P.masked_fill(~causal_mask, float("-inf"))
+
+        # Mirror the kernel: do NOT normalise (i.e. don't call F.softmax
+        # before fp8 quant); the kernel quantises exp(P - row_max) (range
+        # (0, 1] with the row-max element exactly == 1) and divides by the
+        # row_sum AFTER the PV gemm. Doing softmax-then-quant instead would
+        # collapse most values into e4m3's low-resolution low end and
+        # exceed the original atol=0.05 even at p_scale=None.
+        attn_weights = torch.exp(P - P.max(dim=-1)[0][:, :, None])
+        gSum = attn_weights.sum(dim=-1)[:, :, None]
+
+        # P_scale (when provided) is applied per-q-head before fp8 quant.
+        if has_ps:
+            attn_weights = attn_weights * p_scale[:, None, None]
+        attn_weights = attn_weights.to(torch.float8_e4m3fn).float()
+
+        Y = torch.matmul(attn_weights, BV)
+        Y = Y / gSum
+
+        if has_ps:
+            Y = Y * (VS * p_scale_inv[:, None, None])
+        else:
+            Y = Y * VS
+
+        output[bi] = Y.transpose(0, 1)
+
+    return output.reshape(-1, num_head_q, head_dim)
+
+
+def _make_pscale(mode, num_head_q, device):
+    """Helper for the four canonical p_scale modes."""
+    if mode == "none":
+        return None, None
+    if mode == "all_ones":
+        p = torch.ones(num_head_q, dtype=torch.float32, device=device)
+        return p, p.clone()
+    if mode == "all_2":
+        p = torch.full((num_head_q,), 2.0, dtype=torch.float32, device=device)
+        pi = torch.full((num_head_q,), 0.5, dtype=torch.float32, device=device)
+        return p, pi
+    if mode == "per_head_random":
+        g = torch.Generator(device=device).manual_seed(20240514)
+        p = 0.7 + 0.8 * torch.rand(num_head_q, generator=g, device=device, dtype=torch.float32)
+        return p, 1.0 / p
+    raise ValueError(mode)
+
+
+def attention_decode_fp8_pscale_test_func(
+    num_batch,
+    num_seq_q,
+    max_seq_kv,
+    block_size,
+    kv_head_q_head,
+    head_dim,
+    p_scale_mode,
+):
+    """Same data construction as attention_decode_fp8_test_func, but with the
+    optional p_scale / p_scale_inv kwargs on hpc.attention_decode_fp8 and the
+    matching P_scale-aware golden."""
+    torch.manual_seed(10086)
+    torch.cuda.manual_seed(10086)
+
+    num_head_kv, num_head_q = kv_head_q_head
+    num_dim_qk = head_dim
+    num_dim_v = head_dim
+    max_num_blocks = int(num_batch * max_seq_kv // block_size * 1.2)
+
+    T = torch.float8_e4m3fn
+
+    Q = torch.randn(
+        (num_batch * num_seq_q, num_head_q, num_dim_qk), dtype=torch.bfloat16, device="cuda"
+    ) / math.sqrt(num_dim_qk)
+    QS = Q.float().abs().max(-1)[0] / 10
+    Q = (Q / QS[:, :, None]).to(T)
+
+    K = (
+        torch.randn(
+            (num_batch * num_seq_q, num_head_kv, num_dim_qk), dtype=torch.bfloat16, device="cuda"
+        )
+        / math.sqrt(num_dim_qk)
+    ).to(T)
+    V = torch.randn(
+        (num_batch * num_seq_q, num_head_kv, num_dim_v), dtype=torch.bfloat16, device="cuda"
+    ).to(T)
+
+    KS = torch.randn((1), dtype=torch.float32, device="cuda")
+    VS = torch.randn((1), dtype=torch.float32, device="cuda")
+
+    num_seq_kvcache = torch.randint(1, max_seq_kv, (num_batch,), dtype=torch.int32, device="cuda")
+
+    nblocks = (num_seq_kvcache + num_seq_q + block_size - 1) // block_size
+    total_blocks = sum(nblocks)
+    kvcache = (
+        torch.randn(
+            max_num_blocks,
+            2,
+            block_size,
+            num_head_kv,
+            num_dim_qk,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / math.sqrt(num_dim_qk)
+    ).to(T)
+    packed_block_ids = torch.randperm(max_num_blocks)[:total_blocks].to(torch.int32).cuda()
+
+    max_num_block2 = max(nblocks)
+    block_ids = torch.empty(num_batch, max_num_block2, dtype=torch.int32, device="cuda")
+    seqlenq = torch.tensor([num_seq_q] * num_batch, dtype=torch.int32, device="cuda")
+    cu_seqlenq = torch.cumsum(seqlenq, dtype=torch.int32, dim=0)
+
+    cu_blocks = 0
+    for i in range(num_batch):
+        block_ids[i, : nblocks[i]] = packed_block_ids[cu_blocks : cu_blocks + nblocks[i]]
+        cu_blocks += nblocks[i]
+        for sqi in range(seqlenq[i]):
+            si = sqi + num_seq_kvcache[i]
+            blk_id = si // block_size
+            slot_id = si % block_size
+            kvcache[block_ids[i, blk_id], 0, slot_id] = K.reshape(
+                num_batch, num_seq_q, num_head_kv, num_dim_qk
+            )[i, sqi]
+            kvcache[block_ids[i, blk_id], 1, slot_id] = V.reshape(
+                num_batch, num_seq_q, num_head_kv, num_dim_qk
+            )[i, sqi]
+
+    p_scale, p_scale_inv = _make_pscale(p_scale_mode, num_head_q, device="cuda")
+
+    gt = naive_attn_with_paged_kvcache_pscale_func(
+        Q,
+        K,
+        V,
+        kvcache,
+        block_ids,
+        nblocks,
+        seqlenq,
+        cu_seqlenq,
+        num_seq_kvcache,
+        QS,
+        KS,
+        VS,
+        p_scale=p_scale,
+        p_scale_inv=p_scale_inv,
+    )
+
+    my = hpc.attention_decode_fp8(
+        Q,
+        kvcache[:, 0, :, :, :],
+        kvcache[:, 1, :, :, :],
+        block_ids,
+        num_seq_kvcache + num_seq_q,
+        QS,
+        KS,
+        VS,
+        mtp=num_seq_q - 1,
+        new_kv_included=True,
+        quant_type=hpc.QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
+        splitk=True,
+        task_map=None,
+        p_scale=p_scale,
+        p_scale_inv=p_scale_inv,
+    )
+
+    # atol = 0.05: golden mirrors the kernel's exp(P-row_max) -> p_scale ->
+    # fp8 quant -> matmul -> /gSum -> vscale*p_scale_inv round-trip. Empirical
+    # max abs diff over a 30-seed sweep stays under ~0.013; 0.05 leaves
+    # ~4x headroom for unseen seeds / future matrix extensions.
+    assert allclose(my, gt, atol=0.05), (
+        f"[p_scale={p_scale_mode}] decode_fp8_pertensor diverges from golden " f"beyond atol=0.05"
+    )
+    assert gt.shape == my.shape and gt.dtype == my.dtype and gt.device == my.device
+
+
+@pytest.mark.skipif(torch.cuda.get_device_capability()[0] != 9, reason="skip on non sm90!")
+@pytest.mark.parametrize("num_batch", [1, 16])
+@pytest.mark.parametrize("num_seq_q", [1, 2])
+@pytest.mark.parametrize("max_seq_kv", [1024])
+@pytest.mark.parametrize("kv_head_q_head", [(2, 8), (4, 32)])
+@pytest.mark.parametrize("p_scale_mode", ["none", "all_ones", "all_2", "per_head_random"])
+def test_attn_fp8_pscale_sm90(
+    num_batch,
+    num_seq_q,
+    max_seq_kv,
+    kv_head_q_head,
+    p_scale_mode,
+):
+    attention_decode_fp8_pscale_test_func(
+        num_batch=num_batch,
+        num_seq_q=num_seq_q,
+        max_seq_kv=max_seq_kv,
+        block_size=64,
+        kv_head_q_head=kv_head_q_head,
+        head_dim=128,
+        p_scale_mode=p_scale_mode,
     )

@@ -24,7 +24,7 @@ template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int k
           typename TmaK, typename TmaV, typename TmaY, typename SLayoutQ, typename SLayoutK,
           typename SLayoutP, typename SLayoutS, typename SLayoutV, typename SLayoutY, int kClusterM,
           int kClusterN, int kClusterK, int kMmaSM, int kBlockSize, int kStageQ, int kStageK,
-          int kStageP>
+          int kStageP, bool kHasPScale = false>
 __global__ void __launch_bounds__(512, 1)
     attention_decode_fp8_1sm_smallm_clc_qpertoken_perhead_kvpertensor_kernel(
         const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
@@ -34,7 +34,12 @@ __global__ void __launch_bounds__(512, 1)
         int num_seq_q, int num_dim_qk, int num_dim_v, int num_head_q, int num_head_k,
         int num_head_v, int heads_per_group, int lse_pad_heads_per_group, int num_kvcache_blocks,
         int num_seq_max_blocks, int qscale_pad_stride, float one_over_dk_log2e,
-        cutlass::FastDivmod splitk_head_kv_divider) {
+        cutlass::FastDivmod splitk_head_kv_divider, const float *p_scale_ptr = nullptr,
+        const float *p_scale_inv_ptr = nullptr) {
+  // TODO(p_scale): SM100 kernel P_scale implementation is pending. When
+  // kHasPScale=true, the caller should verify numerical correctness on SM100.
+  // For kHasPScale=false (p_scale not passed by user), the kernel behaves
+  // identically to the original implementation.
   using namespace cute;  // NOLINT
 
   using TMEM_LOAD_ATOM = std::conditional_t<

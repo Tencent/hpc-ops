@@ -8,6 +8,7 @@
 #include <string>
 
 #include "cutlass/fast_math.h"
+#include "src/hadamard/hadamard_device.cuh"
 #include "src/rope/rope.h"
 #include "src/utils/utils.cuh"
 
@@ -60,6 +61,16 @@ __device__ __forceinline__ float warp_abs_max(vec_t<T, N> &data) {
 #pragma unroll
   for (int i = 0; i < kN; ++i) m = fmaxf(m, fabsf(data[i]));
   return warp_reduce_max_xor(m);
+}
+
+template <typename T, int N>
+__device__ __forceinline__ void hadamard_128(vec_t<T, N> &data, int ilane) {
+  constexpr float kInvSqrt128 = 0.08838834764831845f;  // 1/sqrt(128)
+  hpc::hadamard::device::hadamard_n128_warp(data, ilane);
+#pragma unroll
+  for (int i = 0; i < N; ++i) {
+    data[i] *= kInvSqrt128;
+  }
 }
 
 template <int kWarpsPerBlock, int kNumQHeads, int kNumKVHeads, int kQKHeadDim, int kVHeadDim,
@@ -538,10 +549,15 @@ __global__ void rope_norm_store_kv_fp8_kernel(
         rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_q_norm_w, ilane);
       }
 
+      if constexpr (kQuantPolicy == 3) {
+        static_assert(kQKHeadDim == 128, "kQuantPolicy=3 (hadamard) requires kQKHeadDim == 128");
+        hadamard_128(data, ilane);
+      }
+
       // Q quantization
       float q_mult;
-      if constexpr (kQuantPolicy == 0 || kQuantPolicy == 1) {
-        // dqskv: dynamic per-token per-head
+      if constexpr (kQuantPolicy == 0 || kQuantPolicy == 1 || kQuantPolicy == 3) {
+        // dqskv (and dqksv+hadamard): dynamic per-token per-head
         float max_abs = warp_abs_max<kNumItemPerThread>(data);
         float q_scale_val = max_abs / upper_max;
         if (ilane == 0) {
@@ -609,14 +625,19 @@ __global__ void rope_norm_store_kv_fp8_kernel(
         rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_k_norm_w, ilane);
       }
 
+      if constexpr (kQuantPolicy == 3) {
+        static_assert(kQKHeadDim == 128, "kQuantPolicy=3 (hadamard) requires kQKHeadDim == 128");
+        hadamard_128(data, ilane);
+      }
+
       QType *k_dst = (out_k_ptr != nullptr)
                          ? out_k_ptr + irow * kNumKVHeads * kQKHeadDim + bidy * kQKHeadDim
                          : kcache_ptr + kc_tok_offset + bidy * kc.s2;
 
       // K quantization
       float k_mult;
-      if constexpr (kQuantPolicy == 0) {
-        // Dynamic per-token per-head quantization
+      if constexpr (kQuantPolicy == 0 || kQuantPolicy == 3) {
+        // Dynamic per-token per-head quantization (with optional hadamard)
         float max_abs = warp_abs_max<kNumItemPerThread>(data);
         float k_scale_val = max_abs / upper_max;
         if (ilane == 0) {
@@ -660,7 +681,7 @@ __global__ void rope_norm_store_kv_fp8_kernel(
                               ? out_v_ptr + irow * kNumKVHeads * kVHeadDim + bidy * kVHeadDim
                               : vcache_ptr + vc_tok_offset + bidy * vc.s2;
 
-      if constexpr (kQuantPolicy == 0) {
+      if constexpr (kQuantPolicy == 0 || kQuantPolicy == 3) {
         v_mult = __frcp_rn(v_scale_ptr[bidy]);
       } else {
         v_mult = __frcp_rn(v_scale_ptr[0]);
@@ -681,7 +702,6 @@ __global__ void rope_norm_store_kv_fp8_kernel(
     }
   }
 }
-
 }  // namespace kernels
 
 template <int kNumQHeads, int kNumKVHeads, int kQKHeadDim, int kVHeadDim>
@@ -831,8 +851,10 @@ void launch_rope_norm_store_kv_fp8(
     dispatch_norm(std::integral_constant<int, 0>{});
   } else if (quant_policy == 1) {
     dispatch_norm(std::integral_constant<int, 1>{});
-  } else {
+  } else if (quant_policy == 2) {
     dispatch_norm(std::integral_constant<int, 2>{});
+  } else {
+    dispatch_norm(std::integral_constant<int, 3>{});
   }
 }
 

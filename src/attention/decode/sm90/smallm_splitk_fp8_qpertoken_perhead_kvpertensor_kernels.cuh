@@ -24,7 +24,7 @@ template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int k
           typename TmaQ, typename TmaK, typename TmaV, typename TmaY, typename TmaSplitY,
           typename SLayoutQ, typename SLayoutK, typename SLayoutP, typename SLayoutS,
           typename SLayoutVTma, typename SLayoutY, typename SLayoutSplitY, int kBlockSize,
-          int kStage, int kSplitK, int kSplitMinLen>
+          int kStage, int kSplitK, int kSplitMinLen, bool kHasPScale = false>
 __global__ void
 attention_decode_fp8_multistage_ws_smallm_splitk_qpertoken_perhead_kvpertensor_kernel(
     const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
@@ -34,7 +34,8 @@ attention_decode_fp8_multistage_ws_smallm_splitk_qpertoken_perhead_kvpertensor_k
     const float *kscale_ptr, const float *vscale_ptr, int *split_flag_ptr, bool new_kv_included,
     int num_batch, int num_seq_q, int num_dim_qk, int num_dim_v, int num_head_q, int num_head_k,
     int num_head_v, int heads_per_group, int lse_pad_heads_per_group, int num_kvcache_blocks,
-    int num_seq_max_blocks, int qscale_pad_stride, float one_over_dk_log2e) {
+    int num_seq_max_blocks, int qscale_pad_stride, float one_over_dk_log2e,
+    const float *p_scale_ptr = nullptr, const float *p_scale_inv_ptr = nullptr) {
   using namespace cute;  // NOLINT
 
   int idx = threadIdx.x;
@@ -257,6 +258,25 @@ attention_decode_fp8_multistage_ws_smallm_splitk_qpertoken_perhead_kvpertensor_k
       }
     }
 
+    // Per-row P_scale / P_scale_inv cache, indexed by the same iqhead logic as qkscales.
+    Tensor pscales = make_tensor<float>(Int<kM>{});
+    Tensor pscales_inv = make_tensor<float>(Int<kM>{});
+    if constexpr (kHasPScale) {
+#pragma unroll
+      for (int i = 0; i < kM; i++) {
+        int im = get<1>(tI_nm(0, i));
+        int iqhead = im % kHeadsPerGroup;
+        if (iqhead < heads_per_group) {
+          int ihq = ihead_kv * heads_per_group + iqhead;
+          pscales(i) = p_scale_ptr[ihq];
+          pscales_inv(i) = p_scale_inv_ptr[ihq];
+        } else {
+          pscales(i) = 1.f;
+          pscales_inv(i) = 1.f;
+        }
+      }
+    }
+
     clear(gSum);
     fill(gMax, -std::numeric_limits<float>::infinity());
     fill(gSoftmaxScale, one_over_dk_log2e);
@@ -319,6 +339,17 @@ attention_decode_fp8_multistage_ws_smallm_splitk_qpertoken_perhead_kvpertensor_k
       online_softmax<true, kTileM>(tAttr_nm, gMax, gSum, tYr_nm, gSoftmaxScale, shm_max, iwarpgroup,
                                    iwarp_in_warpgroup, ilane_in_warpgroup);
 
+      // optional: scale P by per-q-head p_scale before fp8 quantization
+      if constexpr (kHasPScale) {
+#pragma unroll
+        for (int im = 0; im < kM; ++im) {
+#pragma unroll
+          for (int in = 0; in < kN; ++in) {
+            tAttr_nm(in, im) *= pscales(im);
+          }
+        }
+      }
+
       // tAttfp32 => fp8
       cast_fp32reg<Tin>(tAttr_nm, tAttAfp8);
 
@@ -371,6 +402,17 @@ attention_decode_fp8_multistage_ws_smallm_splitk_qpertoken_perhead_kvpertensor_k
       online_softmax<false, kTileM>(tAttr_nm, gMax, gSum, tYr_nm, gSoftmaxScale, shm_max,
                                     iwarpgroup, iwarp_in_warpgroup, ilane_in_warpgroup);
 
+      // optional: scale P by per-q-head p_scale before fp8 quantization
+      if constexpr (kHasPScale) {
+#pragma unroll
+        for (int im = 0; im < kM; ++im) {
+#pragma unroll
+          for (int in = 0; in < kN; ++in) {
+            tAttr_nm(in, im) *= pscales(im);
+          }
+        }
+      }
+
       // Y = PV
       cast_fp32reg<Tin>(tAttr_nm, tAttAfp8);
 
@@ -406,9 +448,22 @@ attention_decode_fp8_multistage_ws_smallm_splitk_qpertoken_perhead_kvpertensor_k
                                    ilane_in_warpgroup);
     }
 
+    if constexpr (kHasPScale) {
+      // fuse vscale * p_scale_inv[ihead_q] per row to compensate the P*p_scale scaling.
+      constexpr int kVdim = size<0>(tYr_nm);
 #pragma unroll
-    for (int i = 0; i < size(tYr); ++i) {
-      tYr(i) *= vscale;
+      for (int im = 0; im < kM; ++im) {
+        float ve = vscale * pscales_inv(im);
+#pragma unroll
+        for (int in = 0; in < kVdim; ++in) {
+          tYr_nm(in, im) *= ve;
+        }
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < size(tYr); ++i) {
+        tYr(i) *= vscale;
+      }
     }
 
     bar_sync<kWarpGroupN * 128>(kWarpGroupN);

@@ -5,52 +5,17 @@
 #include <iostream>
 
 #include "src/hadamard/hadamard.h"
+#include "src/hadamard/hadamard_device.cuh"
 #include "src/utils/utils.cuh"
 
 namespace hpc {
 namespace hadamard {
 namespace kernels {
 
-// ============================
-//   Primitive Hadamard Ops
-// ============================
-
-template <int kStride, int kBaseSize>
-__device__ __forceinline__ void unit_hadamard(vec_t<float, kBaseSize>& data, int ilane) {
-  const float sign = (ilane & kStride) ? -1.f : 1.f;
-#pragma unroll
-  for (int i = 0; i < kBaseSize; i++) {
-    float other = __shfl_xor_sync(0xFFFFFFFF, data[i], kStride);
-    data[i] = sign * data[i] + other;
-  }
-}
-
-template <int kBaseSize>
-__device__ __forceinline__ void base_hadamard(vec_t<float, kBaseSize>& x);
-
-template <>
-__device__ __forceinline__ void base_hadamard<4>(vec_t<float, 4>& x) {
-  float y0 = x[0] + x[1] + x[2] + x[3];
-  float y1 = x[0] - x[1] + x[2] - x[3];
-  float y2 = x[0] + x[1] - x[2] - x[3];
-  float y3 = x[0] - x[1] - x[2] + x[3];
-  x[0] = y0;
-  x[1] = y1;
-  x[2] = y2;
-  x[3] = y3;
-}
-
-// n=64 device Hadamard Compute
-// 1 warp for 2 rows of n=64 hadamard
-__device__ __forceinline__ void hadamard_n64_warp(vec_t<float, 4>& data, int ilane) {
-  // 4 rounds of butterfly
-  unit_hadamard<1, 4>(data, ilane);
-  unit_hadamard<2, 4>(data, ilane);
-  unit_hadamard<4, 4>(data, ilane);
-  unit_hadamard<8, 4>(data, ilane);
-  // 4-point intra-thread Hadamard
-  base_hadamard<4>(data);
-}
+using device::base_hadamard;
+using device::hadamard_n128_warp;
+using device::hadamard_n64_warp;
+using device::unit_hadamard;
 
 // ============================
 //   Optimized Hadamard Kernel for n=64
@@ -111,6 +76,60 @@ __global__ void hadamard_transform_n64(const DType* input_ptr, DType* output_ptr
       }
     }
     store(output_ptr + ibatch * kN + local_lane * kBaseSize, v);
+  }
+}
+
+// ============================
+//   Optimized Hadamard Kernel for n=128
+// ============================
+// For n=128: kBaseSize=4, kActiveThreads=32 → one warp per row.
+// DType: input/output data type (__nv_bfloat16 or float)
+template <typename DType, int kNumWarps>
+__global__ void hadamard_transform_n128(const DType* input_ptr, DType* output_ptr, float inv_sqrt_d,
+                                        int num_rows) {
+  constexpr int kWarpSize = 32;
+  constexpr int kN = 128;
+  constexpr int kBaseSize = 4;
+  constexpr int kRowsPerWarp = 1;
+
+  const int iwarp = threadIdx.x / kWarpSize;
+  const int ilane = threadIdx.x % kWarpSize;
+
+  const int ibatch = blockIdx.x * (kNumWarps * kRowsPerWarp) + iwarp;
+  const bool is_valid_row = (ibatch < num_rows);
+
+  // Initialize to 0; invalid rows still participate in shfl
+  vec_t<float, kBaseSize> data = {};
+
+  if (is_valid_row) {
+    auto v = load<DType, kBaseSize>(input_ptr + ibatch * kN + ilane * kBaseSize);
+    if constexpr (std::is_same_v<DType, __nv_bfloat16>) {
+#pragma unroll
+      for (int i = 0; i < kBaseSize; i++) {
+        data[i] = __bfloat162float(v[i]);
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < kBaseSize; i++) {
+        data[i] = static_cast<float>(v[i]);
+      }
+    }
+  }
+
+  hadamard_n128_warp(data, ilane);
+
+  if (is_valid_row) {
+    vec_t<DType, kBaseSize> v;
+#pragma unroll
+    for (int i = 0; i < kBaseSize; i++) {
+      float val = data[i] * inv_sqrt_d;
+      if constexpr (std::is_same_v<DType, __nv_bfloat16>) {
+        v[i] = __float2bfloat16(val);
+      } else {
+        v[i] = static_cast<DType>(val);
+      }
+    }
+    store(output_ptr + ibatch * kN + ilane * kBaseSize, v);
   }
 }
 
@@ -408,6 +427,12 @@ bool hadamard_transform_async(const void* input_ptr, void* output_ptr, float inv
       kernels::hadamard_transform_n64<DType, kNumWarps>
           <<<grid, block, 0, stream>>>(reinterpret_cast<const DType*>(input_ptr),
                                        reinterpret_cast<DType*>(output_ptr), inv_sqrt_d, num_rows);
+    } else if (n == 128) {
+      constexpr int kRowsPerBlock128 = kNumWarps;
+      dim3 grid((num_rows + kRowsPerBlock128 - 1) / kRowsPerBlock128);
+      kernels::hadamard_transform_n128<DType, kNumWarps>
+          <<<grid, block, 0, stream>>>(reinterpret_cast<const DType*>(input_ptr),
+                                       reinterpret_cast<DType*>(output_ptr), inv_sqrt_d, num_rows);
     } else {
       std::cout << "not supported dimension for hadamard_transform_async: " << n << std::endl;
       return false;
@@ -418,6 +443,12 @@ bool hadamard_transform_async(const void* input_ptr, void* output_ptr, float inv
       constexpr int kRowsPerBlock64 = kNumWarps * 2;
       dim3 grid((num_rows + kRowsPerBlock64 - 1) / kRowsPerBlock64);
       kernels::hadamard_transform_n64<DType, kNumWarps>
+          <<<grid, block, 0, stream>>>(reinterpret_cast<const DType*>(input_ptr),
+                                       reinterpret_cast<DType*>(output_ptr), inv_sqrt_d, num_rows);
+    } else if (n == 128) {
+      constexpr int kRowsPerBlock128 = kNumWarps;
+      dim3 grid((num_rows + kRowsPerBlock128 - 1) / kRowsPerBlock128);
+      kernels::hadamard_transform_n128<DType, kNumWarps>
           <<<grid, block, 0, stream>>>(reinterpret_cast<const DType*>(input_ptr),
                                        reinterpret_cast<DType*>(output_ptr), inv_sqrt_d, num_rows);
     } else {
