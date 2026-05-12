@@ -3,7 +3,6 @@ import ctypes
 import importlib
 import os
 import sys
-import warnings
 from pathlib import Path
 from types import ModuleType
 from typing import Dict
@@ -41,7 +40,6 @@ def _load_nvshmem_library():
     if project_root and project_root not in search_roots:
         search_roots.append(project_root)
 
-    errors: list[tuple[Path, Exception]] = []
     for root in search_roots:
         so_path = root / _NVSHMEM_REL
         if not so_path.exists():
@@ -49,17 +47,8 @@ def _load_nvshmem_library():
         try:
             ctypes.CDLL(str(so_path), mode=ctypes.RTLD_GLOBAL)
             return
-        except OSError as e:
-            errors.append((so_path, e))
-
-    msg = "hpc-ops: failed to load libnvshmem_host.so.\n  Searched:\n"
-    for root in search_roots:
-        msg += f"    {root / _NVSHMEM_REL}\n"
-    for so_path, e in errors:
-        msg += f"  Load error for {so_path}: {e}\n"
-    if not search_roots:
-        msg += "    (no search roots — set HPC_OPS_ROOT or use editable install)\n"
-    warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        except OSError:
+            continue
 
 
 def _discover_modules() -> Dict[str, ModuleType]:
