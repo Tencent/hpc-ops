@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 from torch import Tensor
 
@@ -110,8 +112,11 @@ def pad_and_transpose_fake(x):
 
 
 @torch.library.register_fake("hpc::gemm_blockwise")
-def gemm_blockwise_fake(x, weight, x_scale, w_scale, bias):
-    return torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+def gemm_blockwise_fake(x, weight, x_scale, w_scale, trans_xscale: bool, bias: Optional[Tensor]):
+    # Matches gemm_blockwise_entry: output is bf16; trans_xscale only affects internal layout.
+    return torch.empty(
+        (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device, layout=x.layout
+    )
 
 
 @torch.library.register_fake("hpc::gemm_bf16xfp32")
