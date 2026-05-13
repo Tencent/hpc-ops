@@ -50,7 +50,7 @@ __device__ __forceinline__ void splitk_reduce(Tout *y_ptr, float *splitk_y_ptr, 
     return;
   }
 
-  if (itile_n * kTileN + ilane * 4 >= n) {
+  if (ilane * 4 >= kTileN || itile_n * kTileN + ilane * 4 >= n) {
     return;
   }
 
