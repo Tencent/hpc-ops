@@ -25,6 +25,8 @@ static constexpr auto mma_selector_fp8() {
       return SM90_64x16x32_F32E4M3E4M3_RS_TN<>{};
     } else if constexpr (kTileM == 24) {
       return SM90_64x24x32_F32E4M3E4M3_RS_TN<>{};
+    } else if constexpr (kTileM == 32) {
+      return SM90_64x32x32_F32E4M3E4M3_RS_TN<>{};
     }
   } else {
     if constexpr (kTileM == 8) {
@@ -33,6 +35,8 @@ static constexpr auto mma_selector_fp8() {
       return SM90_64x16x32_F32E4M3E4M3_SS_TN<>{};
     } else if constexpr (kTileM == 24) {
       return SM90_64x24x32_F32E4M3E4M3_SS_TN<>{};
+    } else if constexpr (kTileM == 32) {
+      return SM90_64x32x32_F32E4M3E4M3_SS_TN<>{};
     }
   }
 }
@@ -301,6 +305,31 @@ bool smallm_splitk_dim128_fp8_qpertoken_perhead_kvpertensor_async(
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
                 vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
           }
+        } else if (num_seq_q == 4) {
+          constexpr int kTileM = 32;
+          if (block_size == 32) {
+            constexpr int kBlockSize = 32;
+            launch_attention_decode_fp8_dim128_smallm_splitk<
+                kTileM, kTileN, kTileK, kTileV, kWarpGroupN, kBlockSize, kSplitK, kSplitMinLen>(
+                y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+                num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr,
+                new_kv_included, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
+                heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+                num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
+                kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+          } else if (block_size == 64) {
+            constexpr int kBlockSize = 64;
+            launch_attention_decode_fp8_dim128_smallm_splitk<
+                kTileM, kTileN, kTileK, kTileV, kWarpGroupN, kBlockSize, kSplitK, kSplitMinLen>(
+                y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+                num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr,
+                new_kv_included, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
+                heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+                num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
+                kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+          }
         }
       } else if (splitk_min_len == 512) {
         constexpr int kSplitMinLen = 512;
@@ -356,6 +385,31 @@ bool smallm_splitk_dim128_fp8_qpertoken_perhead_kvpertensor_async(
           }
         } else if (num_seq_q == 3) {
           constexpr int kTileM = 24;
+          if (block_size == 32) {
+            constexpr int kBlockSize = 32;
+            launch_attention_decode_fp8_dim128_smallm_splitk<
+                kTileM, kTileN, kTileK, kTileV, kWarpGroupN, kBlockSize, kSplitK, kSplitMinLen>(
+                y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+                num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr,
+                new_kv_included, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
+                heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+                num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
+                kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+          } else if (block_size == 64) {
+            constexpr int kBlockSize = 64;
+            launch_attention_decode_fp8_dim128_smallm_splitk<
+                kTileM, kTileN, kTileK, kTileV, kWarpGroupN, kBlockSize, kSplitK, kSplitMinLen>(
+                y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+                num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr,
+                new_kv_included, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
+                heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+                num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
+                kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+          }
+        } else if (num_seq_q == 4) {
+          constexpr int kTileM = 32;
           if (block_size == 32) {
             constexpr int kBlockSize = 32;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -436,6 +490,31 @@ bool smallm_splitk_dim128_fp8_qpertoken_perhead_kvpertensor_async(
         }
       } else if (num_seq_q == 3) {
         constexpr int kTileM = 24;
+        if (block_size == 32) {
+          constexpr int kBlockSize = 32;
+          launch_attention_decode_fp8_dim128_smallm_splitk<
+              kTileM, kTileN, kTileK, kTileV, kWarpGroupN, kBlockSize, kSplitK, kSplitMinLen>(
+              y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+              num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr,
+              new_kv_included, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
+              heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+              num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
+              kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+        } else if (block_size == 64) {
+          constexpr int kBlockSize = 64;
+          launch_attention_decode_fp8_dim128_smallm_splitk<
+              kTileM, kTileN, kTileK, kTileV, kWarpGroupN, kBlockSize, kSplitK, kSplitMinLen>(
+              y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+              num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr,
+              new_kv_included, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
+              heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+              num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
+              kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+        }
+      } else if (num_seq_q == 4) {
+        constexpr int kTileM = 32;
         if (block_size == 32) {
           constexpr int kBlockSize = 32;
           launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -542,6 +621,31 @@ bool smallm_splitk_dim128_fp8_qpertoken_perhead_kvpertensor_async(
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
                 vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
           }
+        } else if (num_seq_q == 4) {
+          constexpr int kTileM = 32;
+          if (block_size == 32) {
+            constexpr int kBlockSize = 32;
+            launch_attention_decode_fp8_dim128_smallm_splitk<
+                kTileM, kTileN, kTileK, kTileV, kWarpGroupN, kBlockSize, kSplitK, kSplitMinLen>(
+                y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+                num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr,
+                new_kv_included, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
+                heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+                num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
+                kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+          } else if (block_size == 64) {
+            constexpr int kBlockSize = 64;
+            launch_attention_decode_fp8_dim128_smallm_splitk<
+                kTileM, kTileN, kTileK, kTileV, kWarpGroupN, kBlockSize, kSplitK, kSplitMinLen>(
+                y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+                num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr,
+                new_kv_included, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
+                heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+                num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
+                kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+          }
         }
       } else if (splitk_min_len == 512) {
         constexpr int kSplitMinLen = 512;
@@ -597,6 +701,31 @@ bool smallm_splitk_dim128_fp8_qpertoken_perhead_kvpertensor_async(
           }
         } else if (num_seq_q == 3) {
           constexpr int kTileM = 24;
+          if (block_size == 32) {
+            constexpr int kBlockSize = 32;
+            launch_attention_decode_fp8_dim128_smallm_splitk<
+                kTileM, kTileN, kTileK, kTileV, kWarpGroupN, kBlockSize, kSplitK, kSplitMinLen>(
+                y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+                num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr,
+                new_kv_included, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
+                heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+                num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
+                kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+          } else if (block_size == 64) {
+            constexpr int kBlockSize = 64;
+            launch_attention_decode_fp8_dim128_smallm_splitk<
+                kTileM, kTileN, kTileK, kTileV, kWarpGroupN, kBlockSize, kSplitK, kSplitMinLen>(
+                y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+                num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr,
+                new_kv_included, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
+                heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+                num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
+                kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+          }
+        } else if (num_seq_q == 4) {
+          constexpr int kTileM = 32;
           if (block_size == 32) {
             constexpr int kBlockSize = 32;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -677,6 +806,31 @@ bool smallm_splitk_dim128_fp8_qpertoken_perhead_kvpertensor_async(
         }
       } else if (num_seq_q == 3) {
         constexpr int kTileM = 24;
+        if (block_size == 32) {
+          constexpr int kBlockSize = 32;
+          launch_attention_decode_fp8_dim128_smallm_splitk<
+              kTileM, kTileN, kTileK, kTileV, kWarpGroupN, kBlockSize, kSplitK, kSplitMinLen>(
+              y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+              num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr,
+              new_kv_included, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
+              heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+              num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
+              kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+        } else if (block_size == 64) {
+          constexpr int kBlockSize = 64;
+          launch_attention_decode_fp8_dim128_smallm_splitk<
+              kTileM, kTileN, kTileK, kTileV, kWarpGroupN, kBlockSize, kSplitK, kSplitMinLen>(
+              y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+              num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr,
+              new_kv_included, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
+              heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
+              num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
+              kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+        }
+      } else if (num_seq_q == 4) {
+        constexpr int kTileM = 32;
         if (block_size == 32) {
           constexpr int kBlockSize = 32;
           launch_attention_decode_fp8_dim128_smallm_splitk<

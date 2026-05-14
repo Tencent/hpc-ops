@@ -123,13 +123,14 @@ void attention_with_kvcache_blocksparse_prefill_qpertoken_perhead_kvpertensor_fp
     void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
     int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV,
-    int ldV1, int ldV2, const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream) {
+    int ldV1, int ldV2, const void *block_mask_ptr, int num_tile_kv_in_mask,
+    const float *p_scale_ptr, const float *p_scale_inv_ptr, cudaStream_t stream) {
   prefill::warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128_async(
       y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
       block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
       max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks, block_size,
       num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1, ldV2, block_mask_ptr,
-      num_tile_kv_in_mask, stream);
+      num_tile_kv_in_mask, p_scale_ptr, p_scale_inv_ptr, stream);
 }
 
 void attention_with_kvcache_blocksparse_prefill_qkpertoken_perhead_vperhead_fp8_async(
@@ -140,13 +141,14 @@ void attention_with_kvcache_blocksparse_prefill_qkpertoken_perhead_vperhead_fp8_
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
     int block_size, int scale_block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK,
     int ldK1, int ldK2, int ldV, int ldV1, int ldV2, int ldKS, int ldKS1, int ldKS2,
-    const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream) {
+    const void *block_mask_ptr, int num_tile_kv_in_mask, const float *p_scale_ptr,
+    const float *p_scale_inv_ptr, cudaStream_t stream) {
   prefill::warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128_async(
       y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
       block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
       max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks, block_size,
       scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1, ldV2, ldKS, ldKS1,
-      ldKS2, block_mask_ptr, num_tile_kv_in_mask, stream);
+      ldKS2, block_mask_ptr, num_tile_kv_in_mask, p_scale_ptr, p_scale_inv_ptr, stream);
 }
 
 void attention_blocksparse_prefill_fp8_dim192_async(

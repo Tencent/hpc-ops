@@ -16,7 +16,7 @@ namespace hpc {
 namespace attention {
 namespace prefill {
 
-template <int kBlockSize, bool kHasMask>
+template <int kBlockSize, bool kHasMask, bool kHasPScale>
 void launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
@@ -24,7 +24,8 @@ void launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8
     void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
     int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV,
-    int ldV1, int ldV2, const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream) {
+    int ldV1, int ldV2, const void *block_mask_ptr, int num_tile_kv_in_mask,
+    const float *p_scale_ptr, const float *p_scale_inv_ptr, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   using Tin = cute::float_e4m3_t;
@@ -90,18 +91,19 @@ void launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8
     auto kernel = kernels::
         attention_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_prefill_fp8_warp_specialization_kernel<  // NOLINT
             decltype(config), decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y),
-            decltype(tma_qs), kHasMask>;
+            decltype(tma_qs), kHasMask, kHasPScale>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     kernel<<<grid, block, shm_size, stream>>>(
         tma_qy, tma_k, tma_v, tma_qs, (const float *)kscale_ptr, (const float *)vscale_ptr,
         (const int *)cu_seqlens_q_ptr, (const int *)seqlens_kvcache_ptr, (const int *)block_ids_ptr,
         num_batch, max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
         num_kvcache_blocks, num_seq_max_blocks, one_over_dk_log2e, head_kv_divmod, head_q_divmod,
-        tile_m_divmod, (const uint8_t *)block_mask_ptr, num_tile_kv_in_mask);
+        tile_m_divmod, (const uint8_t *)block_mask_ptr, num_tile_kv_in_mask, p_scale_ptr,
+        p_scale_inv_ptr);
   }
 }
 
-template <int kBlockSize, bool kHasMask>
+template <int kBlockSize, bool kHasMask, bool kHasPScale>
 void launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
@@ -110,7 +112,8 @@ void launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_d
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
     int block_size, int scale_block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK,
     int ldK1, int ldK2, int ldV, int ldV1, int ldV2, int ldKS, int ldKS1, int ldKS2,
-    const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream) {
+    const void *block_mask_ptr, int num_tile_kv_in_mask, const float *p_scale_ptr,
+    const float *p_scale_inv_ptr, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   using Tin = cute::float_e4m3_t;
@@ -190,7 +193,7 @@ void launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_d
     auto kernel = kernels::
         attention_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_prefill_fp8_warp_specialization_kernel<  // NOLINT(whitespace/line_length)
             decltype(config), decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y),
-            decltype(tma_qs), decltype(tma_ks), kHasMask>;
+            decltype(tma_qs), decltype(tma_ks), kHasMask, kHasPScale>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     kernel<<<grid, block, shm_size, stream>>>(
         tma_qy, tma_k, tma_v, tma_qs, tma_ks, (const float *)qscale_ptr, (const float *)kscale_ptr,
@@ -198,7 +201,7 @@ void launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_d
         (const int *)block_ids_ptr, num_batch, max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v,
         num_dim_scale, num_head_q, num_head_kv, num_kvcache_blocks, num_scale_blocks,
         num_seq_max_blocks, one_over_dk_log2e, head_kv_divmod, head_q_divmod, tile_m_divmod,
-        (const uint8_t *)block_mask_ptr, num_tile_kv_in_mask);
+        (const uint8_t *)block_mask_ptr, num_tile_kv_in_mask, p_scale_ptr, p_scale_inv_ptr);
   }
 }
 
@@ -209,45 +212,87 @@ void warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128
     void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
     int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV,
-    int ldV1, int ldV2, const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream) {
+    int ldV1, int ldV2, const void *block_mask_ptr, int num_tile_kv_in_mask,
+    const float *p_scale_ptr, const float *p_scale_inv_ptr, cudaStream_t stream) {
   bool has_mask = block_mask_ptr != nullptr;
+  bool has_p_scale = p_scale_ptr != nullptr;
   if (block_size == 32) {
     constexpr int kBlockSize = 32;
     if (has_mask) {
-      launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128<kBlockSize,
-                                                                                         true>(
-          y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
-          cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
-          max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
-          num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1,
-          ldV2, block_mask_ptr, num_tile_kv_in_mask, stream);
+      if (has_p_scale) {
+        launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128<
+            kBlockSize, true, true>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV,
+            ldV1, ldV2, block_mask_ptr, num_tile_kv_in_mask, p_scale_ptr, p_scale_inv_ptr, stream);
+      } else {
+        launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128<
+            kBlockSize, true, false>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV,
+            ldV1, ldV2, block_mask_ptr, num_tile_kv_in_mask, nullptr, nullptr, stream);
+      }
     } else {
-      launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128<kBlockSize,
-                                                                                         false>(
-          y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
-          cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
-          max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
-          num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1,
-          ldV2, nullptr, 0, stream);
+      if (has_p_scale) {
+        launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128<
+            kBlockSize, false, true>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV,
+            ldV1, ldV2, nullptr, 0, p_scale_ptr, p_scale_inv_ptr, stream);
+      } else {
+        launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128<
+            kBlockSize, false, false>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV,
+            ldV1, ldV2, nullptr, 0, nullptr, nullptr, stream);
+      }
     }
   } else if (block_size == 64) {
     constexpr int kBlockSize = 64;
     if (has_mask) {
-      launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128<kBlockSize,
-                                                                                         true>(
-          y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
-          cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
-          max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
-          num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1,
-          ldV2, block_mask_ptr, num_tile_kv_in_mask, stream);
+      if (has_p_scale) {
+        launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128<
+            kBlockSize, true, true>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV,
+            ldV1, ldV2, block_mask_ptr, num_tile_kv_in_mask, p_scale_ptr, p_scale_inv_ptr, stream);
+      } else {
+        launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128<
+            kBlockSize, true, false>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV,
+            ldV1, ldV2, block_mask_ptr, num_tile_kv_in_mask, nullptr, nullptr, stream);
+      }
     } else {
-      launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128<kBlockSize,
-                                                                                         false>(
-          y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
-          cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
-          max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
-          num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1,
-          ldV2, nullptr, 0, stream);
+      if (has_p_scale) {
+        launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128<
+            kBlockSize, false, true>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV,
+            ldV1, ldV2, nullptr, 0, p_scale_ptr, p_scale_inv_ptr, stream);
+      } else {
+        launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128<
+            kBlockSize, false, false>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV,
+            ldV1, ldV2, nullptr, 0, nullptr, nullptr, stream);
+      }
     }
   }
 }
@@ -260,45 +305,93 @@ void warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128_a
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
     int block_size, int scale_block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK,
     int ldK1, int ldK2, int ldV, int ldV1, int ldV2, int ldKS, int ldKS1, int ldKS2,
-    const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream) {
+    const void *block_mask_ptr, int num_tile_kv_in_mask, const float *p_scale_ptr,
+    const float *p_scale_inv_ptr, cudaStream_t stream) {
   bool has_mask = block_mask_ptr != nullptr;
+  bool has_p_scale = p_scale_ptr != nullptr;
   if (block_size == 32) {
     constexpr int kBlockSize = 32;
     if (has_mask) {
-      launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128<kBlockSize,
-                                                                                       true>(
-          y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
-          cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
-          max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
-          num_kvcache_blocks, block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1,
-          ldK2, ldV, ldV1, ldV2, ldKS, ldKS1, ldKS2, block_mask_ptr, num_tile_kv_in_mask, stream);
+      if (has_p_scale) {
+        launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128<
+            kBlockSize, true, true>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK,
+            ldK1, ldK2, ldV, ldV1, ldV2, ldKS, ldKS1, ldKS2, block_mask_ptr, num_tile_kv_in_mask,
+            p_scale_ptr, p_scale_inv_ptr, stream);
+      } else {
+        launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128<
+            kBlockSize, true, false>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK,
+            ldK1, ldK2, ldV, ldV1, ldV2, ldKS, ldKS1, ldKS2, block_mask_ptr, num_tile_kv_in_mask,
+            nullptr, nullptr, stream);
+      }
     } else {
-      launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128<kBlockSize,
-                                                                                       false>(
-          y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
-          cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
-          max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
-          num_kvcache_blocks, block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1,
-          ldK2, ldV, ldV1, ldV2, ldKS, ldKS1, ldKS2, nullptr, 0, stream);
+      if (has_p_scale) {
+        launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128<
+            kBlockSize, false, true>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK,
+            ldK1, ldK2, ldV, ldV1, ldV2, ldKS, ldKS1, ldKS2, nullptr, 0, p_scale_ptr,
+            p_scale_inv_ptr, stream);
+      } else {
+        launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128<
+            kBlockSize, false, false>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK,
+            ldK1, ldK2, ldV, ldV1, ldV2, ldKS, ldKS1, ldKS2, nullptr, 0, nullptr, nullptr, stream);
+      }
     }
   } else if (block_size == 64) {
     constexpr int kBlockSize = 64;
     if (has_mask) {
-      launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128<kBlockSize,
-                                                                                       true>(
-          y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
-          cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
-          max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
-          num_kvcache_blocks, block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1,
-          ldK2, ldV, ldV1, ldV2, ldKS, ldKS1, ldKS2, block_mask_ptr, num_tile_kv_in_mask, stream);
+      if (has_p_scale) {
+        launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128<
+            kBlockSize, true, true>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK,
+            ldK1, ldK2, ldV, ldV1, ldV2, ldKS, ldKS1, ldKS2, block_mask_ptr, num_tile_kv_in_mask,
+            p_scale_ptr, p_scale_inv_ptr, stream);
+      } else {
+        launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128<
+            kBlockSize, true, false>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK,
+            ldK1, ldK2, ldV, ldV1, ldV2, ldKS, ldKS1, ldKS2, block_mask_ptr, num_tile_kv_in_mask,
+            nullptr, nullptr, stream);
+      }
     } else {
-      launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128<kBlockSize,
-                                                                                       false>(
-          y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
-          cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
-          max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
-          num_kvcache_blocks, block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK, ldK1,
-          ldK2, ldV, ldV1, ldV2, ldKS, ldKS1, ldKS2, nullptr, 0, stream);
+      if (has_p_scale) {
+        launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128<
+            kBlockSize, false, true>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK,
+            ldK1, ldK2, ldV, ldV1, ldV2, ldKS, ldKS1, ldKS2, nullptr, 0, p_scale_ptr,
+            p_scale_inv_ptr, stream);
+      } else {
+        launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128<
+            kBlockSize, false, false>(
+            y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr,
+            cu_seqlens_q_ptr, block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q,
+            max_seq_q, max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv,
+            num_kvcache_blocks, block_size, scale_block_size, num_seq_max_blocks, ldY, ldQ, ldK,
+            ldK1, ldK2, ldV, ldV1, ldV2, ldKS, ldKS1, ldKS2, nullptr, 0, nullptr, nullptr, stream);
+      }
     }
   }
 }

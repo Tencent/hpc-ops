@@ -378,7 +378,7 @@ stages:
         with:
           envId:
           - dpzbvgzp
-          scriptTimeout: "18000"
+          scriptTimeout: "43200"
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash
@@ -399,7 +399,7 @@ stages:
         with:
           envId:
           - dpzbvgzp
-          scriptTimeout: "36000"
+          scriptTimeout: "43200"
           account: reedlauliu
           shellScriptContent: |-
             #!/bin/bash

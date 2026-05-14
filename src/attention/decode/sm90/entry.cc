@@ -32,7 +32,7 @@ torch::Tensor attention_decode_fp8_entry(
   TORCH_CHECK(block_ids.scalar_type() == torch::kInt32, "block_ids dtype must be int32");
   TORCH_CHECK(num_seq_kvcache.scalar_type() == torch::kInt32,
               "num_seq_kvcache dtype must be int32");
-  TORCH_CHECK((mtp == 0 || mtp == 1 || mtp == 2), "we only support mtp 0, 1, 2.");
+  TORCH_CHECK((mtp == 0 || mtp == 1 || mtp == 2 || mtp == 3), "we only support mtp 0, 1, 2, 3.");
 
   int num_batch = num_seq_kvcache.size(0);
   int num_seq_q = q.size(0) / num_batch;

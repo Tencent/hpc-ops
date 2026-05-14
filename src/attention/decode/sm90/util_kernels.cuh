@@ -302,6 +302,7 @@ __device__ __forceinline__ void online_softmax(TensorA& tAttr_nm, TensorM& gMax,
   }
 
   if (ilane < 4) {
+    // Layout: 4 lanes * kM floats covers kTileM floats per warp segment.
     if constexpr (kM == 2 || kM == 4) {
       store(smem_max + iwarp * kTileM + ilane * kM, warp_max);
     } else if constexpr (kM == 6) {
@@ -309,6 +310,11 @@ __device__ __forceinline__ void online_softmax(TensorA& tAttr_nm, TensorM& gMax,
       vec_t<float, 2> warp_max2 = *reinterpret_cast<vec_t<float, 2>*>(&warp_max[4]);
       store(smem_max + iwarp * kTileM + ilane * 4, warp_max1);
       store(smem_max + iwarp * kTileM + ilane * 2 + 16, warp_max2);
+    } else if constexpr (kM == 8) {
+      vec_t<float, 4> warp_max1 = *reinterpret_cast<vec_t<float, 4>*>(&warp_max[0]);
+      vec_t<float, 4> warp_max2 = *reinterpret_cast<vec_t<float, 4>*>(&warp_max[4]);
+      store(smem_max + iwarp * kTileM + ilane * 8, warp_max1);
+      store(smem_max + iwarp * kTileM + ilane * 8 + 4, warp_max2);
     }
   }
 
@@ -326,6 +332,12 @@ __device__ __forceinline__ void online_softmax(TensorA& tAttr_nm, TensorM& gMax,
 
         reduce_max1 = load<float, 4>(smem_max + i * kTileM + ilane * 4);
         reduce_max2 = load<float, 2>(smem_max + i * kTileM + ilane * 2 + 16);
+      } else if constexpr (kM == 8) {
+        vec_t<float, 4>& reduce_max1 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_max[0]);
+        vec_t<float, 4>& reduce_max2 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_max[4]);
+
+        reduce_max1 = load<float, 4>(smem_max + i * kTileM + ilane * 8);
+        reduce_max2 = load<float, 4>(smem_max + i * kTileM + ilane * 8 + 4);
       }
 #pragma unroll
       for (int im = 0; im < kM; ++im) {
@@ -385,7 +397,7 @@ __device__ __forceinline__ void cast_fp32reg(TensorIn& tFp32r, TensorOut& tTr) {
   } else {
 #pragma unroll
     for (int i = 0; i < cute::size(tFp32r); ++i) {
-      tTr(i) = (T)(tFp32r(i));
+      tTr(i) = static_cast<T>(tFp32r(i));
     }
   }
 }
@@ -461,6 +473,7 @@ __device__ __forceinline__ void final_online_softmax(TensorY& tYr_nm, TensorS& g
   }
 
   if (ilane < 4) {
+    // Layout: 4 lanes * kM floats covers kTileM floats per warp segment.
     if constexpr (kM == 2 || kM == 4) {
       store(smem_sum + iwarp * kTileM + ilane * kM, warp_sum);
     } else if constexpr (kM == 6) {
@@ -468,6 +481,11 @@ __device__ __forceinline__ void final_online_softmax(TensorY& tYr_nm, TensorS& g
       vec_t<float, 2> warp_sum2 = *reinterpret_cast<vec_t<float, 2>*>(&warp_sum[4]);
       store(smem_sum + iwarp * kTileM + ilane * 4, warp_sum1);
       store(smem_sum + iwarp * kTileM + ilane * 2 + 16, warp_sum2);
+    } else if constexpr (kM == 8) {
+      vec_t<float, 4> warp_sum1 = *reinterpret_cast<vec_t<float, 4>*>(&warp_sum[0]);
+      vec_t<float, 4> warp_sum2 = *reinterpret_cast<vec_t<float, 4>*>(&warp_sum[4]);
+      store(smem_sum + iwarp * kTileM + ilane * 8, warp_sum1);
+      store(smem_sum + iwarp * kTileM + ilane * 8 + 4, warp_sum2);
     }
   }
 
@@ -489,6 +507,12 @@ __device__ __forceinline__ void final_online_softmax(TensorY& tYr_nm, TensorS& g
 
         reduce_sum1 = load<float, 4>(smem_sum + i * kTileM + ilane * 4);
         reduce_sum2 = load<float, 2>(smem_sum + i * kTileM + ilane * 2 + 16);
+      } else if constexpr (kM == 8) {
+        vec_t<float, 4>& reduce_sum1 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_sum[0]);
+        vec_t<float, 4>& reduce_sum2 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_sum[4]);
+
+        reduce_sum1 = load<float, 4>(smem_sum + i * kTileM + ilane * 8);
+        reduce_sum2 = load<float, 4>(smem_sum + i * kTileM + ilane * 8 + 4);
       }
 #pragma unroll
       for (int im = 0; im < kM; ++im) {

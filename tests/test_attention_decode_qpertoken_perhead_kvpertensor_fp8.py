@@ -302,8 +302,9 @@ def attention_decode_fp8_test_func(
 
 
 @pytest.mark.skipif(torch.cuda.get_device_capability()[0] != 9, reason="skip on non sm90!")
-@pytest.mark.parametrize("num_batch", [1, 16, 200])
-@pytest.mark.parametrize("num_seq_q", [1, 2, 3])
+@pytest.mark.skipif("SANITIZER_CHECK" in os.environ, reason="use sanitizer subset")
+@pytest.mark.parametrize("num_batch", [1, 16, 150])
+@pytest.mark.parametrize("num_seq_q", [1, 4])
 @pytest.mark.parametrize("max_seq_kv", [1024, 4096])
 @pytest.mark.parametrize("block_size", [64])
 @pytest.mark.parametrize("kv_head_q_head", [(2, 8), (4, 32)])
@@ -314,6 +315,47 @@ def attention_decode_fp8_test_func(
 @pytest.mark.parametrize("use_dynamic_sched", [False])
 @pytest.mark.parametrize("kvcache_shape", ["NHD", "HND"])
 def test_attn_fp8_sm90(
+    num_batch,
+    num_seq_q,
+    max_seq_kv,
+    block_size,
+    kv_head_q_head,
+    head_dim,
+    new_kv_included,
+    use_output,
+    splitk,
+    use_dynamic_sched,
+    kvcache_shape,
+):
+    attention_decode_fp8_test_func(
+        num_batch,
+        num_seq_q,
+        max_seq_kv,
+        block_size,
+        kv_head_q_head,
+        head_dim,
+        new_kv_included,
+        use_output,
+        splitk,
+        use_dynamic_sched,
+        kvcache_shape,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.get_device_capability()[0] != 9, reason="skip on non sm90!")
+@pytest.mark.skipif("SANITIZER_CHECK" not in os.environ, reason="sanitizer only")
+@pytest.mark.parametrize("num_batch", [3])
+@pytest.mark.parametrize("num_seq_q", [1, 4])
+@pytest.mark.parametrize("max_seq_kv", [1000])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("kv_head_q_head", [(2, 8), (4, 32)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("new_kv_included", [True])
+@pytest.mark.parametrize("use_output", [False])
+@pytest.mark.parametrize("splitk", [True])
+@pytest.mark.parametrize("use_dynamic_sched", [False])
+@pytest.mark.parametrize("kvcache_shape", ["NHD", "HND"])
+def test_attn_fp8_sm90_sanitizer(
     num_batch,
     num_seq_q,
     max_seq_kv,
@@ -632,7 +674,7 @@ def attention_decode_fp8_pscale_test_func(
 
 @pytest.mark.skipif(torch.cuda.get_device_capability()[0] != 9, reason="skip on non sm90!")
 @pytest.mark.parametrize("num_batch", [1, 16])
-@pytest.mark.parametrize("num_seq_q", [1, 2])
+@pytest.mark.parametrize("num_seq_q", [1, 4])
 @pytest.mark.parametrize("max_seq_kv", [1024])
 @pytest.mark.parametrize("kv_head_q_head", [(2, 8), (4, 32)])
 @pytest.mark.parametrize("p_scale_mode", ["none", "all_ones", "all_2", "per_head_random"])

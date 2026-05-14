@@ -120,6 +120,108 @@ def naive_attn_with_kvcache_qkpv_sparse(
     return output
 
 
+def naive_attn_with_kvcache_qkpv_sparse_pscale(
+    q,
+    k_cache,
+    v_cache,
+    qscale,
+    kscale,
+    vscale,
+    cache_seqlens,
+    page_table,
+    block_mask=None,
+    p_scale=None,
+    p_scale_inv=None,
+    causal=True,
+):
+    """PScale-aware sparse reference for the qkpertoken_perhead_vperhead layout."""
+    num_batch, num_seq_q, num_head_q, num_dim_qk = q.shape
+    _, block_size, num_head_kv, _ = k_cache.shape
+    _, _, _, num_dim_v = v_cache.shape
+    num_group = num_head_q // num_head_kv
+    output = torch.empty_like(q).to(torch.bfloat16)
+    has_ps = p_scale is not None
+    if has_ps:
+        assert p_scale_inv is not None and p_scale.shape == (num_head_q,)
+
+    kvcache_blocks = (cache_seqlens + block_size - 1) // block_size
+
+    for i in range(num_batch):
+        BQ = q[i].transpose(0, 1).float()
+        blk_ids = page_table[i, : kvcache_blocks[i]]
+        num_seq_kv = cache_seqlens[i]
+        BK = (
+            k_cache[blk_ids]
+            .reshape(-1, num_head_kv, num_dim_qk)
+            .transpose(0, 1)[:, :num_seq_kv, :]
+            .repeat_interleave(num_group, dim=0)
+        ).float()
+        BV = (
+            v_cache[blk_ids]
+            .reshape(-1, num_head_kv, num_dim_v)
+            .transpose(0, 1)[:, :num_seq_kv, :]
+            .repeat_interleave(num_group, dim=0)
+        ).float()
+        BKS = (
+            kscale[blk_ids, :, :, :]
+            .permute(0, 1, 3, 2)
+            .reshape(-1, num_head_kv)
+            .transpose(0, 1)[:, :num_seq_kv]
+            .repeat_interleave(num_group, dim=0)
+        ).float()
+
+        scale = qscale[i, :, :].unsqueeze(-1)[:, :num_seq_q, :]
+        scores = torch.matmul(BQ, BK.transpose(-2, -1)) / math.sqrt(num_dim_qk)
+        scores = scores * scale * BKS.unsqueeze(1)
+
+        if block_mask is not None:
+            bm = block_mask[i]
+            elem_mask = bm.repeat_interleave(BSA_BLOCK, dim=-2)[:, :num_seq_q, :]
+            elem_mask = elem_mask.repeat_interleave(BSA_BLOCK, dim=-1)[:, :, :num_seq_kv]
+            scores = scores.masked_fill(~elem_mask, float("-inf"))
+
+        if causal:
+            cm = (
+                torch.tril(torch.ones(num_seq_kv, num_seq_kv, device=q.device, dtype=torch.bool))[
+                    (num_seq_kv - num_seq_q) :, :
+                ]
+                .unsqueeze(0)
+                .unsqueeze(0)
+            )
+            scores = scores.masked_fill(~cm, float("-inf"))
+
+        attn_weights = torch.exp(scores - scores.max(dim=-1, keepdim=True)[0])
+        gsum = attn_weights.sum(dim=-1, keepdim=True)
+        if has_ps:
+            attn_weights = attn_weights * p_scale[:, None, None]
+        attn_weights = attn_weights.to(torch.float8_e4m3fn).float()
+
+        out_head = torch.matmul(attn_weights, BV) / gsum
+        vscale_eff = vscale[:, None, None].repeat_interleave(num_group, dim=0)
+        if has_ps:
+            vscale_eff = vscale_eff * p_scale_inv[:, None, None]
+        output[i] = (out_head * vscale_eff).transpose(1, 2)
+
+    return output
+
+
+def _make_pscale(mode, num_head_q, device):
+    if mode == "none":
+        return None, None
+    if mode == "all_ones":
+        p = torch.ones(num_head_q, dtype=torch.float32, device=device)
+        return p, p.clone()
+    if mode == "all_2":
+        p = torch.full((num_head_q,), 2.0, dtype=torch.float32, device=device)
+        pi = torch.full((num_head_q,), 0.5, dtype=torch.float32, device=device)
+        return p, pi
+    if mode == "per_head_random":
+        g = torch.Generator(device=device).manual_seed(20240514)
+        p = 0.7 + 0.8 * torch.rand(num_head_q, generator=g, device=device, dtype=torch.float32)
+        return p, 1.0 / p
+    raise ValueError(mode)
+
+
 @pytest.mark.parametrize("num_batch", [2])
 @pytest.mark.parametrize("num_seq", [1024, 2048])
 @pytest.mark.parametrize("num_head_q,num_head_kv", [(4, 1)])
@@ -240,3 +342,114 @@ def test_kvcache_blocksparse_qkpertoken_perhead_vperhead_prefill_fp8(
     )
 
     assert allclose(gt, my, atol=0.1)
+
+
+@pytest.mark.parametrize("skip_ratio", [0.0, 0.5])
+@pytest.mark.parametrize("p_scale_mode", ["none", "all_ones", "all_2", "per_head_random"])
+def test_kvcache_blocksparse_qkpertoken_perhead_vperhead_prefill_fp8_pscale(
+    skip_ratio, p_scale_mode
+):
+    torch.manual_seed(10086)
+    torch.cuda.manual_seed(10086)
+
+    T_bf16 = torch.bfloat16
+    T_fp8 = torch.float8_e4m3fn
+    device = "cuda"
+    block_size = 64
+    num_batch = 2
+    num_seq = 1024
+    num_head_q = 4
+    num_head_kv = 1
+    head_dim = 128
+    kScaleBlockSize = block_size // 32
+    num_dim_scale = head_dim // 4
+    num_seq_q_pad = (num_seq + 127) // 128 * 128
+
+    Q = (
+        torch.randn(num_batch, num_seq, num_head_q, head_dim, dtype=T_bf16, device=device)
+        / math.sqrt(head_dim)
+    ).to(T_fp8)
+    qscale = (
+        torch.abs(
+            torch.randn(num_batch, num_head_q, num_seq_q_pad, dtype=torch.float32, device=device)
+        )
+        / 10
+    )
+    vscale = torch.abs(torch.randn(num_head_kv, dtype=torch.float32, device=device))
+
+    seqlens_q = torch.full((num_batch,), num_seq, dtype=torch.int32, device=device)
+    seqlens_kvcache = torch.full((num_batch,), num_seq, dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.zeros(num_batch + 1, dtype=torch.int32, device=device)
+    cu_seqlens_q[1:] = torch.cumsum(seqlens_q, dim=0)
+
+    max_num_blocks = num_batch * ((num_seq + block_size - 1) // block_size) * 2
+    kvcache_blocks = (seqlens_kvcache + block_size - 1) // block_size
+    total_kb = kvcache_blocks.sum().item()
+    max_kb = kvcache_blocks.max().item()
+
+    kvcache = torch.randn(
+        max_num_blocks, 2, block_size, num_head_kv, head_dim, dtype=T_bf16, device=device
+    ).to(T_fp8)
+    kcache = kvcache[:, 0]
+    vcache = kvcache[:, 1]
+    packed_ids = torch.randperm(max_num_blocks, device=device)[:total_kb].to(torch.int32)
+    block_ids = torch.empty(num_batch, max_kb, dtype=torch.int32, device=device)
+    cu = 0
+    for i in range(num_batch):
+        nb = kvcache_blocks[i].item()
+        block_ids[i, :nb] = packed_ids[cu : cu + nb]
+        cu += nb
+
+    kscale = torch.abs(
+        torch.randn(
+            (max_num_blocks, kScaleBlockSize, num_head_kv, num_dim_scale),
+            dtype=torch.float32,
+            device=device,
+        )
+    ).view(torch.float8_e4m3fn)
+    kscale_f32 = kscale.view(torch.float32)
+
+    block_mask = None
+    block_mask_u8 = None
+    if skip_ratio > 0:
+        ntiles = (num_seq + BSA_BLOCK - 1) // BSA_BLOCK
+        block_mask = generate_block_sparse_mask(
+            num_batch, num_head_q, ntiles, ntiles, skip_ratio, causal=True, device=device
+        )
+        block_mask_u8 = block_mask.to(torch.uint8).contiguous()
+
+    p_scale, p_scale_inv = _make_pscale(p_scale_mode, num_head_q, device=device)
+
+    gt = naive_attn_with_kvcache_qkpv_sparse_pscale(
+        Q,
+        kcache,
+        vcache,
+        qscale,
+        kscale_f32,
+        vscale,
+        seqlens_kvcache,
+        block_ids,
+        block_mask=block_mask,
+        p_scale=p_scale,
+        p_scale_inv=p_scale_inv,
+        causal=True,
+    ).reshape(-1, num_head_q, head_dim)
+
+    my = hpc.attention_with_kvcache_blocksparse_prefill_fp8(
+        Q.reshape(-1, num_head_q, head_dim),
+        kcache,
+        vcache,
+        qscale,
+        kscale,
+        vscale,
+        cu_seqlens_q,
+        block_ids,
+        seqlens_kvcache,
+        num_seq,
+        quant_type=QUANT_TYPE_NEW,
+        block_mask=block_mask_u8,
+        p_scale=p_scale,
+        p_scale_inv=p_scale_inv,
+    )
+
+    assert allclose(gt, my, atol=0.05)
