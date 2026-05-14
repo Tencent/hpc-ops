@@ -25,6 +25,12 @@ wheel:
 	find . -type d -name "__pycache__" -exec rm -rf {} +
 	python3 -m build --wheel --no-isolation
 
+# ── multi-arch wheel ──────────────────────────────────────────
+fat-wheel:
+	find . -type d -name "__pycache__" -exec rm -rf {} +
+	mkdir -p dist
+	MULTI_ARCH=1 python3 -m build --wheel --no-isolation --outdir dist
+
 nvshmem:
 	cmake -S 3rd/ucl/nvshmem -B 3rd/ucl/nvshmem-build \
 		-DMLX5_LIB=/usr/lib64/libmlx5.so \

@@ -9,7 +9,11 @@ from typing import Dict
 
 _pkg_dir = Path(__file__).resolve().parent
 
-_NVSHMEM_REL = Path("3rd", "ucl", "nvshmem", "lib", "libnvshmem_host.so")
+# Filenames to try, in order. Versioned SONAME first because that is what the
+# extension .so actually links against (NEEDED libnvshmem_host.so.3).
+_NVSHMEM_NAMES = ("libnvshmem_host.so.3", "libnvshmem_host.so")
+# Legacy in-source layout (master-branch style, kept for backward compatibility).
+_NVSHMEM_LEGACY_REL = Path("3rd", "ucl", "nvshmem", "lib")
 _PROJECT_ROOT_MARKERS = ("CMakeLists.txt", "setup.py")
 
 
@@ -23,32 +27,159 @@ def _find_project_root() -> "Path | None":
     return None
 
 
-def _load_nvshmem_library():
-    """Load ``libnvshmem_host.so`` at import time via ``ctypes.CDLL``.
+def _nvshmem_search_dirs() -> "list[Path]":
+    """Build the ordered list of directories to search for libnvshmem_host."""
+    dirs: list[Path] = []
 
-    Search order:
-      1. ``HPC_OPS_ROOT`` environment variable (explicit override).
-      2. Auto-detected project root (editable install / local cmake build).
-    """
-    search_roots: list[Path] = []
+    # 1. Package directory (wheel install scenario: .so is bundled next to _C_sm*.so).
+    dirs.append(_pkg_dir)
 
+    # 2. Explicit override via env var.
     env_root = os.environ.get("HPC_OPS_ROOT")
     if env_root:
-        search_roots.append(Path(env_root).resolve())
+        root = Path(env_root).resolve()
+        dirs.append(root / _NVSHMEM_LEGACY_REL)
+        # New per-arch cmake layout (build/sm*/hpc/nvshmem-install/lib).
+        dirs.extend((root / "build").glob("sm*/hpc/nvshmem-install/lib"))
 
+    # 3. Auto-detected project root (editable / local cmake build).
     project_root = _find_project_root()
-    if project_root and project_root not in search_roots:
-        search_roots.append(project_root)
+    if project_root:
+        # Legacy in-source layout.
+        legacy = project_root / _NVSHMEM_LEGACY_REL
+        if legacy not in dirs:
+            dirs.append(legacy)
+        # Per-arch build outputs produced by current CMakeLists.txt.
+        for d in (project_root / "build").glob("sm*/hpc/nvshmem-install/lib"):
+            if d not in dirs:
+                dirs.append(d)
 
-    for root in search_roots:
-        so_path = root / _NVSHMEM_REL
-        if not so_path.exists():
+    return dirs
+
+
+def _setup_nvshmem_dlopen_path(lib_dir: Path) -> None:
+    """Make sure NVSHMEM's runtime ``dlopen("nvshmem_bootstrap_*.so.3")``
+    calls (issued from libnvshmem_host) can locate their plugins.
+
+    NVSHMEM loads bootstrap plugins by *bare filename* (no ``/``), so
+    ``ctypes.CDLL`` preload alone is not enough on every glibc/ld.so combo:
+    we also need to inject ``lib_dir`` into ``LD_LIBRARY_PATH`` so the
+    subsequent ``dlopen`` can resolve the plugin via the standard search
+    path. Doing both is intentional belt-and-braces, since glibc's runtime
+    ``dlopen`` re-reads ``LD_LIBRARY_PATH`` at call time.
+    """
+    # 1. Preload every plugin we shipped, so the dynamic linker has the
+    #    SONAME already in its loaded-list cache.
+    for so in sorted(lib_dir.glob("nvshmem_bootstrap_*.so*")):
+        if not so.is_file():
             continue
         try:
-            ctypes.CDLL(str(so_path), mode=ctypes.RTLD_GLOBAL)
-            return
-        except OSError:
+            ctypes.CDLL(str(so), mode=ctypes.RTLD_GLOBAL)
+        except OSError as e:
+            # Non-fatal: LD_LIBRARY_PATH below is the real safety net.
+            print(f"WARNING: failed to preload {so}: {e}", file=sys.stderr)
+
+    # 2. Prepend lib_dir to LD_LIBRARY_PATH so plain-name dlopen() resolves.
+    lib_dir_s = str(lib_dir)
+    cur = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = cur.split(":") if cur else []
+    if lib_dir_s not in parts:
+        os.environ["LD_LIBRARY_PATH"] = f"{lib_dir_s}:{cur}" if cur else lib_dir_s
+
+
+def _load_nvshmem_library():
+    """Preload ``libnvshmem_host.so[.3]`` via ``ctypes.CDLL`` so that the
+    subsequent ``torch.ops.load_library`` call on ``_C_sm*.abi3.so`` can
+    resolve its ``NEEDED libnvshmem_host.so.3`` dependency.
+
+    On success, also configure ``LD_LIBRARY_PATH`` and preload bootstrap
+    plugins so that NVSHMEM's runtime ``dlopen`` calls succeed.
+
+    Failures are reported on stderr (instead of being silently swallowed) to
+    make CI diagnostics tractable.
+    """
+    tried: list[str] = []
+    for d in _nvshmem_search_dirs():
+        if not d.is_dir():
             continue
+        for name in _NVSHMEM_NAMES:
+            so_path = d / name
+            tried.append(str(so_path))
+            if not so_path.exists():
+                continue
+            try:
+                ctypes.CDLL(str(so_path), mode=ctypes.RTLD_GLOBAL)
+            except OSError as e:
+                print(
+                    f"WARNING: failed to preload {so_path}: {e}",
+                    file=sys.stderr,
+                )
+                continue
+            # Host lib loaded: also set up bootstrap plugin discovery.
+            _setup_nvshmem_dlopen_path(d)
+            return
+
+    print(
+        "WARNING: libnvshmem_host.so[.3] not found; "
+        "_C extension load may fail with 'libnvshmem_host.so.3: cannot open "
+        "shared object file'. Tried:\n  " + "\n  ".join(tried),
+        file=sys.stderr,
+    )
+
+
+def _detect_sm_arch() -> "str | None":
+    """Detect SM architecture of the current GPU, e.g. '90', '100'. Returns None if no GPU."""
+    try:
+        if not torch.cuda.is_available():
+            return None
+        major, minor = torch.cuda.get_device_capability(0)
+        return str(major * 10 + minor)
+    except Exception:
+        return None
+
+
+def _load_extension_library():
+    """Load the _C extension library.
+
+    Loading priority:
+      1. Auto-detect current GPU architecture and load matching _C_sm*.abi3.so
+      2. Fallback to legacy _C.*.so glob pattern (backward compatible with old single-arch packages)
+    """
+    # Scan for new-format _C_sm*.abi3.so files: {arch: path}
+    arch_sos: Dict[str, Path] = {
+        f.name[len("_C_sm") : -len(".abi3.so")]: f for f in _pkg_dir.glob("_C_sm*.abi3.so")
+    }
+
+    if arch_sos:
+        # -- New format: auto-detect GPU architecture --
+        detected_arch = _detect_sm_arch()
+        if detected_arch is None:
+            raise ImportError(
+                f"hpc-ops: no GPU detected, cannot auto-select architecture.\n"
+                f"  Available architectures: {sorted(arch_sos)}\n"
+                f"  Search directory: {_pkg_dir}"
+            )
+        so_path = arch_sos.get(detected_arch)
+        if so_path is None:
+            raise ImportError(
+                f"hpc-ops: current GPU architecture sm{detected_arch} is not supported.\n"
+                f"  _C_sm{detected_arch}.abi3.so not found\n"
+                f"  Available architectures: {sorted(arch_sos)}\n"
+                f"  Search directory: {_pkg_dir}"
+            )
+        torch.ops.load_library(so_path)
+        return
+
+    # -- Fallback: legacy _C.*.so format (backward compatible with old single-arch packages) --
+    legacy_files = list(_pkg_dir.glob("_C.*.so"))
+    if len(legacy_files) == 1:
+        torch.ops.load_library(legacy_files[0])
+        return
+
+    raise ImportError(
+        f"hpc-ops: no extension library (.so file) found in {_pkg_dir}.\n"
+        f"  Please make sure hpc-ops is properly installed."
+    )
 
 
 def _discover_modules() -> Dict[str, ModuleType]:
@@ -79,13 +210,7 @@ def _export_functions(modules: Dict[str, ModuleType]):
 # Bootstrap
 
 _load_nvshmem_library()
-
-so_files = list(_pkg_dir.glob("_C.*.so"))
-if len(so_files) != 1:
-    raise ImportError(
-        f"Expected exactly one _C.*.so in {_pkg_dir}, " f"found {len(so_files)}: {so_files}"
-    )
-torch.ops.load_library(so_files[0])
+_load_extension_library()
 
 from .attention import QuantType
 

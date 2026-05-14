@@ -45,8 +45,12 @@ message(STATUS "UCL: Building with CUDA architectures: ${CMAKE_CUDA_ARCHITECTURE
 # NVSHMEM Dependency (Pre-installed)
 #==========================================
 
-# NVSHMEM must be pre-installed in nvshmem subdirectory
-set(NVSHMEM_HOME "${CMAKE_CURRENT_SOURCE_DIR}/nvshmem")
+# NVSHMEM must be pre-installed. NVSHMEM_HOME may be provided externally
+# (e.g. by the parent project pointing to a per-arch build/sm{ARCH}/.../nvshmem-install
+# directory); otherwise default to the in-tree nvshmem subdirectory.
+if(NOT DEFINED NVSHMEM_HOME OR NVSHMEM_HOME STREQUAL "")
+  set(NVSHMEM_HOME "${CMAKE_CURRENT_SOURCE_DIR}/nvshmem")
+endif()
 set(NVSHMEM_INCLUDE_DIR "${NVSHMEM_HOME}/include")
 set(NVSHMEM_LIB_DIR "${NVSHMEM_HOME}/lib")
 

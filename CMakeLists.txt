@@ -11,15 +11,30 @@ elseif("${SM_ARCH}" STREQUAL "90")
   set(CUDA_ARCH_STR "90a")
 elseif("${SM_ARCH}" STREQUAL "100")
   set(CUDA_ARCH_STR "100a")
+elseif("${SM_ARCH}" STREQUAL "103")
+  set(CUDA_ARCH_STR "103a")
+  # SM103 reuses SM100 source directories
+  set(SM_SRC_ARCH "100")
 else()
   set(CUDA_ARCH_STR "${SM_ARCH}")
 endif()
 
-message(STATUS "Building for SM_ARCH=${SM_ARCH}  CUDA_ARCH=${CUDA_ARCH_STR}")
+# SM_SRC_ARCH controls which sm* source directories to include.
+# Default: same as SM_ARCH (only overridden for SM103 -> SM100 above)
+if(NOT DEFINED SM_SRC_ARCH)
+  set(SM_SRC_ARCH "${SM_ARCH}")
+endif()
+
+message(STATUS "Building for SM_ARCH=${SM_ARCH}  SM_SRC_ARCH=${SM_SRC_ARCH}  CUDA_ARCH=${CUDA_ARCH_STR}")
 
 # ── NVSHMEM (ExternalProject) ─────────────────────────────────────────────────
+# NOTE: NVSHMEM_INSTALL_DIR is intentionally placed under CMAKE_CURRENT_BINARY_DIR
+# (i.e. per-arch, e.g. build/sm90/hpc/nvshmem-install) so that parallel multi-arch
+# builds do not overwrite each other's libnvshmem_device.a, which is built per
+# CUDA architecture and would otherwise cause `nvlink: Undefined reference to
+# nvshmemi_device_state_d` errors when linking _C for the wrong arch.
 set(NVSHMEM_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rd/ucl/nvshmem")
-set(NVSHMEM_INSTALL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rd/ucl/nvshmem")
+set(NVSHMEM_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/nvshmem-install")
 
 if(NOT EXISTS "${NVSHMEM_INSTALL_DIR}/include")
     file(MAKE_DIRECTORY "${NVSHMEM_INSTALL_DIR}/include")
@@ -74,8 +89,10 @@ set_target_properties(
 )
 add_dependencies(nvshmem_host nvshmem_external)
 
+# Same per-arch isolation rationale as NVSHMEM_INSTALL_DIR above: libucl_hpc.a
+# is also arch-specific.
 set(UCL_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rd/ucl")
-set(UCL_INSTALL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rd/ucl")
+set(UCL_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/ucl-install")
 
 if(NOT EXISTS "${UCL_INSTALL_DIR}/include")
     file(MAKE_DIRECTORY "${UCL_INSTALL_DIR}/include")
@@ -89,6 +106,7 @@ ExternalProject_Add(ucl_external
    -DCMAKE_INSTALL_PREFIX=${UCL_INSTALL_DIR}
    -DCMAKE_BUILD_TYPE=Release
    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+   -DNVSHMEM_HOME=${NVSHMEM_INSTALL_DIR}
   BUILD_COMMAND $(MAKE)
   INSTALL_COMMAND $(MAKE) install
   DEPENDS nvshmem_external
@@ -131,7 +149,7 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/ucl_comm/.*\\.cu$")
 set(FILTERED_SOURCES "")
 foreach(f ${SOURCES})
   if(f MATCHES ".*/sm([0-9]+)/.*")
-    if(f MATCHES ".*/sm${SM_ARCH}/.*")
+    if(f MATCHES ".*/sm${SM_SRC_ARCH}/.*")
       list(APPEND FILTERED_SOURCES "${f}")
     endif()
   else()
@@ -143,7 +161,7 @@ list(FILTER FILTERED_SOURCES EXCLUDE REGEX ".*test.*")
 
 set(SOURCES ${FILTERED_SOURCES})
 
-message(STATUS "Source files for SM${SM_ARCH}:")
+message(STATUS "Source files for SM${SM_ARCH} (src dirs: sm${SM_SRC_ARCH}):")
 foreach(f ${SOURCES})
   message(STATUS "  ${f}")
 endforeach()
@@ -221,7 +239,7 @@ if("${SM_ARCH}" STREQUAL "90")
       -Wall
     >
   )
-elseif("${SM_ARCH}" STREQUAL "100")
+elseif("${SM_ARCH}" STREQUAL "100" OR "${SM_ARCH}" STREQUAL "103")
   target_compile_options(
     shmem_ops_lib PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
@@ -290,7 +308,7 @@ set_target_properties(
   _C PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/
 
-  OUTPUT_NAME "_C"
+  OUTPUT_NAME "_C_sm${SM_ARCH}"
   PREFIX ""
   SUFFIX ".abi3.so"
   CUDA_RUNTIME_LIBRARY "Shared"
@@ -375,7 +393,7 @@ if("${SM_ARCH}" STREQUAL "90")
       -DTORCH_EXTENSION_NAME=_C
     >
   )
-elseif("${SM_ARCH}" STREQUAL "100")
+elseif("${SM_ARCH}" STREQUAL "100" OR "${SM_ARCH}" STREQUAL "103")
   target_compile_options(
     _C PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
