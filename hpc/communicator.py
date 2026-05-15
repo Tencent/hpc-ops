@@ -157,6 +157,41 @@ class MultiNodeCommunicator:
     def Barrier(self) -> None:
         pass
 
+    def BarrierOnStream(self, tensor: Tensor) -> None:
+        """Performs a barrier synchronization on the current CUDA stream of
+        the given tensor's device.
+
+        Unlike :meth:`Barrier`, which blocks the host until all processes reach
+        the barrier, this method enqueues the barrier operation onto the current
+        CUDA stream (obtained via ``at::cuda::getCurrentCUDAStream`` on the C++
+        side) of the device where ``tensor`` resides. Only execution ordering
+        within that stream is synchronized; the host call returns immediately
+        after enqueueing.
+
+        Args:
+            tensor: A CUDA :class:`torch.Tensor`. The tensor itself is not
+                modified or read; it is only used to determine which device's
+                current stream to run the barrier on.
+
+        Raises:
+            RuntimeError: If ``tensor`` is not a CUDA tensor, or if the barrier
+                fails due to communication errors.
+
+        Example:
+            >>> comm = MultiNodeCommunicator(rank=0, world_size=4, device_id=0,
+            ...                              comm_name="127.0.0.1:10086")
+            >>> with torch.cuda.stream(torch.cuda.Stream()):
+            ...     out = some_kernel(x)          # enqueued on the current stream
+            ...     comm.BarrierOnStream(out)      # barrier on the same stream
+            ...     y = post_process(out)          # observes peers' results
+
+        Note:
+            The barrier is ordered with respect to the current stream of
+            ``tensor.device()`` only; operations on other streams are not
+            synchronized by this call.
+        """
+        pass
+
     def GetRank(self) -> int:
         pass
 

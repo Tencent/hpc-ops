@@ -147,6 +147,12 @@ class IMultiNodeCommunicator : public torch::CustomClassHolder {
 
   void Barrier() { multinode_comm_->Barrier(); }
 
+  void BarrierOnStream(const torch::Tensor &tensor) {
+    TORCH_CHECK(tensor.is_cuda(), "BarrierOnStream expects a CUDA tensor");
+    auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
+    multinode_comm_->BarrierOnStream(stream.stream());
+  }
+
   int64_t GetRank() { return multinode_comm_->GetRank(); }
 
   int64_t GetWorldSize() { return multinode_comm_->GetWorldSize(); }
@@ -184,6 +190,9 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       .def("CreateTensorSync", &hpc::communicator::IMultiNodeCommunicator::CreateTensorSync,
            "create tensor sync", {torch::arg("bytes"), torch::arg("sub_team") = -1})
       .def("Barrier", &hpc::communicator::IMultiNodeCommunicator::Barrier)
+      .def("BarrierOnStream", &hpc::communicator::IMultiNodeCommunicator::BarrierOnStream,
+           "barrier on the current cuda stream of the given tensor's device",
+           {torch::arg("tensor")})
       .def("GetRank", &hpc::communicator::IMultiNodeCommunicator::GetRank)
       .def("GetWorldSize", &hpc::communicator::IMultiNodeCommunicator::GetWorldSize)
       .def("GetDeviceId", &hpc::communicator::IMultiNodeCommunicator::GetDeviceId)

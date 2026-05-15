@@ -650,6 +650,14 @@ __device__ int __forceinline__ load_global_volatile(int *ptr) {
   return val;
 }
 
+__device__ float4 __forceinline__ load_global_volatile_f4(void const *ptr) {
+  float4 ret;
+  asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];\n"
+               : "=f"(ret.x), "=f"(ret.y), "=f"(ret.z), "=f"(ret.w)
+               : "l"(ptr));
+  return ret;
+}
+
 // ================================
 //    Synchronization Primitives
 // ================================
@@ -757,6 +765,37 @@ __device__ __forceinline__ void fence_tmem_after_thread_sync() {
 
 __device__ __forceinline__ void fence_tmem_before_thread_sync() {
   asm volatile("tcgen05.fence::before_thread_sync;\n");
+}
+
+// =======================
+//    Block Reductions
+// =======================
+
+template <typename T, uint32_t kNumWarps = 32>
+__device__ __forceinline__ T block_reduce_sum_full(T val) {
+  static_assert(kNumWarps >= 1 && kNumWarps <= 32, "kNumWarps out of range");
+  static constexpr uint32_t kLog2WarpSize = 5U;
+  static constexpr uint32_t kLaneIdMask = 0x1fU;
+  static constexpr uint32_t kFinalMask = 0xffffffffU;
+
+  __shared__ T smem[kNumWarps];
+  int ilane = threadIdx.x & kLaneIdMask;
+  int iwarp = threadIdx.x >> kLog2WarpSize;
+
+  val = warp_reduce_sum_xor(val);
+  if (ilane == 0) {
+    smem[iwarp] = val;
+  }
+  __syncthreads();
+
+  val = (ilane < kNumWarps) ? smem[ilane] : (T)0.f;
+  if constexpr (kNumWarps > 1) {
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+      val += __shfl_xor_sync(kFinalMask, val, mask, 32);
+    }
+  }
+  return val;
 }
 
 }  // namespace hpc
