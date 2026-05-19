@@ -4,7 +4,7 @@ rm -rf ucl
 rm -rf ucl.git
 
 git clone --recursive git@git.woa.com:astral/OpenUCL/ucl-hpc.git ucl.git
-git -C ./ucl.git checkout 39589ced
+git -C ./ucl.git checkout 55e8ec3f
 
 mkdir -p ucl
 mv ucl.git/cmake ucl/

@@ -155,6 +155,7 @@ __global__ __launch_bounds__(kBlockSize) void two_shot_allreduce_kernel(
 
   int dest_rank = itoken % kWorldSize;
   int dest_token_offset = itoken / kWorldSize;
+
   cudaGridDependencySynchronize();
   LamportBufferScheduler scheduler(buffer_flags, TwoShotAllReduceStage::NUM_STAGES);
 
@@ -257,8 +258,6 @@ __launch_bounds__(kHiddenSize / (sizeof(float4) / sizeof(__nv_bfloat16))) void r
   __nv_bfloat16* input = reinterpret_cast<__nv_bfloat16*>(scheduler.get_cur_lamport_buf(
       reinterpret_cast<void*>(buffer_input), TwoShotAllReduceStage::BROADCAST));
 
-  cudaTriggerProgrammaticLaunchCompletion();
-
   uint32_t const block_load_offset = itoken * kHiddenSize;
   uint32_t const thread_load_offset = thread_offset * kEltsPerLoad;
   uint32_t const offset = block_load_offset + thread_load_offset;
@@ -286,20 +285,18 @@ __launch_bounds__(kHiddenSize / (sizeof(float4) / sizeof(__nv_bfloat16))) void r
 
   float thread_sum = 0.f;
   {
-    auto inp = load<__nv_bfloat16, kEltsPerLoad>(&smem_input[thread_load_offset]);
-    auto res = load<__nv_bfloat16, kEltsPerLoad>(&smem_residual[thread_load_offset]);
+    auto inp = to<float>(load<__nv_bfloat16, kEltsPerLoad>(&smem_input[thread_load_offset]));
+    auto res = to<float>(load<__nv_bfloat16, kEltsPerLoad>(&smem_residual[thread_load_offset]));
 
-    vec_t<__nv_bfloat16, kEltsPerLoad> inp_plus_res;
+    vec_t<float, kEltsPerLoad> inp_plus_res;
 #pragma unroll
     for (int j = 0; j < kEltsPerLoad; j++) {
-      // TODO(draken): Use float square in "+" if accuracy issue ?
-      // TODO(draken): Why use bf16x2 in v1 kernel
       inp_plus_res[j] = inp[j] + res[j];
-      rms_input[j] = __bfloat162float(inp_plus_res[j]);
+      rms_input[j] = inp_plus_res[j];
       thread_sum += rms_input[j] * rms_input[j];
     }
 
-    store<__nv_bfloat16, kEltsPerLoad>(&output_pre_norm[offset], inp_plus_res);
+    store<__nv_bfloat16, kEltsPerLoad>(&output_pre_norm[offset], to<__nv_bfloat16>(inp_plus_res));
   }
 
   __pipeline_wait_prior(0);
@@ -324,6 +321,8 @@ __launch_bounds__(kHiddenSize / (sizeof(float4) / sizeof(__nv_bfloat16))) void r
   scheduler.wait_ctas_and_update(
       {static_cast<uint32_t>(round_up(num_tokens, world_size) * kHiddenSize * kEltsSize),
        static_cast<uint32_t>(num_tokens * kHiddenSize * kEltsSize), 0, 0});
+
+  cudaTriggerProgrammaticLaunchCompletion();
 }
 
 }  // namespace kernels
@@ -360,34 +359,36 @@ static inline void launch_fuse_allreduce_rmsnorm_v2(
     launch_config.attrs = attribute;
     launch_config.numAttrs = 1;
 
-#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE)                                                       \
-  do {                                                                                            \
-    auto allreduce_kernel = kernels::two_shot_allreduce_kernel<WORLD_SIZE, kHiddenSize>;          \
-    cudaLaunchKernelEx(&launch_config, allreduce_kernel, static_cast<__nv_bfloat16*>(output_ptr), \
-                       static_cast<const __nv_bfloat16*>(input_ptr),                              \
-                       reinterpret_cast<__nv_bfloat16**>(buffer_ptrs_dev),                        \
-                       static_cast<__nv_bfloat16*>(const_cast<void*>(mc_input_ptr)),              \
-                       static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(rank),            \
-                       buffer_flags);                                                             \
-  } while (0)
-    switch (world_size) {
-      case 2:
-        LAUNCH_ALLREDUCE_KERNEL(2);
-        break;
-      case 4:
-        LAUNCH_ALLREDUCE_KERNEL(4);
-        break;
-      case 8:
-        LAUNCH_ALLREDUCE_KERNEL(8);
-        break;
-      default:
-        return;
+    if (world_size == 2) {
+      auto allreduce_kernel = kernels::two_shot_allreduce_kernel<2, kHiddenSize>;
+      cudaLaunchKernelEx(&launch_config, allreduce_kernel, static_cast<__nv_bfloat16*>(output_ptr),
+                         static_cast<const __nv_bfloat16*>(input_ptr),
+                         reinterpret_cast<__nv_bfloat16**>(buffer_ptrs_dev),
+                         static_cast<__nv_bfloat16*>(const_cast<void*>(mc_input_ptr)),
+                         static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(rank),
+                         buffer_flags);
+    } else if (world_size == 4) {
+      auto allreduce_kernel = kernels::two_shot_allreduce_kernel<4, kHiddenSize>;
+      cudaLaunchKernelEx(&launch_config, allreduce_kernel, static_cast<__nv_bfloat16*>(output_ptr),
+                         static_cast<const __nv_bfloat16*>(input_ptr),
+                         reinterpret_cast<__nv_bfloat16**>(buffer_ptrs_dev),
+                         static_cast<__nv_bfloat16*>(const_cast<void*>(mc_input_ptr)),
+                         static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(rank),
+                         buffer_flags);
+    } else if (world_size == 8) {
+      auto allreduce_kernel = kernels::two_shot_allreduce_kernel<8, kHiddenSize>;
+      cudaLaunchKernelEx(&launch_config, allreduce_kernel, static_cast<__nv_bfloat16*>(output_ptr),
+                         static_cast<const __nv_bfloat16*>(input_ptr),
+                         reinterpret_cast<__nv_bfloat16**>(buffer_ptrs_dev),
+                         static_cast<__nv_bfloat16*>(const_cast<void*>(mc_input_ptr)),
+                         static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(rank),
+                         buffer_flags);
+    } else {
+      return;
     }
-#undef LAUNCH_ALLREDUCE_KERNEL
   }
 
-  // TODO(draken): open cudaLaunchAttributeClusterDimension and use CUTA to replace cooprative
-  // groups.
+  // TODO(draken): open cudaLaunchAttributeClusterDimension and use CUTA to replace CGA.
 
   // 2. Launch rmsnorm_kernel.
   {
@@ -418,22 +419,22 @@ void fuse_allreduce_rmsnorm_v2_async(const void* input_ptr, const void* mc_input
                                      void* out_residual_ptr, int rank, int world_size,
                                      double rms_norm_eps, int num_tokens, int hidden_size,
                                      bool launch_with_pdl, cudaStream_t stream) {
-#define DISPATCH_FUSE_AR_RMS_V2(HIDDEN)                                                            \
-  case HIDDEN:                                                                                     \
-    launch_fuse_allreduce_rmsnorm_v2<HIDDEN>(                                                      \
-        input_ptr, mc_input_ptr, buffer_ptrs_dev, buffer_ptr_local, buffer_flags, in_residual_ptr, \
-        gamma_ptr, output_ptr, out_residual_ptr, rank, world_size, rms_norm_eps, num_tokens,       \
-        launch_with_pdl, stream);                                                                  \
-    break
-
-  switch (hidden_size) {
-    DISPATCH_FUSE_AR_RMS_V2(4096);
-    DISPATCH_FUSE_AR_RMS_V2(5120);
-    DISPATCH_FUSE_AR_RMS_V2(7168);
-    default:
-      return;
+  if (hidden_size == 4096) {
+    launch_fuse_allreduce_rmsnorm_v2<4096>(
+        input_ptr, mc_input_ptr, buffer_ptrs_dev, buffer_ptr_local, buffer_flags, in_residual_ptr,
+        gamma_ptr, output_ptr, out_residual_ptr, rank, world_size, rms_norm_eps, num_tokens,
+        launch_with_pdl, stream);
+  } else if (hidden_size == 5120) {
+    launch_fuse_allreduce_rmsnorm_v2<5120>(
+        input_ptr, mc_input_ptr, buffer_ptrs_dev, buffer_ptr_local, buffer_flags, in_residual_ptr,
+        gamma_ptr, output_ptr, out_residual_ptr, rank, world_size, rms_norm_eps, num_tokens,
+        launch_with_pdl, stream);
+  } else if (hidden_size == 7168) {
+    launch_fuse_allreduce_rmsnorm_v2<7168>(
+        input_ptr, mc_input_ptr, buffer_ptrs_dev, buffer_ptr_local, buffer_flags, in_residual_ptr,
+        gamma_ptr, output_ptr, out_residual_ptr, rank, world_size, rms_norm_eps, num_tokens,
+        launch_with_pdl, stream);
   }
-#undef DISPATCH_FUSE_AR_RMS_V2
 }
 
 }  // namespace allreduce

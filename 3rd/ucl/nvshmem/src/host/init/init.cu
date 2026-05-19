@@ -1151,7 +1151,7 @@ std::string get_version(nvshmemi_version_t nvshmem_app_version) {
 }
 
 std::string get_version_suffix() {
-    return "R02C02";
+    return "R02C02.HPC";
 }
 
 std::string format_timestamp(std::time_t timestamp) {
@@ -1162,9 +1162,34 @@ std::string format_timestamp(std::time_t timestamp) {
 }
 
 int create_directory(const std::string& path) {
-    if (mkdir(path.c_str(), 0755) == -1 && errno != EEXIST) {
-        std::cout << "Failed to create directory: " << std::string(strerror(errno)) << std::endl;
-        return -1;
+    std::string current_path;
+    size_t pos = 0;
+    
+    if (!path.empty() && path[0] == '/') {
+        current_path = "/";
+        pos = 1;
+    }
+    
+    while (pos < path.size()) {
+        size_t next_pos = path.find('/', pos);
+        if (next_pos == std::string::npos) {
+            next_pos = path.size();
+        }
+        
+        if (next_pos > pos) {
+            current_path += path.substr(pos, next_pos - pos);
+            
+            if (mkdir(current_path.c_str(), 0755) == -1 && errno != EEXIST) {
+                std::cout << "Failed to create directory: " << current_path 
+                          << " - " << std::string(strerror(errno)) << std::endl;
+                return -1;
+            }
+        }
+        
+        if (next_pos < path.size()) {
+            current_path += "/";
+        }
+        pos = next_pos + 1;
     }
     return 0;
 }
