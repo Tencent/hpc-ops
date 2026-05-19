@@ -126,6 +126,11 @@ def reduce(
     return torch.ops.hpc.reduce(x, topk_pos, topk_scale, shared_output)
 
 
+# Dispatch cp.async backend when intermediate_size is small (TP=8 regime);
+# otherwise fall back to the TMA backend.
+_CP_ASYNC_N_TP_MAX = 512
+
+
 def fuse_moe(
     x: Tensor,
     gate_up_weight: Tensor,
@@ -146,6 +151,11 @@ def fuse_moe(
     This function executes the MoE computation with all matrix multiplications
     performed in FP8 precision for improved performance and memory efficiency.
     The gate and up projections are fused into a single matrix multiplication.
+
+    Dispatches to the cp.async backend when ``intermediate_size <= 512``,
+    ``intermediate_size % 64 == 0``, and ``hidden_size % 64 == 0``;
+    otherwise dispatches to the TMA backend.  Call ``fuse_moe_cp_async``
+    directly to force the cp.async path.
 
     Args:
         x: Input activation tensor
@@ -202,6 +212,27 @@ def fuse_moe(
         - Token routing is determined by topk_ids and weighted by topk_scale
         - Output scaling is applied to maintain numerical stability in FP8
     """
+    intermediate_size = gate_up_weight.shape[1] // 2
+    if (
+        intermediate_size <= _CP_ASYNC_N_TP_MAX
+        and intermediate_size % 64 == 0
+        and x.shape[1] % 64 == 0
+    ):
+        return torch.ops.hpc.fuse_moe_cp_async(
+            x,
+            gate_up_weight,
+            down_weight,
+            gate_up_scale,
+            down_scale,
+            act_and_mul_scale,
+            topk_ids,
+            topk_scale,
+            shared_output,
+            rank_ep,
+            num_expert_total,
+            use_bf16_mul,
+            output,
+        )
 
     return torch.ops.hpc.fuse_moe(
         x,
@@ -449,3 +480,104 @@ def fuse_moe_blockwise_fake(
     output: Tensor = None,
 ):
     return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16, device=x.device)
+
+
+def fuse_moe_cp_async(
+    x: Tensor,
+    gate_up_weight: Tensor,
+    down_weight: Tensor,
+    gate_up_scale: Tensor,
+    down_scale: Tensor,
+    act_and_mul_scale: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    rank_ep: int,
+    num_expert_total: int,
+    use_bf16_mul: bool = False,
+    shared_output: Tensor = None,
+    output: Tensor = None,
+) -> Tensor:
+    """Performs Mixture of Experts (MoE) forward operation with FP8 precision,
+    using cp.async based group GEMM kernels.
+
+    This is an alternative implementation to `fuse_moe` that issues all
+    global-to-shared memory transfers via cp.async instead of TMA.  The
+    numerical behaviour matches `fuse_moe` bit-for-bit; the gate and up
+    projections are fused into a single matrix multiplication.
+
+    Args:
+        x: Input activation tensor
+            Shape: [num_seq, hidden_size]
+            Dtype: fp8
+        gate_up_weight: Combined weight tensor for gate and up projections
+            Shape: [num_expert_local, intermediate_size * 2, hidden_size]
+            Dtype: fp8
+            `intermediate_size * 2` is the fused gate+up dimension; the
+            scatter GEMM writes [gate | up] into adjacent N-halves.
+        down_weight: Weight tensor for down projection
+            Shape: [num_expert_local, hidden_size, intermediate_size]
+            Dtype: fp8
+        gate_up_scale: Scaling factors for gate-up projection outputs
+            Shape: [num_expert_local]
+            Dtype: float32
+        down_scale: Scaling factors for down projection outputs
+            Shape: [num_expert_local]
+            Dtype: float32
+        act_and_mul_scale: Scaling factor for activation and multiplication
+            Shape: [1]
+            Dtype: float32
+        topk_ids: Token indices assigned to each expert
+            Shape: [num_seq, num_topk]
+            Dtype: int32
+        topk_scale: Weighting factors for each token-expert assignment
+            Shape: [num_seq, num_topk]
+            Dtype: float32
+        rank_ep: Expert parallel rank (for distributed training)
+            Dtype: int32
+        num_expert_total: the total number of experts across all EP ranks
+            Dtype: int32
+        use_bf16_mul: whether to perform silu(gate) * up in bf16.  The
+            default (False) keeps full fp32 precision through the
+            activation; setting True lowers the intermediate precision
+            and is slightly faster for activation-bound shapes.
+        shared_output: output for shared experts, default is None
+            Shape: [num_seq, hidden_size]
+            Dtype: bfloat16
+        output: specify output tensor.
+            Shape: [num_seq, hidden_size]
+            Dtype: bfloat16
+
+    Returns:
+        torch.Tensor: Output tensor after MoE computation
+            Shape: [num_seq, hidden_size]
+            Dtype: bfloat16
+
+    Raises:
+        RuntimeError: If the input tensors have incompatible shapes or types,
+            or if CUDA kernel execution fails.
+        ValueError: If the intermediate_size is not divisible by 2 for gate/up split.
+
+    Note:
+        - All input tensors must be on CUDA device.
+        - The gate and up projections are combined into a single matrix multiplication.
+        - FP8 precision is used for all matrix operations (torch.float8_e4m3fn).
+        - Activation function used is SiLU (Swish).
+        - Token routing is determined by topk_ids and weighted by topk_scale.
+        - Output scaling is applied to maintain numerical stability in FP8.
+        - num_expert_local must be <= 512 (routing prefix-sum kernel capacity).
+    """
+    return torch.ops.hpc.fuse_moe_cp_async(
+        x,
+        gate_up_weight,
+        down_weight,
+        gate_up_scale,
+        down_scale,
+        act_and_mul_scale,
+        topk_ids,
+        topk_scale,
+        shared_output,
+        rank_ep,
+        num_expert_total,
+        use_bf16_mul,
+        output,
+    )
