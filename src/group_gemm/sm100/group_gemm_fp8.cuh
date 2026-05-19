@@ -21,23 +21,20 @@ namespace kernels {
 
 template <int kMmaSM>
 __device__ __forceinline__ void get_next_tile_horizon(const int *tiles_ptr, int iblock,
-                                                      int num_group, int &igroup, int &itile_m,
-                                                      int &itile_n, int &sum_tile_n,
+                                                      int num_group, int &igroup, int &itile_n,
+                                                      int &itile_m, int &sum_tile_m,
                                                       cutlass::FastDivmod flat_divider) {
-  int num_tile_n, itile_n_total;
-  // if(igroup < 0) {
-  //   return;
-  // }
+  int num_tile_m, itile_m_total;
 
-  flat_divider(itile_n_total, itile_m, iblock);
-  itile_m /= kMmaSM;
+  flat_divider(itile_m_total, itile_n, iblock);
+  itile_n /= kMmaSM;
   for (int i = igroup; i < num_group; i++) {
-    num_tile_n = tiles_ptr[i];
-    sum_tile_n += num_tile_n;
-    if (itile_n_total < sum_tile_n) {
+    num_tile_m = tiles_ptr[i];
+    sum_tile_m += num_tile_m;
+    if (itile_m_total < sum_tile_m) {
       igroup = i;
-      sum_tile_n = sum_tile_n - num_tile_n;
-      itile_n = itile_n_total - sum_tile_n;
+      sum_tile_m = sum_tile_m - num_tile_m;
+      itile_m = itile_m_total - sum_tile_m;
       return;
     }
   }
@@ -88,7 +85,6 @@ __global__ void update_grouped_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
     if (idx == 0) {
       cu_tiles_ptr[num_group] = block_aggregate;
     }
-
   } else {
     __shared__ cute::TmaDescriptor smem_tma_desc[2];
 
@@ -106,14 +102,14 @@ __global__ void update_grouped_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
     if (idx == 0) {
       auto gX = make_tensor(make_gmem_ptr(x_ibatch_ptr), make_shape(num_seq, k),
                             make_stride(k, Int<1>{}));
-      update_tma_gtensor<TmaX>(smem_tma_desc[idx], gX);
+      update_tma_gtensor<TmaX, decltype(gX), true, true>(smem_tma_desc[idx], gX);
     }
 
     // K
     if (idx == 1) {
       auto gY = make_tensor(make_gmem_ptr(y_ibatch_ptr), make_shape(n, num_seq),
                             make_stride(Int<1>{}, n));
-      update_tma_gtensor<TmaY>(smem_tma_desc[idx], gY);
+      update_tma_gtensor<TmaY, decltype(gY), true, true>(smem_tma_desc[idx], gY);
     }
 
 #pragma unroll
@@ -132,35 +128,34 @@ __global__ void update_grouped_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
   }
 }
 
-template <typename Config, typename TiledMma, typename TmaA, typename TmaB, typename TmaDT,
-          int kTaskLoopPolicy, bool kUsePDL = false>
+template <typename GemmConfig, typename TmaX, typename TmaW, typename TmaY, int kTaskLoopPolicy,
+          bool kUsePDL = false>
 __global__ void __launch_bounds__(256, 1)
-    group_gemm_2sm_fp8_kernel(const __grid_constant__ TmaA tma_a, cute::TmaDescriptor *td_xy,
+    group_gemm_2sm_fp8_kernel(const __grid_constant__ TmaW tma_w, cute::TmaDescriptor *td_xy,
                               int *seqlens_ptr, float *yscale_ptr, int *tiles_ptr,
                               int *cu_tiles_ptr, int num_group, int m, int n, int k,
                               cutlass::FastDivmod flat_divider) {
   using namespace cute;  // NOLINT
 
-  using Tin = typename Config::Tin;
-  using Tout = typename Config::Tout;
-  using SLayoutA = typename Config::SLayoutX;
-  using SLayoutB = typename Config::SLayoutW;
-  using SLayoutC = typename Config::SLayoutY;
-  using SLayoutCT = typename Config::SLayoutYT;
+  using Tin = typename GemmConfig::Tin;
+  using Tout = typename GemmConfig::Tout;
+  using SLayoutX = typename GemmConfig::SLayoutX;
+  using SLayoutW = typename GemmConfig::SLayoutW;
+  using SLayoutY = typename GemmConfig::SLayoutY;
 
-  constexpr int kTileM = Config::kTileM;
-  constexpr int kTileN = Config::kTileN;
-  constexpr int kTileK = Config::kTileK;
-  constexpr int kStageK = Config::kStage;
-  constexpr int kClusterM = Config::kClusterM;
-  constexpr int kClusterN = Config::kClusterN;
-  constexpr int kClusterK = Config::kClusterK;
-  constexpr int kMmaSM = Config::kMmaSM;
-  constexpr int kEpiTileN = Config::kEpiTileN;
-  constexpr int kStageTile = Config::kStageTile;
-  constexpr int kStageTMA = Config::kStageTMA;
-  constexpr int kCtaTileM = Config::kCtaTileM;
-  constexpr int kCtaTileN = Config::kCtaTileN;
+  constexpr int kTileM = GemmConfig::kTileM;
+  constexpr int kTileN = GemmConfig::kTileN;
+  constexpr int kTileK = GemmConfig::kTileK;
+  constexpr int kStageK = GemmConfig::kStageK;
+  constexpr int kClusterM = GemmConfig::kClusterM;
+  constexpr int kClusterN = GemmConfig::kClusterN;
+  constexpr int kClusterK = GemmConfig::kClusterK;
+  constexpr int kMmaSM = GemmConfig::kMmaSM;
+  constexpr int kEpiTileM = GemmConfig::kEpiTileM;
+  constexpr int kStageTile = GemmConfig::kStageTile;
+  constexpr int kStageTMA = GemmConfig::kStageTMA;
+  constexpr int kCtaTileM = GemmConfig::kCtaTileM;
+  constexpr int kCtaTileN = GemmConfig::kCtaTileN;
 
   int idx = threadIdx.x;
   int iwarp = idx / 32;
@@ -184,56 +179,54 @@ __global__ void __launch_bounds__(256, 1)
   __shared__ uint32_t tmem_base_ptr;
 
   extern __shared__ uint8_t shm_data[] alignas(128);
-  auto *shm_a = reinterpret_cast<Tin *>(shm_data);
-  auto *shm_b = shm_a + cosize(SLayoutA{});
-  auto *shm_c = reinterpret_cast<Tout *>(shm_b + cosize(SLayoutB{}));
+  auto *shm_w = reinterpret_cast<Tin *>(shm_data);
+  auto *shm_x = shm_w + cosize(SLayoutW{});
+  auto *shm_y = reinterpret_cast<Tout *>(shm_x + cosize(SLayoutX{}));
+  int *shm_tiles = reinterpret_cast<int *>(shm_y + cosize(SLayoutY{}));
 
-  int *shm_tiles = reinterpret_cast<int *>(shm_c + cosize(SLayoutCT{}));
+  TmaX tma_x;
+  TmaY tma_y;
 
-  TmaB tma_b;
-  TmaDT tma_dt;
-
-  auto sA = make_tensor(make_smem_ptr(shm_a), SLayoutA{});
-  auto sB = make_tensor(make_smem_ptr(shm_b), SLayoutB{});
-  auto sC = make_tensor(make_smem_ptr(shm_c), SLayoutC{});
-  auto sCT = make_tensor(make_smem_ptr(shm_c), SLayoutCT{});
+  auto sW = make_tensor(make_smem_ptr(shm_w), SLayoutW{});
+  auto sX = make_tensor(make_smem_ptr(shm_x), SLayoutX{});
+  auto sY = make_tensor(make_smem_ptr(shm_y), SLayoutY{});
 
   auto cluster_layout =
       tiled_divide(make_layout(make_shape(Int<kClusterM>{}, Int<kClusterN>{}, Int<kClusterK>{})),
-                   make_tile(Int<kMmaSM>{}, Int<1>{}, Int<1>{}));
+                   make_tile(Int<1>{}, Int<kMmaSM>{}, Int<1>{}));
   int block_rank_in_cluster = cute::block_rank_in_cluster();
   auto cluster_coord = cluster_layout.get_flat_coord(block_rank_in_cluster);
   bool elected_cta = get<0>(cluster_coord) == Int<0>{};
 
-  auto gA = tma_a.get_tma_tensor(make_shape(m, k, num_group));
-  auto gB = tma_b.get_tma_tensor(make_shape(n, k));
-  auto gC =
+  auto gW = tma_w.get_tma_tensor(make_shape(n, k, num_group));
+  auto gX = tma_x.get_tma_tensor(make_shape(m, k));
+  auto gY =
       make_tensor(make_gmem_ptr(static_cast<float *>(nullptr)),
-                  make_shape(Int<kTileM>{}, Int<kTileN>{}), make_stride(Int<kTileN>{}, Int<1>{}));
+                  make_shape(Int<kTileN>{}, Int<kTileM>{}), make_stride(Int<kTileM>{}, Int<1>{}));
 
   // TMA partition
-  auto btma_ga = tma_a.get_slice(get<2>(cluster_coord) + get<0>(cluster_coord) * kClusterN);
-  auto btma_gb =
-      tma_b.get_slice(get<1>(cluster_coord) + get<0>(cluster_coord) * kClusterM / kMmaSM);
-  auto btma_sa = tma_a.get_slice(get<2>(cluster_coord));
-  auto btma_sb = tma_b.get_slice(get<1>(cluster_coord));
+  auto btma_gw = tma_w.get_slice(get<2>(cluster_coord) + get<0>(cluster_coord) * kClusterM);
+  auto btma_gx =
+      tma_x.get_slice(get<1>(cluster_coord) + get<0>(cluster_coord) * kClusterN / kMmaSM);
+  auto btma_sw = tma_w.get_slice(get<2>(cluster_coord));
+  auto btma_sx = tma_x.get_slice(get<1>(cluster_coord));
 
-  auto tAg = btma_ga.partition_S(gA);  // (TMA, TMA_M, TMA_K)
-  auto tAs = btma_sa.partition_D(sA);  // (TMA, _1, _1, kStage)
+  auto tWg = btma_gw.partition_S(gW);  // (TMA, TMA_M, TMA_K)
+  auto tWs = btma_sw.partition_D(sW);  // (TMA, _1, _1, kStage)
 
-  auto tBg = btma_gb.partition_S(gB);  // (TMA, TMA_N, TMA_K)
-  auto tBs = btma_sb.partition_D(sB);  // (TMA, _1, _1, stage)
+  auto tXg = btma_gx.partition_S(gX);  // (TMA, TMA_N, TMA_K)
+  auto tXs = btma_sx.partition_D(sX);  // (TMA, _1, _1, stage)
 
   // UMMA partition
-  TiledMma tiled_mma;
+  typename GemmConfig::TiledMma tiled_mma;
   auto cta_mma = tiled_mma.get_slice(get<0>(cluster_coord));
 
-  auto tAs4r = cta_mma.partition_A(sA);
-  auto tBs4r = cta_mma.partition_B(sB);
-  auto tCgC = cta_mma.partition_C(gC);
+  auto tWs4r = cta_mma.partition_A(sW);
+  auto tXs4r = cta_mma.partition_B(sX);
+  auto tCgC = cta_mma.partition_C(gY);
 
-  auto tAr = cta_mma.make_fragment_A(tAs4r);
-  auto tBr = cta_mma.make_fragment_B(tBs4r);
+  auto tWr = cta_mma.make_fragment_A(tWs4r);
+  auto tXr = cta_mma.make_fragment_B(tXs4r);
   auto tCt = cta_mma.make_fragment_C(tCgC);
 
   uint16_t mcast_mask_c = 3;
@@ -278,10 +271,9 @@ __global__ void __launch_bounds__(256, 1)
 
   // cluster_relaxed_sync();
 
-  int ntile_k = size<2>(tAg);
+  int ntile_k = size<2>(tXg);
 
   constexpr int kTransactionBytes =
-      // kMmaSM * sizeof(Tin) * (cosize(SLayoutA{}(_, _, 0)) + cosize(SLayoutB{}(_, _, 0)));
       kMmaSM * sizeof(Tin) * (kCtaTileM * kTileK + kCtaTileN * kTileK);
 
   int total_m = 0;
@@ -319,22 +311,23 @@ __global__ void __launch_bounds__(256, 1)
     int istage_clc = 0;
 
     int igroup = 0;
-    int sum_tile_n = 0;
+    int sum_tile_m = 0;
     int itile_m, itile_n;
 
-    get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_m, itile_n,
-                                  sum_tile_n, flat_divider);
+    get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_n, itile_m,
+                                  sum_tile_m, flat_divider);
 
     while (true) {
       if (igroup >= 0) {
         auto *td_x = td_xy + igroup * 2;
+        prefetch_tma_descriptor(td_x);
 
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
           wait_barrier(tma_writable[istage_k], phase);
-          copy(tma_a.with(tma_readable[istage_k]), tAg(_, itile_m, itile_k, igroup),
-               tAs(_, 0, 0, istage_k));
-          copy(tma_b.with(td_x, tma_readable[istage_k]), tBg(_, itile_n, itile_k),
-               tBs(_, 0, 0, istage_k));
+          copy(tma_w.with(tma_readable[istage_k], 0, TMA::CacheHintSm100::EVICT_FIRST),
+               tWg(_, itile_n, itile_k, igroup), tWs(_, 0, 0, istage_k));
+          copy(tma_x.with(td_x, tma_readable[istage_k], 0, TMA::CacheHintSm100::EVICT_FIRST),
+               tXg(_, itile_m, itile_k), tXs(_, 0, 0, istage_k));
           if (elected_cta) {
             set_barrier_transaction_bytes(tma_readable[istage_k], kTransactionBytes);
           } else {
@@ -375,24 +368,24 @@ __global__ void __launch_bounds__(256, 1)
     int istage_clc = 0;
 
     int igroup = 0;
-    int sum_tile_n = 0;
+    int sum_tile_m = 0;
     int itile_m, itile_n;
 
-    get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_m, itile_n,
-                                  sum_tile_n, flat_divider);
+    get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_n, itile_m,
+                                  sum_tile_m, flat_divider);
 
     while (true) {
       if (igroup >= 0) {
         tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;
         wait_barrier(tmem_writable[istage_tile], phase_tile);
-        tCt.data() = tmem_base_ptr + istage_tile * kTileN;
+        tCt.data() = tmem_base_ptr + istage_tile * kTileM;
 
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
           wait_barrier(tma_readable[istage_k], phase);
 
           // Execute a MmaTile_M x MmaTile_N x MmaTile_K GEMM
-          for (int ik = 0; ik < size<2>(tAr); ++ik) {
-            gemm(tiled_mma, tAr(_, _, ik, istage_k), tBr(_, _, ik, istage_k), tCt);
+          for (int ik = 0; ik < size<2>(tWr); ++ik) {
+            gemm(tiled_mma, tWr(_, _, ik, istage_k), tXr(_, _, ik, istage_k), tCt);
             tiled_mma.accumulate_ = UMMA::ScaleOut::One;
           }
 
@@ -436,14 +429,14 @@ __global__ void __launch_bounds__(256, 1)
     int istage_clc = 0;
 
     int igroup = 0;
-    int sum_tile_n = 0;
+    int sum_tile_m = 0;
     int itile_m, itile_n;
 
     while (true) {
       wait_barrier(task_writable[istage_clc], phase_clc_write);
       iblock += gridDim.x;
-      get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_m, itile_n,
-                                    sum_tile_n, flat_divider);
+      get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_n, itile_m,
+                                    sum_tile_m, flat_divider);
       task_shm[istage_clc][0] = igroup;
       task_shm[istage_clc][1] = itile_m;
       task_shm[istage_clc][2] = itile_n;
@@ -464,27 +457,25 @@ __global__ void __launch_bounds__(256, 1)
   } else if (idx >= 128) {
     idx -= 128;
 
-    auto epi_tiler = make_tile(Int<kCtaTileM>{}, Int<kEpiTileN>{});
+    tCt.data() = tmem_base_ptr;
+    auto epi_tiler = make_tile(Int<kCtaTileN>{}, Int<kEpiTileM>{});
     auto tCt_epi = zipped_divide(tCt, make_tile(epi_tiler));
-    auto sC_epi = zipped_divide(sC, epi_tiler);
-    auto sCT_epi = zipped_divide(sCT, epi_tiler);
+    auto rC_epi = zipped_divide(gY, epi_tiler);
+    auto sC_epi = zipped_divide(sY, epi_tiler);
 
     // TiledCopy TMEM -> RMEM
     auto tiled_copy_t2r = make_tmem_copy(SM100_TMEM_LOAD_16dp256b4x{}, tCt_epi(_, _0{}));
     auto thr_copy_t2r = tiled_copy_t2r.get_slice(idx);
     auto tCt4r = thr_copy_t2r.partition_S(tCt_epi);
-    auto tCr4t = make_tensor_like<float>(thr_copy_t2r.partition_D(sC_epi(_, 0)));
+    auto tCr4t = make_tensor_like<float>(thr_copy_t2r.partition_D(rC_epi(_, 0)));
 
     // TiledCopy RMEM -> SMEM
     auto tiled_copy_r2s_t =
         make_tiled_copy_D(Copy_Atom<cute::SM90_U16x8_STSM_T, Tout>{}, tiled_copy_t2r);
 
     auto thr_copy_r2s_t = tiled_copy_r2s_t.get_slice(idx);
-    auto tCTr4s = make_tensor_like<Tout>(thr_copy_r2s_t.partition_S(sC_epi(_, 0)));
-    auto tCTs4r = thr_copy_r2s_t.partition_D(sCT_epi);
-
-    auto &tCr = tCr4t;
-    auto &tCTr = tCTr4s;
+    auto tCr4s = make_tensor_like<Tout>(thr_copy_r2s_t.partition_S(rC_epi(_, 0)));
+    auto tCs4r = thr_copy_r2s_t.partition_D(sC_epi);
 
     auto nepi_tile = size<2>(tCt4r);
 
@@ -496,7 +487,7 @@ __global__ void __launch_bounds__(256, 1)
     int istage_clc = 0;
 
     int igroup = 0;
-    int sum_tile_n = 0;
+    int sum_tile_m = 0;
     int itile_m, itile_n;
 
     int istage_tma = 0;
@@ -505,29 +496,31 @@ __global__ void __launch_bounds__(256, 1)
 
     auto tCt4r_base_ptr = tCt4r.data();
 
-    get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_m, itile_n,
-                                  sum_tile_n, flat_divider);
+    get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_n, itile_m,
+                                  sum_tile_m, flat_divider);
 
-    auto gDT = tma_dt.get_tma_tensor(make_shape(m, n));
-    auto btma_dt = tma_dt.get_slice(0);
+    auto gYY = tma_y.get_tma_tensor(make_shape(n, m));
+    auto btma_y = tma_y.get_slice(0);
 
-    auto tDs = btma_dt.partition_S(sCT);  // (TMA, _2, _1)
-    auto tDg = btma_dt.partition_D(gDT);  // (TMA, TMA_M, TMA_N)
+    auto tDs = btma_y.partition_S(sY);   // (TMA, _2, _1)
+    auto tDg = btma_y.partition_D(gYY);  // (TMA, TMA_M, TMA_N)
 
     while (true) {
       if (igroup >= 0) {
-        tCt4r.data() = tCt4r_base_ptr + istage_tile * kTileN;
+        tCt4r.data() = tCt4r_base_ptr + istage_tile * kTileM;
+        float yscale = yscale_ptr[igroup];
+        auto *td_y = td_xy + igroup * 2 + 1;
+        prefetch_tma_descriptor(td_y);
         wait_barrier(tmem_readable[istage_tile], phase_tile);
         // per-group output scale (applied before fp32->bf16 cast in epilogue)
-        float yscale = yscale_ptr[igroup];
 #pragma unroll
         for (int iepi = 0; iepi < nepi_tile; iepi++) {
           // TMEM -> RMEM
           copy(tiled_copy_t2r, tCt4r(_, _, iepi), tCr4t);
           cutlass::arch::fence_view_async_tmem_load();
 
-          auto tCr_fp2 = recast<float2>(tCr);
-          auto tCr_bf162 = recast<__nv_bfloat162>(tCTr);
+          auto tCr_fp2 = recast<float2>(tCr4t);
+          auto tCr_bf162 = recast<__nv_bfloat162>(tCr4s);
 
           // cast (with per-group output scale)
 #pragma unroll
@@ -542,17 +535,16 @@ __global__ void __launch_bounds__(256, 1)
           cutlass::arch::NamedBarrier::sync(128, 0);
 
           // RMEM -> SMEM
-          copy(tiled_copy_r2s_t, tCTr4s, tCTs4r(_, _, istage_tma));
+          copy(tiled_copy_r2s_t, tCr4s, tCs4r(_, _, istage_tma));
 
           // SMEM -> GMEM
           tma_store_fence();
           cutlass::arch::NamedBarrier::sync(128, 0);
 
           if (is_leader) {
-            auto *td_y = td_xy + igroup * 2 + 1;
             cute::copy(
-                tma_dt.with(td_y), tDs(_, 0, 0, istage_tma),
-                tDg(_, itile_m * kMmaSM + get<0>(cluster_coord), itile_n * nepi_tile + iepi));
+                tma_y.with(td_y), tDs(_, 0, 0, istage_tma),
+                tDg(_, itile_n * kMmaSM + get<0>(cluster_coord), itile_m * nepi_tile + iepi));
             tma_store_arrive();
           }
 
@@ -601,35 +593,34 @@ __global__ void __launch_bounds__(256, 1)
   }
 }
 
-template <typename Config, typename TiledMma, typename TmaA, typename TmaB, typename TmaDT,
-          int kTaskLoopPolicy, bool kUsePDL = false>
+template <typename GemmConfig, typename TmaX, typename TmaW, typename TmaY, int kTaskLoopPolicy,
+          bool kUsePDL = false>
 __global__ void __launch_bounds__(256, 1)
-    group_gemm_1sm_fp8_kernel(const __grid_constant__ TmaA tma_a, cute::TmaDescriptor *td_xy,
+    group_gemm_1sm_fp8_kernel(const __grid_constant__ TmaW tma_w, cute::TmaDescriptor *td_xy,
                               int *seqlens_ptr, float *yscale_ptr, int *tiles_ptr,
                               int *cu_tiles_ptr, int num_group, int m, int n, int k,
                               cutlass::FastDivmod flat_divider) {
   using namespace cute;  // NOLINT
 
-  using Tin = typename Config::Tin;
-  using Tout = typename Config::Tout;
-  using SLayoutA = typename Config::SLayoutX;
-  using SLayoutB = typename Config::SLayoutW;
-  using SLayoutC = typename Config::SLayoutY;
-  using SLayoutCT = typename Config::SLayoutYT;
+  using Tin = typename GemmConfig::Tin;
+  using Tout = typename GemmConfig::Tout;
+  using SLayoutX = typename GemmConfig::SLayoutX;
+  using SLayoutW = typename GemmConfig::SLayoutW;
+  using SLayoutY = typename GemmConfig::SLayoutY;
 
-  constexpr int kTileM = Config::kTileM;
-  constexpr int kTileN = Config::kTileN;
-  constexpr int kTileK = Config::kTileK;
-  constexpr int kStageK = Config::kStage;
-  constexpr int kClusterM = Config::kClusterM;
-  constexpr int kClusterN = Config::kClusterN;
-  constexpr int kClusterK = Config::kClusterK;
-  constexpr int kMmaSM = Config::kMmaSM;
-  constexpr int kEpiTileN = Config::kEpiTileN;
-  constexpr int kStageTile = Config::kStageTile;
-  constexpr int kStageTMA = Config::kStageTMA;
-  constexpr int kCtaTileM = Config::kCtaTileM;
-  constexpr int kCtaTileN = Config::kCtaTileN;
+  constexpr int kTileM = GemmConfig::kTileM;
+  constexpr int kTileN = GemmConfig::kTileN;
+  constexpr int kTileK = GemmConfig::kTileK;
+  constexpr int kStageK = GemmConfig::kStageK;
+  constexpr int kClusterM = GemmConfig::kClusterM;
+  constexpr int kClusterN = GemmConfig::kClusterN;
+  constexpr int kClusterK = GemmConfig::kClusterK;
+  constexpr int kMmaSM = GemmConfig::kMmaSM;
+  constexpr int kEpiTileM = GemmConfig::kEpiTileM;
+  constexpr int kStageTile = GemmConfig::kStageTile;
+  constexpr int kStageTMA = GemmConfig::kStageTMA;
+  constexpr int kCtaTileM = GemmConfig::kCtaTileM;
+  constexpr int kCtaTileN = GemmConfig::kCtaTileN;
 
   int idx = threadIdx.x;
   int iwarp = idx / 32;
@@ -654,19 +645,17 @@ __global__ void __launch_bounds__(256, 1)
   __shared__ uint32_t tmem_base_ptr;
 
   extern __shared__ uint8_t shm_data[] alignas(128);
-  auto *shm_a = reinterpret_cast<Tin *>(shm_data);
-  auto *shm_b = shm_a + cosize(SLayoutA{});
-  auto *shm_c = reinterpret_cast<Tout *>(shm_b + cosize(SLayoutB{}));
+  auto *shm_w = reinterpret_cast<Tin *>(shm_data);
+  auto *shm_x = shm_w + cosize(SLayoutW{});
+  auto *shm_y = reinterpret_cast<Tout *>(shm_x + cosize(SLayoutX{}));
+  int *shm_tiles = reinterpret_cast<int *>(shm_y + cosize(SLayoutY{}));
 
-  int *shm_tiles = reinterpret_cast<int *>(shm_c + cosize(SLayoutCT{}));
+  TmaX tma_x;
+  TmaY tma_y;
 
-  TmaB tma_b;
-  TmaDT tma_dt;
-
-  auto sA = make_tensor(make_smem_ptr(shm_a), SLayoutA{});
-  auto sB = make_tensor(make_smem_ptr(shm_b), SLayoutB{});
-  auto sC = make_tensor(make_smem_ptr(shm_c), SLayoutC{});
-  auto sCT = make_tensor(make_smem_ptr(shm_c), SLayoutCT{});
+  auto sW = make_tensor(make_smem_ptr(shm_w), SLayoutW{});
+  auto sX = make_tensor(make_smem_ptr(shm_x), SLayoutX{});
+  auto sY = make_tensor(make_smem_ptr(shm_y), SLayoutY{});
 
   auto cluster_layout =
       tiled_divide(make_layout(make_shape(Int<kClusterM>{}, Int<kClusterN>{}, Int<kClusterK>{})),
@@ -675,36 +664,53 @@ __global__ void __launch_bounds__(256, 1)
   auto cluster_coord = cluster_layout.get_flat_coord(block_rank_in_cluster);
   bool elected_cta = get<0>(cluster_coord) == Int<0>{};
 
-  auto gA = tma_a.get_tma_tensor(make_shape(m, k, num_group));
-  auto gB = tma_b.get_tma_tensor(make_shape(n, k));
-  auto gC =
+  auto gW = tma_w.get_tma_tensor(make_shape(n, k, num_group));
+  auto gX = tma_x.get_tma_tensor(make_shape(m, k));
+  auto gY =
       make_tensor(make_gmem_ptr(static_cast<float *>(nullptr)),
-                  make_shape(Int<kTileM>{}, Int<kTileN>{}), make_stride(Int<kTileN>{}, Int<1>{}));
+                  make_shape(Int<kTileN>{}, Int<kTileM>{}), make_stride(Int<kTileM>{}, Int<1>{}));
 
   // TMA partition
-  auto btma_a = tma_a.get_slice(0);
-  auto btma_b = tma_b.get_slice(0);
+  auto btma_w = tma_w.get_slice(0);
+  auto btma_x = tma_x.get_slice(0);
 
-  auto tAg = btma_a.partition_S(gA);  // (TMA, TMA_M, TMA_K)
-  auto tAs = btma_a.partition_D(sA);  // (TMA, _1, _1, kStage)
+  auto tWg = btma_w.partition_S(gW);  // (TMA, TMA_M, TMA_K)
+  auto tWs = btma_w.partition_D(sW);  // (TMA, _1, _1, kStage)
 
-  auto tBg = btma_b.partition_S(gB);  // (TMA, TMA_N, TMA_K)
-  auto tBs = btma_b.partition_D(sB);  // (TMA, _1, _1, stage)
+  auto tXg = btma_x.partition_S(gX);  // (TMA, TMA_N, TMA_K)
+  auto tXs = btma_x.partition_D(sX);  // (TMA, _1, _1, stage)
 
   // UMMA partition
-  TiledMma tiled_mma;
+  typename GemmConfig::TiledMma tiled_mma;
   auto cta_mma = tiled_mma.get_slice(0);
 
-  auto tAs4r = cta_mma.partition_A(sA);
-  auto tBs4r = cta_mma.partition_B(sB);
-  auto tCgC = cta_mma.partition_C(gC);
+  auto tWs4r = cta_mma.partition_A(sW);
+  auto tXs4r = cta_mma.partition_B(sX);
+  auto tCgC = cta_mma.partition_C(gY);
 
-  auto tAr = cta_mma.make_fragment_A(tAs4r);
-  auto tBr = cta_mma.make_fragment_B(tBs4r);
+  auto tWr = cta_mma.make_fragment_A(tWs4r);
+  auto tXr = cta_mma.make_fragment_B(tXs4r);
   auto tCt = cta_mma.make_fragment_C(tCgC);
 
   using TmemAllocator = TMEM::Allocator1Sm;
   TmemAllocator tmem_allocator{};
+
+  auto next_power2 = [&](auto tmem_cols) {
+    constexpr int x = decltype(tmem_cols)::value;
+    if constexpr (x <= 32) {
+      return 32;
+    } else if constexpr (x <= 64) {
+      return 64;
+    } else if constexpr (x <= 128) {
+      return 128;
+    } else if constexpr (x <= 256) {
+      return 256;
+    } else {
+      return 512;
+    }
+  };
+
+  constexpr int kTmemCols = next_power2(std::integral_constant<int, kTileM * kStageTile>{});
 
   // __syncthreads();
   if (iwarp == 0 && elected) {
@@ -732,13 +738,14 @@ __global__ void __launch_bounds__(256, 1)
 
     cutlass::arch::fence_barrier_init();
   } else if (iwarp == 1) {
-    tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &tmem_base_ptr);
+    // tmem_allocator.allocate(kTileN * kStageTile, &tmem_base_ptr);
+    tmem_allocator.allocate(kTmemCols, &tmem_base_ptr);
+    tmem_allocator.release_allocation_lock();
   }
 
-  int ntile_k = size<2>(tAg);
+  int ntile_k = size<2>(tWg);
 
   constexpr int kTransactionBytes =
-      // kMmaSM * sizeof(Tin) * (cosize(SLayoutA{}(_, _, 0)) + cosize(SLayoutB{}(_, _, 0)));
       kMmaSM * sizeof(Tin) * (kCtaTileM * kTileK + kCtaTileN * kTileK);
 
   int total_m = 0;
@@ -775,22 +782,22 @@ __global__ void __launch_bounds__(256, 1)
     int istage_clc = 0;
 
     int igroup = 0;
-    int sum_tile_n = 0;
+    int sum_tile_m = 0;
     int itile_m, itile_n;
 
-    get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_m, itile_n,
-                                  sum_tile_n, flat_divider);
+    get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_n, itile_m,
+                                  sum_tile_m, flat_divider);
 
     while (true) {
       if (igroup >= 0) {
         auto *td_x = td_xy + igroup * 2;
-
+        prefetch_tma_descriptor(td_x);
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
           wait_barrier(tma_writable[istage_k], phase);
-          copy(tma_a.with(tma_readable[istage_k]), tAg(_, itile_m, itile_k, igroup),
-               tAs(_, 0, 0, istage_k));
-          copy(tma_b.with(td_x, tma_readable[istage_k]), tBg(_, itile_n, itile_k),
-               tBs(_, 0, 0, istage_k));
+          copy(tma_w.with(tma_readable[istage_k], 0, TMA::CacheHintSm90::EVICT_FIRST),
+               tWg(_, itile_n, itile_k, igroup), tWs(_, 0, 0, istage_k));
+          copy(tma_x.with(td_x, tma_readable[istage_k], 0, TMA::CacheHintSm90::EVICT_FIRST),
+               tXg(_, itile_m, itile_k), tXs(_, 0, 0, istage_k));
           set_barrier_transaction_bytes(tma_readable[istage_k], kTransactionBytes);
 
           istage_k++;
@@ -827,24 +834,24 @@ __global__ void __launch_bounds__(256, 1)
     int istage_clc = 0;
 
     int igroup = 0;
-    int sum_tile_n = 0;
+    int sum_tile_m = 0;
     int itile_m, itile_n;
 
-    get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_m, itile_n,
-                                  sum_tile_n, flat_divider);
+    get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_n, itile_m,
+                                  sum_tile_m, flat_divider);
 
     while (true) {
       if (igroup >= 0) {
         tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;
         wait_barrier(tmem_writable[istage_tile], phase_tile);
-        tCt.data() = tmem_base_ptr + istage_tile * kTileN;
+        tCt.data() = tmem_base_ptr + istage_tile * kTileM;
 
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
           wait_barrier(tma_readable[istage_k], phase);
 
           // Execute a MmaTile_M x MmaTile_N x MmaTile_K GEMM
-          for (int ik = 0; ik < size<2>(tAr); ++ik) {
-            gemm(tiled_mma, tAr(_, _, ik, istage_k), tBr(_, _, ik, istage_k), tCt);
+          for (int ik = 0; ik < size<2>(tWr); ++ik) {
+            gemm(tiled_mma, tWr(_, _, ik, istage_k), tXr(_, _, ik, istage_k), tCt);
             tiled_mma.accumulate_ = UMMA::ScaleOut::One;
           }
 
@@ -888,14 +895,14 @@ __global__ void __launch_bounds__(256, 1)
     int istage_clc = 0;
 
     int igroup = 0;
-    int sum_tile_n = 0;
+    int sum_tile_m = 0;
     int itile_m, itile_n;
 
     while (true) {
       wait_barrier(task_writable[istage_clc], phase_clc_write);
       iblock += gridDim.x;
-      get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_m, itile_n,
-                                    sum_tile_n, flat_divider);
+      get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_n, itile_m,
+                                    sum_tile_m, flat_divider);
       task_shm[istage_clc][0] = igroup;
       task_shm[istage_clc][1] = itile_m;
       task_shm[istage_clc][2] = itile_n;
@@ -916,27 +923,25 @@ __global__ void __launch_bounds__(256, 1)
   } else if (idx >= 128) {
     idx -= 128;
 
-    auto epi_tiler = make_tile(Int<kCtaTileM>{}, Int<kEpiTileN>{});
+    tCt.data() = tmem_base_ptr;
+    auto epi_tiler = make_tile(Int<kCtaTileN>{}, Int<kEpiTileM>{});
     auto tCt_epi = zipped_divide(tCt, make_tile(epi_tiler));
-    auto sC_epi = zipped_divide(sC, epi_tiler);
-    auto sCT_epi = zipped_divide(sCT, epi_tiler);
+    auto rC_epi = zipped_divide(gY, epi_tiler);
+    auto sC_epi = zipped_divide(sY, epi_tiler);
 
     // TiledCopy TMEM -> RMEM
     auto tiled_copy_t2r = make_tmem_copy(SM100_TMEM_LOAD_16dp256b2x{}, tCt_epi(_, _0{}));
     auto thr_copy_t2r = tiled_copy_t2r.get_slice(idx);
     auto tCt4r = thr_copy_t2r.partition_S(tCt_epi);
-    auto tCr4t = make_tensor_like<float>(thr_copy_t2r.partition_D(sC_epi(_, 0)));
+    auto tCr4t = make_tensor_like<float>(thr_copy_t2r.partition_D(rC_epi(_, 0)));
 
     // TiledCopy RMEM -> SMEM
     auto tiled_copy_r2s_t =
         make_tiled_copy_D(Copy_Atom<cute::SM90_U16x8_STSM_T, Tout>{}, tiled_copy_t2r);
 
     auto thr_copy_r2s_t = tiled_copy_r2s_t.get_slice(idx);
-    auto tCTr4s = make_tensor_like<Tout>(thr_copy_r2s_t.partition_S(sC_epi(_, 0)));
-    auto tCTs4r = thr_copy_r2s_t.partition_D(sCT_epi);
-
-    auto &tCr = tCr4t;
-    auto &tCTr = tCTr4s;
+    auto tCr4s = make_tensor_like<Tout>(thr_copy_r2s_t.partition_S(rC_epi(_, 0)));
+    auto tCs4r = thr_copy_r2s_t.partition_D(sC_epi);
 
     auto nepi_tile = size<2>(tCt4r);
 
@@ -948,7 +953,7 @@ __global__ void __launch_bounds__(256, 1)
     int istage_clc = 0;
 
     int igroup = 0;
-    int sum_tile_n = 0;
+    int sum_tile_m = 0;
     int itile_m, itile_n;
 
     int istage_tma = 0;
@@ -957,22 +962,24 @@ __global__ void __launch_bounds__(256, 1)
 
     auto tCt4r_base_ptr = tCt4r.data();
 
-    get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_m, itile_n,
-                                  sum_tile_n, flat_divider);
+    get_next_tile_horizon<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_n, itile_m,
+                                  sum_tile_m, flat_divider);
 
     while (true) {
       if (igroup >= 0) {
-        tCt4r.data() = tCt4r_base_ptr + istage_tile * kTileN;
-        wait_barrier(tmem_readable[istage_tile], phase_tile);
+        tCt4r.data() = tCt4r_base_ptr + istage_tile * kTileM;
         float yscale = yscale_ptr[igroup];
+        auto *td_y = td_xy + igroup * 2 + 1;
+        prefetch_tma_descriptor(td_y);
+        wait_barrier(tmem_readable[istage_tile], phase_tile);
 #pragma unroll
         for (int iepi = 0; iepi < nepi_tile; iepi++) {
           // TMEM -> RMEM
           copy(tiled_copy_t2r, tCt4r(_, _, iepi), tCr4t);
           cutlass::arch::fence_view_async_tmem_load();
 
-          auto tCr_fp2 = recast<float2>(tCr);
-          auto tCr_bf162 = recast<__nv_bfloat162>(tCTr);
+          auto tCr_fp2 = recast<float2>(tCr4t);
+          auto tCr_bf162 = recast<__nv_bfloat162>(tCr4s);
 
           // cast (with per-group output scale)
 #pragma unroll
@@ -987,22 +994,21 @@ __global__ void __launch_bounds__(256, 1)
           cutlass::arch::NamedBarrier::sync(128, 0);
 
           // RMEM -> SMEM
-          copy(tiled_copy_r2s_t, tCTr4s, tCTs4r(_, _, istage_tma));
+          copy(tiled_copy_r2s_t, tCr4s, tCs4r(_, _, istage_tma));
 
           // SMEM -> GMEM
           tma_store_fence();
           cutlass::arch::NamedBarrier::sync(128, 0);
 
           if (iwarp == 4 && elected) {
-            auto gDT = tma_dt.get_tma_tensor(make_shape(m, n));
-            auto btma_dt = tma_dt.get_slice(0);
+            auto gYY = tma_y.get_tma_tensor(make_shape(n, m));
+            auto btma_y = tma_y.get_slice(0);
 
-            auto tDs = btma_dt.partition_S(sCT);  // (TMA, _2, _1)
-            auto tDg = btma_dt.partition_D(gDT);  // (TMA, TMA_M, TMA_N)
+            auto tDs = btma_y.partition_S(sY);   // (TMA, _2, _1)
+            auto tDg = btma_y.partition_D(gYY);  // (TMA, TMA_M, TMA_N)
 
-            auto *td_y = td_xy + igroup * 2 + 1;
-            cute::copy(tma_dt.with(td_y), tDs(_, 0, 0, istage_tma),
-                       tDg(_, itile_m, itile_n * nepi_tile + iepi));
+            cute::copy(tma_y.with(td_y), tDs(_, 0, 0, istage_tma),
+                       tDg(_, itile_n, itile_m * nepi_tile + iepi));
             tma_store_arrive();
           }
 
@@ -1043,7 +1049,8 @@ __global__ void __launch_bounds__(256, 1)
   // Then deallocate TMEM
   if (iwarp == 1) {
     // tmem_allocator.release_allocation_lock();
-    tmem_allocator.free(tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+    // tmem_allocator.free(tmem_base_ptr, kTileN * kStageTile);
+    tmem_allocator.free(tmem_base_ptr, kTmemCols);
   }
 
   if constexpr (kUsePDL) {

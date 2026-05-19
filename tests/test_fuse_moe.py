@@ -65,7 +65,7 @@ def naive_gather_expert_inputs(x, topk_ids, num_expert, rank_ep):
     )
 
 
-def naive_group_gemm(x, w, cu_seqlens, scale, expert_ids):
+def naive_group_gemm(x, w, cu_seqlens, scale, expert_ids, out_dtype):
 
     m, k = x.shape
     num_group, n, _ = w.shape
@@ -86,7 +86,7 @@ def naive_group_gemm(x, w, cu_seqlens, scale, expert_ids):
             scale_a=scale[i],
             scale_b=torch.ones((1), dtype=torch.float, device="cuda"),
             bias=None,
-            out_dtype=torch.bfloat16,
+            out_dtype=out_dtype,
         )
         y[start_idx:end_idx] = y_group
     return y
@@ -98,7 +98,7 @@ def naive_act_mul_and_quant(gate_up, scale):
         return x / (1 + (-x).exp())
 
     gate, up = torch.chunk(gate_up.float(), 2, dim=1)
-    out = (silu(gate).to(torch.bfloat16) * up.to(torch.bfloat16)).float() * scale
+    out = (silu(gate) * up).float() * scale
     outfp8 = out.to(torch.float8_e4m3fn)
     return outfp8
 
@@ -136,14 +136,21 @@ def naive_fuse_moe_pertensor_fp8(
 
     # gate_up_proj
     gate_up_output = naive_group_gemm(
-        gate_up_input, gate_up_weight, cu_seqlens, gate_up_scale, expert_ids
+        gate_up_input,
+        gate_up_weight,
+        cu_seqlens,
+        gate_up_scale,
+        expert_ids,
+        out_dtype=torch.float32,
     )
 
     # act_and_mul
     down_input = naive_act_mul_and_quant(gate_up_output, act_and_mul_scale)
 
     # down_proj
-    down_output = naive_group_gemm(down_input, down_weight, cu_seqlens, down_scale, expert_ids)
+    down_output = naive_group_gemm(
+        down_input, down_weight, cu_seqlens, down_scale, expert_ids, out_dtype=torch.bfloat16
+    )
 
     # reduce
     y = naive_reduce(down_output, topk_pos, topk_scale, shared_output)
@@ -189,8 +196,8 @@ def test_fuse_moe_pertensor_fp8(
         dtype=torch.float,
         device="cuda",
     ).to(dtype)
-    gate_up_scale = torch.randn((num_expert // size_ep), dtype=torch.float, device="cuda")
-    down_scale = torch.randn((num_expert // size_ep), dtype=torch.float, device="cuda")
+    gate_up_scale = torch.randn((num_expert // size_ep), dtype=torch.float, device="cuda") / 4
+    down_scale = torch.randn((num_expert // size_ep), dtype=torch.float, device="cuda") / 4
     act_and_mul_scale = torch.randn((1), dtype=torch.float, device="cuda")
     topk_scale = torch.randn((num_seq, num_topk), dtype=torch.float, device="cuda") / num_topk
     if has_shared_output:

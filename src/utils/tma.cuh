@@ -29,7 +29,8 @@ __device__ __forceinline__ void tma_descriptor_replace_shapes_in_shared_mem(
       "r"(prob_shape[4]));
 }
 
-template <typename Tma, typename GTensor, bool kUpdateShape = true>
+template <typename Tma, typename GTensor, bool kUpdateShape = true,
+          bool kUpdateMemoryControlBit = false>
 __device__ __forceinline__ void update_tma_gtensor(cute::TmaDescriptor &smem_tma_desc,
                                                    const GTensor &gtensor) {
   cute::array<uint32_t, 5> shape{1, 1, 1, 1, 1};
@@ -39,6 +40,30 @@ __device__ __forceinline__ void update_tma_gtensor(cute::TmaDescriptor &smem_tma
 
   const void *gmem_ptr = gtensor.data().get();
   cute::tma_descriptor_replace_addr_in_shared_mem(smem_tma_desc, gmem_ptr);
+
+  if constexpr (kUpdateMemoryControlBit) {
+    using T = typename GTensor::value_type;
+    constexpr int kTSize = cute::sizeof_bits_v<T> / 8;
+    constexpr int kLargeMemoryThreshold = 128 * 1024;
+    int64_t old_size = kTSize;
+    int64_t new_size = kTSize;
+
+    for (auto &s : shape) {
+      new_size *= s;
+    }
+    int32_t *tma_desc_as_int = reinterpret_cast<int32_t *>(&smem_tma_desc);
+#pragma unroll
+    for (int i = 8; i < 13; i++) {
+      old_size *= (tma_desc_as_int[i] + 1);
+    }
+
+    bool is_new_size_larger = (new_size >= kLargeMemoryThreshold);
+    bool is_old_size_larger = (old_size >= kLargeMemoryThreshold);
+
+    if (is_new_size_larger ^ is_old_size_larger) {
+      tma_desc_as_int[2] ^= (1 << 21);
+    }
+  }
 
   if constexpr (kUpdateShape) {
     tma_descriptor_replace_shapes_in_shared_mem(smem_tma_desc, shape);

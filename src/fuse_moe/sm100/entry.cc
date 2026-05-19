@@ -38,14 +38,13 @@ count_and_gather_entry(const torch::Tensor &x, const torch::Tensor &topk_ids,
       torch::empty({num_seq * num_topk, hidden_size}, options.dtype(torch::kBFloat16));
 
   torch::Tensor topk_pos = torch::empty({num_seq, num_topk}, options.dtype(torch::kInt32));
-  torch::Tensor seqlens = torch::zeros({num_expert}, options.dtype(torch::kInt32));
+  torch::Tensor seqlens = torch::empty({num_expert}, options.dtype(torch::kInt32));
   torch::Tensor cu_seqlens = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
-  torch::Tensor tiles = torch::empty({num_expert}, options.dtype(torch::kInt32));
-  torch::Tensor cu_tiles = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
+  torch::Tensor tiles = torch::empty({2 * num_expert}, options.dtype(torch::kInt32));
+  torch::Tensor cu_tiles = torch::empty({2 * (num_expert + 1)}, options.dtype(torch::kInt32));
   torch::Tensor gate_up_tmas = torch::empty({num_expert * 2, 128}, options.dtype(torch::kInt8));
   torch::Tensor dowm_tmas = torch::empty({num_expert * 2, 128}, options.dtype(torch::kInt8));
 
-  const auto *x_ptr = x.const_data_ptr();
   const auto *topk_ids_ptr = topk_ids.const_data_ptr();
 
   auto *gate_up_input_ptr = gate_up_input.mutable_data_ptr();
@@ -60,9 +59,19 @@ count_and_gather_entry(const torch::Tensor &x, const torch::Tensor &topk_ids,
   auto *gate_up_tmas_ptr = gate_up_tmas.mutable_data_ptr();
   auto *dowm_tmas_ptr = dowm_tmas.mutable_data_ptr();
 
+  const bool fuse_act = true;
+
+  int gateup_k = hidden_size;
+  int gateup_n = fuse_act ? intermediate_size / 2 : intermediate_size;
+
+  int down_k = intermediate_size / 2;
+  int down_n = hidden_size;
+
   count_and_gather_async(topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr,
-                         cu_tiles_ptr, num_seq, num_topk, num_expert, rank_ep,
-                         num_seq_per_group_avg, stream);
+                         cu_tiles_ptr, gate_up_tmas_ptr, dowm_tmas_ptr, gate_up_input_ptr,
+                         fuse_act ? down_input_ptr : gate_up_output_ptr, down_input_ptr,
+                         down_output_ptr, gateup_k, gateup_n, down_k, down_n, num_seq, num_topk,
+                         num_expert, rank_ep, num_seq_per_group_avg, stream, nullptr, fuse_act);
 
   return std::make_tuple(gate_up_input, gate_up_output, topk_pos, seqlens, cu_seqlens, tiles,
                          cu_tiles, gate_up_tmas, dowm_tmas);
@@ -179,8 +188,6 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   int num_expert = gate_up_weight.size(0);
   int intermediate_size = gate_up_weight.size(1);
   int num_topk = topk_ids.size(1);
-  int aligned_size = 0;
-  int num_tokens_per_group_avg = num_seq * num_topk / num_expert_total;
   TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
   auto options = x.options();
@@ -207,34 +214,17 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   torch::Tensor down_tmas = torch::empty({num_expert * 2, 128}, options.dtype(torch::kInt8));
 
   torch::Tensor topk_pos = torch::empty({num_seq, num_topk}, options.dtype(torch::kInt32));
-  torch::Tensor seqlens = torch::zeros({num_expert}, options.dtype(torch::kInt32));
+  torch::Tensor seqlens = torch::empty({num_expert}, options.dtype(torch::kInt32));
   torch::Tensor cu_seqlens = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
-  torch::Tensor tiles = torch::empty({num_expert}, options.dtype(torch::kInt32));
-  torch::Tensor cu_tiles = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
+  torch::Tensor tiles = torch::empty({2 * num_expert}, options.dtype(torch::kInt32));
+  torch::Tensor cu_tiles = torch::empty({2 * (num_expert + 1)}, options.dtype(torch::kInt32));
+  torch::Tensor x_row_map =
+      torch::empty({num_seq * num_topk + num_expert}, options.dtype(torch::kInt32));
 
-  torch::Tensor x_row_map = torch::empty({num_seq * num_topk}, options.dtype(torch::kInt32));
-
-  if (num_tokens_per_group_avg <= 8) {
-    // aligned_size is actually the kTileM in group gemm
-    aligned_size = 8;
-  } else if (num_tokens_per_group_avg <= 16) {
-    aligned_size = 16;
-  } else if (num_tokens_per_group_avg <= 32) {
-    aligned_size = 32;
-  } else if (num_tokens_per_group_avg <= 48) {
-    aligned_size = 48;
-  } else {
-    aligned_size = 64;
-  }
-
-  int num_sm = get_sm_count();
-  constexpr int kTileN = 128;
-  int num_gateup_tiles = ((num_seq + aligned_size - 1) / aligned_size) *
-                         ((intermediate_size + kTileN - 1) / kTileN) * num_expert;
-  int num_down_tiles = ((num_seq + aligned_size - 1) / aligned_size) *
-                       ((hidden_size + kTileN - 1) / kTileN) * num_expert;
-  int num_gateup_waves = (num_gateup_tiles + num_sm - 1) / num_sm + 1;
-  int num_down_waves = (num_down_tiles + num_sm - 1) / num_sm + 1;
+  int num_gateup_tiles = 0;
+  int num_down_tiles = 0;
+  int num_gateup_waves = 0;
+  int num_down_waves = 0;
 
   const auto *x_ptr = x.const_data_ptr();
   const auto *topk_ids_ptr = topk_ids.const_data_ptr();
