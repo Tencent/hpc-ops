@@ -27,32 +27,75 @@ def _find_project_root() -> "Path | None":
     return None
 
 
-def _nvshmem_search_dirs() -> "list[Path]":
-    """Build the ordered list of directories to search for libnvshmem_host."""
+def _detect_sm_arch() -> "str | None":
+    """Detect SM architecture of the current GPU, e.g. '90', '100'. Returns None if no GPU."""
+    try:
+        if not torch.cuda.is_available():
+            return None
+        major, minor = torch.cuda.get_device_capability(0)
+        return str(major * 10 + minor)
+    except Exception:
+        return None
+
+
+def _nvshmem_search_dirs(arch: "str | None") -> "list[Path]":
+    """Build the ordered list of directories to search for libnvshmem_host.
+
+    NVSHMEM's ``libnvshmem_host.so`` statically embeds a per-arch device
+    fatbin (see comment in setup.py). Therefore the search order MUST
+    prefer per-arch subdirectories matching the current GPU architecture
+    over generic flat directories. Otherwise CUDA Runtime fails to
+    register the embedded module on a GPU of a different arch and the
+    test reports ``Unable to access device state. 500``.
+
+    The lookup priority is:
+      1. Wheel install per-arch layout: ``<pkg>/nvshmem/sm{ARCH}/``
+      2. Wheel install flat layout (legacy / single-arch wheels): ``<pkg>/``
+      3. Per-arch CMake build outputs: ``<root>/build/sm{ARCH}/hpc/nvshmem-install/lib``
+      4. Generic per-arch CMake build outputs (any arch).
+      5. Legacy in-source layout: ``<root>/3rd/ucl/nvshmem/lib``
+    """
     dirs: list[Path] = []
 
-    # 1. Package directory (wheel install scenario: .so is bundled next to _C_sm*.so).
+    # 1. Package per-arch subdirectory (current MULTI_ARCH wheel layout).
+    if arch is not None:
+        per_arch = _pkg_dir / "nvshmem" / f"sm{arch}"
+        if per_arch not in dirs:
+            dirs.append(per_arch)
+
+    # 2. Package flat directory (legacy single-arch wheel layout).
     dirs.append(_pkg_dir)
 
-    # 2. Explicit override via env var.
+    # 3. Explicit override via env var.
     env_root = os.environ.get("HPC_OPS_ROOT")
     if env_root:
         root = Path(env_root).resolve()
-        dirs.append(root / _NVSHMEM_LEGACY_REL)
-        # New per-arch cmake layout (build/sm*/hpc/nvshmem-install/lib).
-        dirs.extend((root / "build").glob("sm*/hpc/nvshmem-install/lib"))
-
-    # 3. Auto-detected project root (editable / local cmake build).
-    project_root = _find_project_root()
-    if project_root:
-        # Legacy in-source layout.
-        legacy = project_root / _NVSHMEM_LEGACY_REL
+        if arch is not None:
+            arch_build = root / "build" / f"sm{arch}" / "hpc" / "nvshmem-install" / "lib"
+            if arch_build not in dirs:
+                dirs.append(arch_build)
+        # Generic per-arch cmake layout (build/sm*/hpc/nvshmem-install/lib),
+        # used as a last-resort fallback when arch detection fails.
+        for d in (root / "build").glob("sm*/hpc/nvshmem-install/lib"):
+            if d not in dirs:
+                dirs.append(d)
+        legacy = root / _NVSHMEM_LEGACY_REL
         if legacy not in dirs:
             dirs.append(legacy)
-        # Per-arch build outputs produced by current CMakeLists.txt.
+
+    # 4. Auto-detected project root (editable / local cmake build).
+    project_root = _find_project_root()
+    if project_root:
+        if arch is not None:
+            arch_build = project_root / "build" / f"sm{arch}" / "hpc" / "nvshmem-install" / "lib"
+            if arch_build not in dirs:
+                dirs.append(arch_build)
         for d in (project_root / "build").glob("sm*/hpc/nvshmem-install/lib"):
             if d not in dirs:
                 dirs.append(d)
+        legacy = project_root / _NVSHMEM_LEGACY_REL
+        if legacy not in dirs:
+            dirs.append(legacy)
 
     return dirs
 
@@ -92,14 +135,20 @@ def _load_nvshmem_library():
     subsequent ``torch.ops.load_library`` call on ``_C_sm*.abi3.so`` can
     resolve its ``NEEDED libnvshmem_host.so.3`` dependency.
 
+    The host lib is per-arch (it statically links libnvshmem_device.a whose
+    fatbin is per-arch), so we MUST pick the copy that matches the current
+    GPU's compute capability. ``_nvshmem_search_dirs`` enforces this
+    ordering by placing ``<pkg>/nvshmem/sm{ARCH}/`` first.
+
     On success, also configure ``LD_LIBRARY_PATH`` and preload bootstrap
     plugins so that NVSHMEM's runtime ``dlopen`` calls succeed.
 
     Failures are reported on stderr (instead of being silently swallowed) to
     make CI diagnostics tractable.
     """
+    arch = _detect_sm_arch()
     tried: list[str] = []
-    for d in _nvshmem_search_dirs():
+    for d in _nvshmem_search_dirs(arch):
         if not d.is_dir():
             continue
         for name in _NVSHMEM_NAMES:
@@ -125,17 +174,6 @@ def _load_nvshmem_library():
         "shared object file'. Tried:\n  " + "\n  ".join(tried),
         file=sys.stderr,
     )
-
-
-def _detect_sm_arch() -> "str | None":
-    """Detect SM architecture of the current GPU, e.g. '90', '100'. Returns None if no GPU."""
-    try:
-        if not torch.cuda.is_available():
-            return None
-        major, minor = torch.cuda.get_device_capability(0)
-        return str(major * 10 + minor)
-    except Exception:
-        return None
 
 
 def _load_extension_library():

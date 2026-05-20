@@ -96,21 +96,41 @@ class CMakeBuild(build_ext):
         so_dst_path = os.path.join(build_lib_dir, "hpc", so_filename)
         shutil.copy(so_src_path, so_dst_path)
 
-        # Bundle every shared object produced by the NVSHMEM external project
-        # alongside _C_sm*.abi3.so. This must include not only
-        # libnvshmem_host.so[.3] (the NEEDED dependency of _C_sm*.abi3.so)
-        # but also bootstrap plugins such as nvshmem_bootstrap_uid.so.3,
-        # which NVSHMEM loads at runtime via dlopen by bare filename
+        # Bundle every shared object produced by the NVSHMEM external project.
+        # This must include not only libnvshmem_host.so[.3] (the NEEDED
+        # dependency of _C_sm*.abi3.so) but also bootstrap plugins such as
+        # nvshmem_bootstrap_uid.so.3, which NVSHMEM loads at runtime via
+        # dlopen by bare filename
         # (see 3rd/ucl/nvshmem/src/host/bootstrap/bootstrap_loader.cpp).
         # Without these plugins the wheel will fail at test_communicator with
         #   "nvshmem_bootstrap_uid.so.3: cannot open shared object file".
+        #
+        # IMPORTANT (per-arch isolation):
+        # libnvshmem_host.so statically links libnvshmem_device.a, whose
+        # device fatbin is built per CUDA architecture (sm_90a / sm_100a /
+        # sm_103a). Therefore libnvshmem_host.so produced under SM_ARCH=X
+        # only contains a fatbin for sm_Xa and CANNOT be reused across
+        # architectures. Running such a host lib on a GPU of a different
+        # arch causes CUDA Runtime to fail registering the embedded module,
+        # and downstream NVSHMEM calls fail with
+        #   "Unable to access device state. 500"
+        #   "Unable to access ibgda device state. 500"
+        # which is exactly the failure mode of MULTI_ARCH=1 wheels prior to
+        # this fix (see commit log for cf42b82).
+        #
+        # We therefore install the per-arch NVSHMEM shared libs into a
+        # dedicated subdirectory (hpc/nvshmem/sm{ARCH}/) so each arch keeps
+        # its own copy. hpc/__init__.py picks the right subdir at runtime
+        # based on the detected GPU compute capability.
         #
         # NVSHMEM_INSTALL_DIR in CMakeLists.txt is set to
         #   ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-install
         # i.e. <build_temp_dir>/nvshmem-install in this script.
         nvshmem_lib_dir = os.path.join(build_temp_dir, "nvshmem-install", "lib")
         hpc_pkg_dir = os.path.join(build_lib_dir, "hpc")
+        nvshmem_arch_dir = os.path.join(hpc_pkg_dir, "nvshmem", f"sm{ext.sm_arch}")
         if os.path.isdir(nvshmem_lib_dir):
+            os.makedirs(nvshmem_arch_dir, exist_ok=True)
             bundled = 0
             for entry in os.listdir(nvshmem_lib_dir):
                 # Match libfoo.so / libfoo.so.X / libfoo.so.X.Y.Z and bare
@@ -121,13 +141,7 @@ class CMakeBuild(build_ext):
                 # Skip directories (none expected, but be defensive).
                 if os.path.isdir(src) and not os.path.islink(src):
                     continue
-                dst = os.path.join(hpc_pkg_dir, entry)
-                # MULTI_ARCH=1 invokes this codepath once per arch; the lib
-                # contents are identical across archs (host-side libs only
-                # depend on CUDA, not on SM_ARCH), so skip if already copied
-                # by a previous arch to keep the build idempotent.
-                if os.path.exists(dst):
-                    continue
+                dst = os.path.join(nvshmem_arch_dir, entry)
                 # follow_symlinks=True (the default): wheels cannot contain
                 # symlinks, so we materialise the symlink target as a real
                 # file under its SONAME-style name (e.g. libnvshmem_host.so.3
@@ -235,7 +249,17 @@ setup(
     # Important: include all .so files in the wheel.
     # "*.so.*" is required to pick up versioned SONAMEs such as
     # libnvshmem_host.so.3 which are otherwise excluded by "*.so".
-    package_data={"hpc": ["*.so", "*.so.*"]},
+    # The "nvshmem/sm*/..." patterns pick up per-arch NVSHMEM shared libs
+    # bundled into hpc/nvshmem/sm{ARCH}/ subdirectories (see CMakeBuild
+    # for the rationale on per-arch isolation).
+    package_data={
+        "hpc": [
+            "*.so",
+            "*.so.*",
+            "nvshmem/sm*/*.so",
+            "nvshmem/sm*/*.so.*",
+        ]
+    },
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
     install_requires=["torch"],
 )
