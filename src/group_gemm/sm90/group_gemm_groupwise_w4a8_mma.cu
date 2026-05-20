@@ -686,12 +686,26 @@ void group_gemm_groupwise_w4a8_mma_async(void *y_ptr, const void *x_ptr, const v
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
+
+  // SM90-Safety PerBlockSharedMemory size
+  constexpr int kDynSmemBudgetBytes = 46 * 1024;
+  int shm_size_no_task_map = kScaleSharedMemorySize + static_cast<int>(sizeof(int)) *
+                                                          (num_group + num_group + 1 + num_group);
+  if (use_task_map) {
+    int shm_size_with_task_map =
+        kScaleSharedMemorySize + static_cast<int>(sizeof(int4)) * num_waves;
+    if (shm_size_with_task_map > kDynSmemBudgetBytes) {
+      use_task_map = false;
+      task_map_ptr = nullptr;
+      num_waves = 0;
+    }
+  }
+
   int shm_size = kScaleSharedMemorySize;  // scale
   if (use_task_map) {
     shm_size += sizeof(int4) * num_waves;
   } else {
-    shm_size += sizeof(int) *
-                (num_group + num_group + 1 + num_group);  // seqlens + cu_seqlens + pad_seqlens;
+    shm_size = shm_size_no_task_map;  // seqlens + cu_seqlens + pad_seqlens;
   }
 
   config.dynamicSmemBytes = shm_size;

@@ -641,23 +641,35 @@ torch::Tensor fuse_moe_groupwise_w4a8_entry(
 
   // Allocate task_map workspaces sized to the worst-case number of tiles the
   // w4a8 mma kernel may visit, The kernel uses kTileM=8 and kTileN=64.
-  int num_sm = get_sm_count();
-  int num_block = num_sm * 7;
-  constexpr int kW4TileM = 8;
-  constexpr int kW4TileN = 64;
-  int num_gateup_tiles = ((num_seq + kW4TileM - 1) / kW4TileM) *
-                         ((intermediate_size + kW4TileN - 1) / kW4TileN) * num_expert;
-  int num_down_tiles = ((num_seq + kW4TileM - 1) / kW4TileM) *
-                       ((hidden_size + kW4TileN - 1) / kW4TileN) * num_expert;
-  int num_gateup_waves = (num_gateup_tiles + num_block - 1) / num_block + 1;
-  int num_down_waves = (num_down_tiles + num_block - 1) / num_block + 1;
+  // Limit of BatchSize which TaskMap can be generated
+  constexpr int kTaskMapMaxBatchSize = 2048;
+  int total_num_seq = num_seq * num_topk;
+  bool use_task_map = total_num_seq <= kTaskMapMaxBatchSize;
 
-  torch::Tensor gate_up_task_map =
-      torch::empty({num_gateup_waves, num_block, 4}, options.dtype(torch::kInt32));
-  torch::Tensor down_task_map =
-      torch::empty({num_down_waves, num_block, 4}, options.dtype(torch::kInt32));
-  auto *gate_up_task_map_ptr = gate_up_task_map.mutable_data_ptr();
-  auto *down_task_map_ptr = down_task_map.mutable_data_ptr();
+  int num_gateup_waves = 0;
+  int num_down_waves = 0;
+  torch::Tensor gate_up_task_map;
+  torch::Tensor down_task_map;
+  void *gate_up_task_map_ptr = nullptr;
+  void *down_task_map_ptr = nullptr;
+
+  if (use_task_map) {
+    int num_sm = get_sm_count();
+    int num_block = num_sm * 7;
+    constexpr int kW4TileM = 8;
+    constexpr int kW4TileN = 64;
+    int num_gateup_tiles = ((num_seq + kW4TileM - 1) / kW4TileM) *
+                           ((intermediate_size + kW4TileN - 1) / kW4TileN) * num_expert;
+    int num_down_tiles = ((num_seq + kW4TileM - 1) / kW4TileM) *
+                         ((hidden_size + kW4TileN - 1) / kW4TileN) * num_expert;
+    num_gateup_waves = (num_gateup_tiles + num_block - 1) / num_block + 1;
+    num_down_waves = (num_down_tiles + num_block - 1) / num_block + 1;
+
+    gate_up_task_map = torch::empty({num_gateup_waves, num_block, 4}, options.dtype(torch::kInt32));
+    down_task_map = torch::empty({num_down_waves, num_block, 4}, options.dtype(torch::kInt32));
+    gate_up_task_map_ptr = gate_up_task_map.mutable_data_ptr();
+    down_task_map_ptr = down_task_map.mutable_data_ptr();
+  }
 
   fuse_moe_groupwise_w4a8_async(
       y_ptr, x_ptr, gate_up_input_ptr, gate_up_output_ptr, gate_up_weight_ptr, gate_up_scale_ptr,
