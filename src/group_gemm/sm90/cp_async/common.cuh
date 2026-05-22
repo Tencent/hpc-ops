@@ -49,10 +49,18 @@ __device__ __forceinline__ void get_next_tile_horizon(const int *tiles_ptr, int 
 // The multiplier is tuned per kTileM to balance SM occupancy against the
 // per-CTA scheduler walk cost.
 static constexpr int grid_multiplier(int tile_m) {
-  if (tile_m <= 8) return 8;
-  if (tile_m <= 16) return 9;
-  if (tile_m <= 32) return 8;
-  if (tile_m <= 48) return 7;
+  if (tile_m <= 8) {
+    return 8;
+  }
+  if (tile_m <= 16) {
+    return 9;
+  }
+  if (tile_m <= 32) {
+    return 8;
+  }
+  if (tile_m <= 48) {
+    return 7;
+  }
   return 5;
 }
 

@@ -144,10 +144,14 @@ __global__ void __launch_bounds__(128, kMinBlocks) group_gemm_fp8_scatter_kernel
   int ntile = k / kTileK;
   while (true) {
     if constexpr (kUseTaskMap) {
-      if (iblock >= task_map_len) break;
+      if (iblock >= task_map_len) {
+        break;
+      }
       int4 task = task_map_ptr[iblock];
       igroup = task.x;
-      if (igroup < 0) break;
+      if (igroup < 0) {
+        break;
+      }
       itile_m = task.y;
       itile_n = task.z;
     } else {

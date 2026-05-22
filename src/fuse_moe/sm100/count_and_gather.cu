@@ -347,7 +347,9 @@ __global__ void route_row_map_kernel(
       const int itopk_base = iseq * num_topk;
 #pragma unroll
       for (int k = 0; k < kMaxNumTopk; ++k) {
-        if (k >= num_topk) break;
+        if (k >= num_topk) {
+          break;
+        }
         const int iexpert = topk_ids_ptr[itopk_base + k];
         if ((iexpert >= start_expert) && (iexpert < end_expert)) {
           const int local_expert = iexpert - start_expert;
@@ -383,7 +385,9 @@ __global__ void route_row_map_kernel(
       const int itopk_base = iseq * num_topk;
 #pragma unroll
       for (int k = 0; k < kMaxNumTopk; ++k) {
-        if (k >= num_topk) break;
+        if (k >= num_topk) {
+          break;
+        }
         const int local_expert = local_expert_k[k];
         if (local_expert >= 0) {
           const int itopk = itopk_base + k;
@@ -800,7 +804,9 @@ void launch_count_and_gather(const void *topk_ids_ptr, void *topk_pos_ptr,
     {
       int num_block = (total_num_topk + kThreadPerBlock - 1) / kThreadPerBlock;
       const int coop_max_block = num_sm_count * 2;
-      if (num_block > coop_max_block) num_block = coop_max_block;
+      if (num_block > coop_max_block) {
+        num_block = coop_max_block;
+      }
 
       cudaLaunchAttribute attrs[2];
       attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -858,7 +864,9 @@ void launch_count_and_gather(const void *topk_ids_ptr, void *topk_pos_ptr,
       constexpr int kRouteThreadPerBlock = 256;
       constexpr int kMaxNumTopk = 8;  // matches MoE configs exercised in-repo.
       int route_blocks = (num_seq + kRouteThreadPerBlock - 1) / kRouteThreadPerBlock;
-      if (route_blocks < 1) route_blocks = 1;
+      if (route_blocks < 1) {
+        route_blocks = 1;
+      }
 
       cudaLaunchConfig_t config{};
       config.gridDim = dim3(route_blocks + num_expert);

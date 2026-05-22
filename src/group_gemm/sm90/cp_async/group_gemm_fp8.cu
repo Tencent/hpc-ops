@@ -69,10 +69,14 @@ __global__ void __launch_bounds__(128, kMinBlocks)
   int sum_tile_m = 0;
   while (true) {
     if constexpr (kUseTaskMap) {
-      if (iblock >= task_map_len) break;
+      if (iblock >= task_map_len) {
+        break;
+      }
       int4 task = task_map_ptr[iblock];
       igroup = task.x;
-      if (igroup < 0) break;
+      if (igroup < 0) {
+        break;
+      }
       itile_m = task.y;
       itile_n = task.z;
     } else {
@@ -304,15 +308,17 @@ void group_gemm_fp8_multistage_async(void *y_ptr, const void *x_ptr, const void 
     };
 
     if (use_task_map) {
-      if (use_pdl)
+      if (use_pdl) {
         dispatch(std::true_type{}, std::true_type{});
-      else
+      } else {
         dispatch(std::true_type{}, std::false_type{});
+      }
     } else {
-      if (use_pdl)
+      if (use_pdl) {
         dispatch(std::false_type{}, std::true_type{});
-      else
+      } else {
         dispatch(std::false_type{}, std::false_type{});
+      }
     }
   };
 
@@ -327,16 +333,17 @@ void group_gemm_fp8_multistage_async(void *y_ptr, const void *x_ptr, const void 
   };
 
   // Pick kTileM from the average tokens per expert.
-  if (num_seq_per_group_avg <= 8)
+  if (num_seq_per_group_avg <= 8) {
     dispatch_k_stage(Int<8>{});
-  else if (num_seq_per_group_avg <= 16)
+  } else if (num_seq_per_group_avg <= 16) {
     dispatch_k_stage(Int<16>{});
-  else if (num_seq_per_group_avg <= 32)
+  } else if (num_seq_per_group_avg <= 32) {
     dispatch_k_stage(Int<32>{});
-  else if (num_seq_per_group_avg <= 48)
+  } else if (num_seq_per_group_avg <= 48) {
     dispatch_k_stage(Int<48>{});
-  else
+  } else {
     dispatch_k_stage(Int<64>{});
+  }
 }
 
 }  // namespace group_gemm_cp_async

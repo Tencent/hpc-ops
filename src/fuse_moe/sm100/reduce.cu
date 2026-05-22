@@ -100,7 +100,9 @@ __global__ void reduce_kernel_v2(T *y_ptr, const T *x_ptr, const int *topk_pos_p
                                  const float *topk_scale_ptr, const T *shared_output_ptr,
                                  int total_num_seq, int num_seq, int hidden_size) {
   const uint64_t irow = blockIdx.x;
-  if (irow >= (uint64_t)num_seq) return;
+  if (irow >= (uint64_t)num_seq) {
+    return;
+  }
 
   // Load pos/scale once per row. Up to kNumTopk <= kThreadPerBlock so the
   // first kNumTopk threads cover everything. Stash into shared memory so the
@@ -136,7 +138,9 @@ __global__ void reduce_kernel_v2(T *y_ptr, const T *x_ptr, const int *topk_pos_p
 #pragma unroll
   for (int v = 0; v < kVecsPerThread; ++v) {
     int icol = (v * kThreadPerBlock + threadIdx.x) * kNumItemPer16B;
-    if (icol >= hidden_size) break;
+    if (icol >= hidden_size) {
+      break;
+    }
 
     vec_t<float, kNumItemPer16B> y_fp32;
 #pragma unroll

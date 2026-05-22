@@ -16,10 +16,18 @@ namespace group_gemm_cp_async {
 
 // Must match the kTileM dispatch inside group_gemm_fp8_*_async.
 static int pick_tile_m(int num_seq_per_group_avg) {
-  if (num_seq_per_group_avg <= 8) return 8;
-  if (num_seq_per_group_avg <= 16) return 16;
-  if (num_seq_per_group_avg <= 32) return 32;
-  if (num_seq_per_group_avg <= 48) return 48;
+  if (num_seq_per_group_avg <= 8) {
+    return 8;
+  }
+  if (num_seq_per_group_avg <= 16) {
+    return 16;
+  }
+  if (num_seq_per_group_avg <= 32) {
+    return 32;
+  }
+  if (num_seq_per_group_avg <= 48) {
+    return 48;
+  }
   return 64;
 }
 

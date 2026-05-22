@@ -140,8 +140,12 @@ void launch_build_two_task_maps(void *gateup_task_map_ptr, void *down_task_map_p
                                 int gate_up_num_tile_n, int down_num_tile_n,
                                 int gateup_task_map_len, int down_task_map_len, bool use_pdl,
                                 cudaStream_t stream) {
-  if (num_group <= 0) return;
-  if (gateup_task_map_ptr == nullptr && down_task_map_ptr == nullptr) return;
+  if (num_group <= 0) {
+    return;
+  }
+  if (gateup_task_map_ptr == nullptr && down_task_map_ptr == nullptr) {
+    return;
+  }
   auto *gu = reinterpret_cast<int4 *>(gateup_task_map_ptr);
   auto *dn = reinterpret_cast<int4 *>(down_task_map_ptr);
   // Extra CTAs initialize the unused task-map suffix with sentinel entries.
@@ -150,8 +154,12 @@ void launch_build_two_task_maps(void *gateup_task_map_ptr, void *down_task_map_p
       (static_cast<int64_t>(gateup_task_map_len) + static_cast<int64_t>(down_task_map_len)) * 16;
   int bytes_per_block = kBlockSize * 16 * 8;  // ~16 KB / block
   int tail_blocks = static_cast<int>((total_bytes + bytes_per_block - 1) / bytes_per_block);
-  if (tail_blocks < 1) tail_blocks = 1;
-  if (tail_blocks > 32) tail_blocks = 32;
+  if (tail_blocks < 1) {
+    tail_blocks = 1;
+  }
+  if (tail_blocks > 32) {
+    tail_blocks = 32;
+  }
   int grid = num_group + tail_blocks;
   if (use_pdl) {
     cudaLaunchAttribute attr[1];
@@ -178,8 +186,12 @@ void launch_build_two_task_maps(void *gateup_task_map_ptr, void *down_task_map_p
 
 void launch_build_task_map(void *task_map_ptr, const void *cu_tiles_ptr, const void *tiles_ptr,
                            int num_group, int num_tile_n, bool use_pdl, cudaStream_t stream) {
-  if (num_group <= 0) return;
-  if (task_map_ptr == nullptr) return;
+  if (num_group <= 0) {
+    return;
+  }
+  if (task_map_ptr == nullptr) {
+    return;
+  }
   if (use_pdl) {
     cudaLaunchAttribute attr[1];
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;

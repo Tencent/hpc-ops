@@ -407,8 +407,12 @@ void launch_count_and_build(const int *topk_ids_ptr, int *row_indices_ptr, int *
             16;
         int bytes_per_block = kThreadPerBlock * 16 * 8;  // ~32 KB
         tail_blocks = static_cast<int>((total_bytes + bytes_per_block - 1) / bytes_per_block);
-        if (tail_blocks < 1) tail_blocks = 1;
-        if (tail_blocks > 32) tail_blocks = 32;  // cap at 32 for small kernel
+        if (tail_blocks < 1) {
+          tail_blocks = 1;
+        }
+        if (tail_blocks > 32) {
+          tail_blocks = 32;  // cap at 32 for small kernel
+        }
       }
       int task_map_blocks = need_tm ? (num_expert + tail_blocks) : 0;
       dim3 block(kThreadPerBlock);
