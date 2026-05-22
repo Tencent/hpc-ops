@@ -384,7 +384,7 @@ __global__ void attention_decode_bf16_multistage_ws_kernel(
       auto tAttAbf16 = make_tensor_like<cute::bfloat16_t>(tAttA);
 #pragma unroll
       for (int i = 0; i < size(tAttA); ++i) {
-        tAttAbf16(i) = (cute::bfloat16_t)(tAttA(i));
+        tAttAbf16(i) = static_cast<cute::bfloat16_t>(tAttA(i));
       }
 
       wait_barrier(bar_v_readable[istage_read], phase);
@@ -437,7 +437,7 @@ __global__ void attention_decode_bf16_multistage_ws_kernel(
       auto tAttAbf16 = make_tensor_like<cute::bfloat16_t>(tAttA);
 #pragma unroll
       for (int i = 0; i < size(tAttA); ++i) {
-        tAttAbf16(i) = (cute::bfloat16_t)(tAttA(i));
+        tAttAbf16(i) = static_cast<cute::bfloat16_t>(tAttA(i));
       }
 
       wait_barrier(bar_v_readable[istage_read], phase);
@@ -683,7 +683,7 @@ __global__ void attention_decode_bf16_onestage_kernel(
     auto tAttAbf16 = make_tensor_like<cute::bfloat16_t>(tAttA);
 #pragma unroll
     for (int i = 0; i < size(tAttA); ++i) {
-      tAttAbf16(i) = (cute::bfloat16_t)(tAttA(i));
+      tAttAbf16(i) = static_cast<cute::bfloat16_t>(tAttA(i));
     }
 
     wait_barrier(bar_v, phase);
@@ -730,7 +730,7 @@ __global__ void attention_decode_bf16_onestage_kernel(
     auto tAttAbf16 = make_tensor_like<cute::bfloat16_t>(tAttA);
 #pragma unroll
     for (int i = 0; i < size(tAttA); ++i) {
-      tAttAbf16(i) = (cute::bfloat16_t)(tAttA(i));
+      tAttAbf16(i) = static_cast<cute::bfloat16_t>(tAttA(i));
     }
 
     wait_barrier(bar_v, phase);

@@ -347,7 +347,7 @@ __global__ void __launch_bounds__(384, 1)
         auto tAttAbf16 = make_tensor_like<cute::bfloat16_t>(tAttA);
 #pragma unroll
         for (int i = 0; i < size(tAttA); ++i) {
-          tAttAbf16(i) = (cute::bfloat16_t)(tAttA(i));
+          tAttAbf16(i) = static_cast<cute::bfloat16_t>(tAttA(i));
         }
 
         warpgroup_fence_operand(tYr);

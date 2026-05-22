@@ -126,7 +126,9 @@ __global__ void deepseekv4_routing_method_kernel(float* __restrict__ out_weights
   const int local_warp_id = threadIdx.x / kWarpSize;
   const int lane_id = threadIdx.x % kWarpSize;
 
-  if (global_warp_id >= batch_size) return;
+  if (global_warp_id >= batch_size) {
+    return;
+  }
 
   auto warp = cg::tiled_partition<kWarpSize>(cg::this_thread_block());
 

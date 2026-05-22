@@ -464,7 +464,7 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_kernel(
       auto tAttAbf16 = make_tensor_like<cute::bfloat16_t>(tAttr);
 #pragma unroll
       for (int i = 0; i < size(tAttr); ++i) {
-        tAttAbf16(i) = (cute::bfloat16_t)(tAttr(i));
+        tAttAbf16(i) = static_cast<cute::bfloat16_t>(tAttr(i));
       }
 
       auto tPr4s = thr_copy_P_r2s.retile_S(tAttAbf16);
@@ -525,7 +525,7 @@ __global__ void attention_decode_bf16_multistage_ws_smallm_kernel(
       auto tAttAbf16 = make_tensor_like<cute::bfloat16_t>(tAttr);
 #pragma unroll
       for (int i = 0; i < size(tAttr); ++i) {
-        tAttAbf16(i) = (cute::bfloat16_t)(tAttr(i));
+        tAttAbf16(i) = static_cast<cute::bfloat16_t>(tAttr(i));
       }
 
       auto tPr4s = thr_copy_P_r2s.retile_S(tAttAbf16);

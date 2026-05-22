@@ -55,7 +55,9 @@ static inline KernelConfig select_config(int m, int n, bool use_splitk) {
 
   if (n == kN192) {
     for (const auto &seg : kN192Segments) {
-      if (m <= seg.m_max) return seg.cfg;
+      if (m <= seg.m_max) {
+        return seg.cfg;
+      }
     }
     return {kDefaultSk1, kDefaultWg1, kDefaultKtm64};
   }

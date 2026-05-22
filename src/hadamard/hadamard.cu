@@ -367,11 +367,21 @@ __global__ void hadamard_transform(const DType* input_ptr, DType* output_ptr, fl
     }
 
     // Step 3: Perform kUnitIters levels of unit Hadamard transform (inter-thread butterfly)
-    if constexpr (kUnitIters >= 1) unit_hadamard<1, kBaseSize>(data, ilane);
-    if constexpr (kUnitIters >= 2) unit_hadamard<2, kBaseSize>(data, ilane);
-    if constexpr (kUnitIters >= 3) unit_hadamard<4, kBaseSize>(data, ilane);
-    if constexpr (kUnitIters >= 4) unit_hadamard<8, kBaseSize>(data, ilane);
-    if constexpr (kUnitIters >= 5) unit_hadamard<16, kBaseSize>(data, ilane);
+    if constexpr (kUnitIters >= 1) {
+      unit_hadamard<1, kBaseSize>(data, ilane);
+    }
+    if constexpr (kUnitIters >= 2) {
+      unit_hadamard<2, kBaseSize>(data, ilane);
+    }
+    if constexpr (kUnitIters >= 3) {
+      unit_hadamard<4, kBaseSize>(data, ilane);
+    }
+    if constexpr (kUnitIters >= 4) {
+      unit_hadamard<8, kBaseSize>(data, ilane);
+    }
+    if constexpr (kUnitIters >= 5) {
+      unit_hadamard<16, kBaseSize>(data, ilane);
+    }
 
     // Step 4: Perform base Hadamard transform (intra-thread)
     base_hadamard<kBaseSize>(data);

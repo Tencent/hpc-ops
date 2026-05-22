@@ -77,7 +77,9 @@ __global__ void fuse_cal_three_H_kernel(float* output_H_pre_ptr, float* output_H
                                         const float* hc_scale_ptr, const float* hc_base_ptr,
                                         int num_batch, int hc_sinkhorn_iters, float hc_eps) {
   const int irow = blockIdx.x * blockDim.x + threadIdx.x;
-  if (irow >= num_batch) return;
+  if (irow >= num_batch) {
+    return;
+  }
 
   constexpr int kHCDim = 2 * kHCMult + kHCMult * kHCMult;
   const float* mixes_hat_hat_H_row_ptr = mixes_hat_hat_H_ptr + irow * kHCDim;

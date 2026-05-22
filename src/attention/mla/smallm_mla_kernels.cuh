@@ -447,7 +447,7 @@ __global__ void __launch_bounds__(384, 1)
       auto tAttAbf16 = make_tensor_like<cute::bfloat16_t>(tAttr);
 #pragma unroll
       for (int i = 0; i < size(tAttr); ++i) {
-        tAttAbf16(i) = (cute::bfloat16_t)(tAttr(i));
+        tAttAbf16(i) = static_cast<cute::bfloat16_t>(tAttr(i));
       }
 
       auto tPr4s = thr_copy_P_r2s.retile_S(tAttAbf16);

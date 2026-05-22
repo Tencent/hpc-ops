@@ -40,7 +40,9 @@ __device__ __forceinline__ void rms_norm_apply(vec_t<T, N> &data, const float *s
                                                int ilane) {
   float sum_sq = 0.f;
 #pragma unroll
-  for (int i = 0; i < kNumItemPerThread; ++i) sum_sq += data[i] * data[i];
+  for (int i = 0; i < kNumItemPerThread; ++i) {
+    sum_sq += data[i] * data[i];
+  }
   sum_sq = warp_reduce_sum_xor(sum_sq);
   float inv_rms = rsqrtf(sum_sq / kHeadDim + kEps);
   constexpr int kRoundsHalf = (kHeadDim / 2 + kWarpSize - 1) / kWarpSize;
@@ -59,7 +61,9 @@ template <int kN, typename T, int N>
 __device__ __forceinline__ float warp_abs_max(vec_t<T, N> &data) {
   float m = kEps;
 #pragma unroll
-  for (int i = 0; i < kN; ++i) m = fmaxf(m, fabsf(data[i]));
+  for (int i = 0; i < kN; ++i) {
+    m = fmaxf(m, fabsf(data[i]));
+  }
   return warp_reduce_max_xor(m);
 }
 
@@ -108,11 +112,15 @@ __global__ void rope_norm_store_kv_kernel(
   // ---- Clear blocks: bidx >= num_compute_blocks → one block per request -----
   if (bidx >= num_compute_blocks) {
     int req_id = bidx - num_compute_blocks;
-    if (req_id >= num_batch) return;
+    if (req_id >= num_batch) {
+      return;
+    }
 
     // Last token of this request determines the clear range
     int last_token_pos = num_seqlen_per_req_ptr[req_id] - 1;
-    if (last_token_pos < 0) return;
+    if (last_token_pos < 0) {
+      return;
+    }
 
     int block_idx_in_batch, pos_in_block;
     kv_block_size_divider(block_idx_in_batch, pos_in_block, last_token_pos);
@@ -124,16 +132,21 @@ __global__ void rope_norm_store_kv_kernel(
       constexpr int kKItemPerThread = 16 / sizeof(DType);
       vec_t<DType, kKItemPerThread> zero_vec;
 #pragma unroll
-      for (int z = 0; z < kKItemPerThread; ++z) zero_vec[z] = DType(0);
+      for (int z = 0; z < kKItemPerThread; ++z) {
+        zero_vec[z] = DType(0);
+      }
       // Each grid.y clears only its own kv_head = bidy; warps cooperate across rows
       for (int row = zero_from + iwarp; row < zero_to; row += kWarpsPerBlock) {
         DType *k_row = kcache_ptr + phys_block_id * kc.s0 + row * kc.s1 + bidy * kc.s2;
         for (int idx = ilane * kKItemPerThread; idx < kQKHeadDim;
-             idx += kWarpSize * kKItemPerThread)
+             idx += kWarpSize * kKItemPerThread) {
           store(k_row + idx, zero_vec);
+        }
         DType *v_row = vcache_ptr + phys_block_id * vc.s0 + row * vc.s1 + bidy * vc.s2;
-        for (int idx = ilane * kKItemPerThread; idx < kVHeadDim; idx += kWarpSize * kKItemPerThread)
+        for (int idx = ilane * kKItemPerThread; idx < kVHeadDim;
+             idx += kWarpSize * kKItemPerThread) {
           store(v_row + idx, zero_vec);
+        }
       }
     }
   } else {
@@ -185,10 +198,14 @@ __global__ void rope_norm_store_kv_kernel(
     __syncthreads();
 
     //  Early-exit for invalid rows
-    if (irow >= num_rows) return;
+    if (irow >= num_rows) {
+      return;
+    }
     batch_id = smem_batch_id[iwarp];
     token_id = smem_token_pos[iwarp];
-    if (token_id < 0) return;
+    if (token_id < 0) {
+      return;
+    }
 
     //  Load cos_sin
     {
@@ -377,10 +394,14 @@ __global__ void rope_norm_store_kv_fp8_kernel(
   // ---- Clear blocks: bidx >= num_compute_blocks → one warp per request -----
   if (bidx >= num_compute_blocks) {
     int req_id = (bidx - num_compute_blocks) * kWarpsPerBlock + iwarp;
-    if (req_id >= num_batch) return;
+    if (req_id >= num_batch) {
+      return;
+    }
 
     int last_token_pos = num_seqlen_per_req_ptr[req_id] - 1;
-    if (last_token_pos < 0) return;
+    if (last_token_pos < 0) {
+      return;
+    }
 
     int block_idx_in_batch, pos_in_block;
     kv_block_size_divider(block_idx_in_batch, pos_in_block, last_token_pos);
@@ -399,7 +420,9 @@ __global__ void rope_norm_store_kv_fp8_kernel(
     constexpr int kVRounds = (kVHeadDim + kKItemPerRound - 1) / kKItemPerRound;
     vec_t<QType, kKItemPerThread> zero_vec;
 #pragma unroll
-    for (int z = 0; z < kKItemPerThread; ++z) zero_vec[z] = QType(0);
+    for (int z = 0; z < kKItemPerThread; ++z) {
+      zero_vec[z] = QType(0);
+    }
     for (int row = zero_from; row < zero_to; ++row) {
       // Each grid.y clears only its own kv_head = bidy
       QType *k_row = kcache_ptr + phys_block_id * kc.s0 + row * kc.s1 + bidy * kc.s2;
@@ -475,8 +498,9 @@ __global__ void rope_norm_store_kv_fp8_kernel(
 #pragma unroll
         for (int i = 0; i < kNumLoadRound; ++i) {
           int ioffset = (i * kWarpSize + ilane) * kElemPerThread;
-          if (ioffset < kNumElemPerRow)
+          if (ioffset < kNumElemPerRow) {
             store(dst + ioffset, load<DType, kElemPerThread>(src + ioffset));
+          }
         }
       }
     }
@@ -485,10 +509,14 @@ __global__ void rope_norm_store_kv_fp8_kernel(
     __syncthreads();
 
     // Early-exit for invalid/padding rows
-    if (irow >= num_rows) return;
+    if (irow >= num_rows) {
+      return;
+    }
     batch_id = smem_batch_id[iwarp];
     token_id = smem_token_pos[iwarp];
-    if (token_id < 0) return;
+    if (token_id < 0) {
+      return;
+    }
 
     // Load cos/sin (per-warp, needs __syncwarp for intra-warp visibility)
     {

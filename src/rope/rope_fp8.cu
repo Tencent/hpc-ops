@@ -158,7 +158,9 @@ __global__ void apply_rotary_pos_emb_prefill_fp8_kernel(
   }
 
   int irow = bid * kNumWarpsPerBlock + iwarp;
-  if (irow >= num_rows) return;
+  if (irow >= num_rows) {
+    return;
+  }
 
   // Compute batch_id and token_id_in_batch for each warp
   if (tid < kNumWarpsPerBlock) {
@@ -446,7 +448,9 @@ __global__ void apply_rotary_pos_emb_blocked_prefill_fp8_kernel(
   }
 
   int irow = bid * kNumWarpsPerBlock + iwarp;
-  if (irow >= num_rows) return;
+  if (irow >= num_rows) {
+    return;
+  }
 
   // Compute batch_id and token_id_in_batch for each warp
   if (tid < kNumWarpsPerBlock) {

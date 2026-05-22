@@ -101,10 +101,14 @@ __device__ __forceinline__ void splitk_reduce(Tout *y_ptr, float *splitk_y_ptr,
 
 #pragma unroll
   for (int irow = iwarp; irow < kTileM; irow += kWarpCount) {
-    if (row + irow >= m) return;
+    if (row + irow >= m) {
+      return;
+    }
 
     int icol = ilane * kN;
-    if (col + icol >= n) return;
+    if (col + icol >= n) {
+      return;
+    }
 
     auto y = load<float, kN>(splitk_y_tile + irow * n + icol);
     if constexpr (HasBias) {

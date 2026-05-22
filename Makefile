@@ -68,12 +68,25 @@ doc:
 	python3 tools/generate_docs.py
 	python3 -m mkdocs build
 
-format:
+# InsertBraces (used in .clang-format) was introduced in clang-format 15.
+# requirements-dev.txt pins clang-format==20.1.8; this guard fails early if a
+# stale system clang-format is on PATH and would silently ignore the option.
+CLANG_FORMAT_MIN_MAJOR := 15
+
+check-format-tools:
+	@cf_ver=$$(clang-format --version 2>/dev/null | sed -n 's/.*version \([0-9]\{1,\}\).*/\1/p'); \
+	 if [ -z "$$cf_ver" ] || [ "$$cf_ver" -lt $(CLANG_FORMAT_MIN_MAJOR) ]; then \
+	   echo "ERROR: clang-format >= $(CLANG_FORMAT_MIN_MAJOR) required (found '$$cf_ver')."; \
+	   echo "       Install pinned dev tools via: pip install -r requirements-dev.txt"; \
+	   exit 1; \
+	 fi
+
+format: check-format-tools
 	python3 -m black --line-length 100 $(PY_FILES)
 	clang-format --style=file -i $(CSRC_FILES)
 	python3 -m cpplint --quiet $(CSRC_FILES)
 
-format-check:
+format-check: check-format-tools
 	python3 -m black --check --line-length 100 $(PY_FILES)
 	clang-format --style=file --dry-run -Werror $(CSRC_FILES)
 	python3 -m cpplint $(CSRC_FILES)

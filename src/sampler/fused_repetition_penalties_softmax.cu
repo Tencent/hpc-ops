@@ -283,7 +283,9 @@ __global__ void block_fused_repetition_penalties_softmax_kernel(
 #pragma unroll
       for (int istage = 0; istage < kStage; istage++) {
         int64_t icol = kIters * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
-        if (icol + kItemPerLoad > vocab_size) break;
+        if (icol + kItemPerLoad > vocab_size) {
+          break;
+        }
         int ibit = icol % 8;
         masks[istage] = penalties_masks_batch[icol / 8];
         masks[istage] >>= ibit;
@@ -300,7 +302,9 @@ __global__ void block_fused_repetition_penalties_softmax_kernel(
 #pragma unroll
     for (int istage = 0; istage < kStage; istage++) {
       int64_t icol = kIters * kItemsPerIter + istage * kItemsPerStage + idx * kItemPerLoad;
-      if (icol + kItemPerLoad > vocab_size) break;
+      if (icol + kItemPerLoad > vocab_size) {
+        break;
+      }
 #pragma unroll
       for (int i = 0; i < kItemPerLoad; i++) {
         if (temperature > 0.f) {
