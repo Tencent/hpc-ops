@@ -40,8 +40,8 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
   int down_n = hidden_size;
 
   // 0. call count_and_gather_async (produces topk_pos and optionally x_row_map)
-  count_and_gather_async(topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr,
-                         cu_tiles_ptr, gate_up_tmas_ptr, down_tmas_ptr, gate_up_x_ptr,
+  count_and_gather_async(topk_ids_ptr, topk_pos_ptr, topk_scale_ptr, seqlens_ptr, cu_seqlens_ptr,
+                         tiles_ptr, cu_tiles_ptr, gate_up_tmas_ptr, down_tmas_ptr, gate_up_x_ptr,
                          fuse_act ? down_input_ptr : gate_up_output_ptr, down_input_ptr,
                          down_output_ptr, gateup_k, gateup_n, down_k, down_n, num_seq, num_topk,
                          num_expert_local, rank_ep, num_seq_per_group_avg, stream, x_row_map_ptr,
@@ -53,7 +53,8 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
   void *gateup_cu_tiles_ptr = reinterpret_cast<void *>(reinterpret_cast<int32_t *>(cu_tiles_ptr));
   void *down_cu_tiles_ptr =
       reinterpret_cast<void *>(reinterpret_cast<int32_t *>(cu_tiles_ptr) + num_expert_local + 1);
-
+  void *topk_scale_row_map_ptr =
+      reinterpret_cast<void *>(reinterpret_cast<float *>(x_row_map_ptr) + total_num_seq);
   if (fuse_act) {
     // 1. && 2. call gate_up linear FUSED with act_mul_and_quant.
     group_gemm::group_gemm_cp_async_fp8_act_mul_async(
@@ -81,15 +82,23 @@ void fuse_moe_async(void *output_ptr, const void *input_ptr, void *gate_up_input
   }
 
   // 3. call down linear
-  group_gemm::group_gemm_fp8_async(
-      down_output_ptr, down_input_ptr, down_weight_ptr, seqlens_ptr, cu_seqlens_ptr, down_scale_ptr,
-      down_tmas_ptr, down_tiles_ptr, down_cu_tiles_ptr, /*task_map=*/nullptr, num_down_waves,
-      num_expert_local, total_num_seq, hidden_size, intermediate_size / 2, num_seq_per_group_avg,
-      false, use_pdl, stream);
+  if (shared_output_ptr && (num_seq_per_group_avg >= 128 || num_seq_per_group_avg <= 32)) {
+    group_gemm::group_gemm_fp8_with_reduce_async(
+        output_ptr, down_input_ptr, down_weight_ptr, seqlens_ptr, cu_seqlens_ptr, down_scale_ptr,
+        down_tmas_ptr, down_tiles_ptr, down_cu_tiles_ptr, /*task_map=*/nullptr, x_row_map_ptr,
+        topk_scale_row_map_ptr, num_down_waves, num_expert_local, total_num_seq, hidden_size,
+        intermediate_size / 2, num_seq_per_group_avg, false, use_pdl, stream);
+  } else {
+    group_gemm::group_gemm_fp8_async(
+        output_ptr, down_input_ptr, down_weight_ptr, seqlens_ptr, cu_seqlens_ptr, down_scale_ptr,
+        down_tmas_ptr, down_tiles_ptr, down_cu_tiles_ptr, /*task_map=*/nullptr, num_down_waves,
+        num_expert_local, total_num_seq, hidden_size, intermediate_size / 2, num_seq_per_group_avg,
+        false, use_pdl, stream);
 
-  // 4. call reduce
-  reduce_async(output_ptr, down_output_ptr, topk_pos_ptr, topk_scale_ptr, shared_output_ptr,
-               total_num_seq, num_seq, hidden_size, num_topk, use_pdl, stream);
+    // 4. call reduce
+    reduce_async(output_ptr, down_output_ptr, topk_pos_ptr, topk_scale_ptr, shared_output_ptr,
+                 total_num_seq, num_seq, hidden_size, num_topk, use_pdl, stream);
+  }
 }
 
 void fuse_moe_blockwise_async(

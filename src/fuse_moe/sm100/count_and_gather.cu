@@ -230,12 +230,13 @@ template <int kThreadPerBlock, int kMaxNumTopk, typename Tin, typename Tout, typ
           typename GateUpTmaX, typename GateUpTmaY, typename DownTmaX, typename DownTmaY,
           bool kUsePDL = false>
 __global__ void route_row_map_kernel(
-    const int *topk_ids_ptr, int *topk_pos_ptr, int *seqlens_ptr, const int *cu_seqlens_ptr,
-    const vec_t<cute::TmaDescriptor, 4> td_xy, cute::TmaDescriptor *gate_up_tma_xy,
-    cute::TmaDescriptor *down_tma_xy, const Tin *gate_up_input_ptr, Tout_Gateup *gate_up_output_ptr,
-    Tin *down_input_ptr, Tout *down_output_ptr, int *row_map_race_pos_ptr, int gateup_k,
-    int gateup_n, int down_k, int down_n, int total_num_topk, int num_topk, int num_expert,
-    int start_expert, int end_expert, cutlass::FastDivmod topk_divider, int *x_row_map_ptr) {
+    const int *topk_ids_ptr, int *topk_pos_ptr, const float *topk_scale_ptr, int *seqlens_ptr,
+    const int *cu_seqlens_ptr, const vec_t<cute::TmaDescriptor, 4> td_xy,
+    cute::TmaDescriptor *gate_up_tma_xy, cute::TmaDescriptor *down_tma_xy,
+    const Tin *gate_up_input_ptr, Tout_Gateup *gate_up_output_ptr, Tin *down_input_ptr,
+    Tout *down_output_ptr, int *row_map_race_pos_ptr, int gateup_k, int gateup_n, int down_k,
+    int down_n, int total_num_topk, int num_topk, int num_expert, int start_expert, int end_expert,
+    cutlass::FastDivmod topk_divider, int *x_row_map_ptr, float *weight_scale_row_map_ptr) {
   const int tid = threadIdx.x;
   // int ilane = tid % 32;
   int iwarp = tid / 32;
@@ -338,6 +339,7 @@ __global__ void route_row_map_kernel(
   } else {
     // route row map blocks
     int local_expert_k[kMaxNumTopk];
+    float local_expert_scale[kMaxNumTopk];
     int local_pos_k[kMaxNumTopk];
 
     // Stage A: shared-memory atomicAdd.
@@ -350,9 +352,11 @@ __global__ void route_row_map_kernel(
         if ((iexpert >= start_expert) && (iexpert < end_expert)) {
           const int local_expert = iexpert - start_expert;
           local_expert_k[k] = local_expert;
+          local_expert_scale[k] = topk_scale_ptr[itopk_base + k];
           local_pos_k[k] = atomicAdd(&counter_shm[local_expert], 1);
         } else {
           local_expert_k[k] = -1;
+          local_expert_scale[k] = 0;
           local_pos_k[k] = 0;
         }
       }
@@ -388,6 +392,7 @@ __global__ void route_row_map_kernel(
                                 static_cast<uint64_t>(local_pos_k[k]);
           topk_pos_ptr[itopk] = irow;
           x_row_map_ptr[irow] = iseq;
+          weight_scale_row_map_ptr[irow] = local_expert_scale[k];
         }
       }
     }
@@ -404,10 +409,11 @@ template <int kThreadPerBlock, int kClusterSize, int kGroupPerThread, int kTileM
           typename DownTmaY, bool kUsePDL = false>
 __global__ void fused_count_cuseq_route_kernel(
     const int *__restrict__ topk_ids_ptr, int *__restrict__ topk_pos_ptr,
-    int *__restrict__ seqlens_ptr, int *__restrict__ cu_seqlens_ptr,
-    int *__restrict__ gateup_tiles_ptr, int *__restrict__ gateup_cu_tiles_ptr,
-    int *__restrict__ down_tiles_ptr, int *__restrict__ down_cu_tiles_ptr,
-    int *__restrict__ x_row_map_ptr, const vec_t<cute::TmaDescriptor, 4> td_xy,
+    const float *__restrict__ topk_scale_ptr, int *__restrict__ seqlens_ptr,
+    int *__restrict__ cu_seqlens_ptr, int *__restrict__ gateup_tiles_ptr,
+    int *__restrict__ gateup_cu_tiles_ptr, int *__restrict__ down_tiles_ptr,
+    int *__restrict__ down_cu_tiles_ptr, int *__restrict__ x_row_map_ptr,
+    float *__restrict__ weight_scale_row_map_ptr, const vec_t<cute::TmaDescriptor, 4> td_xy,
     cute::TmaDescriptor *gate_up_tma_xy, cute::TmaDescriptor *down_tma_xy,
     const Tin *gate_up_input_ptr, Tout_Gateup *gate_up_output_ptr, Tin *down_input_ptr,
     Tout *down_output_ptr, int gateup_k, int gateup_n, int down_k, int down_n, int num_seq,
@@ -664,6 +670,7 @@ __global__ void fused_count_cuseq_route_kernel(
                               static_cast<uint64_t>(local_pos);
         topk_pos_ptr[pos] = static_cast<int>(irow);
         x_row_map_ptr[irow] = iseq;
+        weight_scale_row_map_ptr[irow] = topk_scale_ptr[pos];
       } else {
         topk_pos_ptr[pos] = -1;
       }
@@ -678,14 +685,14 @@ __global__ void fused_count_cuseq_route_kernel(
 }  // namespace kernels
 
 template <typename GateupGemmConfig, typename DownGemmConfig, bool kUsePDL = false>
-void launch_count_and_gather(const void *topk_ids_ptr, void *topk_pos_ptr, void *seqlens_ptr,
-                             void *cu_seqlens_ptr, void *gateup_tiles_ptr,
-                             void *gateup_cu_tiles_ptr, void *down_tiles_ptr,
-                             void *down_cu_tiles_ptr, void *gateup_tmas_ptr, void *down_tmas_ptr,
-                             const void *gate_up_input_ptr, void *gate_up_output_ptr,
-                             void *down_input_ptr, void *down_output_ptr, int gateup_k,
-                             int gateup_n, int down_k, int down_n, int num_seq, int num_topk,
-                             int num_expert, int eprank, cudaStream_t stream,
+void launch_count_and_gather(const void *topk_ids_ptr, void *topk_pos_ptr,
+                             const void *topk_scale_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
+                             void *gateup_tiles_ptr, void *gateup_cu_tiles_ptr,
+                             void *down_tiles_ptr, void *down_cu_tiles_ptr, void *gateup_tmas_ptr,
+                             void *down_tmas_ptr, const void *gate_up_input_ptr,
+                             void *gate_up_output_ptr, void *down_input_ptr, void *down_output_ptr,
+                             int gateup_k, int gateup_n, int down_k, int down_n, int num_seq,
+                             int num_topk, int num_expert, int eprank, cudaStream_t stream,
                              void *x_row_map_ptr = nullptr) {
   using namespace cute;  // NOLINT
   int total_num_topk = num_seq * num_topk;
@@ -696,7 +703,8 @@ void launch_count_and_gather(const void *topk_ids_ptr, void *topk_pos_ptr, void 
   auto *gate_up_tma_xy = static_cast<cute::TmaDescriptor *>(gateup_tmas_ptr);
   auto *down_tma_xy = static_cast<cute::TmaDescriptor *>(down_tmas_ptr);
 
-  auto *x_row_map_race_pos_ptr = reinterpret_cast<int *>(x_row_map_ptr) + num_seq * num_topk;
+  auto *weight_scale_row_map_ptr = reinterpret_cast<float *>(x_row_map_ptr) + num_seq * num_topk;
+  auto *x_row_map_race_pos_ptr = reinterpret_cast<int *>(x_row_map_ptr) + 2 * num_seq * num_topk;
 
   auto X_gateup = make_tensor(
       make_gmem_ptr(reinterpret_cast<const typename GateupGemmConfig::Tin *>(gate_up_input_ptr)),
@@ -773,9 +781,10 @@ void launch_count_and_gather(const void *topk_ids_ptr, void *topk_pos_ptr, void 
         typename DownGemmConfig::Tout, typename GateupGemmConfig::Tout, decltype(gata_up_tma_x),
         decltype(gata_up_tma_y), decltype(down_tma_x), decltype(down_tma_y), kUsePDL>;
     cudaLaunchKernelEx(&config, kernel, (const int *)topk_ids_ptr, (int *)topk_pos_ptr,
-                       (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (int *)gateup_tiles_ptr,
-                       (int *)gateup_cu_tiles_ptr, (int *)down_tiles_ptr, (int *)down_cu_tiles_ptr,
-                       (int *)x_row_map_ptr, td_xy, gate_up_tma_xy, down_tma_xy,
+                       (const float *)topk_scale_ptr, (int *)seqlens_ptr, (int *)cu_seqlens_ptr,
+                       (int *)gateup_tiles_ptr, (int *)gateup_cu_tiles_ptr, (int *)down_tiles_ptr,
+                       (int *)down_cu_tiles_ptr, (int *)x_row_map_ptr,
+                       (float *)weight_scale_row_map_ptr, td_xy, gate_up_tma_xy, down_tma_xy,
                        reinterpret_cast<const typename GateupGemmConfig::Tin *>(gate_up_input_ptr),
                        reinterpret_cast<typename GateupGemmConfig::Tout *>(gate_up_output_ptr),
                        reinterpret_cast<typename DownGemmConfig::Tin *>(down_input_ptr),
@@ -865,26 +874,28 @@ void launch_count_and_gather(const void *topk_ids_ptr, void *topk_pos_ptr, void 
           typename DownGemmConfig::Tout, typename GateupGemmConfig::Tout, decltype(gata_up_tma_x),
           decltype(gata_up_tma_y), decltype(down_tma_x), decltype(down_tma_y), kUsePDL>;
       cudaLaunchKernelEx(
-          &config, kernel, (const int *)topk_ids_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
-          (const int *)cu_seqlens_ptr, td_xy, gate_up_tma_xy, down_tma_xy,
+          &config, kernel, (const int *)topk_ids_ptr, (int *)topk_pos_ptr,
+          (const float *)topk_scale_ptr, (int *)seqlens_ptr, (const int *)cu_seqlens_ptr, td_xy,
+          gate_up_tma_xy, down_tma_xy,
           reinterpret_cast<const typename GateupGemmConfig::Tin *>(gate_up_input_ptr),
           reinterpret_cast<typename GateupGemmConfig::Tout *>(gate_up_output_ptr),
           reinterpret_cast<typename DownGemmConfig::Tin *>(down_input_ptr),
           reinterpret_cast<typename DownGemmConfig::Tout *>(down_output_ptr),
           x_row_map_race_pos_ptr, gateup_k, gateup_n, down_k, down_n, total_num_topk, num_topk,
-          num_expert, start_expert, end_expert, topk_divider, (int *)x_row_map_ptr);
+          num_expert, start_expert, end_expert, topk_divider, (int *)x_row_map_ptr,
+          (float *)weight_scale_row_map_ptr);
     }
   }
 }
 
-void count_and_gather_async(const void *topk_ids_ptr, void *topk_pos_ptr, void *seqlens_ptr,
-                            void *cu_seqlens_ptr, void *tiles_ptr, void *cu_tiles_ptr,
-                            void *gateup_tmas_ptr, void *down_tmas_ptr,
-                            const void *gate_up_input_ptr, void *gate_up_output_ptr,
-                            void *down_input_ptr, void *down_output_ptr, int gateup_k, int gateup_n,
-                            int down_k, int down_n, int num_seq, int num_topk, int num_expert,
-                            int eprank, int num_seq_per_group_avg, cudaStream_t stream,
-                            void *x_row_map_ptr, bool fuse_act) {
+void count_and_gather_async(const void *topk_ids_ptr, void *topk_pos_ptr,
+                            const void *topk_scale_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
+                            void *tiles_ptr, void *cu_tiles_ptr, void *gateup_tmas_ptr,
+                            void *down_tmas_ptr, const void *gate_up_input_ptr,
+                            void *gate_up_output_ptr, void *down_input_ptr, void *down_output_ptr,
+                            int gateup_k, int gateup_n, int down_k, int down_n, int num_seq,
+                            int num_topk, int num_expert, int eprank, int num_seq_per_group_avg,
+                            cudaStream_t stream, void *x_row_map_ptr, bool fuse_act) {
   constexpr bool kUsePDL = true;
 
   void *gateup_tiles_ptr = reinterpret_cast<void *>(reinterpret_cast<int32_t *>(tiles_ptr));
@@ -906,7 +917,7 @@ void count_and_gather_async(const void *topk_ids_ptr, void *topk_pos_ptr, void *
         decltype(group_gemm::get_group_gemm_config<kDownGemmFunc, kNumSeqPerGroupAvg>());
 
     launch_count_and_gather<GateupGemmConfig, DownGemmConfig, kUsePDL>(
-        topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gateup_tiles_ptr,
+        topk_ids_ptr, topk_pos_ptr, topk_scale_ptr, seqlens_ptr, cu_seqlens_ptr, gateup_tiles_ptr,
         gateup_cu_tiles_ptr, down_tiles_ptr, down_cu_tiles_ptr, gateup_tmas_ptr, down_tmas_ptr,
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, gateup_k, gateup_n,
         down_k, down_n, num_seq, num_topk, num_expert, eprank, stream, x_row_map_ptr);

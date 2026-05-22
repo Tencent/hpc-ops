@@ -13,14 +13,15 @@
 namespace hpc {
 namespace fuse_moe {
 
-void count_and_gather_async(const void *topk_ids_ptr, void *topk_pos_ptr, void *seqlens_ptr,
-                            void *cu_seqlens_ptr, void *tiles_ptr, void *cu_tiles_ptr,
-                            void *gateup_tmas_ptr, void *down_tmas_ptr,
-                            const void *gate_up_input_ptr, void *gate_up_output_ptr,
-                            void *down_input_ptr, void *down_output_ptr, int gateup_k, int gateup_n,
-                            int down_k, int down_n, int num_seq, int num_topk, int num_expert,
-                            int eprank, int num_seq_per_group_avg, cudaStream_t stream,
-                            void *x_row_map_ptr = nullptr, bool fuse_act = true);
+void count_and_gather_async(const void *topk_ids_ptr, void *topk_pos_ptr,
+                            const void *topk_scale_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
+                            void *tiles_ptr, void *cu_tiles_ptr, void *gateup_tmas_ptr,
+                            void *down_tmas_ptr, const void *gate_up_input_ptr,
+                            void *gate_up_output_ptr, void *down_input_ptr, void *down_output_ptr,
+                            int gateup_k, int gateup_n, int down_k, int down_n, int num_seq,
+                            int num_topk, int num_expert, int eprank, int num_seq_per_group_avg,
+                            cudaStream_t stream, void *x_row_map_ptr = nullptr,
+                            bool fuse_act = true);
 
 void blockwise_count_and_gather_async(
     const void *input_ptr, const void *input_scale_ptr, void *gate_up_input_ptr,

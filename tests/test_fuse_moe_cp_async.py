@@ -192,7 +192,7 @@ def test_fuse_moe_cp_async(
 
     if use_output:
         output = torch.empty_like(x, dtype=torch.bfloat16)
-        hpc.fuse_moe_cp_async(
+        hpc.fuse_moe(
             x,
             gate_up_weight,
             down_weight,
@@ -209,7 +209,7 @@ def test_fuse_moe_cp_async(
         )
         actual_output = output
     else:
-        actual_output = hpc.fuse_moe_cp_async(
+        actual_output = hpc.fuse_moe(
             x,
             gate_up_weight,
             down_weight,

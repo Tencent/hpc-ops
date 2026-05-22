@@ -212,28 +212,6 @@ def fuse_moe(
         - Token routing is determined by topk_ids and weighted by topk_scale
         - Output scaling is applied to maintain numerical stability in FP8
     """
-    intermediate_size = gate_up_weight.shape[1] // 2
-    if (
-        intermediate_size <= _CP_ASYNC_N_TP_MAX
-        and intermediate_size % 64 == 0
-        and x.shape[1] % 64 == 0
-    ):
-        return torch.ops.hpc.fuse_moe_cp_async(
-            x,
-            gate_up_weight,
-            down_weight,
-            gate_up_scale,
-            down_scale,
-            act_and_mul_scale,
-            topk_ids,
-            topk_scale,
-            shared_output,
-            rank_ep,
-            num_expert_total,
-            use_bf16_mul,
-            output,
-        )
-
     return torch.ops.hpc.fuse_moe(
         x,
         gate_up_weight,

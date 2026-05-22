@@ -120,11 +120,11 @@ static constexpr auto group_gemm_1sm_fp8_dispatch_selector() {
                               /*kSwapAB=*/true, /*kMmaTileN=*/1>{};
   } else if constexpr (kNumSeqPerGroupAvg <= 32) {
     return GroupGEMMFp8Config<cute::float_e4m3_t, cute::bfloat16_t, float,
-                              /*kTile=*/32, 128, 128, 32,
+                              /*kTile=*/32, 128, 128, 16,
                               /*kCluster=*/1, 1, 1, 1,
                               /*kStage=*/2, 4, 4,
                               /*kSwizzle=*/128, 128, 128,
-                              /*kCopyBox=*/32, 128, 128, 32, 128,
+                              /*kCopyBox=*/32, 128, 128, 16, 128,
                               /*kSwapAB=*/true, /*kMmaTileN=*/1>{};
   } else if constexpr (kNumSeqPerGroupAvg <= 48) {
     return GroupGEMMFp8Config<cute::float_e4m3_t, cute::bfloat16_t, float,
@@ -165,11 +165,11 @@ static constexpr auto group_gemm_2sm_fp8_dispatch_selector() {
                               /*kSwapAB=*/true, /*kMmaTileN=*/1>{};
   } else if constexpr (kNumSeqPerGroupAvg <= 64) {
     return GroupGEMMFp8Config<cute::float_e4m3_t, cute::bfloat16_t, float,
-                              /*kTile=*/64, 256, 128, 32,
+                              /*kTile=*/64, 256, 128, 64,
                               /*kCluster=*/1, 2, 1, 2,
                               /*kStage=*/6, 4, 4,
                               /*kSwizzle=*/128, 128, 128,
-                              /*kCopyBox=*/64, 256, 128, 32, 128,
+                              /*kCopyBox=*/64, 256, 128, 64, 128,
                               /*kSwapAB=*/true, /*kMmaTileN=*/1>{};
   } else if constexpr (kNumSeqPerGroupAvg <= 96) {
     return GroupGEMMFp8Config<cute::float_e4m3_t, cute::bfloat16_t, float,

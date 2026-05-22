@@ -16,6 +16,14 @@ void group_gemm_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                           int num_seq_per_group_avg, bool update_tma, bool use_pdl,
                           cudaStream_t stream);
 
+void group_gemm_fp8_with_reduce_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
+                                      const void *seqlens_ptr, const void *cu_seqlens_ptr,
+                                      const void *y_scale, void *tmas_ptr, void *tiles_ptr,
+                                      void *cu_tiles_ptr, void *task_map_ptr, void *x_row_map_ptr,
+                                      void *topk_scale_row_map_ptr, int num_waves, int num_group,
+                                      int m, int n, int k, int num_seq_per_group_avg,
+                                      bool update_tma, bool use_pdl, cudaStream_t stream);
+
 void group_gemm_cp_async_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                                    const void *seqlens_ptr, const void *cu_seqlens_ptr,
                                    const void *y_scale, void *tmas_ptr, void *tiles_ptr,

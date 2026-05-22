@@ -67,11 +67,12 @@ count_and_gather_entry(const torch::Tensor &x, const torch::Tensor &topk_ids,
   int down_k = intermediate_size / 2;
   int down_n = hidden_size;
 
-  count_and_gather_async(topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr,
-                         cu_tiles_ptr, gate_up_tmas_ptr, dowm_tmas_ptr, gate_up_input_ptr,
-                         fuse_act ? down_input_ptr : gate_up_output_ptr, down_input_ptr,
-                         down_output_ptr, gateup_k, gateup_n, down_k, down_n, num_seq, num_topk,
-                         num_expert, rank_ep, num_seq_per_group_avg, stream, nullptr, fuse_act);
+  count_and_gather_async(topk_ids_ptr, topk_pos_ptr, nullptr, seqlens_ptr, cu_seqlens_ptr,
+                         tiles_ptr, cu_tiles_ptr, gate_up_tmas_ptr, dowm_tmas_ptr,
+                         gate_up_input_ptr, fuse_act ? down_input_ptr : gate_up_output_ptr,
+                         down_input_ptr, down_output_ptr, gateup_k, gateup_n, down_k, down_n,
+                         num_seq, num_topk, num_expert, rank_ep, num_seq_per_group_avg, stream,
+                         nullptr, fuse_act);
 
   return std::make_tuple(gate_up_input, gate_up_output, topk_pos, seqlens, cu_seqlens, tiles,
                          cu_tiles, gate_up_tmas, dowm_tmas);
@@ -170,19 +171,6 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   TORCH_CHECK(gate_up_weight.size(0) == down_weight.size(0),
               "gate_up_weight and down_weight must share the same num_expert");
 
-  const void *shared_output_ptr = nullptr;
-  if (shared_output.has_value()) {
-    const auto shared_output_tensor = shared_output.value();
-    TORCH_CHECK(shared_output_tensor.device().is_cuda(), "shared_output tensor must be cuda");
-    TORCH_CHECK(shared_output_tensor.is_contiguous(), "shared_output tensor must be contiguous");
-    TORCH_CHECK(shared_output_tensor.dtype() == torch::kBFloat16,
-                "shared_output tensor dtype must be bfloat16");
-    TORCH_CHECK(
-        shared_output_tensor.size(0) == x.size(0) && shared_output_tensor.size(1) == x.size(1),
-        "shared_output tensor shape must be same as x tensor");
-    shared_output_ptr = shared_output_tensor.const_data_ptr();
-  }
-
   int num_seq = x.size(0);
   int hidden_size = x.size(1);
   int num_expert = gate_up_weight.size(0);
@@ -193,15 +181,32 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   auto options = x.options();
   torch::Tensor y;
   void *y_ptr = nullptr;
-  if (output.has_value()) {
-    TORCH_CHECK(output.value().size(0) == num_seq && output.value().size(1) == hidden_size,
-                "output shape must be [num_tokens, hidden_size]");
-    TORCH_CHECK(output.value().dtype() == torch::kBFloat16, "output dtype must be bfloat16");
-    TORCH_CHECK(output.value().device().is_cuda(), "output must be cuda tensor");
-    y_ptr = output.value().mutable_data_ptr();
-  } else {
-    y = torch::empty({num_seq, hidden_size}, options.dtype(torch::kBFloat16));
+
+  const void *shared_output_ptr = nullptr;
+  if (shared_output.has_value()) {
+    const auto shared_output_tensor = shared_output.value();
+    // TORCH_CHECK(shared_output_tensor.device().is_cuda(), "shared_output tensor must be cuda");
+    // TORCH_CHECK(shared_output_tensor.is_contiguous(), "shared_output tensor must be contiguous");
+    // TORCH_CHECK(shared_output_tensor.dtype() == torch::kBFloat16,
+    //             "shared_output tensor dtype must be bfloat16");
+    // TORCH_CHECK(
+    //     shared_output_tensor.size(0) == x.size(0) && shared_output_tensor.size(1) == x.size(1),
+    //     "shared_output tensor shape must be same as x tensor");
+    shared_output_ptr = shared_output_tensor.const_data_ptr();
+    y = shared_output.value();
     y_ptr = y.mutable_data_ptr();
+  } else {
+    if (output.has_value()) {
+      TORCH_CHECK(output.value().size(0) == num_seq && output.value().size(1) == hidden_size,
+                  "output shape must be [num_tokens, hidden_size]");
+      TORCH_CHECK(output.value().dtype() == torch::kBFloat16, "output dtype must be bfloat16");
+      TORCH_CHECK(output.value().device().is_cuda(), "output must be cuda tensor");
+      y = output.value();
+      y_ptr = output.value().mutable_data_ptr();
+    } else {
+      y = torch::empty({num_seq, hidden_size}, options.dtype(torch::kBFloat16));
+      y_ptr = y.mutable_data_ptr();
+    }
   }
 
   torch::Tensor gate_up_input = torch::empty({num_seq * num_topk, hidden_size}, options);
@@ -219,7 +224,7 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   torch::Tensor tiles = torch::empty({2 * num_expert}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({2 * (num_expert + 1)}, options.dtype(torch::kInt32));
   torch::Tensor x_row_map =
-      torch::empty({num_seq * num_topk + num_expert}, options.dtype(torch::kInt32));
+      torch::empty({2 * num_seq * num_topk + num_expert}, options.dtype(torch::kInt32));
 
   int num_gateup_tiles = 0;
   int num_down_tiles = 0;
@@ -256,11 +261,7 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
                  shared_output_ptr, num_gateup_waves, num_down_waves, num_seq, hidden_size,
                  intermediate_size, num_topk, num_expert_total, num_expert, rank_ep, use_bf16_mul,
                  stream, x_row_map_ptr);
-  if (output.has_value()) {
-    return output.value();
-  } else {
-    return y;
-  }
+  return y;
 }
 
 torch::Tensor fuse_moe_blockwise_entry(
