@@ -83,14 +83,9 @@ def naive_group_gemm(x, w, cu_seqlens, scale, expert_ids):
         x_group = x[start_idx:end_idx]
         w_group = w[i]
 
-        y_group = torch._scaled_mm(
-            x_group,
-            w_group.t(),
-            scale_a=scale[i],
-            scale_b=torch.ones((1), dtype=torch.float, device="cuda"),
-            bias=None,
-            out_dtype=torch.bfloat16,
-        )
+        y_group = (
+            (x_group.to(torch.float32) @ w_group.t().to(torch.float32)) * scale[i].to(torch.float32)
+        ).to(torch.bfloat16)
         y[start_idx:end_idx] = y_group
     return y
 
