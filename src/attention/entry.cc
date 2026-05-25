@@ -326,7 +326,8 @@ torch::Tensor attention_with_kvcache_blocksparse_prefill_fp8_entry(
   int max_seqlens_q_pad = qscale.size(2);
 
   constexpr int kTileM = 128;
-  TORCH_CHECK(128 % block_size == 0, "unsupported block_size for FP8 blocksparse prefill");
+  constexpr int kTileN = 128;
+  TORCH_CHECK(kTileN % block_size == 0, "unsupported block_size for FP8 blocksparse prefill");
   int expected_max_num_tile_m = (max_seqlens_q + kTileM - 1) / kTileM;
 
   int num_tile_kv_in_mask = 0;
@@ -340,8 +341,10 @@ torch::Tensor attention_with_kvcache_blocksparse_prefill_fp8_entry(
                     block_mask_tensor.size(1) == num_head_q &&
                     block_mask_tensor.size(2) == expected_max_num_tile_m,
                 "block_mask must have shape [", num_batch, ", ", num_head_q, ", ",
-                expected_max_num_tile_m, ", Kb] where Kb = ceil(max_kv_len / 128)");
+                expected_max_num_tile_m, ", Kb] where Kb = ceil(max_kv_len / kTileN=", kTileN, ")");
     num_tile_kv_in_mask = block_mask_tensor.size(3);
+
+    TORCH_CHECK(num_tile_kv_in_mask > 0, "block_mask Kb dim must be > 0");
   }
 
   auto options = q.options().dtype(torch::kBFloat16);
@@ -490,7 +493,9 @@ torch::Tensor attention_blocksparse_prefill_fp8_dim192_entry(
   int num_batch = cu_seqlens_q.size(0) - 1;
 
   constexpr int kTileM = 128;
+  constexpr int kTileN = 128;
   int expected_max_num_tile_m = (max_seqlens_q + kTileM - 1) / kTileM;
+  int expected_min_num_tile_n = (max_seqlens_kv + kTileN - 1) / kTileN;
 
   int num_tile_kv_in_mask = 0;
   if (has_block_mask) {
@@ -503,8 +508,13 @@ torch::Tensor attention_blocksparse_prefill_fp8_dim192_entry(
                     block_mask_tensor.size(1) == num_head_q &&
                     block_mask_tensor.size(2) == expected_max_num_tile_m,
                 "block_mask must have shape [", num_batch, ", ", num_head_q, ", ",
-                expected_max_num_tile_m, ", Kb] where Kb = ceil(max_kv_len / 128)");
+                expected_max_num_tile_m, ", Kb] where Kb >= ceil(max_seqlens_kv / kTileN=", kTileN,
+                ")");
     num_tile_kv_in_mask = block_mask_tensor.size(3);
+    TORCH_CHECK(num_tile_kv_in_mask >= expected_min_num_tile_n, "block_mask Kb dim (",
+                num_tile_kv_in_mask, ") must be >= ceil(max_seqlens_kv=", max_seqlens_kv,
+                " / kTileN=", kTileN, ") = ", expected_min_num_tile_n,
+                "; otherwise BSA tail-padding (kernels.cuh:4071-4076) silently drops K-tiles");
   }
 
   auto options = q.options().dtype(torch::kBFloat16);

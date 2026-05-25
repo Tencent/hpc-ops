@@ -5,6 +5,7 @@ docs/
 .vscode/
 *.egg-info/
 _C.*.so
+_C_sm*.so
 __pycache__
 *.ncu-rep
 *.nsys-rep
@@ -26,3 +27,5 @@ version.py
 3rd/ucl/nvshmem/src/include/non_abi/nvshmem_build_options.h
 3rd/ucl/nvshmem/src/include/non_abi/nvshmem_version.h
 3rd/ucl/nvshmem/src/device/comm/
+
+hpc/nvshmem/

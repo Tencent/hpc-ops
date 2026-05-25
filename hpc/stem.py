@@ -288,33 +288,44 @@ def stem_tpd(
     block_logits: Tensor,
     q_seq_lens: Tensor,
     kv_seq_lens: Tensor,
+    num_prompt_tokens: Tensor,
     block_size: int = 128,
     alpha: float = 1.0,
     initial_blocks: int = 4,
     window_size: int = 4,
-    k_block_num_rate: float = 0.1,
-    k_block_num_bias: int = 30,
+    k_block_num_rate_medium: float = 0.2,
+    k_block_num_bias_medium: int = 30,
+    k_block_num_rate_large: float = 0.1,
+    k_block_num_bias_large: int = 30,
 ) -> Tensor:
     """Generate sparse block mask via top-k policy denoising.
 
-    Fuses budget computation (per-row dynamic K), radix-based threshold
-    selection, fixed retention patterns (initial / window / diagonal).
+    Fuses per-row budget (3-regime k_schedule + linear decay, both keyed on
+    the full prompt KV length so the result is chunked-prefill invariant),
+    radix top-k threshold, and fixed retention (initial / window / diagonal).
 
     Args:
         block_logits: Block-level OAM scores.
             Shape: [num_batch, num_q_heads, max_Qb, max_Kb]
             Dtype: bfloat16 (invalid positions set to -inf)
-        q_seq_lens: Q sequence length per request.
+        q_seq_lens: Q sequence length per request (current chunk).
             Shape: [num_batch], Dtype: int32
-        kv_seq_lens: KV sequence length per request.
+        kv_seq_lens: KV sequence length per request (cumulative through current chunk).
+            Shape: [num_batch], Dtype: int32
+        num_prompt_tokens: Full prompt KV-token count per request. For
+            chunked prefill pass the same value for every chunk of one
+            prompt; for normal prefill pass ``kv_seq_lens``.
             Shape: [num_batch], Dtype: int32
         block_size: Stem sparse scoring block size (default 128).
-        alpha: Budget decay factor (default 1.0, maps to k_schedule scale).
-        initial_blocks: Number of leading KV blocks always retained (default 4).
-        window_size: Number of recent (diagonal-adjacent) blocks always retained (default 4).
-        k_block_num_rate: Multiplier for qi_blocks in k_schedule large regime
-            (qi_blocks >= 160). Default 0.1.
-        k_block_num_bias: Additive bias in k_schedule large regime. Default 30.
+        alpha: Per-row budget decay factor (default 1.0 disables decay).
+        initial_blocks: Leading KV blocks always retained (default 4).
+        window_size: Recent diagonal-adjacent blocks always retained (default 4).
+        k_block_num_rate_medium: k_schedule multiplier when
+            56 <= prompt_kv_blocks < 160 (default 0.2).
+        k_block_num_bias_medium: k_schedule bias in the medium regime (default 30).
+        k_block_num_rate_large: k_schedule multiplier when
+            prompt_kv_blocks >= 160 (default 0.1).
+        k_block_num_bias_large: k_schedule bias in the large regime (default 30).
 
     Returns:
         mask: Per-block selection byte-mask.
@@ -325,12 +336,15 @@ def stem_tpd(
         block_logits,
         q_seq_lens,
         kv_seq_lens,
+        num_prompt_tokens,
         block_size,
         alpha,
         initial_blocks,
         window_size,
-        k_block_num_rate,
-        k_block_num_bias,
+        k_block_num_rate_medium,
+        k_block_num_bias_medium,
+        k_block_num_rate_large,
+        k_block_num_bias_large,
     )
 
 
@@ -344,6 +358,7 @@ def stem_paged_kv(
     kv_indices: Tensor,
     cu_seqlens_q: Tensor,
     kv_seq_lens: Tensor,
+    num_prompt_tokens: Tensor,
     lambda_mag: float = 0.3,
     alpha: float = 1.0,
     stem_block_size: int = 128,
@@ -351,8 +366,10 @@ def stem_paged_kv(
     causal: bool = True,
     initial_blocks: int = 4,
     window_size: int = 4,
-    k_block_num_rate: float = 0.1,
-    k_block_num_bias: int = 30,
+    k_block_num_rate_medium: float = 0.2,
+    k_block_num_bias_medium: int = 30,
+    k_block_num_rate_large: float = 0.1,
+    k_block_num_bias_large: int = 30,
     quant_type: QuantType = QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
 ) -> Tensor:
     """End-to-end Stem sparse mask generation for paged FP8 KV cache (dim_qk=128).
@@ -379,18 +396,25 @@ def stem_paged_kv(
             Shape: [num_batch, max_blocks_per_req], Dtype: int32
         cu_seqlens_q: Cumulative Q sequence lengths.
             Shape: [num_batch + 1], Dtype: int32
-        kv_seq_lens: KV sequence length per request.
+        kv_seq_lens: KV sequence length per request (cumulative through current chunk).
+            Shape: [num_batch], Dtype: int32
+        num_prompt_tokens: Full prompt KV-token count per request. For
+            chunked prefill pass the same value for every chunk of one
+            prompt; for normal prefill pass ``kv_seq_lens``.
             Shape: [num_batch], Dtype: int32
         lambda_mag: V-bias scaling coefficient (default 0.3).
-        alpha: TPD budget decay factor (default 1.0).
+        alpha: TPD budget decay factor (default 1.0; see ``stem_tpd``).
         stem_block_size: Sparse scoring block size (default 128).
         stem_stride: Downsampling stride (default 16).
         causal: Apply causal masking (default True).
         initial_blocks: Leading KV blocks always retained (default 4).
         window_size: Recent diagonal-adjacent blocks always retained (default 4).
-        k_block_num_rate: Multiplier for qi_blocks in k_schedule large regime
-            (qi_blocks >= 160). Default 0.1.
-        k_block_num_bias: Additive bias in k_schedule large regime. Default 30.
+        k_block_num_rate_medium: k_schedule multiplier when
+            56 <= prompt_kv_blocks < 160 (default 0.2).
+        k_block_num_bias_medium: k_schedule bias in the medium regime (default 30).
+        k_block_num_rate_large: k_schedule multiplier when
+            prompt_kv_blocks >= 160 (default 0.1).
+        k_block_num_bias_large: k_schedule bias in the large regime (default 30).
         quant_type: Scale dispatch for dim128. Defaults to
             QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR; pass
             QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD for per-token K-scale
@@ -436,12 +460,15 @@ def stem_paged_kv(
         block_logits,
         q_seq_lens,
         kv_seq_lens,
+        num_prompt_tokens,
         stem_block_size,
         alpha,
         initial_blocks,
         window_size,
-        k_block_num_rate,
-        k_block_num_bias,
+        k_block_num_rate_medium,
+        k_block_num_bias_medium,
+        k_block_num_rate_large,
+        k_block_num_bias_large,
     )
     return mask
 
@@ -455,6 +482,7 @@ def stem_varlen_kv_dim192(
     vscale: Tensor,
     cu_seqlens_q: Tensor,
     cu_seqlens_kv: Tensor,
+    num_prompt_tokens: Tensor,
     lambda_mag: float = 0.3,
     alpha: float = 1.0,
     stem_block_size: int = 128,
@@ -462,8 +490,10 @@ def stem_varlen_kv_dim192(
     causal: bool = True,
     initial_blocks: int = 4,
     window_size: int = 4,
-    k_block_num_rate: float = 0.1,
-    k_block_num_bias: int = 30,
+    k_block_num_rate_medium: float = 0.2,
+    k_block_num_bias_medium: int = 30,
+    k_block_num_rate_large: float = 0.1,
+    k_block_num_bias_large: int = 30,
 ) -> Tensor:
     """End-to-end Stem sparse mask generation for ragged dim192 FP8 KV.
 
@@ -488,18 +518,25 @@ def stem_varlen_kv_dim192(
             Shape: [1], Dtype: float32
         cu_seqlens_q: Cumulative Q sequence lengths.
             Shape: [num_batch + 1], Dtype: int32
-        cu_seqlens_kv: Cumulative KV sequence lengths.
+        cu_seqlens_kv: Cumulative KV sequence lengths (current chunk).
             Shape: [num_batch + 1], Dtype: int32
+        num_prompt_tokens: Full prompt KV-token count per request. For
+            chunked prefill pass the same value for every chunk of one
+            prompt; for normal prefill pass the chunk KV lengths.
+            Shape: [num_batch], Dtype: int32
         lambda_mag: V-bias scaling coefficient (default 0.3).
-        alpha: TPD budget decay factor (default 1.0).
+        alpha: TPD budget decay factor (default 1.0; see ``stem_tpd``).
         stem_block_size: Sparse scoring block size (default 128).
         stem_stride: Downsampling stride (default 16).
         causal: Apply causal masking (default True).
         initial_blocks: Leading KV blocks always retained (default 4).
         window_size: Recent diagonal-adjacent blocks always retained (default 4).
-        k_block_num_rate: Multiplier for qi_blocks in k_schedule large regime
-            (qi_blocks >= 160). Default 0.1.
-        k_block_num_bias: Additive bias in k_schedule large regime. Default 30.
+        k_block_num_rate_medium: k_schedule multiplier when
+            56 <= prompt_kv_blocks < 160 (default 0.2).
+        k_block_num_bias_medium: k_schedule bias in the medium regime (default 30).
+        k_block_num_rate_large: k_schedule multiplier when
+            prompt_kv_blocks >= 160 (default 0.1).
+        k_block_num_bias_large: k_schedule bias in the large regime (default 30).
 
     Returns:
         mask: Per-block selection byte-mask.
@@ -541,12 +578,15 @@ def stem_varlen_kv_dim192(
         block_logits,
         q_seq_lens,
         kv_seq_lens,
+        num_prompt_tokens,
         stem_block_size,
         alpha,
         initial_blocks,
         window_size,
-        k_block_num_rate,
-        k_block_num_bias,
+        k_block_num_rate_medium,
+        k_block_num_bias_medium,
+        k_block_num_rate_large,
+        k_block_num_bias_large,
     )
     return mask
 
@@ -715,11 +755,14 @@ def _stem_tpd_fake(
     block_logits,
     q_seq_lens,
     kv_seq_lens,
+    num_prompt_tokens,
     block_size,
     alpha,
     initial_blocks,
     window_size,
-    k_block_num_rate,
-    k_block_num_bias,
+    k_block_num_rate_medium,
+    k_block_num_bias_medium,
+    k_block_num_rate_large,
+    k_block_num_bias_large,
 ):
     return torch.empty_like(block_logits, dtype=torch.uint8)

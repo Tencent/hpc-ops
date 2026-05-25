@@ -34,8 +34,10 @@ LAMBDA_MAG = 0.3
 ALPHA = 1.0
 INITIAL_BLOCKS = 4
 WINDOW_SIZE = 4
-K_BLOCK_NUM_RATE = 0.1
-K_BLOCK_NUM_BIAS = 30
+K_BLOCK_NUM_RATE_MEDIUM = 0.2
+K_BLOCK_NUM_BIAS_MEDIUM = 30
+K_BLOCK_NUM_RATE_LARGE = 0.1
+K_BLOCK_NUM_BIAS_LARGE = 30
 
 
 def _setup_paged_fp8_data(
@@ -446,6 +448,7 @@ def test_qkpertoken_perhead_vperhead_e2e(num_batch, seq_len, num_head_q, num_hea
         d["kv_indices"],
         d["cu_q_seqlens"],
         d["kv_seqlens"],
+        d["kv_seqlens"],  # num_prompt_tokens (normal prefill: equals kv_seqlens)
         lambda_mag=LAMBDA_MAG,
         alpha=ALPHA,
         stem_block_size=STEM_BLOCK_SIZE,
@@ -453,8 +456,10 @@ def test_qkpertoken_perhead_vperhead_e2e(num_batch, seq_len, num_head_q, num_hea
         causal=True,
         initial_blocks=INITIAL_BLOCKS,
         window_size=WINDOW_SIZE,
-        k_block_num_rate=K_BLOCK_NUM_RATE,
-        k_block_num_bias=K_BLOCK_NUM_BIAS,
+        k_block_num_rate_medium=K_BLOCK_NUM_RATE_MEDIUM,
+        k_block_num_bias_medium=K_BLOCK_NUM_BIAS_MEDIUM,
+        k_block_num_rate_large=K_BLOCK_NUM_RATE_LARGE,
+        k_block_num_bias_large=K_BLOCK_NUM_BIAS_LARGE,
         quant_type=hpc.QuantType.QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD,
     )
 

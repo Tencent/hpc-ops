@@ -367,22 +367,29 @@ torch::Tensor stem_oam_gemm_dim192_entry(const torch::Tensor &qflat, const torch
   return block_logits.slice(2, 0, max_num_qb).slice(3, 0, max_num_kb).contiguous();
 }
 
-// Returns u8_mask [num_batch, num_heads, max_Qb, max_Kb] uint8
+// Returns u8_mask [num_batch, num_heads, max_Qb, max_Kb] uint8.
+// `num_prompt_tokens` ([num_batch] int32) is the full prompt KV-token count
+// per request (chunked-invariant; pass kv_seq_lens for normal prefill).
 torch::Tensor stem_tpd_entry(const torch::Tensor &block_logits, const torch::Tensor &q_seq_lens,
-                             const torch::Tensor &kv_seq_lens, int64_t block_size, double alpha,
-                             int64_t initial_blocks, int64_t window_size, double k_block_num_rate,
-                             int64_t k_block_num_bias) {
+                             const torch::Tensor &kv_seq_lens,
+                             const torch::Tensor &num_prompt_tokens, int64_t block_size,
+                             double alpha, int64_t initial_blocks, int64_t window_size,
+                             double k_block_num_rate_medium, int64_t k_block_num_bias_medium,
+                             double k_block_num_rate_large, int64_t k_block_num_bias_large) {
   auto stream = at::cuda::getCurrentCUDAStream(block_logits.get_device());
 
   TORCH_CHECK(block_logits.device().is_cuda(), "block_logits must be CUDA tensor");
   TORCH_CHECK(q_seq_lens.device().is_cuda(), "q_seq_lens must be CUDA tensor");
   TORCH_CHECK(kv_seq_lens.device().is_cuda(), "kv_seq_lens must be CUDA tensor");
+  TORCH_CHECK(num_prompt_tokens.device().is_cuda(), "num_prompt_tokens must be CUDA tensor");
   TORCH_CHECK(block_logits.dtype() == torch::kBFloat16, "block_logits must be bfloat16");
   TORCH_CHECK(block_logits.is_contiguous(), "block_logits must be contiguous");
   TORCH_CHECK(q_seq_lens.dtype() == torch::kInt32, "q_seq_lens must be int32, got ",
               q_seq_lens.dtype());
   TORCH_CHECK(kv_seq_lens.dtype() == torch::kInt32, "kv_seq_lens must be int32, got ",
               kv_seq_lens.dtype());
+  TORCH_CHECK(num_prompt_tokens.dtype() == torch::kInt32, "num_prompt_tokens must be int32, got ",
+              num_prompt_tokens.dtype());
 
   // block_logits: [B, Hq, max_Qb, max_Kb]
   int num_batch = block_logits.size(0);
@@ -390,17 +397,23 @@ torch::Tensor stem_tpd_entry(const torch::Tensor &block_logits, const torch::Ten
   int max_Qb = block_logits.size(2);
   int max_Kb = block_logits.size(3);
 
+  TORCH_CHECK(num_prompt_tokens.dim() == 1 && num_prompt_tokens.size(0) == num_batch,
+              "num_prompt_tokens must have shape [num_batch=", num_batch, "], got ",
+              num_prompt_tokens.sizes());
+
   // Maximum number of blocks (4M tokens) supported by TPD kernel
   TORCH_CHECK(max_Kb <= 32768, "stem_tpd: max_Kb=", max_Kb, " exceeds 32768 limit");
 
   auto mask = torch::zeros({num_batch, num_heads, max_Qb, max_Kb},
                            block_logits.options().dtype(torch::kUInt8));
 
-  stem_tpd_async(mask.data_ptr(), block_logits.const_data_ptr(), q_seq_lens.const_data_ptr(),
-                 kv_seq_lens.const_data_ptr(), num_batch, num_heads, max_Qb, max_Kb,
-                 static_cast<int>(block_size), static_cast<float>(alpha),
-                 static_cast<int>(initial_blocks), static_cast<int>(window_size),
-                 static_cast<float>(k_block_num_rate), static_cast<int>(k_block_num_bias), stream);
+  stem_tpd_async(
+      mask.data_ptr(), block_logits.const_data_ptr(), q_seq_lens.const_data_ptr(),
+      kv_seq_lens.const_data_ptr(), num_prompt_tokens.const_data_ptr(), num_batch, num_heads,
+      max_Qb, max_Kb, static_cast<int>(block_size), static_cast<float>(alpha),
+      static_cast<int>(initial_blocks), static_cast<int>(window_size),
+      static_cast<float>(k_block_num_rate_medium), static_cast<int>(k_block_num_bias_medium),
+      static_cast<float>(k_block_num_rate_large), static_cast<int>(k_block_num_bias_large), stream);
 
   return mask;
 }
@@ -446,8 +459,10 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 
   m.def(
       "stem_tpd(Tensor block_logits, Tensor q_seq_lens, Tensor kv_seq_lens, "
+      "Tensor num_prompt_tokens, "
       "int block_size, float alpha, int initial_blocks, int window_size, "
-      "float k_block_num_rate, int k_block_num_bias) -> Tensor");
+      "float k_block_num_rate_medium, int k_block_num_bias_medium, "
+      "float k_block_num_rate_large, int k_block_num_bias_large) -> Tensor");
   m.impl("stem_tpd", torch::kCUDA, &hpc::stem::stem_tpd_entry);
 }
 

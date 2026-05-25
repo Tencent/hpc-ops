@@ -18,8 +18,10 @@ LAMBDA_MAG = 0.3
 ALPHA = 1.0
 INITIAL_BLOCKS = 4
 WINDOW_SIZE = 4
-K_BLOCK_NUM_RATE = 0.1
-K_BLOCK_NUM_BIAS = 30
+K_BLOCK_NUM_RATE_MEDIUM = 0.2
+K_BLOCK_NUM_BIAS_MEDIUM = 30
+K_BLOCK_NUM_RATE_LARGE = 0.1
+K_BLOCK_NUM_BIAS_LARGE = 30
 
 
 def _setup_varlen_fp8_data(
@@ -165,6 +167,7 @@ def test_stem_varlen_kv_dim192_e2e(num_batch, seq_len, num_head_q, num_head_kv):
         d["vscale"],
         d["cu_seqlens_q"],
         d["cu_seqlens_kv"],
+        d["kv_seq_lens"],  # num_prompt_tokens (normal prefill: equals chunk KV lens)
         lambda_mag=LAMBDA_MAG,
         alpha=ALPHA,
         stem_block_size=STEM_BLOCK_SIZE,
@@ -172,8 +175,10 @@ def test_stem_varlen_kv_dim192_e2e(num_batch, seq_len, num_head_q, num_head_kv):
         causal=True,
         initial_blocks=INITIAL_BLOCKS,
         window_size=WINDOW_SIZE,
-        k_block_num_rate=K_BLOCK_NUM_RATE,
-        k_block_num_bias=K_BLOCK_NUM_BIAS,
+        k_block_num_rate_medium=K_BLOCK_NUM_RATE_MEDIUM,
+        k_block_num_bias_medium=K_BLOCK_NUM_BIAS_MEDIUM,
+        k_block_num_rate_large=K_BLOCK_NUM_RATE_LARGE,
+        k_block_num_bias_large=K_BLOCK_NUM_BIAS_LARGE,
     )
 
     max_blocks = (seq_len + STEM_BLOCK_SIZE - 1) // STEM_BLOCK_SIZE

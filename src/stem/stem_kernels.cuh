@@ -1031,34 +1031,37 @@ __device__ __forceinline__ uint16_t bf16_to_ordered(uint16_t bits) {
 // bf16 isfinite: exponent (bits 14-7) not all ones.
 __device__ __forceinline__ bool bf16_isfinite(uint16_t bits) { return (bits & 0x7F80) != 0x7F80; }
 
-// Per-row top-k budget; mirrors Python _k_schedule + linspace decay.
-__device__ __forceinline__ int compute_budget(int q_row, int qi_blocks, float alpha,
-                                              float k_block_num_rate, int k_block_num_bias) {
-  // 3-regime k_schedule: small (<56) → no sparsity; medium (<160) → 20% + 30;
-  // large → caller-tunable rate*qi_blocks + bias.
+// Per-row top-k budget: 3-regime k_schedule + linspace decay, both keyed on
+// the FULL prompt KV length (`prompt_kv_blocks`) so the result is chunked-
+// prefill invariant. `ki_blocks` only feeds `kb_offset` for absolute q_pos.
+__device__ __forceinline__ int compute_budget(int q_row, int qi_blocks, int ki_blocks,
+                                              int prompt_kv_blocks, float alpha,
+                                              float k_block_num_rate_medium,
+                                              int k_block_num_bias_medium,
+                                              float k_block_num_rate_large,
+                                              int k_block_num_bias_large) {
   constexpr int kSmallSeqMax = 56;
   constexpr int kMediumSeqMax = 160;
-  constexpr float kMediumRate = 0.2f;
-  constexpr int kMediumBias = 30;
 
   int k_val;
-  if (qi_blocks < kSmallSeqMax) {
-    k_val = qi_blocks;
-  } else if (qi_blocks < kMediumSeqMax) {
-    k_val = static_cast<int>(qi_blocks * kMediumRate) + kMediumBias;
+  if (prompt_kv_blocks < kSmallSeqMax) {
+    k_val = prompt_kv_blocks;
+  } else if (prompt_kv_blocks < kMediumSeqMax) {
+    k_val = static_cast<int>(prompt_kv_blocks * k_block_num_rate_medium) + k_block_num_bias_medium;
   } else {
-    k_val = static_cast<int>(qi_blocks * k_block_num_rate) + k_block_num_bias;
+    k_val = static_cast<int>(prompt_kv_blocks * k_block_num_rate_large) + k_block_num_bias_large;
   }
 
-  // Flat region (q_row in [0, k_val)); also guards decay_len=1 div-by-zero below.
-  int decay_len = qi_blocks - k_val;
-  if (q_row < k_val || decay_len <= 1) {
+  const int kb_offset = ki_blocks - qi_blocks;
+  const int q_pos = q_row + kb_offset;
+
+  int decay_len = prompt_kv_blocks - k_val;
+  if (q_pos < k_val || decay_len <= 1) {
     return k_val;
   }
 
-  // Linear decay from k_val (at q_row=k_val) to k_val*alpha (at q_row=qi_blocks-1).
   float k_end = k_val * alpha;
-  float t = static_cast<float>(q_row - k_val) / (decay_len - 1);
+  float t = static_cast<float>(q_pos - k_val) / (decay_len - 1);
   int budget = static_cast<int>(floorf(k_val + t * (k_end - k_val)));
   return budget < 1 ? 1 : (budget > k_val ? k_val : budget);
 }
@@ -1133,9 +1136,10 @@ template <int kEPT, int kWPR, int kWPC>
 __global__ void __launch_bounds__(kWPC * 32, (kWPR == 1) ? 0 : 1)
     stem_tpd_kernel(const __nv_bfloat16* __restrict__ block_logits, uint8_t* __restrict__ mask,
                     const int* __restrict__ q_seq_lens, const int* __restrict__ kv_seq_lens,
-                    float alpha, int block_size, int initial_blocks, int window_size,
-                    float k_block_num_rate, int k_block_num_bias, int num_heads, int max_Qb,
-                    int max_Kb) {
+                    const int* __restrict__ num_prompt_tokens, float alpha, int block_size,
+                    int initial_blocks, int window_size, float k_block_num_rate_medium,
+                    int k_block_num_bias_medium, float k_block_num_rate_large,
+                    int k_block_num_bias_large, int num_heads, int max_Qb, int max_Kb) {
   static_assert(kWPR == 1 || kWPC == kWPR, "cooperative mode requires kWPC == kWPR");
   constexpr int kRowsPerCta = kWPC / kWPR;
   constexpr int kThreadsPerRow = kWPR * 32;
@@ -1155,6 +1159,7 @@ __global__ void __launch_bounds__(kWPC * 32, (kWPR == 1) ? 0 : 1)
   // Number of stem blocks for this request (matches host-side max_Qb / max_Kb derivation).
   const int qi_blocks = (q_seq_lens[ireq] + block_size - 1) / block_size;
   const int ki_blocks = (kv_seq_lens[ireq] + block_size - 1) / block_size;
+  const int prompt_kv_blocks = (num_prompt_tokens[ireq] + block_size - 1) / block_size;
   if (qi_blocks == 0 || ki_blocks == 0 || q_row >= qi_blocks) {
     return;
   }
@@ -1180,7 +1185,9 @@ __global__ void __launch_bounds__(kWPC * 32, (kWPR == 1) ? 0 : 1)
     local_finite += is_finite;
   }
 
-  const int budget = compute_budget(q_row, qi_blocks, alpha, k_block_num_rate, k_block_num_bias);
+  const int budget =
+      compute_budget(q_row, qi_blocks, ki_blocks, prompt_kv_blocks, alpha, k_block_num_rate_medium,
+                     k_block_num_bias_medium, k_block_num_rate_large, k_block_num_bias_large);
 
   // Sum local_finite across all threads in this row.  Reuses smem_warp_counts in radix below.
   // kWPR==1 path elides the smem allocation.
@@ -1209,7 +1216,12 @@ __global__ void __launch_bounds__(kWPC * 32, (kWPR == 1) ? 0 : 1)
     threshold = radix_find_threshold<kEPT, kWPR>(ordered, budget, smem_warp_counts, warp_in_group);
   }
 
-  // mask = top-k ∪ initial sink ∪ recent window ∪ diagonal.
+  // mask = top-k & initial sink & recent window & diagonal.
+  //
+  // Chunked-prefill alignment: Q is the tail of a longer KV, so a Q-block at
+  // local index q_row corresponds to KV-block index (q_row + kb_offset).
+  const int kb_offset = ki_blocks - qi_blocks;
+  const int diag_col = q_row + kb_offset;
 #pragma unroll
   for (int j = 0; j < kEPT; ++j) {
     int col = linear_id + j * kThreadsPerRow;
@@ -1218,9 +1230,9 @@ __global__ void __launch_bounds__(kWPC * 32, (kWPR == 1) ? 0 : 1)
     }
 
     bool selected = (ordered[j] >= threshold);
-    selected |= (col < initial_blocks);                         // initial sink
-    selected |= (col <= q_row) && (col > q_row - window_size);  // recent window
-    selected |= (col == q_row);                                 // diagonal (always on)
+    selected |= (col < initial_blocks);                               // initial sink (KV head)
+    selected |= (col <= diag_col) && (col > diag_col - window_size);  // recent window (KV-aligned)
+    selected |= (col == diag_col);                                    // diagonal (KV-aligned)
 
     mask_ptr[col] = static_cast<uint8_t>(selected);
   }
