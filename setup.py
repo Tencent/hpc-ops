@@ -235,10 +235,25 @@ if MULTI_ARCH:
 else:
     ext_modules = [CMakeExtension("hpc", sm_arch=SM_ARCH, version_macros=version_macros)]
 
+# ── Description: include last commit id, author and message ──
+try:
+    _last_commit_id = subprocess.check_output(
+        ["git", "rev-parse", "--short=7", "HEAD"], stderr=subprocess.DEVNULL, text=True
+    ).strip()
+    _last_commit_msg = subprocess.check_output(
+        ["git", "log", "-1", "--pretty=%s"], stderr=subprocess.DEVNULL, text=True
+    ).strip()
+    _last_commit_author = subprocess.check_output(
+        ["git", "log", "-1", "--pretty=%an"], stderr=subprocess.DEVNULL, text=True
+    ).strip()
+    description = f"{_last_commit_id} ({_last_commit_author}): {_last_commit_msg}"
+except subprocess.CalledProcessError:
+    description = "High Performance Computing Operator"
+
 setup(
     name="hpc-ops",
     version=version,
-    description="High Performance Computing Operator",
+    description=description,
     author="hpc-ops team",
     author_email="authors@hpc-ops",
     url="https://mirrors.tencent.com/#/private/pypi/detail?repo_id=155&project_name=hpc-ops",
