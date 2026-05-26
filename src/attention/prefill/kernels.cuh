@@ -17,6 +17,9 @@ namespace hpc {
 namespace attention {
 namespace kernels {
 
+constexpr float kFp8PrefillPScale = 256.0f;
+constexpr float kFp8PrefillPScaleInv = 1.0f / kFp8PrefillPScale;
+
 template <int kTileM>
 __device__ __forceinline__ auto get_next_tile(const int *seqlens_q_ptr, int &iblock, int num_head_q,
                                               int num_batch, int max_total_blocks,
@@ -1025,7 +1028,7 @@ __global__ void __launch_bounds__(384, 1)
 }
 
 template <typename Config, typename TmaQ, typename TmaK, typename TmaV, typename TmaY,
-          typename TmaQS, bool kHasPScale = false>
+          typename TmaQS>
 __global__ void __launch_bounds__(384, 1)
     attention_with_kvcache_qpertoken_perhead_kvpertensor_prefill_fp8_warp_specialization_kernel(
         cute::TmaDescriptor *td_qy, const __grid_constant__ TmaK tma_k,
@@ -1035,8 +1038,7 @@ __global__ void __launch_bounds__(384, 1)
         int num_batch, int max_seq_q, int max_seq_q_pad, int num_dim_qk, int num_dim_v,
         int num_head_q, int num_head_kv, int num_kvcache_blocks, int block_size,
         int num_seq_max_blocks, float one_over_dk_log2e, cutlass::FastDivmod head_kv_divmod,
-        cutlass::FastDivmod head_q_divmod, cutlass::FastDivmod tile_m_divmod,
-        const float *p_scale_ptr = nullptr, const float *p_scale_inv_ptr = nullptr) {
+        cutlass::FastDivmod head_q_divmod, cutlass::FastDivmod tile_m_divmod) {
   using namespace cute;  // NOLINT
 
   using Tin = typename Config::Tin;
@@ -1403,13 +1405,10 @@ __global__ void __launch_bounds__(384, 1)
         // online_softmax_with_scale(tAttr_mn, gMax, gSum, tYr_mn, tQS, kM, kN, one_over_dk_log2e);
         online_softmax(tAttr_mn, gMax, gSum, tYr_mn, kM, kN, one_over_dk_log2e);
 
-        // optional: scale P by per-q-head p_scale before fp8 quantization
-        if constexpr (kHasPScale) {
-          float p_s = p_scale_ptr[ihead_q];
+        // Scale P before FP8 quantization; epilogue applies the reciprocal.
 #pragma unroll
-          for (int i = 0; i < size(tAttr); ++i) {
-            tAttr(i) *= p_s;
-          }
+        for (int i = 0; i < size(tAttr); ++i) {
+          tAttr(i) *= kFp8PrefillPScale;
         }
 
         // convert P to fp8 and permute for pv gemm
@@ -1478,10 +1477,7 @@ __global__ void __launch_bounds__(384, 1)
       // to bfloat16
       auto tYr_bf16 = make_tensor_like<Tout>(tYr);
 
-      float vscale_eff = vscale;
-      if constexpr (kHasPScale) {
-        vscale_eff = vscale * p_scale_inv_ptr[ihead_q];
-      }
+      float vscale_eff = vscale * kFp8PrefillPScaleInv;
 #pragma unroll
       for (int i = 0; i < size(tYr); ++i) {
         tYr_bf16(i) = Tout(tYr(i) * vscale_eff);
@@ -1517,7 +1513,7 @@ __global__ void __launch_bounds__(384, 1)
 }
 
 template <typename Config, typename TmaQ, typename TmaK, typename TmaV, typename TmaY,
-          typename TmaQS, typename TmaKS, bool kHasPScale = false>
+          typename TmaQS, typename TmaKS>
 __global__ void __launch_bounds__(384, 1)
     attention_with_kvcache_qkpertoken_perhead_vperhead_prefill_fp8_warp_specialization_kernel(
         cute::TmaDescriptor *td_qy, const __grid_constant__ TmaK tma_k,
@@ -1528,8 +1524,7 @@ __global__ void __launch_bounds__(384, 1)
         int num_dim_v, int num_dim_scale, int num_head_q, int num_head_kv, int num_kvcache_blocks,
         int num_scale_blocks, int block_size, int num_seq_max_blocks, float one_over_dk_log2e,
         cutlass::FastDivmod head_kv_divmod, cutlass::FastDivmod head_q_divmod,
-        cutlass::FastDivmod tile_m_divmod, const float *p_scale_ptr = nullptr,
-        const float *p_scale_inv_ptr = nullptr) {
+        cutlass::FastDivmod tile_m_divmod) {
   using namespace cute;  // NOLINT
 
   using Tin = typename Config::Tin;
@@ -1919,13 +1914,10 @@ __global__ void __launch_bounds__(384, 1)
         // one_over_dk_log2e);
         online_softmax(tAttr_mn, gMax, gSum, tYr_mn, kM, kN, one_over_dk_log2e);
 
-        // optional: scale P by per-q-head p_scale before fp8 quantization
-        if constexpr (kHasPScale) {
-          float p_s = p_scale_ptr[ihead_q];
+        // Scale P before FP8 quantization; epilogue applies the reciprocal.
 #pragma unroll
-          for (int i = 0; i < size(tAttr); ++i) {
-            tAttr(i) *= p_s;
-          }
+        for (int i = 0; i < size(tAttr); ++i) {
+          tAttr(i) *= kFp8PrefillPScale;
         }
 
         // convert P to fp8 and permute for pv gemm
@@ -1994,10 +1986,7 @@ __global__ void __launch_bounds__(384, 1)
       // to bfloat16
       auto tYr_bf16 = make_tensor_like<Tout>(tYr);
 
-      float vscale_eff = vscale;
-      if constexpr (kHasPScale) {
-        vscale_eff = vscale * p_scale_inv_ptr[ihead_q];
-      }
+      float vscale_eff = vscale * kFp8PrefillPScaleInv;
 #pragma unroll
       for (int i = 0; i < size(tYr); ++i) {
         tYr_bf16(i) = Tout(tYr(i) * vscale_eff);
@@ -2035,7 +2024,7 @@ __global__ void __launch_bounds__(384, 1)
 // FP8 warp-specialization kernel with paged KV cache and Block-Sparse Attention support,
 // dim_qk=128, dim_v=128.
 template <typename Config, typename TmaQ, typename TmaK, typename TmaV, typename TmaY,
-          typename TmaQS, bool kHasMask, bool kHasPScale = false>
+          typename TmaQS, bool kHasMask>
 __global__ void __launch_bounds__(384, 1)
     attention_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_prefill_fp8_warp_specialization_kernel(  // NOLINT(whitespace/line_length)
         cute::TmaDescriptor *td_qy, const __grid_constant__ TmaK tma_k,
@@ -2045,8 +2034,7 @@ __global__ void __launch_bounds__(384, 1)
         int max_seq_q_pad, int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv,
         int num_kvcache_blocks, int num_seq_max_blocks, float one_over_dk_log2e,
         cutlass::FastDivmod head_kv_divmod, cutlass::FastDivmod head_q_divmod,
-        cutlass::FastDivmod tile_m_divmod, const uint8_t *block_mask_ptr, int num_tile_kv_in_mask,
-        const float *p_scale_ptr = nullptr, const float *p_scale_inv_ptr = nullptr) {
+        cutlass::FastDivmod tile_m_divmod, const uint8_t *block_mask_ptr, int num_tile_kv_in_mask) {
   using namespace cute;  // NOLINT
 
   using Tin = typename Config::Tin;
@@ -2494,13 +2482,10 @@ __global__ void __launch_bounds__(384, 1)
         // online_softmax_with_scale(tAttr_mn, gMax, gSum, tYr_mn, tQS, kM, kN, one_over_dk_log2e);
         online_softmax(tAttr_mn, gMax, gSum, tYr_mn, kM, kN, one_over_dk_log2e);
 
-        // optional: scale P by per-q-head p_scale before fp8 quantization
-        if constexpr (kHasPScale) {
-          float p_s = p_scale_ptr[ihead_q];
+        // Scale P before FP8 quantization; epilogue applies the reciprocal.
 #pragma unroll
-          for (int i = 0; i < size(tAttr); ++i) {
-            tAttr(i) *= p_s;
-          }
+        for (int i = 0; i < size(tAttr); ++i) {
+          tAttr(i) *= kFp8PrefillPScale;
         }
 
         // convert P to fp8 and permute for pv gemm
@@ -2573,10 +2558,7 @@ __global__ void __launch_bounds__(384, 1)
       // to bfloat16
       auto tYr_bf16 = make_tensor_like<Tout>(tYr);
 
-      float vscale_eff = vscale;
-      if constexpr (kHasPScale) {
-        vscale_eff = vscale * p_scale_inv_ptr[ihead_q];
-      }
+      float vscale_eff = vscale * kFp8PrefillPScaleInv;
 #pragma unroll
       for (int i = 0; i < size(tYr); ++i) {
         tYr_bf16(i) = Tout(tYr(i) * vscale_eff);
@@ -2614,7 +2596,7 @@ __global__ void __launch_bounds__(384, 1)
 // FP8 warp-specialization kernel with paged KV cache and Block-Sparse Attention support,
 // qkpertoken_perhead_vperhead scale layout, dim_qk=128, dim_v=128.
 template <typename Config, typename TmaQ, typename TmaK, typename TmaV, typename TmaY,
-          typename TmaQS, typename TmaKS, bool kHasMask, bool kHasPScale = false>
+          typename TmaQS, typename TmaKS, bool kHasMask>
 __global__ void __launch_bounds__(384, 1)
     attention_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_prefill_fp8_warp_specialization_kernel(  // NOLINT(whitespace/line_length)
         cute::TmaDescriptor *td_qy, const __grid_constant__ TmaK tma_k,
@@ -2625,8 +2607,7 @@ __global__ void __launch_bounds__(384, 1)
         int num_dim_v, int num_dim_scale, int num_head_q, int num_head_kv, int num_kvcache_blocks,
         int num_scale_blocks, int num_seq_max_blocks, float one_over_dk_log2e,
         cutlass::FastDivmod head_kv_divmod, cutlass::FastDivmod head_q_divmod,
-        cutlass::FastDivmod tile_m_divmod, const uint8_t *block_mask_ptr, int num_tile_kv_in_mask,
-        const float *p_scale_ptr = nullptr, const float *p_scale_inv_ptr = nullptr) {
+        cutlass::FastDivmod tile_m_divmod, const uint8_t *block_mask_ptr, int num_tile_kv_in_mask) {
   using namespace cute;  // NOLINT
 
   using Tin = typename Config::Tin;
@@ -3092,13 +3073,10 @@ __global__ void __launch_bounds__(384, 1)
         // online softmax
         online_softmax(tAttr_mn, gMax, gSum, tYr_mn, kM, kN, one_over_dk_log2e);
 
-        // optional: scale P by per-q-head p_scale before fp8 quantization
-        if constexpr (kHasPScale) {
-          float p_s = p_scale_ptr[ihead_q];
+        // Scale P before FP8 quantization; epilogue applies the reciprocal.
 #pragma unroll
-          for (int i = 0; i < size(tAttr); ++i) {
-            tAttr(i) *= p_s;
-          }
+        for (int i = 0; i < size(tAttr); ++i) {
+          tAttr(i) *= kFp8PrefillPScale;
         }
 
         // convert P to fp8 and permute for pv gemm
@@ -3171,10 +3149,7 @@ __global__ void __launch_bounds__(384, 1)
       // to bfloat16
       auto tYr_bf16 = make_tensor_like<Tout>(tYr);
 
-      float vscale_eff = vscale;
-      if constexpr (kHasPScale) {
-        vscale_eff = vscale * p_scale_inv_ptr[ihead_q];
-      }
+      float vscale_eff = vscale * kFp8PrefillPScaleInv;
 #pragma unroll
       for (int i = 0; i < size(tYr); ++i) {
         tYr_bf16(i) = Tout(tYr(i) * vscale_eff);
@@ -4255,6 +4230,12 @@ __global__ void __launch_bounds__(384, 1)
         // online softmax
         online_softmax(tAttr_mn, gMax, gSum, tYr_mn, kM, kN, one_over_dk_log2e);
 
+        // Scale P before FP8 quantization; epilogue applies the reciprocal.
+#pragma unroll
+        for (int i = 0; i < size(tAttr); ++i) {
+          tAttr(i) *= kFp8PrefillPScale;
+        }
+
         // convert P to fp8 and permute for pv gemm
         auto tAttr_float32x4 = recast<float4>(tAttr);
         auto tAttr_fp8x4 = recast<__nv_fp8x4_e4m3>(tAttr_fp8);
@@ -4325,9 +4306,10 @@ __global__ void __launch_bounds__(384, 1)
       // to bfloat16
       auto tYr_bf16 = make_tensor_like<Tout>(tYr);
 
+      float vscale_eff = vscale * kFp8PrefillPScaleInv;
 #pragma unroll
       for (int i = 0; i < size(tYr); ++i) {
-        tYr_bf16(i) = Tout(tYr(i) * vscale);
+        tYr_bf16(i) = Tout(tYr(i) * vscale_eff);
       }
 
       // Epilogue: write register-C to global memory

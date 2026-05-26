@@ -46,67 +46,7 @@ def generate_block_sparse_mask(batch, heads, nrow, ncol, skip_ratio, causal=True
 # ====================================================================
 
 
-def naive_attn_with_kvcache_sparse(
-    q,
-    k_cache,
-    v_cache,
-    qkscale,
-    vscale,
-    cache_seqlens,
-    page_table,
-    block_mask=None,
-    causal=True,
-):
-    """FP8 paged-KV-cache naive reference with optional block-sparse mask."""
-    num_batch, num_seq_q, num_head_q, num_dim_qk = q.shape
-    num_blocks, block_size, num_head_kv, _ = k_cache.shape
-    _, _, _, num_dim_v = v_cache.shape
-    num_group = num_head_q // num_head_kv
-    output = torch.empty_like(q).to(torch.bfloat16)
-    kvcache_blocks = (cache_seqlens + block_size - 1) // block_size
-
-    for i in range(num_batch):
-        BQ = q[i].transpose(0, 1).float()
-        blk_ids = page_table[i, : kvcache_blocks[i]]
-        num_seq_kv = cache_seqlens[i]
-        BK = (
-            k_cache[blk_ids]
-            .reshape(-1, num_head_kv, num_dim_qk)
-            .transpose(0, 1)[:, :num_seq_kv, :]
-            .repeat_interleave(num_group, dim=0)
-        ).float()
-        BV = (
-            v_cache[blk_ids]
-            .reshape(-1, num_head_kv, num_dim_v)
-            .transpose(0, 1)[:, :num_seq_kv, :]
-            .repeat_interleave(num_group, dim=0)
-        ).float()
-
-        scale = qkscale[i, :, :].unsqueeze(-1)[:, :num_seq_q, :]
-        scores = torch.matmul(BQ, BK.transpose(-2, -1)) * scale / math.sqrt(num_dim_qk)
-
-        if block_mask is not None:
-            bm = block_mask[i]
-            elem_mask = bm.repeat_interleave(BSA_BLOCK, dim=-2)[:, :num_seq_q, :]
-            elem_mask = elem_mask.repeat_interleave(BSA_BLOCK, dim=-1)[:, :, :num_seq_kv]
-            scores = scores.masked_fill(~elem_mask, float("-inf"))
-
-        if causal:
-            cm = (
-                torch.tril(torch.ones(num_seq_kv, num_seq_kv, device=q.device, dtype=torch.bool))[
-                    (num_seq_kv - num_seq_q) :, :
-                ]
-                .unsqueeze(0)
-                .unsqueeze(0)
-            )
-            scores = scores.masked_fill(~cm, float("-inf"))
-
-        attn_w = torch.softmax(scores, dim=-1)
-        output[i] = torch.matmul(attn_w, BV).transpose(1, 2) * vscale[0]
-    return output
-
-
-def naive_attn_with_kvcache_sparse_pscale(
+def naive_attn_with_kvcache_sparse_fixed_pscale(
     q,
     k_cache,
     v_cache,
@@ -116,19 +56,14 @@ def naive_attn_with_kvcache_sparse_pscale(
     cache_seqlens,
     page_table,
     block_mask=None,
-    p_scale=None,
-    p_scale_inv=None,
     causal=True,
 ):
-    """PScale-aware FP8 paged-KV-cache sparse reference."""
+    """Sparse reference for the kernel's fixed P-scale=256 FP8 path."""
     num_batch, num_seq_q, num_head_q, num_dim_qk = q.shape
     _, block_size, num_head_kv, _ = k_cache.shape
     _, _, _, num_dim_v = v_cache.shape
     num_group = num_head_q // num_head_kv
     output = torch.empty_like(q).to(torch.bfloat16)
-    has_ps = p_scale is not None
-    if has_ps:
-        assert p_scale_inv is not None and p_scale.shape == (num_head_q,)
 
     kvcache_blocks = (cache_seqlens + block_size - 1) // block_size
 
@@ -170,35 +105,14 @@ def naive_attn_with_kvcache_sparse_pscale(
 
         attn_weights = torch.exp(scores - scores.max(dim=-1, keepdim=True)[0])
         gsum = attn_weights.sum(dim=-1, keepdim=True)
-        if has_ps:
-            attn_weights = attn_weights * p_scale[:, None, None]
+        attn_weights = attn_weights * 256.0
         attn_weights = attn_weights.to(torch.float8_e4m3fn).float()
 
         out_head = torch.matmul(attn_weights, BV) / gsum
-        if has_ps:
-            out_head = out_head * (vscale[0] * p_scale_inv[:, None, None])
-        else:
-            out_head = out_head * vscale[0]
+        out_head = out_head * (vscale[0] / 256.0)
         output[i] = out_head.transpose(1, 2)
 
     return output
-
-
-def _make_pscale(mode, num_head_q, device):
-    if mode == "none":
-        return None, None
-    if mode == "all_ones":
-        p = torch.ones(num_head_q, dtype=torch.float32, device=device)
-        return p, p.clone()
-    if mode == "all_2":
-        p = torch.full((num_head_q,), 2.0, dtype=torch.float32, device=device)
-        pi = torch.full((num_head_q,), 0.5, dtype=torch.float32, device=device)
-        return p, pi
-    if mode == "per_head_random":
-        g = torch.Generator(device=device).manual_seed(20240514)
-        p = 0.7 + 0.8 * torch.rand(num_head_q, generator=g, device=device, dtype=torch.float32)
-        return p, 1.0 / p
-    raise ValueError(mode)
 
 
 @pytest.mark.parametrize("num_batch", [2])
@@ -277,11 +191,12 @@ def test_blocksparse_qpertoken_perhead_kvpertensor_fp8(
         block_mask_u8 = block_mask.to(torch.uint8).contiguous()
 
     # Reference
-    gt = naive_attn_with_kvcache_sparse(
+    gt = naive_attn_with_kvcache_sparse_fixed_pscale(
         Q,
         kcache,
         vcache,
-        qscale * kscale,
+        qscale,
+        kscale,
         vscale,
         seqlens_kvcache,
         block_ids,
@@ -310,8 +225,7 @@ def test_blocksparse_qpertoken_perhead_kvpertensor_fp8(
 
 
 @pytest.mark.parametrize("skip_ratio", [0.0, 0.5])
-@pytest.mark.parametrize("p_scale_mode", ["none", "all_ones", "all_2", "per_head_random"])
-def test_blocksparse_qpertoken_perhead_kvpertensor_fp8_pscale(skip_ratio, p_scale_mode):
+def test_blocksparse_qpertoken_perhead_kvpertensor_fp8_fixed_pscale(skip_ratio):
     torch.manual_seed(10086)
     torch.cuda.manual_seed(10086)
 
@@ -371,9 +285,7 @@ def test_blocksparse_qpertoken_perhead_kvpertensor_fp8_pscale(skip_ratio, p_scal
         )
         block_mask_u8 = block_mask.to(torch.uint8).contiguous()
 
-    p_scale, p_scale_inv = _make_pscale(p_scale_mode, num_head_q, device=device)
-
-    gt = naive_attn_with_kvcache_sparse_pscale(
+    gt = naive_attn_with_kvcache_sparse_fixed_pscale(
         Q,
         kcache,
         vcache,
@@ -383,8 +295,6 @@ def test_blocksparse_qpertoken_perhead_kvpertensor_fp8_pscale(skip_ratio, p_scal
         seqlens_kvcache,
         block_ids,
         block_mask=block_mask,
-        p_scale=p_scale,
-        p_scale_inv=p_scale_inv,
         causal=True,
     ).reshape(-1, num_head_q, head_dim)
 
@@ -401,8 +311,6 @@ def test_blocksparse_qpertoken_perhead_kvpertensor_fp8_pscale(skip_ratio, p_scal
         num_seq,
         quant_type=hpc.QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
         block_mask=block_mask_u8,
-        p_scale=p_scale,
-        p_scale_inv=p_scale_inv,
     )
 
     assert allclose(gt, my, atol=0.05)

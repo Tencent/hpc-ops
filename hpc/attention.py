@@ -157,8 +157,6 @@ def attention_with_kvcache_prefill_fp8(
     seqlens_kvcache: Tensor,
     max_seqlens_q: int,
     quant_type: QuantType = QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
-    p_scale: Optional[Tensor] = None,
-    p_scale_inv: Optional[Tensor] = None,
     output: Tensor = None,
 ) -> Tensor:
     """Computes paged KV-cache attention prefill with FP8 KV tensors.
@@ -215,13 +213,6 @@ def attention_with_kvcache_prefill_fp8(
             Dtype: int
         quant_type: Type of quantization scheme for attention computation.
             Defaults to QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR.
-        p_scale: Optional per-q-head scale applied to softmax output P before
-            FP8 quantization. Shape: [num_head_q], Dtype: float32. Must be on
-            the same device as ``q`` and paired with ``p_scale_inv``. If None,
-            kernel runs the original path (no P scaling).
-        p_scale_inv: Caller-provided reciprocal of ``p_scale`` (kernel avoids
-            division). Shape: [num_head_q], Dtype: float32. Must be provided
-            together with ``p_scale``.
         output: Optional output tensor to store the attention result.
             If provided, must be a bf16 tensor with appropriate shape
             (typically [total_seq, num_head_q, num_dim_v]).
@@ -243,7 +234,6 @@ def attention_with_kvcache_prefill_fp8(
           preserved and strides encode the desired KV layout (NHD/HND).
         - total_seq = sum(seqlens_q[ibatch] for ibatch in range(num_batch))
     """
-
     return torch.ops.hpc.attention_with_kvcache_prefill_fp8(
         q,
         kcache,
@@ -256,8 +246,6 @@ def attention_with_kvcache_prefill_fp8(
         seqlens_kvcache,
         max_seqlens_q,
         quant_type.value,
-        p_scale,
-        p_scale_inv,
         output,
     )
 
@@ -275,8 +263,6 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
     max_seqlens_q: int,
     quant_type: QuantType = QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
     block_mask: Optional[Tensor] = None,
-    p_scale: Optional[Tensor] = None,
-    p_scale_inv: Optional[Tensor] = None,
     output: Tensor = None,
 ) -> Tensor:
     """Unified dense / block-sparse attention prefill with paged FP8 KV cache.
@@ -330,12 +316,6 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
             layout (K per-token-group per-head per-dim-group, V per-head).
         block_mask: Optional bool mask for KV tiles. True = compute, False = skip.
             Shape: [num_batch, num_head_q, max_tile_m, num_tile_kv_in_mask], Dtype: uint8.
-        p_scale: Optional per-q-head scale applied to softmax output P before
-            FP8 quantization. Shape: [num_head_q], Dtype: float32. Must be on
-            the same device as ``q`` and paired with ``p_scale_inv``.
-        p_scale_inv: Caller-provided reciprocal of ``p_scale``. Shape:
-            [num_head_q], Dtype: float32. Must be provided together with
-            ``p_scale``.
         output: Optional pre-allocated output tensor.
 
     Returns:
@@ -354,8 +334,6 @@ def attention_with_kvcache_blocksparse_prefill_fp8(
         max_seqlens_q,
         quant_type.value,
         block_mask,
-        p_scale,
-        p_scale_inv,
         output,
     )
 
@@ -902,8 +880,6 @@ def attention_with_kvcache_prefill_fp8_fake(
     seqlens_kvcache,
     max_seqlens_q,
     quant_type,
-    p_scale=None,
-    p_scale_inv=None,
     output=None,
 ):
     return torch.empty(
@@ -925,8 +901,6 @@ def attention_with_kvcache_blocksparse_prefill_fp8_fake(
     max_seqlens_q,
     quant_type,
     block_mask=None,
-    p_scale=None,
-    p_scale_inv=None,
     output=None,
 ):
     return torch.empty(

@@ -83,8 +83,12 @@ def naive_attention_varlen_fp8(
             ]
             scores.masked_fill_(~cm.unsqueeze(0), float("-inf"))
 
-        attn_w = torch.softmax(scores, dim=-1)
-        out = torch.matmul(attn_w, bv) * v_descale
+        # Mirror the kernel's online-softmax + fixed-P-scale fp8 quant path.
+        attn_w = torch.exp(scores - scores.max(dim=-1, keepdim=True)[0])
+        gsum = attn_w.sum(dim=-1, keepdim=True)
+        attn_w = (attn_w * 256.0).to(torch.float8_e4m3fn).float()
+        out = torch.matmul(attn_w, bv) / gsum
+        out = out * (v_descale / 256.0)
         output[sq_s:sq_e] = out.transpose(0, 1).to(torch.bfloat16)
 
     return output
