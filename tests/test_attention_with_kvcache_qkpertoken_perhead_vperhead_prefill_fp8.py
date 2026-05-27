@@ -76,7 +76,9 @@ def naive_attn_with_kvcache_func(
                 .unsqueeze(0)
             )  # (1, 1, num_seq_q, num_seq_kv)
         else:
-            causal_mask = causal_mask.view(1, 1, num_seq_q, num_seq_kv)
+            causal_mask = torch.ones(
+                (1, 1, num_seq_q, num_seq_kv), device=q.device, dtype=torch.bool
+            )
 
         scores = scores.masked_fill(~causal_mask, float("-inf"))
 

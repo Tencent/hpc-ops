@@ -83,7 +83,7 @@ template <typename Tin, typename Tout, int kTileM, int kTileN, int kTileK, int k
           int kHeadsPerGroup, typename TiledMmaQK, typename TiledMmaSV, typename TmaQ,
           typename TmaK, typename TmaV, typename TmaSplitY, typename SLayoutQ, typename SLayoutK,
           typename SLayoutP, typename SLayoutS, typename SLayoutVTma, typename SLayoutSplitY,
-          int kBlockSize, int kStage, int kMaxSplitK, bool kHasPScale = false>
+          int kBlockSize, int kStage, int kMaxSplitK>
 __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertensor_kernel(
     const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
     const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaSplitY tma_splity,
@@ -91,8 +91,7 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
     const float* qscale_ptr, const float* kscale_ptr, const float* vscale_ptr, int num_batch,
     int num_seq_q, int num_dim_qk, int num_dim_v, int num_head_q, int num_head_k, int num_head_v,
     int heads_per_group, int lse_pad_heads_per_group, int num_kvcache_blocks,
-    int num_seq_max_blocks, int qscale_pad_stride, float one_over_dk_log2e,
-    const float* p_scale_ptr = nullptr, const float* p_scale_inv_ptr = nullptr) {
+    int num_seq_max_blocks, int qscale_pad_stride, float one_over_dk_log2e) {
   using namespace cute;  // NOLINT
   using TaskInfo = DynamicTaskInfo;
 
@@ -161,7 +160,7 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
   auto tVs = btma_v.partition_D(sVTma);
 
   const float kscale = kscale_ptr[0];
-  const float vscale = vscale_ptr[0];
+  const float vscale = vscale_ptr[0] / 256;
 
   // ==========================================================================
   // One-time mbarrier init (sm100 pattern). Each warp inits its own group of
@@ -319,8 +318,6 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
     Tensor gSum = make_tensor<float>(Int<kM>{});
     Tensor qkscales = make_tensor<float>(Int<kM>{});
     Tensor gSoftmaxScale = make_tensor<float>(Int<kM>{});
-    Tensor pscales = make_tensor<float>(Int<kM>{});
-    Tensor pscales_inv = make_tensor<float>(Int<kM>{});
 
     auto tiled_copy_P_r2s = hpc::attention::kernels::make_tiled_copy_P_interleave<kTileM, Tin>();
     auto thr_copy_P_r2s = tiled_copy_P_r2s.get_slice(idx_in_warpgroup);
@@ -345,7 +342,6 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
     int kv_istage_r = kIWarpgroup;
     int kv_phase_r = 0;
     int phase_q = 0;
-    int prev_ihead_kv = -1;
 
     while (true) {
       TaskInfo task;
@@ -386,26 +382,6 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
       fill(gMax, -std::numeric_limits<float>::infinity());
       fill(gSoftmaxScale, one_over_dk_log2e);
 
-      // Per-row P_scale / P_scale_inv: only refresh on ihead_kv boundary.
-      if constexpr (kHasPScale) {
-        if (ihead_kv != prev_ihead_kv) {
-#pragma unroll
-          for (int i = 0; i < kM; i++) {
-            int im = get<1>(tI_nm(0, i));
-            int iqhead = im % kHeadsPerGroup;
-            if (iqhead < heads_per_group) {
-              int ihq = ihead_kv * heads_per_group + iqhead;
-              pscales(i) = p_scale_ptr[ihq];
-              pscales_inv(i) = p_scale_inv_ptr[ihq];
-            } else {
-              pscales(i) = 1.f;
-              pscales_inv(i) = 1.f;
-            }
-          }
-          prev_ihead_kv = ihead_kv;
-        }
-      }
-
       clear(tYr);
       tiled_mma_sv.accumulate_ = GMMA::ScaleOut::One;
 
@@ -440,13 +416,11 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
             tAttr_nm, gMax, gSum, tYr_nm, gSoftmaxScale, shm_max_wg, kIWarpgroup,
             iwarp_in_warpgroup, ilane_in_warpgroup);
 
-        if constexpr (kHasPScale) {
 #pragma unroll
-          for (int im = 0; im < kM; ++im) {
+        for (int im = 0; im < kM; ++im) {
 #pragma unroll
-            for (int in = 0; in < kN; ++in) {
-              tAttr_nm(in, im) *= pscales(im);
-            }
+          for (int in = 0; in < kN; ++in) {
+            tAttr_nm(in, im) *= 256;
           }
         }
 
@@ -494,13 +468,11 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
             tAttr_nm, gMax, gSum, tYr_nm, gSoftmaxScale, shm_max_wg, kIWarpgroup,
             iwarp_in_warpgroup, ilane_in_warpgroup);
 
-        if constexpr (kHasPScale) {
 #pragma unroll
-          for (int im = 0; im < kM; ++im) {
+        for (int im = 0; im < kM; ++im) {
 #pragma unroll
-            for (int in = 0; in < kN; ++in) {
-              tAttr_nm(in, im) *= pscales(im);
-            }
+          for (int in = 0; in < kN; ++in) {
+            tAttr_nm(in, im) *= 256;
           }
         }
 
@@ -531,21 +503,9 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
             tYr_nm, gSum, shm_max_wg, kIWarpgroup, iwarp_in_warpgroup, ilane_in_warpgroup);
       }
 
-      if constexpr (kHasPScale) {
-        constexpr int kVdim = size<0>(tYr_nm);
 #pragma unroll
-        for (int im = 0; im < kM; ++im) {
-          float ve = vscale * pscales_inv(im);
-#pragma unroll
-          for (int in = 0; in < kVdim; ++in) {
-            tYr_nm(in, im) *= ve;
-          }
-        }
-      } else {
-#pragma unroll
-        for (int i = 0; i < size(tYr); ++i) {
-          tYr(i) *= vscale;
-        }
+      for (int i = 0; i < size(tYr); ++i) {
+        tYr(i) *= vscale;
       }
 
       hpc::bar_sync<kWarpGroupN * 128>(kWarpGroupN);

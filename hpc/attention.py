@@ -427,8 +427,6 @@ def attention_decode_fp8(
     splitk: bool = True,
     task_map: Tensor = None,
     split_flag: Tensor = None,
-    p_scale: Optional[Tensor] = None,
-    p_scale_inv: Optional[Tensor] = None,
     output: Tensor = None,
 ) -> Tensor:
     """Computes attention decode using bfloat16 precision.
@@ -501,8 +499,6 @@ def attention_decode_fp8(
         splitk,
         task_map,
         split_flag,
-        p_scale,
-        p_scale_inv,
         output,
     )
 
@@ -1191,11 +1187,12 @@ def attention_decode_fp8_fake(
     qscale,
     kscale,
     vscale,
+    mtp,
     new_kv_included,
+    quant_type,
     splitk,
-    split_flag,
-    p_scale=None,
-    p_scale_inv=None,
+    task_map=None,
+    split_flag=None,
     output=None,
 ):
     return torch.empty_like(q)

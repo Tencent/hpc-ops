@@ -44,7 +44,7 @@ static constexpr auto mma_selector_fp8() {
   }
 }
 
-template <int kTileM, int kTileN, int kTileK, int kTileV, int kBlockSize, bool kHasPScale>
+template <int kTileM, int kTileN, int kTileK, int kTileV, int kBlockSize>
 static void launch_persistent_and_combine(
     void *y_ptr, void *splitk_out_ptr, void *lse_ptr, int *task_map_ptr, const void *q_ptr,
     void *kcache_ptr, void *vcache_ptr, const int *block_ids_ptr, const float *qscale_ptr,
@@ -53,7 +53,7 @@ static void launch_persistent_and_combine(
     int num_kvcache_blocks, int num_seq_max_blocks, int qscale_pad_stride, int ldQ,
     int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
-    const float *p_scale_ptr, const float *p_scale_inv_ptr, cudaStream_t stream) {
+    cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   constexpr int kStage = 2;
@@ -154,8 +154,7 @@ static void launch_persistent_and_combine(
           Tin, Tout, kTileM, kTileN, kTileK, kTileV, kHeadsPerGroup, TiledMmaQK, TiledMmaSV,
           decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_splity),
           decltype(slayout_q), decltype(slayout_k), decltype(slayout_p), decltype(slayout_s),
-          decltype(slayout_vtma), decltype(slayout_splity), kBlockSize, kStage, kMaxSplitK,
-          kHasPScale>;
+          decltype(slayout_vtma), decltype(slayout_splity), kBlockSize, kStage, kMaxSplitK>;
 
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
@@ -182,8 +181,7 @@ static void launch_persistent_and_combine(
                      task_map_ptr, block_ids_ptr, qscale_ptr, kscale_ptr, vscale_ptr, num_batch,
                      num_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_k, num_head_v,
                      heads_per_group, pad_heads_per_group, num_kvcache_blocks, num_seq_max_blocks,
-                     qscale_pad_stride, one_over_dk_log2e, kHasPScale ? p_scale_ptr : nullptr,
-                     kHasPScale ? p_scale_inv_ptr : nullptr);
+                     qscale_pad_stride, one_over_dk_log2e);
 
   // ---- combine kernel: LSE-weighted reduction across chunks ----
   constexpr int kCombineWarps = 4;
@@ -222,8 +220,7 @@ bool smallm_dim128_fp8_qpertoken_perhead_kvpertensor_dynamic_async(
     int num_dim_v, int num_kvcache_blocks, int block_size, int num_seq_max_blocks,
     int qscale_pad_stride, int ldY, int ldQ, int64_t kcache_block_stride,
     int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
-    int64_t vcache_token_stride, int64_t vcache_head_stride, const float *p_scale_ptr,
-    const float *p_scale_inv_ptr, cudaStream_t stream) {
+    int64_t vcache_token_stride, int64_t vcache_head_stride, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   constexpr int kTileN = 64;
@@ -257,50 +254,40 @@ bool smallm_dim128_fp8_qpertoken_perhead_kvpertensor_dynamic_async(
   // The (num_seq_q, block_size, has_p_scale) triplet is dispatched here so
   // launch_persistent_and_combine only needs to compile one kernel variant per
   // instantiation. has_p_scale is decided by `p_scale_ptr == nullptr`.
-  auto launch = [&](auto tilem_tag, auto bs_tag, auto hps_tag) {
+  auto launch = [&](auto tilem_tag, auto bs_tag) {
     constexpr int kTileM = decltype(tilem_tag)::value;
     constexpr int kBlockSize = decltype(bs_tag)::value;
-    constexpr bool kHasPScale = decltype(hps_tag)::value;
-    launch_persistent_and_combine<kTileM, kTileN, kTileK, kTileV, kBlockSize, kHasPScale>(
+    launch_persistent_and_combine<kTileM, kTileN, kTileK, kTileV, kBlockSize>(
         y_ptr, splitk_out_ptr, lse_ptr, task_map_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
         qscale_ptr, kscale_ptr, vscale_ptr, num_batch, num_seq_q, num_head_q, num_head_k,
         num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, num_seq_max_blocks,
         qscale_pad_stride, ldQ, kcache_block_stride, kcache_token_stride, kcache_head_stride,
-        vcache_block_stride, vcache_token_stride, vcache_head_stride, p_scale_ptr, p_scale_inv_ptr,
-        stream);
-  };
-
-  auto dispatch_hps = [&](auto tilem_tag, auto bs_tag) {
-    if (p_scale_ptr == nullptr) {
-      launch(tilem_tag, bs_tag, std::false_type{});
-    } else {
-      launch(tilem_tag, bs_tag, std::true_type{});
-    }
+        vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
   };
 
   if (num_seq_q == 1) {
     if (block_size == 32) {
-      dispatch_hps(std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{});
+      launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{});
     } else {
-      dispatch_hps(std::integral_constant<int, 8>{}, std::integral_constant<int, 64>{});
+      launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 64>{});
     }
   } else if (num_seq_q == 2) {
     if (block_size == 32) {
-      dispatch_hps(std::integral_constant<int, 16>{}, std::integral_constant<int, 32>{});
+      launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 32>{});
     } else {
-      dispatch_hps(std::integral_constant<int, 16>{}, std::integral_constant<int, 64>{});
+      launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 64>{});
     }
   } else if (num_seq_q == 3) {
     if (block_size == 32) {
-      dispatch_hps(std::integral_constant<int, 24>{}, std::integral_constant<int, 32>{});
+      launch(std::integral_constant<int, 24>{}, std::integral_constant<int, 32>{});
     } else {
-      dispatch_hps(std::integral_constant<int, 24>{}, std::integral_constant<int, 64>{});
+      launch(std::integral_constant<int, 24>{}, std::integral_constant<int, 64>{});
     }
   } else if (num_seq_q == 4) {
     if (block_size == 32) {
-      dispatch_hps(std::integral_constant<int, 32>{}, std::integral_constant<int, 32>{});
+      launch(std::integral_constant<int, 32>{}, std::integral_constant<int, 32>{});
     } else {
-      dispatch_hps(std::integral_constant<int, 32>{}, std::integral_constant<int, 64>{});
+      launch(std::integral_constant<int, 32>{}, std::integral_constant<int, 64>{});
     }
   } else {
     std::cout << "smallm_dim128_fp8_qpertoken_perhead_kvpertensor_dynamic_async "

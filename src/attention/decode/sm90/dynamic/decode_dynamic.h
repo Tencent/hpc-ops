@@ -68,8 +68,7 @@ bool smallm_dim128_fp8_qpertoken_perhead_kvpertensor_dynamic_async(
     int num_dim_v, int num_kvcache_blocks, int block_size, int num_seq_max_blocks,
     int qscale_pad_stride, int ldY, int ldQ, int64_t kcache_block_stride,
     int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
-    int64_t vcache_token_stride, int64_t vcache_head_stride, const float *p_scale_ptr,
-    const float *p_scale_inv_ptr, cudaStream_t stream);
+    int64_t vcache_token_stride, int64_t vcache_head_stride, cudaStream_t stream);
 
 // Drop-in replacement for attention_decode_fp8_qkpertoken_perhead_vperhead_async
 // using the same task_map dynamic scheduling path as its kvpertensor sibling.
@@ -82,8 +81,7 @@ bool smallm_dim128_fp8_qkpertoken_perhead_vperhead_dynamic_async(
     int num_dim_v, int num_kvcache_blocks, int block_size, int num_seq_max_blocks,
     int qscale_pad_stride, int ldY, int ldQ, int64_t kcache_block_stride,
     int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
-    int64_t vcache_token_stride, int64_t vcache_head_stride, const float *p_scale_ptr,
-    const float *p_scale_inv_ptr, cudaStream_t stream);
+    int64_t vcache_token_stride, int64_t vcache_head_stride, cudaStream_t stream);
 
 }  // namespace dynamic
 }  // namespace decode

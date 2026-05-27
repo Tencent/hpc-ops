@@ -52,7 +52,7 @@ void launch_attention_decode_fp8_dim128_smallm_splitk(
     int block_size, int num_seq_max_blocks, int qscale_pad_stride, int ldY, int ldQ,
     int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
-    const float *p_scale_ptr, const float *p_scale_inv_ptr, cudaStream_t stream) {
+    cudaStream_t stream) {
   using namespace cute;  // NOLINT
   constexpr int kStage = 4;
   constexpr int kHeadsPerGroup = 8;
@@ -163,44 +163,25 @@ void launch_attention_decode_fp8_dim128_smallm_splitk(
   constexpr float kLog2e = 1.4426950408889634f;
   float one_over_dk_log2e = 1.f / sqrtf(float(num_dim_qk)) * kLog2e;
 
-  auto kernel_no_ps =
+  auto kernel =
       kernels::attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perhead_vperhead_kernel<
           Tout, Tin, kTileM, kTileN, kTileK, kTileV, kHeadsPerGroup, kWarpGroupN, TiledMmaQK,
           TiledMmaSV, decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y),
           decltype(tma_splity), decltype(tma_ks), decltype(slayout_q), decltype(slayout_k),
           decltype(slayout_p), decltype(slayout_s), decltype(slayout_vtma), decltype(slayout_y),
-          decltype(slayout_splity), decltype(slayout_ks), kBlockSize, kStage, kSplitK, kSplitMinLen,
-          false>;
-  auto kernel_with_ps =
-      kernels::attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perhead_vperhead_kernel<
-          Tout, Tin, kTileM, kTileN, kTileK, kTileV, kHeadsPerGroup, kWarpGroupN, TiledMmaQK,
-          TiledMmaSV, decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_y),
-          decltype(tma_splity), decltype(tma_ks), decltype(slayout_q), decltype(slayout_k),
-          decltype(slayout_p), decltype(slayout_s), decltype(slayout_vtma), decltype(slayout_y),
-          decltype(slayout_splity), decltype(slayout_ks), kBlockSize, kStage, kSplitK, kSplitMinLen,
-          true>;
-  cudaFuncSetAttribute(kernel_no_ps, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-  cudaFuncSetAttribute(kernel_with_ps, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+          decltype(slayout_splity), decltype(slayout_ks), kBlockSize, kStage, kSplitK,
+          kSplitMinLen>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
   int pad_heads_per_group = ((heads_per_group + 7) / 8) * 8;
 
-  if (p_scale_ptr == nullptr) {
-    kernel_no_ps<<<grid, block, shm_size, stream>>>(
-        tma_q, tma_k, tma_v, tma_y, tma_splity, tma_ks, reinterpret_cast<Tout *>(y_ptr),
-        reinterpret_cast<float *>(splitk_out_ptr), reinterpret_cast<float *>(lse_ptr),
-        block_ids_ptr, num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr,
-        new_kv_included, num_batch, num_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_k,
-        num_head_v, heads_per_group, pad_heads_per_group, num_kvcache_blocks, num_seq_max_blocks,
-        qscale_pad_stride, one_over_dk_log2e, nullptr, nullptr);
-  } else {
-    kernel_with_ps<<<grid, block, shm_size, stream>>>(
-        tma_q, tma_k, tma_v, tma_y, tma_splity, tma_ks, reinterpret_cast<Tout *>(y_ptr),
-        reinterpret_cast<float *>(splitk_out_ptr), reinterpret_cast<float *>(lse_ptr),
-        block_ids_ptr, num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr,
-        new_kv_included, num_batch, num_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_k,
-        num_head_v, heads_per_group, pad_heads_per_group, num_kvcache_blocks, num_seq_max_blocks,
-        qscale_pad_stride, one_over_dk_log2e, p_scale_ptr, p_scale_inv_ptr);
-  }
+  kernel<<<grid, block, shm_size, stream>>>(
+      tma_q, tma_k, tma_v, tma_y, tma_splity, tma_ks, reinterpret_cast<Tout *>(y_ptr),
+      reinterpret_cast<float *>(splitk_out_ptr), reinterpret_cast<float *>(lse_ptr), block_ids_ptr,
+      num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr, new_kv_included,
+      num_batch, num_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_k, num_head_v,
+      heads_per_group, pad_heads_per_group, num_kvcache_blocks, num_seq_max_blocks,
+      qscale_pad_stride, one_over_dk_log2e);
 }
 
 bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
@@ -212,7 +193,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
     int num_kvcache_blocks, int block_size, int num_seq_max_blocks, int qscale_pad_stride, int ldY,
     int ldQ, int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
-    const float *p_scale_ptr, const float *p_scale_inv_ptr, cudaStream_t stream) {
+    cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   constexpr int kTileN = 64;
@@ -260,7 +241,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -271,7 +252,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         } else if (num_seq_q == 2) {
           constexpr int kTileM = 16;
@@ -285,7 +266,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -296,7 +277,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         } else if (num_seq_q == 3) {
           constexpr int kTileM = 24;
@@ -310,7 +291,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -321,7 +302,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         } else if (num_seq_q == 4) {
           constexpr int kTileM = 32;
@@ -335,7 +316,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -346,7 +327,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         }
       } else if (splitk_min_len == 512) {
@@ -363,7 +344,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -374,7 +355,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         } else if (num_seq_q == 2) {
           constexpr int kTileM = 16;
@@ -388,7 +369,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -399,7 +380,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         } else if (num_seq_q == 3) {
           constexpr int kTileM = 24;
@@ -413,7 +394,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -424,7 +405,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         } else if (num_seq_q == 4) {
           constexpr int kTileM = 32;
@@ -438,7 +419,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -449,7 +430,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         }
       }
@@ -468,7 +449,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         } else if (block_size == 64) {
           constexpr int kBlockSize = 64;
           launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -479,7 +460,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         }
       } else if (num_seq_q == 2) {
         constexpr int kTileM = 16;
@@ -493,7 +474,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         } else if (block_size == 64) {
           constexpr int kBlockSize = 64;
           launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -504,7 +485,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         }
       } else if (num_seq_q == 3) {
         constexpr int kTileM = 24;
@@ -518,7 +499,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         } else if (block_size == 64) {
           constexpr int kBlockSize = 64;
           launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -529,7 +510,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         }
       } else if (num_seq_q == 4) {
         constexpr int kTileM = 32;
@@ -543,7 +524,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         } else if (block_size == 64) {
           constexpr int kBlockSize = 64;
           launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -554,7 +535,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         }
       }
     }
@@ -576,7 +557,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -587,7 +568,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         } else if (num_seq_q == 2) {
           constexpr int kTileM = 16;
@@ -601,7 +582,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -612,7 +593,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         } else if (num_seq_q == 3) {
           constexpr int kTileM = 24;
@@ -626,7 +607,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -637,7 +618,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         } else if (num_seq_q == 4) {
           constexpr int kTileM = 32;
@@ -651,7 +632,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -662,7 +643,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         }
       } else if (splitk_min_len == 512) {
@@ -679,7 +660,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -690,7 +671,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         } else if (num_seq_q == 2) {
           constexpr int kTileM = 16;
@@ -704,7 +685,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -715,7 +696,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         } else if (num_seq_q == 3) {
           constexpr int kTileM = 24;
@@ -729,7 +710,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -740,7 +721,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         } else if (num_seq_q == 4) {
           constexpr int kTileM = 32;
@@ -754,7 +735,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           } else if (block_size == 64) {
             constexpr int kBlockSize = 64;
             launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -765,7 +746,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
                 heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
                 num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
                 kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-                vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+                vcache_head_stride, stream);
           }
         }
       }
@@ -784,7 +765,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         } else if (block_size == 64) {
           constexpr int kBlockSize = 64;
           launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -795,7 +776,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         }
       } else if (num_seq_q == 2) {
         constexpr int kTileM = 16;
@@ -809,7 +790,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         } else if (block_size == 64) {
           constexpr int kBlockSize = 64;
           launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -820,7 +801,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         }
       } else if (num_seq_q == 3) {
         constexpr int kTileM = 24;
@@ -834,7 +815,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         } else if (block_size == 64) {
           constexpr int kBlockSize = 64;
           launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -845,7 +826,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         }
       } else if (num_seq_q == 4) {
         constexpr int kTileM = 32;
@@ -859,7 +840,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         } else if (block_size == 64) {
           constexpr int kBlockSize = 64;
           launch_attention_decode_fp8_dim128_smallm_splitk<
@@ -870,7 +851,7 @@ bool smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
               heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
               num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
               kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
-              vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+              vcache_head_stride, stream);
         }
       }
     }

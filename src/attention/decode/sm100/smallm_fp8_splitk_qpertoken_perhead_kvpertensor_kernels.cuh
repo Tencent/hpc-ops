@@ -25,7 +25,7 @@ template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int k
           typename TmaK, typename TmaV, typename TmaY, typename SLayoutQ, typename SLayoutK,
           typename SLayoutP, typename SLayoutS, typename SLayoutV, typename SLayoutY, int kClusterM,
           int kClusterN, int kClusterK, int kMmaSM, int kBlockSize, int kStageQ, int kStageK,
-          int kStageP, bool kHasPScale = false>
+          int kStageP>
 __global__ void __launch_bounds__(512, 1)
     attention_decode_fp8_1sm_smallm_splitk_qpertoken_perhead_kvpertensor_kernel(
         const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
@@ -35,10 +35,11 @@ __global__ void __launch_bounds__(512, 1)
         bool new_kv_included, int num_batch, int num_seq_q, int num_dim_qk, int num_dim_v,
         int num_head_q, int num_head_k, int num_head_v, int heads_per_group,
         int lse_pad_heads_per_group, int num_kvcache_blocks, int num_seq_max_blocks,
-        int qscale_pad_stride, float one_over_dk_log2e, cutlass::FastDivmod splitk_head_kv_divider,
-        const float *p_scale_ptr = nullptr, const float *p_scale_inv_ptr = nullptr) {
-  // TODO(p_scale): SM100 kernel P_scale implementation is pending.
+        int qscale_pad_stride, float one_over_dk_log2e,
+        cutlass::FastDivmod splitk_head_kv_divider) {
   using namespace cute;  // NOLINT
+  constexpr float kDecodePScale = 256.0f;
+  constexpr float kDecodePScaleInv = 1.0f / kDecodePScale;
 
   using TMEM_LOAD_ATOM = std::conditional_t<
       (kTileM == 8), SM100_TMEM_LOAD_16dp256b1x,
@@ -92,9 +93,6 @@ __global__ void __launch_bounds__(512, 1)
   __shared__ uint64_t y_writable[kStageQ];
   __shared__ uint32_t y_phase[kStageQ];
 
-  __shared__ uint64_t blkids_readable[kStageQ];
-  __shared__ uint64_t blkids_writable[kStageQ];
-
   __shared__ uint32_t tmem_base_ptr;
 
   extern __shared__ uint8_t shm_data[] alignas(128);
@@ -143,7 +141,6 @@ __global__ void __launch_bounds__(512, 1)
 
   constexpr int kTmaThreads = 1;
   constexpr int kMmaThreads = 32;
-  constexpr int kLoadBlkIdsThreads = 32;
   constexpr int kExpThreads = 128;
   constexpr int kRescaleThreads = 128;
   constexpr int kEpiThreads = 128;
@@ -164,13 +161,6 @@ __global__ void __launch_bounds__(512, 1)
       initialize_barrier(y_readable[i], 1);
       initialize_barrier(y_writable[i], kEpiThreads);
       y_phase[i] = 1;
-    }
-    cutlass::arch::fence_barrier_init();
-  } else if (iwarp == 3 && elected) {
-#pragma unroll
-    for (int i = 0; i < kStageQ; i++) {
-      initialize_barrier(blkids_readable[i], kLoadBlkIdsThreads);
-      initialize_barrier(blkids_writable[i], 1);
     }
     cutlass::arch::fence_barrier_init();
   } else if (iwarp == 5 && elected) {
@@ -212,9 +202,8 @@ __global__ void __launch_bounds__(512, 1)
 #pragma unroll
     for (int i = 0; i < kStageQ; i++) {
       initialize_barrier(task_readable[i], 1);
-      initialize_barrier(task_writable[i],
-                         kClusterSize * (kTmaThreads + kMmaThreads + kLoadBlkIdsThreads +
-                                         kExpThreads + kRescaleThreads + kEpiThreads));
+      initialize_barrier(task_writable[i], kClusterSize * (kTmaThreads + kMmaThreads + kExpThreads +
+                                                           kRescaleThreads + kEpiThreads));
     }
     cutlass::arch::fence_barrier_init();
   }
@@ -301,8 +290,8 @@ __global__ void __launch_bounds__(512, 1)
       load_q(tma_q, q_readable, q_writable, tQg, tQs, task_info.ihead_kv, task_info.ibatch,
              num_seq_q, kHeadsPerGroup * num_seq_q * num_dim_qk * sizeof(Tin), istage_q, phase_q);
 
-      wait_barrier(blkids_readable[istage_q], !phase_q);
-      auto *block_ids = shm_blkids + istage_q * num_seq_max_blocks;
+      auto *block_ids =
+          block_ids_ptr + task_info.ibatch * num_seq_max_blocks + task_info.num_blocks_per_chunk;
 
       int itile_seq_k = task_info.num_tile_kv - 1;
       // load Kn
@@ -329,7 +318,6 @@ __global__ void __launch_bounds__(512, 1)
                                                      task_info.ihead_kv, num_dim_v, block_ids,
                                                      task_info.num_blocks, 0, istage_v, phase_v);
 
-      arrive_barrier(blkids_writable[istage_q]);
       wait_barrier(task_readable[istage_q], !phase_q);
       TaskInfo::load(&smem_task[istage_q], task_info);
       arrive_barrier(task_writable[istage_q]);
@@ -434,31 +422,6 @@ __global__ void __launch_bounds__(512, 1)
       arrive_barrier(task_readable[istage_q]);
       advance_stage<kStageQ>(istage_q, phase_q);
     }
-  } else if (iwarp == 3) {
-    // Load block ids
-    int phase_q = 1;
-    int istage_q = 0;
-
-    task_info.valid =
-        get_task_info<kTileN, kBlockSize>(task_info, task_map_ptr, task_map_num_chunks_ptr, iblock,
-                                          splitk_head_kv_divider, num_tiles_per_sm, num_seq_q);
-
-    while (true) {
-      if (!task_info.valid) {
-        break;
-      }
-
-      wait_barrier(blkids_writable[istage_q], phase_q);
-      load_block_ids(
-          shm_blkids + istage_q * num_seq_max_blocks,
-          block_ids_ptr + task_info.ibatch * num_seq_max_blocks + task_info.num_blocks_per_chunk,
-          task_info.num_blocks, ilane);
-      cpasync_barrier_arrive_noinc(&blkids_readable[istage_q]);
-      wait_barrier(task_readable[istage_q], !phase_q);
-      TaskInfo::load(&smem_task[istage_q], task_info);
-      arrive_barrier(task_writable[istage_q]);
-      advance_stage<kStageQ>(istage_q, phase_q);
-    }
   } else if (idx >= 128 && idx < 256) {
     // Exp: tP -> rP -> atmoicmax -> exp -> stsm P -> sttm sum
     cutlass::arch::warpgroup_reg_alloc<184>();
@@ -555,6 +518,15 @@ __global__ void __launch_bounds__(512, 1)
         online_softmax<true, kTileM>(tAttr_nm, gMax, gSum, gSoftmaxScale, smem_max,
                                      smem_correct_scale[istage_exp], kBarId, iwarp, ilane);
 
+        // Scale P before FP8 quantization; epilogue applies the reciprocal.
+#pragma unroll
+        for (int im = 0; im < kM; ++im) {
+#pragma unroll
+          for (int in = 0; in < kN; ++in) {
+            tAttr_nm(in, im) *= kDecodePScale;
+          }
+        }
+
         if (task_info.num_tile_full == 0) {
 #pragma unroll
           for (int im = 0; im < kM; ++im) {
@@ -600,6 +572,15 @@ __global__ void __launch_bounds__(512, 1)
         online_softmax<false, kTileM>(tAttr_nm, gMax, gSum, gSoftmaxScale, smem_max,
                                       smem_correct_scale[istage_exp], kBarId, iwarp, ilane);
 
+        // Scale P before FP8 quantization; epilogue applies the reciprocal.
+#pragma unroll
+        for (int im = 0; im < kM; ++im) {
+#pragma unroll
+          for (int in = 0; in < kN; ++in) {
+            tAttr_nm(in, im) *= kDecodePScale;
+          }
+        }
+
         // P from reg to tmem
         wait_barrier(exp_writable[istage_exp], phase_exp);
         copy(tiled_copy_r2t, tSr4t, tSt4r);
@@ -624,6 +605,15 @@ __global__ void __launch_bounds__(512, 1)
         auto tAttr_nm = retile_fragment(tPr4t);
         online_softmax<false, kTileM>(tAttr_nm, gMax, gSum, gSoftmaxScale, smem_max,
                                       smem_correct_scale[istage_exp], kBarId, iwarp, ilane);
+
+        // Scale P before FP8 quantization; epilogue applies the reciprocal.
+#pragma unroll
+        for (int im = 0; im < kM; ++im) {
+#pragma unroll
+          for (int in = 0; in < kN; ++in) {
+            tAttr_nm(in, im) *= kDecodePScale;
+          }
+        }
 
         // store gsum to smem_sum
 #pragma unroll
@@ -839,6 +829,7 @@ __global__ void __launch_bounds__(512, 1)
     vec_t<float, kM> gMax;
 
     float vscale = vscale_ptr[0];
+    float vscale_eff = vscale * kDecodePScaleInv;
 
     task_info.valid =
         get_task_info<kTileN, kBlockSize>(task_info, task_map_ptr, task_map_num_chunks_ptr, iblock,
@@ -873,7 +864,7 @@ __global__ void __launch_bounds__(512, 1)
 
 #pragma unroll
       for (int i = 0; i < size(tYr4t); i++) {
-        tYr4t(i) *= vscale;
+        tYr4t(i) *= vscale_eff;
       }
 
       // cast to Tout

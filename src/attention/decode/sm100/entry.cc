@@ -10,14 +10,15 @@
 namespace hpc {
 namespace attention {
 
-torch::Tensor attention_decode_fp8_entry(
-    const torch::Tensor &q, torch::Tensor &kcache, torch::Tensor &vcache,
-    const torch::Tensor &block_ids, const torch::Tensor &num_seq_kvcache,
-    const torch::Tensor &qscale, const torch::Tensor &kscale, const torch::Tensor &vscale,
-    int64_t mtp, bool new_kv_included, int64_t quant_type, bool use_splitk,
-    std::optional<torch::Tensor> task_map, std::optional<torch::Tensor> split_flag,
-    std::optional<torch::Tensor> p_scale, std::optional<torch::Tensor> p_scale_inv,
-    std::optional<torch::Tensor> output) {
+torch::Tensor attention_decode_fp8_entry(const torch::Tensor &q, torch::Tensor &kcache,
+                                         torch::Tensor &vcache, const torch::Tensor &block_ids,
+                                         const torch::Tensor &num_seq_kvcache,
+                                         const torch::Tensor &qscale, const torch::Tensor &kscale,
+                                         const torch::Tensor &vscale, int64_t mtp,
+                                         bool new_kv_included, int64_t quant_type, bool use_splitk,
+                                         std::optional<torch::Tensor> task_map,
+                                         std::optional<torch::Tensor> split_flag,
+                                         std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
 
   TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
@@ -32,7 +33,7 @@ torch::Tensor attention_decode_fp8_entry(
   TORCH_CHECK(block_ids.scalar_type() == torch::kInt32, "block_ids dtype must be int32");
   TORCH_CHECK(num_seq_kvcache.scalar_type() == torch::kInt32,
               "num_seq_kvcache dtype must be int32");
-  TORCH_CHECK((mtp == 0 || mtp == 1 || mtp == 2), "we only support mtp 0, 1, 2.");
+  TORCH_CHECK((mtp == 0 || mtp == 1 || mtp == 2 || mtp == 3), "we only support mtp 0, 1, 2, 3.");
 
   int num_batch = num_seq_kvcache.size(0);
   int num_seq_q = q.size(0) / num_batch;
@@ -117,25 +118,6 @@ torch::Tensor attention_decode_fp8_entry(
   int vcache_head_stride = vcache.stride(2);
   int ldY = y.stride(0);  // num_head_q * num_dim_v;
 
-  const float *p_scale_ptr = nullptr;
-  const float *p_scale_inv_ptr = nullptr;
-  if (p_scale.has_value() || p_scale_inv.has_value()) {
-    TORCH_CHECK(p_scale.has_value() && p_scale_inv.has_value(),
-                "p_scale and p_scale_inv must be provided together");
-    const auto &ps = p_scale.value();
-    const auto &psi = p_scale_inv.value();
-    TORCH_CHECK(ps.device() == q.device() && psi.device() == q.device(),
-                "p_scale/p_scale_inv must share q's device");
-    TORCH_CHECK(ps.scalar_type() == torch::kFloat32 && psi.scalar_type() == torch::kFloat32,
-                "p_scale/p_scale_inv dtype must be float32");
-    TORCH_CHECK(ps.is_contiguous() && psi.is_contiguous(),
-                "p_scale/p_scale_inv must be contiguous");
-    TORCH_CHECK(ps.numel() == num_head_q && psi.numel() == num_head_q,
-                "p_scale/p_scale_inv must have shape [num_head_q=", num_head_q, "]");
-    p_scale_ptr = ps.const_data_ptr<float>();
-    p_scale_inv_ptr = psi.const_data_ptr<float>();
-  }
-
   bool running = false;
   if (quant_type == 0) {
     running = attention_decode_fp8_qkpertoken_perhead_vperhead_async(
@@ -144,8 +126,7 @@ torch::Tensor attention_decode_fp8_entry(
         splitk, splitk_min_len, consumers, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
         num_dim_qk, num_dim_v, num_kvcache_blocks, block_size, num_seq_max_blocks,
         qscale_pad_stride, ldY, ldQ, kcache_block_stride, kcache_token_stride, kcache_head_stride,
-        vcache_block_stride, vcache_token_stride, vcache_head_stride, p_scale_ptr, p_scale_inv_ptr,
-        stream);
+        vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
   } else if (quant_type == 1) {
     running = attention_decode_fp8_qpertoken_perhead_kvpertensor_async(
         y_ptr, lse_ptr, split_out_ptr, task_map_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
@@ -153,8 +134,7 @@ torch::Tensor attention_decode_fp8_entry(
         splitk, splitk_min_len, consumers, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
         num_dim_qk, num_dim_v, num_kvcache_blocks, block_size, num_seq_max_blocks,
         qscale_pad_stride, ldY, ldQ, kcache_block_stride, kcache_token_stride, kcache_head_stride,
-        vcache_block_stride, vcache_token_stride, vcache_head_stride, p_scale_ptr, p_scale_inv_ptr,
-        stream);
+        vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
   }
 
   TORCH_CHECK(running, "attn decode kernel launch failed!");
@@ -170,7 +150,6 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "attention_decode_fp8(Tensor q, Tensor! kcache, Tensor! vcache, Tensor block_ids, Tensor "
       "num_seq_kvcache, Tensor qscale, Tensor kscale, Tensor vscale, int mtp, bool "
       "new_kv_included, int quant_type, bool "
-      "use_splitk, Tensor? task_map, Tensor? split_flag, Tensor? p_scale, Tensor? p_scale_inv, "
-      "Tensor? output) -> (Tensor)");
+      "use_splitk, Tensor? task_map, Tensor? split_flag, Tensor? output) -> (Tensor)");
   m.impl("attention_decode_fp8", torch::kCUDA, &hpc::attention::attention_decode_fp8_entry);
 }

@@ -40,7 +40,7 @@ bool attention_decode_fp8_qpertoken_perhead_kvpertensor_async(
     int num_kvcache_blocks, int block_size, int num_seq_max_blocks, int qscale_pad_stride, int ldY,
     int ldQ, int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
-    const float *p_scale_ptr, const float *p_scale_inv_ptr, cudaStream_t stream) {
+    cudaStream_t stream) {
   if (num_dim_qk == 128) {
     return decode::smallm_splitk_dim128_fp8_qpertoken_perhead_kvpertensor_async(
         y_ptr, lse_ptr, split_out_ptr, task_map_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
@@ -48,8 +48,7 @@ bool attention_decode_fp8_qpertoken_perhead_kvpertensor_async(
         splitk, splitk_min_len, consumers, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
         num_dim_qk, num_dim_v, num_kvcache_blocks, block_size, num_seq_max_blocks,
         qscale_pad_stride, ldY, ldQ, kcache_block_stride, kcache_token_stride, kcache_head_stride,
-        vcache_block_stride, vcache_token_stride, vcache_head_stride, p_scale_ptr, p_scale_inv_ptr,
-        stream);
+        vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
   }
   return false;
 }
@@ -63,7 +62,7 @@ bool attention_decode_fp8_qkpertoken_perhead_vperhead_async(
     int num_kvcache_blocks, int block_size, int num_seq_max_blocks, int qscale_pad_stride, int ldY,
     int ldQ, int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
-    const float *p_scale_ptr, const float *p_scale_inv_ptr, cudaStream_t stream) {
+    cudaStream_t stream) {
   if (num_dim_qk == 128) {
     return decode::smallm_splitk_dim128_fp8_qkpertoken_perhead_vperhead_async(
         y_ptr, lse_ptr, split_out_ptr, task_map_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
@@ -71,8 +70,7 @@ bool attention_decode_fp8_qkpertoken_perhead_vperhead_async(
         splitk, splitk_min_len, consumers, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
         num_dim_qk, num_dim_v, num_kvcache_blocks, block_size, num_seq_max_blocks,
         qscale_pad_stride, ldY, ldQ, kcache_block_stride, kcache_token_stride, kcache_head_stride,
-        vcache_block_stride, vcache_token_stride, vcache_head_stride, p_scale_ptr, p_scale_inv_ptr,
-        stream);
+        vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
   }
   return false;
 }
