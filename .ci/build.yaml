@@ -32,13 +32,53 @@ variables:
         - id: "false"
           description: "false"
       description: "true = full, false = incremental, default false"
+  TAIJI_API_TOKEN:
+    value: vgsb1k2nXk6ZuFYP-V68sQ
+    const: true
+    props:
+      type: vuex-input
+      description: Taiji OpenAPI token
+  WSID:
+    value: "12471"
+    const: true
+    props:
+      type: vuex-input
+      description: https://hunyuanaide.taiji.woa.com/web/home_new?wsId=12471
+  BUSINESS_FLAG:
+    value: TaiJi_HYAide_HCF_CICD_SZ_H20
+    const: true
+    props:
+      type: vuex-input
+      description: Taiji business flag (resource group)
+  CICD_IMAGE:
+    value: mirrors.tencent.com/hunyuan_infer/text2text_infer:H-5.2.1-v1
+    const: true
+    props:
+      type: vuex-input
+      description: Taiji GPU container image for stage-2 tests
+  CI_POLL_INTERVAL:
+    value: "60"
+    const: true
+    props:
+      type: vuex-input
+      description: Polling interval in seconds
+  BKREPO_USER:
+    value: reedlauliu
+    const: true
+    props:
+      type: vuex-input
+  BKREPO_TOKEN:
+    value: 063d7d21ae494ce73636f0f767a15ec5
+    const: true
+    props:
+      type: vuex-input
 stages:
 - name: stage-1
   label:
   - Build
   jobs:
-    job_Cty:
-      name: Compile torch290 cuda12.9 sm90
+    job_Pack:
+      name: Pack and check source code
       runs-on:
         pool-name: docker
         container:
@@ -83,6 +123,23 @@ stages:
           filePath: code.tar.gz
           downloadFiles: "[{\"path\":\"\",\"param\":\"\"}]"
           metadata: []
+- name: stage-2
+  label:
+  - Build
+  jobs:
+    job_Cty:
+      name: torch290+cu129+sm90
+      runs-on:
+        pool-name: docker
+        container:
+          image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.0
+      steps:
+      - checkout:
+          repo-id: rxOYK
+        name: git clone and checkout
+        with:
+          refName: "${BK_CI_HOOK_SOURCE_BRANCH}"
+          enableGitLfs: false
       - name: compile sm90
         uses: linuxScript@1.*
         with:
@@ -112,8 +169,8 @@ stages:
           - verbose
           distribution: dist/hpc*.whl
         retry-times: 2
-    job_lz_:
-      name: Compile torch2100 cuda12.9 sm90
+    job_N46:
+      name: torch2100+cu129+sm90
       runs-on:
         pool-name: docker
         container:
@@ -155,7 +212,7 @@ stages:
           distribution: dist/hpc*.whl
         retry-times: 2
     job_sfp_sm90:
-      name: Compile torch2100 cuda13.0 sm90
+      name: torch2100+cu130+sm90
       runs-on:
         pool-name: docker
         container:
@@ -197,7 +254,7 @@ stages:
           distribution: dist/hpc*.whl
         retry-times: 2
     job_sfp_sm100:
-      name: Compile torch2100 cuda13.0 sm100
+      name: torch2100+cu130+sm100
       runs-on:
         pool-name: docker
         container:
@@ -239,7 +296,7 @@ stages:
           distribution: dist/hpc*.whl
         retry-times: 2
     job_sfp_multi_arch:
-      name: Compile torch2100 cuda13.0 multi-arch
+      name: torch2100+cu130+multi-arch
       runs-on:
         pool-name: docker
         container:
@@ -280,11 +337,159 @@ stages:
           - verbose
           distribution: dist/hpc*.whl
         retry-times: 2
-- name: stage-2
-  label:
-  - Build
-  jobs:
     job_4Xn:
+      name: Test (Taiji 1xH20)
+      runs-on:
+        pool-name: docker
+        hw-spec: Standard-S
+        container:
+          image-code: tlinux3_ci
+          image-version: 2.*
+      steps:
+      - name: 启动单测任务
+        id: start
+        run: |
+          #!/bin/bash
+          # Start a Taiji CI task that runs make + test + sanitizer in one GPU container.
+          set -xe
+
+          if [ "${{variables.RUN_FULL_SANITIZER}}" = "true" ]; then
+            _SANITIZER_TARGET="sanitizer-all"
+          else
+            _SANITIZER_TARGET="sanitizer"
+          fi
+
+          _GPU_NUM=8
+          _TASK_NAME="hpc-ops-ci-${{ci.build_id}}"
+          _TASK_DESCRIPTION="hpc-ops #${{ci.build_num}} stage-2"
+
+          # Inline start_cmd: download code.tar.gz from bkrepo, untar, build, test, sanitizer.
+          # Use semicolons to keep it as a single shell line (no real newlines inside JSON).
+          _WORKDIR="/tmp/hpc-ops-ci-${{ci.build_id}}"
+          _CODE_URL="https://bkrepo.woa.com/generic/ds-opt/pipeline/${{ci.pipeline_id}}/${{ci.build_id}}/code.tar.gz"
+          # Serial execution with fail-fast: any non-zero exit aborts immediately.
+          # Step order:
+          #   download -> untar -> pip install build cmake -> make
+          #   -> (pkill) -> make test -> (pkill) -> make sanitizer[-all]
+          # `|| true` on pkill is intentional: pkill returns 1 when no process matched.
+          _START_CMD="set -xe \
+          && mkdir -p ${_WORKDIR} \
+          && cd ${_WORKDIR} \
+          && curl -fL -o code.tar.gz --user ${{variables.BKREPO_USER}}:${{variables.BKREPO_TOKEN}} '${_CODE_URL}' \
+          && tar -xvf code.tar.gz \
+          && pip install build cmake \
+          && make \
+          && { pkill -9 python3 || true; } \
+          && make test \
+          && { pkill -9 python3 || true; } \
+          && make ${_SANITIZER_TARGET}"
+
+          # Build JSON payload via jq to avoid quoting hell.
+          PAYLOAD=$(jq -n \
+            --arg name "${_TASK_NAME}" \
+            --arg desc "${_TASK_DESCRIPTION}" \
+            --arg cmd "${_START_CMD}" \
+            --arg image "${{variables.CICD_IMAGE}}" \
+            --arg bf "${{variables.BUSINESS_FLAG}}" \
+            --arg actor "${{ci.actor}}" \
+            --argjson gpu_num "${_GPU_NUM}" \
+            '{
+              train_stage: "SFT",
+              thinking_type: "all",
+              name: $name,
+              project_name: "HCF",
+              description: $desc,
+              task_tag: ["hpc_ops_ci"],
+              train_framework: "other",
+              init_cmd: "",
+              start_cmd: $cmd,
+              image_name: $image,
+              business_flag: $bf,
+              location: "sz",
+              gpu_name: "H20",
+              host_num: 1,
+              host_gpu_num: $gpu_num,
+              envs: {
+                http_proxy: "http://star-proxy.oa.com:3128",
+                https_proxy: "http://star-proxy.oa.com:3128",
+                no_proxy: "127.0.0.1,localhost,.woa.com",
+                PYTEST_SKIP: "1",
+                CMAKE_BUILD_PARALLEL_LEVEL: "32"
+              },
+              admin_group: [$actor]
+            }')
+
+          RESPONSE=$(curl -sS -X POST "http://hunyuanaide.taiji.woa.com/taskmanagement/openapi/v1/task/start" \
+            -H "Content-Type: application/json" \
+            -H "IPLUS-TASK-SERVER-API-TOKEN: ${{variables.TAIJI_API_TOKEN}}" \
+            -H "WSID: ${{variables.WSID}}" \
+            -d "${PAYLOAD}")
+
+          # Check response
+          RESPONSE_CODE=$(echo "${RESPONSE}" | jq -r '.error.code')
+          if [ "${RESPONSE_CODE}" != "SUCCESS" ]; then
+            echo "ERROR: task start failed: ${RESPONSE}"
+            exit 1
+          fi
+          # Export outputs
+          _TASK_ID=$(echo "${RESPONSE}" | jq -r '.data.task_id')
+          _INSTANCE_URL=$(echo "${RESPONSE}" | jq -r '.data.instance_url')
+          echo "::set-output name=TASK_ID::${_TASK_ID}"
+          echo "::set-output name=INSTANCE_URL::${_INSTANCE_URL}"
+
+          # Print task_id and instance_url
+          echo "================================"
+          echo "task_id:      ${_TASK_ID}"
+          echo "instance_url: ${_INSTANCE_URL}"
+          echo "================================"
+        shell: bash
+      - name: 查询任务
+        id: status
+        run: |
+          #!/bin/bash
+          # Poll Taiji CI task status. Fail fast on first failure (no retry).
+          set -ex
+
+          _TASK_ID="${{jobs.job_4Xn.steps.start.outputs.TASK_ID}}"
+          _CI_POLL_INTERVAL=${{variables.CI_POLL_INTERVAL}}
+
+          # Query task status
+          get_task_status() {
+            local _response
+            _response=$(curl -sS -X GET "http://hunyuanaide.taiji.woa.com/taskmanagement/openapi/v1/task/${_TASK_ID}" \
+              -H "Content-Type: application/json" \
+              -H "IPLUS-TASK-SERVER-API-TOKEN: ${{variables.TAIJI_API_TOKEN}}" \
+              -H "WSID: ${{variables.WSID}}" \
+              -d '{}')
+            STATUS=$(echo "${_response}" | jq -r '.data.status')
+            STATUS_TEXT=$(echo "${_response}" | jq -r '.data.status_text')
+          }
+
+          # Poll until done; fail fast on FAILED/KILLED.
+          while true; do
+            get_task_status
+            echo "::set-output name=STATUS_TEXT::${STATUS_TEXT}"
+            case "$STATUS" in
+              SUCCEED|SUCCEEDED)
+                echo "INFO: Task(${_TASK_ID}) succeeded."
+                exit 0
+                ;;
+              FAILED)
+                echo "ERROR: Task(${_TASK_ID}) failed. Aborting (no retry)."
+                exit 1
+                ;;
+              KILLED)
+                echo "ERROR: Task(${_TASK_ID}) killed. Aborting."
+                exit 1
+                ;;
+              *)
+                echo "INFO: Task status: ${STATUS}"
+                ;;
+            esac
+            sleep "${_CI_POLL_INTERVAL}"
+          done
+        shell: bash
+    job_old_test:
       name: Test
       mutex:
         label: singleton
@@ -414,24 +619,37 @@ stages:
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
             sudo docker exec -t hpc-ops-cicd bash -c "pkill -9 python3 || true"
             sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make sanitizer-all"
-finally:
-  job_SCd:
-    name: clean temp file
-    runs-on:
-      pool-name: agentless
-    steps:
-    - name: clean
-      uses: JobScriptExecutionA@1.*
-      with:
-        envId:
-        - dpzbvgzp
-        account: reedlauliu
-        shellScriptContent: |-
-          #!/bin/bash
-          set -xe
 
-          workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-          sudo rm -rf $workpath
+finally:
+  job_StopTaiji:
+    name: stop taiji task
+    runs-on:
+      pool-name: docker
+      hw-spec: Standard-S
+      container:
+        image-code: tlinux3_ci
+        image-version: 2.*
+    steps:
+    - name: 停止任务
+      id: stop
+      if: ALWAYS
+      continue-on-error: true
+      run: |
+        #!/bin/bash
+        # Best-effort stop of the Taiji CI task.
+        set -x
+        _TASK_ID="${{jobs.job_4Xn.steps.start.outputs.TASK_ID}}"
+        if [ -z "${_TASK_ID}" ] || [ "${_TASK_ID}" = "null" ]; then
+          echo "INFO: no task_id, nothing to stop."
+          exit 0
+        fi
+        RESPONSE=$(curl -sS -X POST "http://hunyuanaide.taiji.woa.com/taskmanagement/openapi/v1/task/${_TASK_ID}/stop" \
+          -H "Content-Type: application/json" \
+          -H "IPLUS-TASK-SERVER-API-TOKEN: ${{variables.TAIJI_API_TOKEN}}" \
+          -H "WSID: ${{variables.WSID}}" \
+          -d '{}') || true
+        echo "Stop response: ${RESPONSE}"
+      shell: bash
 notices:
 - if: FAILURE
   type:

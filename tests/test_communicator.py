@@ -58,6 +58,7 @@ def run_task(node_id, local_rank, world_rank, local_size, world_size, device, by
 
 
 @pytest.mark.skipif(os.getenv("NV_SANITIZER_INJECTION_PORT_BASE"), reason="skip sanitizer")
+@pytest.mark.skipif(os.getenv("PYTEST_SKIP"), reason="skip pytest as only 1 H20")
 @pytest.mark.parametrize("local_size", [3, 8])
 @pytest.mark.parametrize("bytes", [5, 1024 * 1024 * 600])
 def test_communicator(local_size, bytes):
