@@ -6,6 +6,7 @@
 #include <torch/library.h>
 
 #include "src/attention/decode/decode.h"
+#include "src/attention/decode/sm90/dynamic/decode_dynamic.h"
 
 namespace hpc {
 namespace attention {
@@ -103,13 +104,21 @@ torch::Tensor attention_decode_fp8_entry(
 
   torch::Tensor split_flag_tensor;
 
-  bool use_split = splitk > 1 || consumers > 1;
+  // Dynamic task_map path (sm90): activated when caller passes a task_map
+  // tensor. Works for both quant_type=0 (qkpertoken_perhead_vperhead) and
+  // quant_type=1 (qpertoken_perhead_kvpertensor). In this path we split-k up
+  // to decode::dynamic::kMaxSplitK chunks at runtime; the bucketing kernel in
+  // the dynamic launcher decides how many are actually used per request.
+  bool use_dynamic = task_map.has_value();
+
+  bool use_split = splitk > 1 || consumers > 1 || use_dynamic;
 
   if (use_split) {
     int pad_heads_per_group = ((heads_per_group + 7) / 8) * 8;
-    lse = torch::empty({num_batch, splitk * consumers, num_head_k, num_seq_q, pad_heads_per_group},
+    int split_chunks = use_dynamic ? decode::dynamic::kMaxSplitK : splitk * consumers;
+    lse = torch::empty({num_batch, split_chunks, num_head_k, num_seq_q, pad_heads_per_group},
                        q.options().dtype(torch::kFloat32));
-    split_out = torch::empty({num_batch, splitk * consumers, num_seq_q, num_head_q, num_dim_v},
+    split_out = torch::empty({num_batch, split_chunks, num_seq_q, num_head_q, num_dim_v},
                              q.options().dtype(torch::kFloat32));
     if (split_flag.has_value()) {
       split_flag_tensor = split_flag.value();
@@ -157,28 +166,123 @@ torch::Tensor attention_decode_fp8_entry(
 
   bool running = false;
   if (quant_type == 0) {
-    running = attention_decode_fp8_qkpertoken_perhead_vperhead_async(
-        y_ptr, lse_ptr, split_out_ptr, nullptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
-        num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr, new_kv_included,
-        splitk, splitk_min_len, consumers, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
-        num_dim_qk, num_dim_v, num_kvcache_blocks, block_size, num_seq_max_blocks,
-        qscale_pad_stride, ldY, ldQ, kcache_block_stride, kcache_token_stride, kcache_head_stride,
-        vcache_block_stride, vcache_token_stride, vcache_head_stride, p_scale_ptr, p_scale_inv_ptr,
-        stream);
+    if (use_dynamic) {
+      int *task_map_ptr = reinterpret_cast<int *>(task_map.value().mutable_data_ptr());
+      running = decode::dynamic::smallm_dim128_fp8_qkpertoken_perhead_vperhead_dynamic_async(
+          y_ptr, lse_ptr, split_out_ptr, task_map_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+          num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, new_kv_included, num_batch,
+          num_seq_q, num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks,
+          block_size, num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
+          kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+          vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+    } else {
+      running = attention_decode_fp8_qkpertoken_perhead_vperhead_async(
+          y_ptr, lse_ptr, split_out_ptr, nullptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+          num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr, new_kv_included,
+          splitk, splitk_min_len, consumers, num_batch, num_seq_q, num_head_q, num_head_k,
+          num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size, num_seq_max_blocks,
+          qscale_pad_stride, ldY, ldQ, kcache_block_stride, kcache_token_stride, kcache_head_stride,
+          vcache_block_stride, vcache_token_stride, vcache_head_stride, p_scale_ptr,
+          p_scale_inv_ptr, stream);
+    }
   } else if (quant_type == 1) {
-    running = attention_decode_fp8_qpertoken_perhead_kvpertensor_async(
-        y_ptr, lse_ptr, split_out_ptr, nullptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
-        num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr, new_kv_included,
-        splitk, splitk_min_len, consumers, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v,
-        num_dim_qk, num_dim_v, num_kvcache_blocks, block_size, num_seq_max_blocks,
-        qscale_pad_stride, ldY, ldQ, kcache_block_stride, kcache_token_stride, kcache_head_stride,
-        vcache_block_stride, vcache_token_stride, vcache_head_stride, p_scale_ptr, p_scale_inv_ptr,
-        stream);
+    if (use_dynamic) {
+      int *task_map_ptr = reinterpret_cast<int *>(task_map.value().mutable_data_ptr());
+      running = decode::dynamic::smallm_dim128_fp8_qpertoken_perhead_kvpertensor_dynamic_async(
+          y_ptr, lse_ptr, split_out_ptr, task_map_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+          num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, new_kv_included, num_batch,
+          num_seq_q, num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks,
+          block_size, num_seq_max_blocks, qscale_pad_stride, ldY, ldQ, kcache_block_stride,
+          kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
+          vcache_head_stride, p_scale_ptr, p_scale_inv_ptr, stream);
+    } else {
+      running = attention_decode_fp8_qpertoken_perhead_kvpertensor_async(
+          y_ptr, lse_ptr, split_out_ptr, nullptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+          num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr, new_kv_included,
+          splitk, splitk_min_len, consumers, num_batch, num_seq_q, num_head_q, num_head_k,
+          num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size, num_seq_max_blocks,
+          qscale_pad_stride, ldY, ldQ, kcache_block_stride, kcache_token_stride, kcache_head_stride,
+          vcache_block_stride, vcache_token_stride, vcache_head_stride, p_scale_ptr,
+          p_scale_inv_ptr, stream);
+    }
   }
 
   TORCH_CHECK(running, "attn decode kernel launch failed!");
 
   return y;
+}
+
+// Populate a task_map buffer for the sm90 dynamic path (kTileN=64). The buffer
+// must have been allocated with matching kTileN=64 sizing (see the Python
+// helper get_attention_decode_task_workspace_sm90_dynamic).
+torch::Tensor assign_attention_decode_task_sm90_dynamic_entry(
+    const torch::Tensor &num_seq_kvcache, int64_t num_head_kv, int64_t num_seq_q,
+    bool new_kv_included, int64_t min_process_len, std::optional<torch::Tensor> task_map) {
+  TORCH_CHECK(num_seq_kvcache.device().is_cuda(), "num_seq_kvcache tensor must be cuda");
+  TORCH_CHECK(task_map.has_value(),
+              "assign_attention_decode_task_sm90_dynamic (CUDA) must be given a task_map output");
+  auto task_map_tensor = task_map.value();
+  TORCH_CHECK(task_map_tensor.device().is_cuda(), "task_map tensor must be cuda");
+
+  int num_batch = num_seq_kvcache.size(0);
+  auto stream = at::cuda::getCurrentCUDAStream(num_seq_kvcache.get_device());
+
+  constexpr int kMaxNumBatch = 2048;
+  TORCH_CHECK(num_batch <= kMaxNumBatch,
+              "assign_attention_decode_task_sm90_dynamic only supports batch_size <= 2048");
+
+  const int *num_seq_kvcache_ptr = num_seq_kvcache.const_data_ptr<int>();
+  int *task_map_ptr = reinterpret_cast<int *>(task_map_tensor.mutable_data_ptr());
+
+  auto running = decode::dynamic::assign_attention_decode_task_sm90_dynamic_async(
+      task_map_ptr, num_seq_kvcache_ptr, num_batch, num_head_kv, num_seq_q, new_kv_included,
+      min_process_len, stream);
+
+  TORCH_CHECK(running, "launch assign_attention_decode_task_sm90_dynamic_async failed");
+
+  return task_map_tensor;
+}
+
+// CPU-side twin of assign_attention_decode_task_sm90_dynamic_entry. Returns a
+// newly-allocated int8 tensor on CPU with the same task_map layout as the CUDA
+// path (kTileN=64, SM90DynamicTaskInfo-sized tasks = 48B each). The optional
+// `task_map` arg is ignored on CPU (schema symmetry with the CUDA variant).
+// Used by tests that allclose the CUDA task_map against a host reference.
+torch::Tensor assign_attention_decode_task_sm90_dynamic_cpu_entry(
+    const torch::Tensor &num_seq_kvcache, int64_t num_head_kv, int64_t num_seq_q,
+    bool new_kv_included, int64_t min_process_len, std::optional<torch::Tensor> /*placehold*/) {
+  TORCH_CHECK(num_seq_kvcache.device().is_cpu(), "num_seq_kvcache tensor must be cpu");
+  int num_batch = num_seq_kvcache.size(0);
+
+  const int *num_seq_kvcache_ptr = num_seq_kvcache.const_data_ptr<int>();
+
+  auto tasks_pair = decode::dynamic::assign_attention_decode_task_sm90_dynamic_sync(
+      num_seq_kvcache_ptr, num_batch, num_head_kv, num_seq_q, new_kv_included, min_process_len);
+  auto tasks = tasks_pair.first;
+  auto num_chunks = tasks_pair.second;
+  // num_chunks layout: [num_head_kv * num_batch] per-(head, batch) entries,
+  // then a trailing slot that stores num_tile_per_cta+1 (CPU-entry contract).
+  int num_tile_per_cta = num_chunks[num_head_kv * num_batch];
+
+  constexpr int kTaskInfoSize = sizeof(decode::dynamic::SM90DynamicTaskInfo);  // 48
+  int num_task = tasks.size();
+  auto options = num_seq_kvcache.options().dtype(torch::kInt8);
+
+  // Task_map byte layout on CPU mirror:
+  //   header (kTaskInfoSize B, first 4 = num_tile_per_cta+1)
+  // + per-CTA tasks (num_task × kTaskInfoSize B)
+  // + num_chunks region for combine (ceil(num_head_kv*num_batch*sizeof(int) / kTaskInfoSize)
+  //                                   blocks of kTaskInfoSize)
+  int num_chunks_bytes = num_head_kv * num_batch * sizeof(int);
+  int task_map_shape0 = 1 + num_task + (num_chunks_bytes + kTaskInfoSize - 1) / kTaskInfoSize;
+  auto task_map = torch::zeros({task_map_shape0, kTaskInfoSize}, options);
+  uint8_t *task_map_ptr = reinterpret_cast<uint8_t *>(task_map.mutable_data_ptr());
+
+  memcpy(task_map_ptr, &num_tile_per_cta, sizeof(int));
+  memcpy(task_map_ptr + kTaskInfoSize, tasks.data(), kTaskInfoSize * num_task);
+  memcpy(task_map_ptr + kTaskInfoSize * (num_task + 1), num_chunks.data(), num_chunks_bytes);
+
+  return task_map;
 }
 
 }  // namespace attention
@@ -192,4 +296,12 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "use_splitk, Tensor? task_map, Tensor? split_flag, Tensor? p_scale, Tensor? p_scale_inv, "
       "Tensor? output) -> (Tensor)");
   m.impl("attention_decode_fp8", torch::kCUDA, &hpc::attention::attention_decode_fp8_entry);
+
+  m.def(
+      "assign_attention_decode_task_sm90_dynamic(Tensor num_seq_kvcache, int num_head_kv, int mtp, "
+      "bool new_kv_included, int min_process_len, Tensor? task_map) -> (Tensor)");
+  m.impl("assign_attention_decode_task_sm90_dynamic", torch::kCUDA,
+         &hpc::attention::assign_attention_decode_task_sm90_dynamic_entry);
+  m.impl("assign_attention_decode_task_sm90_dynamic", torch::kCPU,
+         &hpc::attention::assign_attention_decode_task_sm90_dynamic_cpu_entry);
 }
