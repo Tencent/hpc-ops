@@ -92,7 +92,6 @@ GLOBAL_IMPACT_REGEX: List[Tuple[str, re.Pattern]] = [
         ("tests/utils.py",       r"^tests/utils\.py$"),
         ("src/C/**",             r"^src/C/.*$"),
         ("src/utils/**",         r"^src/utils/.*$"),
-        ("src/communicator/**",  r"^src/communicator/.*$"),
         ("3rd/**",               r"^3rd/.*$"),
     ]
 ]

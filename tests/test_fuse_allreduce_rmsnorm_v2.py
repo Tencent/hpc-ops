@@ -98,6 +98,7 @@ def run_task(rank, world_size, N, H):
 
 
 @pytest.mark.skipif(os.getenv("NV_SANITIZER_INJECTION_PORT_BASE"), reason="skip sanitizer")
+@pytest.mark.skipif(os.getenv("PYTEST_SKIP"), reason="skip pytest as only 1 H20")
 @pytest.mark.parametrize("world_size", [4, 8])
 @pytest.mark.parametrize("N", [64, 128])
 @pytest.mark.parametrize("H", [4096, 7168])

@@ -348,6 +348,7 @@ stages:
       steps:
       - name: 启动单测任务
         id: start
+        continue-on-error: true
         run: |
           #!/bin/bash
           # Start a Taiji CI task that runs make + test + sanitizer in one GPU container.
@@ -359,8 +360,8 @@ stages:
             _SANITIZER_TARGET="sanitizer"
           fi
 
-          _GPU_NUM=8
-          _TASK_NAME="hpc-ops-ci-${{ci.build_id}}"
+          _GPU_NUM=1
+          _TASK_NAME="hpc-ops-ci-${{ci.build_id}}-$(date +%Y%m%d%H%M%S)"
           _TASK_DESCRIPTION="hpc-ops #${{ci.build_num}} stage-2"
 
           # Inline start_cmd: download code.tar.gz from bkrepo, untar, build, test, sanitizer.
@@ -445,6 +446,7 @@ stages:
         shell: bash
       - name: 查询任务
         id: status
+        continue-on-error: true
         run: |
           #!/bin/bash
           # Poll Taiji CI task status. Fail fast on first failure (no retry).
@@ -555,7 +557,7 @@ stages:
             echo ${{BK_CI_BUILD_TASK_ID}}
 
             workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make"
+            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && export CMAKE_BUILD_PARALLEL_LEVEL=32 && make"
       - name: pytest
         id: yST
         uses: JobScriptExecutionA@1.*

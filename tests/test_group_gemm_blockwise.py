@@ -127,6 +127,7 @@ def test_group_gemm1(num_group, actual_m, n, k, use_task_map):
 
 
 @pytest.mark.skipif(os.getenv("NV_SANITIZER_INJECTION_PORT_BASE"), reason="skip sanitizer")
+@pytest.mark.skipif(os.getenv("PYTEST_SKIP"), reason="skip pytest as only 1 H20")
 @pytest.mark.parametrize("num_group", [256])
 @pytest.mark.parametrize("actual_m", [1, 10, 25, 47, 50])
 @pytest.mark.parametrize("m", [768])
@@ -221,6 +222,7 @@ def naive_deepep_input_format_group_gemm(x, w, seqlens, cu_seqlens, xscale, wsca
 
 
 @pytest.mark.skipif(os.getenv("NV_SANITIZER_INJECTION_PORT_BASE"), reason="skip sanitizer")
+@pytest.mark.skipif(os.getenv("PYTEST_SKIP"), reason="skip pytest as only 1 H20")
 @pytest.mark.parametrize("num_group", [16])
 @pytest.mark.parametrize("actual_m", [1, 10, 25, 47, 50])
 @pytest.mark.parametrize("m", [768])
