@@ -11,6 +11,8 @@ namespace hpc {
 
 int get_sm_count();
 
+int get_sm_major_version();
+
 }  // namespace hpc
 
 #endif  // SRC_UTILS_UTILS_H_
