@@ -590,6 +590,11 @@ template <int N>
 __device__ __forceinline__ void bar_sync(int barrier_id) {
   asm volatile("barrier.cta.sync %0, %1;\n" ::"r"(barrier_id), "n"(N) : "memory");
 }
+
+__device__ __forceinline__ void fence_async_global() {
+  asm volatile("fence.proxy.async.global;\n");
+}
+
 }  // namespace hpc
 
 namespace cute {

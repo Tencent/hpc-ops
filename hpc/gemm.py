@@ -4,6 +4,15 @@ import torch
 from torch import Tensor
 
 
+def get_gemm_bf16xfp32_workspace(max_weight_hidden_size: int, max_tokens: int = 131072) -> Tensor:
+
+    min_tile_m = 16
+    min_tile_n = 64
+    nm_max = (max_tokens + min_tile_m - 1) // min_tile_m
+    nn_max = (max_weight_hidden_size + min_tile_n - 1) // min_tile_n
+    return torch.zeros((nm_max, nn_max), dtype=torch.int32, device="cuda")
+
+
 def gemm_bf16xfp32(
     x: Tensor,
     w_high: Tensor,
