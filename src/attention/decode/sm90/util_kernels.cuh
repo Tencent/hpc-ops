@@ -1,7 +1,7 @@
-// Copyright (C) 2026 Tencent.
+// Copyright 2025 hpc-ops authors
 
-#ifndef SRC_ATTENTION_DECODE_UTIL_KERNELS_CUH_
-#define SRC_ATTENTION_DECODE_UTIL_KERNELS_CUH_
+#ifndef SRC_ATTENTION_DECODE_SM90_UTIL_KERNELS_CUH_
+#define SRC_ATTENTION_DECODE_SM90_UTIL_KERNELS_CUH_
 
 #include <cuda.h>
 #include <stdio.h>
@@ -16,7 +16,21 @@
 
 namespace hpc {
 namespace attention {
+namespace decode {
 namespace kernels {
+
+struct alignas(16) TaskInfo {
+  int ihead_kv;
+  int ibatch;
+  int ichunk;
+  int num_seq_kvcache;
+  int num_seq_kv;
+  int num_blocks;
+  int num_blocks_per_chunk;
+  int num_tile_kv;
+  int num_tile_full;
+  int num_tile_causal;
+};
 
 template <int kTileN, int kBlockSize, int kSplitK, int kSplitMinLen>
 __device__ __forceinline__ bool get_task(const int* num_seq_kvcache_ptr, bool new_kv_included,
@@ -80,6 +94,42 @@ __device__ __forceinline__ bool get_task(const int* num_seq_kvcache_ptr, bool ne
   return true;
 }
 
+template <int kBlockSize>
+__device__ __forceinline__ bool get_task(TaskInfo& task_info, const int* task_map_ptr) {
+  auto v1 = load<int, 4>(task_map_ptr);
+  auto v2 = load<int, 4>(task_map_ptr + 4);
+  auto v3 = load<int, 4>(task_map_ptr + 8);
+
+  int ihead_kv = v1[0];
+  int ibatch = v1[1];
+  if (ihead_kv < 0 || ibatch < 0) {
+    return false;
+  }
+
+  int ichunk = v1[2];
+  int iseq_start = v1[3];
+
+  int num_seq_kv = v2[0];
+  int num_seq_kvcache = v2[1];
+  int num_tile_kv = v2[2];
+  int num_tile_full = v2[3];
+
+  int is_casual_chunk = v3[0];
+
+  task_info.ihead_kv = ihead_kv;
+  task_info.ibatch = ibatch;
+  task_info.ichunk = ichunk;
+  task_info.num_seq_kvcache = num_seq_kvcache;
+  task_info.num_seq_kv = num_seq_kv;
+  task_info.num_blocks = (num_seq_kv + kBlockSize - 1) / kBlockSize;
+  task_info.num_blocks_per_chunk = (iseq_start + kBlockSize - 1) / kBlockSize;
+  task_info.num_tile_kv = num_tile_kv;
+  task_info.num_tile_full = num_tile_full;
+  task_info.num_tile_causal = is_casual_chunk ? (num_tile_kv - num_tile_full) : 0;
+
+  return true;
+}
+
 template <bool kCheckBound, int kBlockPerTileN, int kBlockSize, int kStage, typename Tin,
           typename TmaK, typename TmaV, typename TensorGK, typename TensorSK, typename TensorGV,
           typename TensorSV>
@@ -120,6 +170,60 @@ __device__ __forceinline__ void load_paged_kv(TmaK& tma_k, TmaV& tma_v, uint64_t
   }
   set_barrier_transaction_bytes(k_readable[istage],
                                 sizeof(Tin) * load_blocks * kBlockSize * num_dim_qk);
+
+  wait_barrier(v_writable[istage], phase);
+  // v
+#pragma unroll
+  for (int ikvblock = 0; ikvblock < kBlockPerTileN; ikvblock++) {
+    int blk_id = blk_ids[ikvblock];
+    cute::copy(tma_v.with(v_readable[istage]), tVg(_, _, 0, ihead_kv, blk_id),
+               tVs(_, _, ikvblock, istage));
+  }
+  set_barrier_transaction_bytes(v_readable[istage],
+                                sizeof(Tin) * load_blocks * kBlockSize * num_dim_v);
+}
+
+template <bool kCheckBound, int kBlockPerTileN, int kBlockSize, int kStage, typename Tin,
+          typename TmaK, typename TmaV, typename TmaKS, typename TensorGK, typename TensorSK,
+          typename TensorGV, typename TensorSV, typename TensorGKS, typename TensorSKS>
+__device__ __forceinline__ void load_paged_kv_with_scale(
+    TmaK& tma_k, TmaV& tma_v, TmaKS& tma_ks, uint64_t* k_writable, uint64_t* v_writable,
+    uint64_t* k_readable, uint64_t* v_readable, TensorGK& tKg, TensorSK& tKs, TensorGV& tVg,
+    TensorSV& tVs, TensorGKS& tKSg, TensorSKS& tKSs, int ihead_kv, int num_dim_qk, int num_dim_v,
+    int* block_ids, int num_blocks, int itile, int istage_write, int phase) {
+  using namespace cute;  // NOLINT
+
+  int load_blocks = kBlockPerTileN;
+  int istage = istage_write;
+
+  vec_t<int, kBlockPerTileN> blk_ids;
+
+#pragma unroll
+  for (int ikvblock = 0; ikvblock < kBlockPerTileN; ikvblock++) {
+    int kvblk_id = itile * kBlockPerTileN + ikvblock;
+    int blk_id = -1;
+    if constexpr (kCheckBound) {
+      if (kvblk_id < num_blocks) {
+        blk_id = block_ids[kvblk_id];
+      }
+    } else {
+      blk_id = block_ids[kvblk_id];
+    }
+    blk_ids[ikvblock] = blk_id;
+  }
+
+  wait_barrier(k_writable[istage], phase);
+#pragma unroll
+  for (int ikvblock = 0; ikvblock < kBlockPerTileN; ikvblock++) {
+    int blk_id = blk_ids[ikvblock];
+    cute::copy(tma_k.with(k_readable[istage]), tKg(_, 0, _, ihead_kv, blk_id),
+               tKs(_, ikvblock, _, istage));
+    cute::copy(tma_ks.with(k_readable[istage]), tKSg(_, 0, _, ihead_kv, blk_id),
+               tKSs(_, ikvblock, _, istage));
+  }
+  set_barrier_transaction_bytes(k_readable[istage],
+                                sizeof(Tin) * load_blocks * kBlockSize * num_dim_qk +
+                                    sizeof(float) * kBlockPerTileN * kBlockSize);
 
   wait_barrier(v_writable[istage], phase);
   // v
@@ -200,6 +304,31 @@ __device__ __forceinline__ void apply_casual_mask_with_scale(TensorAtt& tAttr_nm
   }
 }
 
+template <int kTileN, int kHeadsPerGroup, typename TensorAtt, typename TensorI,
+          typename TensorQScale, typename TensorKScale>
+__device__ __forceinline__ void apply_casual_mask_with_scale(
+    TensorAtt& tAttr_nm, TensorI& tI_nm, TensorQScale& qscales, TensorKScale& kscales,
+    const int& itile_seq_kv, const int& num_seq_kvcache, const int& num_seq_kv) {
+  using namespace cute;  // NOLINT
+  constexpr int kN = size<0>(TensorAtt{});
+  constexpr int kM = size<1>(TensorAtt{});
+
+#pragma unroll
+  for (int im = 0; im < kM; ++im) {
+#pragma unroll
+    for (int in = 0; in < kN; ++in) {
+      int iposq = num_seq_kvcache + get<1>(tI_nm(in, im)) / kHeadsPerGroup;
+      int iposk = itile_seq_kv * kTileN + get<0>(tI_nm(in, im));
+
+      if ((iposk > iposq) || (iposk >= num_seq_kv)) {
+        tAttr_nm(in, im) = -std::numeric_limits<float>::infinity();
+      } else {
+        tAttr_nm(in, im) *= qscales(im) * kscales(in);
+      }
+    }
+  }
+}
+
 template <bool kCheckInf, int kTileM, typename TensorA, typename TensorM, typename TensorS,
           typename TensorY, typename TensorScale>
 __device__ __forceinline__ void online_softmax(TensorA& tAttr_nm, TensorM& gMax, TensorS& gSum,
@@ -223,6 +352,7 @@ __device__ __forceinline__ void online_softmax(TensorA& tAttr_nm, TensorM& gMax,
   }
 
   if (ilane < 4) {
+    // Layout: 4 lanes * kM floats covers kTileM floats per warp segment.
     if constexpr (kM == 2 || kM == 4) {
       store(smem_max + iwarp * kTileM + ilane * kM, warp_max);
     } else if constexpr (kM == 6) {
@@ -230,6 +360,11 @@ __device__ __forceinline__ void online_softmax(TensorA& tAttr_nm, TensorM& gMax,
       vec_t<float, 2> warp_max2 = *reinterpret_cast<vec_t<float, 2>*>(&warp_max[4]);
       store(smem_max + iwarp * kTileM + ilane * 4, warp_max1);
       store(smem_max + iwarp * kTileM + ilane * 2 + 16, warp_max2);
+    } else if constexpr (kM == 8) {
+      vec_t<float, 4> warp_max1 = *reinterpret_cast<vec_t<float, 4>*>(&warp_max[0]);
+      vec_t<float, 4> warp_max2 = *reinterpret_cast<vec_t<float, 4>*>(&warp_max[4]);
+      store(smem_max + iwarp * kTileM + ilane * 8, warp_max1);
+      store(smem_max + iwarp * kTileM + ilane * 8 + 4, warp_max2);
     }
   }
 
@@ -247,6 +382,12 @@ __device__ __forceinline__ void online_softmax(TensorA& tAttr_nm, TensorM& gMax,
 
         reduce_max1 = load<float, 4>(smem_max + i * kTileM + ilane * 4);
         reduce_max2 = load<float, 2>(smem_max + i * kTileM + ilane * 2 + 16);
+      } else if constexpr (kM == 8) {
+        vec_t<float, 4>& reduce_max1 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_max[0]);
+        vec_t<float, 4>& reduce_max2 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_max[4]);
+
+        reduce_max1 = load<float, 4>(smem_max + i * kTileM + ilane * 8);
+        reduce_max2 = load<float, 4>(smem_max + i * kTileM + ilane * 8 + 4);
       }
 #pragma unroll
       for (int im = 0; im < kM; ++im) {
@@ -306,7 +447,7 @@ __device__ __forceinline__ void cast_fp32reg(TensorIn& tFp32r, TensorOut& tTr) {
   } else {
 #pragma unroll
     for (int i = 0; i < cute::size(tFp32r); ++i) {
-      tTr(i) = (T)(tFp32r(i));
+      tTr(i) = static_cast<T>(tFp32r(i));
     }
   }
 }
@@ -382,6 +523,7 @@ __device__ __forceinline__ void final_online_softmax(TensorY& tYr_nm, TensorS& g
   }
 
   if (ilane < 4) {
+    // Layout: 4 lanes * kM floats covers kTileM floats per warp segment.
     if constexpr (kM == 2 || kM == 4) {
       store(smem_sum + iwarp * kTileM + ilane * kM, warp_sum);
     } else if constexpr (kM == 6) {
@@ -389,6 +531,11 @@ __device__ __forceinline__ void final_online_softmax(TensorY& tYr_nm, TensorS& g
       vec_t<float, 2> warp_sum2 = *reinterpret_cast<vec_t<float, 2>*>(&warp_sum[4]);
       store(smem_sum + iwarp * kTileM + ilane * 4, warp_sum1);
       store(smem_sum + iwarp * kTileM + ilane * 2 + 16, warp_sum2);
+    } else if constexpr (kM == 8) {
+      vec_t<float, 4> warp_sum1 = *reinterpret_cast<vec_t<float, 4>*>(&warp_sum[0]);
+      vec_t<float, 4> warp_sum2 = *reinterpret_cast<vec_t<float, 4>*>(&warp_sum[4]);
+      store(smem_sum + iwarp * kTileM + ilane * 8, warp_sum1);
+      store(smem_sum + iwarp * kTileM + ilane * 8 + 4, warp_sum2);
     }
   }
 
@@ -410,6 +557,12 @@ __device__ __forceinline__ void final_online_softmax(TensorY& tYr_nm, TensorS& g
 
         reduce_sum1 = load<float, 4>(smem_sum + i * kTileM + ilane * 4);
         reduce_sum2 = load<float, 2>(smem_sum + i * kTileM + ilane * 2 + 16);
+      } else if constexpr (kM == 8) {
+        vec_t<float, 4>& reduce_sum1 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_sum[0]);
+        vec_t<float, 4>& reduce_sum2 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_sum[4]);
+
+        reduce_sum1 = load<float, 4>(smem_sum + i * kTileM + ilane * 8);
+        reduce_sum2 = load<float, 4>(smem_sum + i * kTileM + ilane * 8 + 4);
       }
 #pragma unroll
       for (int im = 0; im < kM; ++im) {
@@ -658,7 +811,8 @@ __device__ __forceinline__ auto make_tiled_copy_Y_interleave(R2SCopyAtom const& 
 }
 
 }  // namespace kernels
+}  // namespace decode
 }  // namespace attention
 }  // namespace hpc
 
-#endif  // SRC_ATTENTION_DECODE_UTIL_KERNELS_CUH_
+#endif  // SRC_ATTENTION_DECODE_SM90_UTIL_KERNELS_CUH_
