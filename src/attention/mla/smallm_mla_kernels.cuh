@@ -133,7 +133,7 @@ __device__ __forceinline__ void online_softmax(TensorA &tAttr_nm, TensorM &gMax,
         reduce_max_16B[1] = load<float, 4>(smem_max + i * kTileM +
                                            iwarpgroup * kMaxItemsPerWarpGroup + 16 + ilane * 4);
       } else {
-        reduce_max = load<float, kN>(smem_max + i * kTileM + ilane * kM);
+        reduce_max = load<float, kM>(smem_max + i * kTileM + ilane * kM);
       }
 #pragma unroll
       for (int im = 0; im < kM; ++im) {

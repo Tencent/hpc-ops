@@ -557,6 +557,95 @@ def attention_mla_with_kvcache_bf16(
     )
 
 
+def mla_decode_with_kvcache_bf16(
+    q: Tensor,
+    kvcache: Tensor,
+    block_ids: Tensor,
+    cu_seqlens_q: Tensor,
+    num_seq_kv: Tensor,
+    sink_weight: Tensor = None,
+    softmax_scale: float = 0.0,
+    task_tensor: Tensor = None,
+    output: Tensor = None,
+) -> Tensor:
+    """dim576 MLA decode — persistent kernel pipeline.
+
+    Implements a three-kernel chain (get_scheduler_map → persistent_attn →
+    combine). Designed to win on small-batch / kv-skewed shapes where a
+    dense single-CTA-per-batch kernel underutilises the SM array.
+
+    Constraints (raised via TORCH_CHECK if violated):
+
+    - ``num_dim_qk == 576``  (kv_lora_rank=512 + qk_rope_head_dim=64).
+    - ``num_head_q ∈ {16, 32}`` (num_head_tile == 1).
+    - Decode only: ``total_seq_q == num_batch`` (one q-token per batch).
+    - ``num_batch ≤ 1024``.
+    - ``kvcache.size(1) == 64``  (paged block size).
+
+    Args:
+        q: [num_batch, num_head_q, 576] bf16, packed [ql_nope(512) | q_pe(64)].
+        kvcache: [num_blocks, 64, 576] bf16, packed [kv_c_normed(512) | k_pe(64)];
+            the first 512 cols are reused as both K-latent and V-latent.
+        block_ids: [num_batch, num_seq_max_blocks] int32.
+        cu_seqlens_q: [num_batch + 1] int32, ``cu_seqlens_q[b+1] - cu_seqlens_q[b] == 1``.
+        num_seq_kv: [num_batch] int32, per-batch KV length.
+        sink_weight: optional fp32 [num_head_q]; bf16 inputs are auto-upcast.
+        softmax_scale: 0.0 means use ``1 / sqrt(num_dim_qk)``.
+        task_tensor: optional precomputed scheduler map from
+            :func:`get_mla_scheduler_map`. When provided, skips the inline
+            get_scheduler_map kernel. Multi-layer transformer decode should
+            build this once per forward pass and pass it to every layer's
+            attn call to amortise the launch cost.
+        output: optional pre-allocated bf16 [num_batch, num_head_q, 512].
+            Latent V dim is always 512 (dim576 attn writes V in latent space).
+
+    Returns:
+        Tensor: [num_batch, num_head_q, 512] bf16.
+    """
+    if sink_weight is not None and sink_weight.dtype == torch.bfloat16:
+        sink_weight = sink_weight.float()
+    return torch.ops.hpc.mla_decode_with_kvcache_bf16(
+        q,
+        kvcache,
+        block_ids,
+        cu_seqlens_q,
+        num_seq_kv,
+        sink_weight,
+        float(softmax_scale),
+        task_tensor,
+        output,
+    )
+
+
+def get_mla_scheduler_map(
+    num_seq_kv: Tensor,
+    task_tensor: Tensor = None,
+) -> Tensor:
+    """Build the per-forward scheduler map for :func:`mla_decode_with_kvcache_bf16`.
+
+    For multi-layer transformer decode where ``num_seq_kv`` is constant
+    across attention layers, call this once per forward pass and pass the
+    returned tensor to every per-layer attn call via
+    ``mla_decode_with_kvcache_bf16(..., task_tensor=t)``. Amortises the
+    get_scheduler_map kernel's launch cost across the layer count.
+
+    Args:
+        num_seq_kv: Per-batch KV length tensor.
+            Shape: [num_batch] (num_batch ≤ 1024)
+            Dtype: int32
+        task_tensor: Optional pre-allocated int32 buffer to reuse across
+            forwards.  Must be CUDA, contiguous, int32, and at least
+            ``(num_batch + num_sm) * 4 + (num_sm + 1) + (num_batch + 1)``
+            ints (layout: task_list | cu_tasks | cu_splits).
+            If omitted, a fresh tensor is allocated.
+
+    Returns:
+        Tensor: opaque scheduler map; pass it back to
+            ``mla_decode_with_kvcache_bf16``.
+    """
+    return torch.ops.hpc.get_mla_scheduler_map(num_seq_kv, task_tensor)
+
+
 def sparse_mla_with_kvcache_bf16(
     q: Tensor,
     win_kvcache: Tensor,
@@ -1208,6 +1297,35 @@ def attention_mla_with_kvcache_bf16_fake(
     output: Tensor = None,
 ):
     return torch.empty_like(q)
+
+
+@torch.library.register_fake("hpc::mla_decode_with_kvcache_bf16")
+def mla_decode_with_kvcache_bf16_fake(
+    q: Tensor,
+    kvcache: Tensor,
+    block_ids: Tensor,
+    cu_seqlens_q: Tensor,
+    num_seq_kv: Tensor,
+    sink_weight: Tensor = None,
+    softmax_scale: float = 0.0,
+    task_tensor: Tensor = None,
+    output: Tensor = None,
+):
+    out_shape = (q.size(0), q.size(1), 512)
+    return q.new_empty(out_shape, dtype=torch.bfloat16)
+
+
+@torch.library.register_fake("hpc::get_mla_scheduler_map")
+def get_mla_scheduler_map_fake(
+    num_seq_kv: Tensor,
+    task_tensor: Tensor = None,
+):
+    num_batch = num_seq_kv.size(0)
+    num_sm = 148  # maximum number of SMs
+    # Layout: [task_list (max_num_jobs * 4) | cu_tasks (num_sm + 1) |
+    #          cu_splits (num_batch + 1)].
+    n = (num_batch + num_sm) * 4 + (num_sm + 1) + (num_batch + 1)
+    return num_seq_kv.new_empty((n,), dtype=torch.int32)
 
 
 @torch.library.register_fake("hpc::attention_sparse_mla_with_kvcache_bf16")

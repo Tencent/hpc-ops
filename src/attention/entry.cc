@@ -7,7 +7,9 @@
 
 #include "src/attention/decode/decode.h"
 #include "src/attention/mla/mla.h"
+#include "src/attention/mla/smallm_mla_dim576_persistent.h"
 #include "src/attention/prefill/prefill.h"
+#include "src/utils/utils.h"
 
 namespace hpc {
 namespace attention {
@@ -886,6 +888,148 @@ torch::Tensor assign_attention_decode_task_cuda_entry(const torch::Tensor &num_s
   return task_map_tensor;
 }
 
+namespace {
+
+torch::Tensor resolve_dim576_task_tensor(std::optional<torch::Tensor> task_tensor,
+                                         int64_t expected_elems, int num_batch,
+                                         torch::TensorOptions i32_options) {
+  if (task_tensor.has_value()) {
+    auto t = task_tensor.value();
+    TORCH_CHECK(t.device().is_cuda(), "task_tensor must be cuda");
+    TORCH_CHECK(t.scalar_type() == torch::kInt32, "task_tensor must be int32");
+    TORCH_CHECK(t.is_contiguous(), "task_tensor must be contiguous");
+    TORCH_CHECK(t.numel() >= expected_elems, "task_tensor too small: have ", t.numel(), ", need ≥ ",
+                expected_elems, " (num_batch=", num_batch, ")");
+    return t;
+  }
+  return torch::empty({expected_elems}, i32_options);
+}
+
+}  // namespace
+
+torch::Tensor mla_decode_with_kvcache_bf16_entry(
+    const torch::Tensor &q, const torch::Tensor &kvcache, const torch::Tensor &block_ids,
+    const torch::Tensor &cu_seqlens_q, const torch::Tensor &num_seq_kv,
+    std::optional<torch::Tensor> sink_weight, double softmax_scale,
+    std::optional<torch::Tensor> task_tensor, std::optional<torch::Tensor> output) {
+  auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+  TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
+  TORCH_CHECK(kvcache.device().is_cuda(), "kvcache tensor must be cuda");
+  TORCH_CHECK(block_ids.device().is_cuda(), "block_ids tensor must be cuda");
+  TORCH_CHECK(cu_seqlens_q.device().is_cuda(), "cu_seqlens_q tensor must be cuda");
+  TORCH_CHECK(num_seq_kv.device().is_cuda(), "num_seq_kv tensor must be cuda");
+
+  int num_batch = num_seq_kv.size(0);
+  int total_seq_q = q.size(0);
+  int num_head_q = q.size(1);
+  int head_dim = q.size(2);
+
+  int num_kvcache_blocks = kvcache.size(0);
+  int block_size = kvcache.size(1);
+
+  TORCH_CHECK(block_size == 64, "mla_decode path requires kvcache block_size == 64, got ",
+              block_size);
+  TORCH_CHECK(head_dim == 576, "mla_decode path requires head_dim == 576, got ", head_dim);
+  TORCH_CHECK(head_dim == kvcache.size(2), "q and kvcache must share the same last-dim (", head_dim,
+              " vs ", kvcache.size(2), ").");
+  TORCH_CHECK(num_head_q == 1 || num_head_q == 2 || num_head_q == 4 || num_head_q == 8 ||
+                  num_head_q == 16 || num_head_q == 32,
+              "mla_decode path requires num_head_q in {1, 2, 4, 8, 16, 32} "
+              "(num_head_tile == 1), got ",
+              num_head_q);
+  TORCH_CHECK(num_batch <= 1024, "mla_decode path requires num_batch <= 1024, got ", num_batch);
+  TORCH_CHECK(total_seq_q == num_batch,
+              "mla_decode path is decode-only (total_seq_q == num_batch); got total_seq_q=",
+              total_seq_q, ", num_batch=", num_batch);
+
+  const int v_dim = mla::kDim576VDim;
+  int num_seq_max_blocks = block_ids.size(1);
+
+  const auto *q_ptr = q.const_data_ptr();
+  auto *kvcache_ptr = kvcache.mutable_data_ptr();
+  const int *block_ids_ptr = block_ids.const_data_ptr<int>();
+  const int *cu_seqlens_q_ptr = cu_seqlens_q.const_data_ptr<int>();
+  const int *num_seq_kv_ptr = num_seq_kv.const_data_ptr<int>();
+
+  auto bf16_options = q.options().dtype(torch::kBFloat16);
+  torch::Tensor y;
+  if (output.has_value()) {
+    y = output.value();
+    TORCH_CHECK(y.device().is_cuda(), "output tensor must be cuda");
+    TORCH_CHECK(y.scalar_type() == torch::kBFloat16, "output dtype must be bfloat16");
+    TORCH_CHECK(y.is_contiguous(), "output tensor must be contiguous");
+    TORCH_CHECK(
+        y.dim() == 3 && y.size(0) == total_seq_q && y.size(1) == num_head_q && y.size(2) == v_dim,
+        "output must have shape [total_seq_q, num_head_q, ", v_dim, "]");
+  } else {
+    y = torch::empty({total_seq_q, num_head_q, v_dim}, bf16_options);
+  }
+
+  int ldQ = q.stride(0);
+  int ldKV = kvcache.stride(0);
+  int ldY = y.stride(0);
+
+  const float *sink_weight_ptr = nullptr;
+  if (sink_weight.has_value()) {
+    const auto &sw = sink_weight.value();
+    TORCH_CHECK(sw.device().is_cuda(), "sink_weight must be cuda");
+    TORCH_CHECK(sw.scalar_type() == torch::kFloat32, "sink_weight must be float32");
+    TORCH_CHECK(sw.dim() == 1 && sw.size(0) == num_head_q,
+                "sink_weight must have shape [num_head_q]");
+    sink_weight_ptr = sw.const_data_ptr<float>();
+  }
+
+  auto fp32_options = q.options().dtype(torch::kFloat32);
+  auto i32_options = q.options().dtype(torch::kInt32);
+
+  int num_sm = hpc::get_sm_count();
+  bool task_tensor_prebuilt = task_tensor.has_value();
+  int64_t expected_task_elems =
+      static_cast<int64_t>(mla::dim576_persistent_task_tensor_elems(num_batch, num_sm));
+  auto resolved_task_tensor =
+      resolve_dim576_task_tensor(task_tensor, expected_task_elems, num_batch, i32_options);
+
+  auto y_partial = torch::empty({static_cast<int64_t>(mla::dim576_persistent_y_partial_elems(
+                                    num_batch, num_head_q, v_dim, num_sm))},
+                                fp32_options);
+  auto lse = torch::empty(
+      {static_cast<int64_t>(mla::dim576_persistent_lse_elems(num_batch, num_head_q, num_sm))},
+      fp32_options);
+
+  bool running = mla::smallm_mla_dim576_persistent_async(
+      y.data_ptr(), q_ptr, kvcache_ptr, y_partial.mutable_data_ptr<float>(),
+      lse.mutable_data_ptr<float>(), resolved_task_tensor.mutable_data_ptr<int>(), block_ids_ptr,
+      cu_seqlens_q_ptr, num_seq_kv_ptr, sink_weight_ptr, num_batch, total_seq_q, num_head_q,
+      /*qk_dim=*/head_dim, v_dim, num_kvcache_blocks, num_seq_max_blocks, ldY, ldQ, ldKV,
+      static_cast<float>(softmax_scale), stream, task_tensor_prebuilt);
+
+  TORCH_CHECK(running, "mla_decode_with_kvcache_bf16_entry kernel launch failed!");
+  return y;
+}
+
+torch::Tensor get_mla_scheduler_map_entry(const torch::Tensor &num_seq_kv,
+                                          std::optional<torch::Tensor> task_tensor) {
+  auto stream = at::cuda::getCurrentCUDAStream(num_seq_kv.get_device());
+  TORCH_CHECK(num_seq_kv.device().is_cuda(), "num_seq_kv must be cuda");
+  TORCH_CHECK(num_seq_kv.scalar_type() == torch::kInt32, "num_seq_kv must be int32");
+  TORCH_CHECK(num_seq_kv.dim() == 1, "num_seq_kv must be 1-D");
+
+  int num_batch = num_seq_kv.size(0);
+  TORCH_CHECK(num_batch <= 1024, "get_mla_scheduler_map requires num_batch ≤ 1024, got ",
+              num_batch);
+
+  int num_sm = hpc::get_sm_count();
+  int64_t expected =
+      static_cast<int64_t>(mla::dim576_persistent_task_tensor_elems(num_batch, num_sm));
+  auto i32_options = num_seq_kv.options().dtype(torch::kInt32);
+  auto out = resolve_dim576_task_tensor(task_tensor, expected, num_batch, i32_options);
+
+  bool running = mla::dim576_persistent_get_scheduler_map_async(
+      out.mutable_data_ptr<int>(), num_seq_kv.const_data_ptr<int>(), num_batch, stream);
+  TORCH_CHECK(running, "get_mla_scheduler_map_entry launch failed!");
+  return out;
+}
+
 }  // namespace attention
 }  // namespace hpc
 
@@ -963,4 +1107,14 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
          &hpc::attention::assign_attention_decode_task_cpu_entry);
   m.impl("assign_attention_decode_task", torch::kCUDA,
          &hpc::attention::assign_attention_decode_task_cuda_entry);
+
+  m.def(
+      "mla_decode_with_kvcache_bf16(Tensor q, Tensor kvcache, Tensor block_ids, "
+      "Tensor cu_seqlens_q, Tensor num_seq_kv, Tensor? sink_weight, float softmax_scale, "
+      "Tensor? task_tensor, Tensor? output) -> (Tensor)");
+  m.impl("mla_decode_with_kvcache_bf16", torch::kCUDA,
+         &hpc::attention::mla_decode_with_kvcache_bf16_entry);
+
+  m.def("get_mla_scheduler_map(Tensor num_seq_kv, Tensor? task_tensor) -> (Tensor)");
+  m.impl("get_mla_scheduler_map", torch::kCUDA, &hpc::attention::get_mla_scheduler_map_entry);
 }
