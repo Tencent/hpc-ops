@@ -102,7 +102,7 @@ def run_task(rank, world_size, N, H, num_max_blocks):
 @pytest.mark.skipif(os.getenv("PYTEST_SKIP"), reason="skip pytest as only 1 H20")
 @pytest.mark.parametrize("world_size", [3, 8])
 @pytest.mark.parametrize("N", [128, 77, 4567, 16384])
-@pytest.mark.parametrize("H", [7168])
+@pytest.mark.parametrize("H", [4096, 7168])
 @pytest.mark.parametrize("num_max_blocks", [16])
 def test_fuse_allreduce_rmsnorm(world_size, N, H, num_max_blocks):
     ctx = multiprocessing.get_context("spawn")

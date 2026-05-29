@@ -255,7 +255,7 @@ void reduce_scatter_entry(const torch::Tensor &input,     // [..., hidden_size]
   int hidden_size = input.size(-1);
   int num_tokens = input.numel() / hidden_size;
 
-  TORCH_CHECK(hidden_size == 7168, "unsupported hidden_size");
+  TORCH_CHECK(hidden_size == 4096 || hidden_size == 7168, "unsupported hidden_size");
   bool ptrs_are_aligned = (reinterpret_cast<int64_t>(input_ptr) % 16 == 0 &&
                            reinterpret_cast<int64_t>(mc_input_ptr) % 16 == 0 &&
                            reinterpret_cast<int64_t>(output_ptr) % 16 == 0 &&

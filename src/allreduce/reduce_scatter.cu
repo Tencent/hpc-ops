@@ -75,6 +75,18 @@ void reduce_scatter_async(const void *input_ptr, const void *mc_input_ptr, void 
             static_cast<__nv_bfloat16 *>(output_ptr), static_cast<__nv_bfloat16 *>(mc_output_ptr),
             reinterpret_cast<uint32_t **>(signal_ptr), static_cast<int>(rank),
             static_cast<int>(world_size), num_tokens);
+  } else if (hidden_size == 4096) {
+    constexpr int kNumThreadPerBlcok = 512;
+    constexpr int kHiddenSize = 4096;
+    dim3 grid(num_max_blocks);
+    dim3 block(kNumThreadPerBlcok);
+    kernels::reduce_scatter_kernel<kVecSize, kHiddenSize, kNumThreadPerBlcok>
+        <<<grid, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16 *>(input_ptr),
+            static_cast<const __nv_bfloat16 *>(mc_input_ptr),
+            static_cast<__nv_bfloat16 *>(output_ptr), static_cast<__nv_bfloat16 *>(mc_output_ptr),
+            reinterpret_cast<uint32_t **>(signal_ptr), static_cast<int>(rank),
+            static_cast<int>(world_size), num_tokens);
   }
 }
 
