@@ -801,111 +801,53 @@ def mla_prefill_bf16(
     )
 
 
-def _get_attention_decode_task_workspace_generic(
+def get_attention_decode_task_workspace(
     max_num_batch: int, max_seqlen: int, num_head_kv: int, min_process_len: int = 512
 ):
-    """Allocate task map for attention decode (non-sm90 / legacy path)."""
+    """Allocate task map for attention decode.
 
-    kTileN = 128
-    num_sm_count = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
+    On sm90 this dispatches to the dynamic flat-bin workspace (kTileN=64); on
+    other archs it uses the legacy per-SM workspace (kTileN=128). The returned
+    tensor layout differs between the two — always pair it with
+    ``assign_attention_decode_task`` / the matching attention kernel from the
+    same process, never reuse it across GPUs with different capabilities.
 
-    num_sm_count = num_sm_count // num_head_kv
+    Args:
+        max_num_batch: max batch size decode will process
+        max_seqlen: max seqlen of service support.
+        num_head_kv:
+        min_process_len: each sm will process at_least 'min_process_len' token.
 
-    task_info_byte_size = 32
-    max_num_tasks = max_num_batch * (max_seqlen + kTileN - 1) // kTileN
-    max_num_tiles_per_sm = max(
-        (max_num_tasks + num_sm_count - 1) // num_sm_count, min_process_len // kTileN
-    )
-    max_num_tasks = max_num_tiles_per_sm * num_sm_count
-    finish_tasks = num_sm_count
-    num_tile_per_sm_store_task = 1
-    int_size = 4
-    max_num_batch_pad = (
-        (max_num_batch * int_size + task_info_byte_size - 1)
-        // task_info_byte_size
-        * task_info_byte_size
-    )
-
-    num_sm_count_pad = (
-        (num_sm_count + task_info_byte_size - 1) // task_info_byte_size * task_info_byte_size
-    )
-
-    sched_need_byte_size = (
-        max_num_tasks + finish_tasks + num_tile_per_sm_store_task
-    ) * task_info_byte_size + max_num_batch_pad
-    workspace_byte_size = sched_need_byte_size + 2 * num_sm_count_pad
-    workspace = torch.zeros(
-        workspace_byte_size,
-        dtype=torch.int8,
-        device="cuda",
-    )
-
-    workspace.view(torch.int32)[1] = num_head_kv
-    workspace.view(torch.int32)[2] = max_num_batch
-    workspace.view(torch.int32)[3] = sched_need_byte_size
-
-    return workspace
-
-
-def _assign_attention_decode_task_generic(
-    num_seq_kvcache: Tensor,
-    task_map: Tensor,
-    num_head_kv: int,
-    mtp: int,
-    new_kv_included: bool,
-    min_process_len: int = 512,
-) -> Tensor:
-    """Populate task_map for the legacy (non-sm90) attention-decode path."""
-    if num_seq_kvcache.device.type == "cpu":
-        task_map_host = torch.ops.hpc.assign_attention_decode_task(
-            num_seq_kvcache, num_head_kv, mtp, new_kv_included, min_process_len, None
-        )
-        task_map[:4].copy_(task_map_host.reshape(-1)[:4], non_blocking=True)
-        task_map[32 : task_map_host.numel()].copy_(
-            task_map_host.reshape(-1)[32:], non_blocking=True
-        )
-        return task_map
-    else:
-        return torch.ops.hpc.assign_attention_decode_task(
-            num_seq_kvcache, num_head_kv, mtp, new_kv_included, min_process_len, task_map
-        )
-
-
-def _get_attention_decode_task_workspace_sm90_dynamic(
-    max_num_batch: int, max_seqlen: int, num_head_kv: int, min_process_len: int = 512
-):
-    """Allocate task_map for the sm90 dynamic attention-decode path."""
+    Returns:
+        Tensor: Shape [task_map_byte_size], Dtype: int8.
+    """
     # Per-task size: must match SM90DynamicTaskInfo (12 int32 = 48 B).
     kTaskInfoByteSize = 48
-    kCTAPerSM = 4
+    kMaxCtaPerSm = 4
 
     num_sm_count = torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
-    num_cta_count = num_sm_count * kCTAPerSM
+    max_num_cta_count = num_sm_count * kMaxCtaPerSm
 
-    # Total tile load across all heads: per-head worst-case × num_head_kv.
-    kTileN = 64
-    max_num_tasks = max_num_batch * num_head_kv * ((max_seqlen + kTileN - 1) // kTileN)
+    kMinTileN = 64
+    max_num_tasks = max_num_batch * num_head_kv * ((max_seqlen + kMinTileN - 1) // kMinTileN)
     max_num_tile_per_cta = max(
-        (max_num_tasks + num_cta_count - 1) // num_cta_count, min_process_len // kTileN
+        (max_num_tasks + max_num_cta_count - 1) // max_num_cta_count, min_process_len // kMinTileN
     )
-    max_num_tasks = max_num_tile_per_cta * num_cta_count
-    finish_tasks = num_cta_count
+    max_num_tasks = max_num_tile_per_cta * max_num_cta_count
+    finish_tasks = max_num_cta_count
+
     num_tile_per_cta_store_task = 1
     int_size = 4
-    # num_chunks region: one int per (ihead_kv, ibatch), not per batch —
-    # flat packing lets different heads of the same batch end up with
-    # different chunk counts, so the combine kernel needs a 2D table.
+
     num_chunks_bytes = max_num_batch * num_head_kv * int_size
     max_num_batch_pad = (
         (num_chunks_bytes + kTaskInfoByteSize - 1) // kTaskInfoByteSize * kTaskInfoByteSize
     )
     kTaskStrideInts = kTaskInfoByteSize // int_size  # 12
     num_cta_count_pad_ints = (
-        (num_cta_count + kTaskStrideInts - 1) // kTaskStrideInts * kTaskStrideInts
+        (max_num_cta_count + kTaskStrideInts - 1) // kTaskStrideInts * kTaskStrideInts
     )
     num_cta_count_pad = num_cta_count_pad_ints * int_size
 
@@ -919,14 +861,14 @@ def _get_attention_decode_task_workspace_sm90_dynamic(
         device="cuda",
     )
 
-    workspace.view(torch.int32)[1] = num_head_kv
-    workspace.view(torch.int32)[2] = max_num_batch
-    workspace.view(torch.int32)[3] = sched_need_byte_size
+    workspace.view(torch.int32)[2] = num_head_kv
+    workspace.view(torch.int32)[3] = max_num_batch
+    workspace.view(torch.int32)[4] = sched_need_byte_size
 
     return workspace
 
 
-def _assign_attention_decode_task_sm90_dynamic(
+def assign_attention_decode_task(
     num_seq_kvcache: Tensor,
     task_map: Tensor,
     num_head_kv: int,
@@ -934,105 +876,53 @@ def _assign_attention_decode_task_sm90_dynamic(
     new_kv_included: bool,
     min_process_len: int = 512,
 ) -> Tensor:
-    """Populate a task_map buffer for the sm90 dynamic path (kTileN=64).
+    """Populate the task_map returned by ``get_attention_decode_task_workspace``.
 
-    Dispatches by num_seq_kvcache.device:
-      - CUDA: launches the sm90 dynamic assigner kernel into ``task_map``.
-      - CPU : computes a host-side reference with the CPU sync assigner
-              (kTileN=64) and copies it into ``task_map`` (which itself must
-              already be on CUDA — tests use this to allclose the CUDA output
-              against a host reference buffer).
+    Dispatches by device capability to match the allocator: sm90 → dynamic
+    assigner; other archs → legacy per-SM assigner. Both impls support
+    ``num_seq_kvcache`` on either CUDA or CPU; the CPU path is for tests that
+    want to allclose a host reference against the CUDA output.
+
+    Args:
+        num_seq_kvcache: number tokens in kvcache before cur iteration.
+            Shape: [num_batch]
+            Dtype: int32
+        task_map: task_map for store output
+            Shape: [task_map_byte_size]
+            Dtype: int8
+        num_head_kv: num_head_kv.
+        mtp: number draft tokens.
+        new_kv_included: whether ``num_seq_kvcache`` already counts new KV.
+        min_process_len: each sm will process at_least 'min_process_len' token.
     """
     if num_seq_kvcache.device.type == "cpu":
-        task_map_host = torch.ops.hpc.assign_attention_decode_task_sm90_dynamic(
+        task_map_host = torch.ops.hpc.assign_attention_decode_task(
             num_seq_kvcache, num_head_kv, mtp, new_kv_included, min_process_len, None
         )
-        # Header: first 4 bytes (num_tile_per_cta+1). Per-task entries start at
-        # byte offset 48 (SM90DynamicTaskInfo size). Bytes 4..47 are metadata
-        # that the CUDA workspace sets (num_head_kv / max_num_batch /
-        # sched_need_byte_size) and we must not overwrite — hence the gap.
-        task_map[:4].copy_(task_map_host.reshape(-1)[:4], non_blocking=True)
+        task_map[:8].copy_(task_map_host.reshape(-1)[:8], non_blocking=True)
         task_map[48 : task_map_host.numel()].copy_(
             task_map_host.reshape(-1)[48:], non_blocking=True
         )
         return task_map
     else:
-        return torch.ops.hpc.assign_attention_decode_task_sm90_dynamic(
+        return torch.ops.hpc.assign_attention_decode_task(
             num_seq_kvcache, num_head_kv, mtp, new_kv_included, min_process_len, task_map
         )
 
 
-def _print_attention_decode_task_generic(task_map: Tensor) -> None:
-    task = task_map.view(torch.int32).reshape(-1, 12).cpu()
-    num_tile_per_sm = task[0][0]
-    num_head_kv = task[0][1]
-    num_sm_count = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
-
-    num_sm_count = num_sm_count // num_head_kv
-
-    print(
-        f"\n[Decode Attn Task Map]: num_tile_per_sm({task[0][0]}), num_chunks:{task[num_sm_count * num_tile_per_sm + 1:]}\n"
-    )
-
-    idx = 0
-    num_task_per_sm = torch.zeros(num_sm_count)
-    seqlen_per_sm = torch.zeros(num_sm_count)
-    for ism in range(num_sm_count):
-        print(f"#######SM{ism}########")
-        for itask in range(num_tile_per_sm):
-            i = ism * num_tile_per_sm + itask
-            if task[i + 1][0] < 0:
-                break
-            print(
-                f"task:{idx}, ibatch:{task[i + 1][0]}, ichunk:{task[i + 1][1]}, iseq_start:{task[i + 1][2]}, seqkv:{task[i + 1][3]}, num_seqkvcache:{task[i + 1][4]}, num_tile_kv:{task[i + 1][5]}, num_tile_full:{task[i + 1][6]}, is_casual_chunk:{task[i + 1][7]}\n"
-            )
-            idx += 1
-            num_task_per_sm[ism] += 1
-            seqlen_per_sm[ism] += task[i + 1][3]
-
-    print(f"Summary:")
-    for ism in range(num_sm_count):
-        print(f"SM:{ism}, num_tasks:{num_task_per_sm[ism]}, total_seq:{seqlen_per_sm[ism]}")
-
-
-def _print_attention_decode_task_sm90_dynamic(task_map: Tensor) -> None:
-    """Pretty-print a task_map produced by the sm90 dynamic path.
-
-    Layout differences from the legacy ``print_attention_decode_task`` helper:
-      * per-task stride is 12 int32 (48 B) — SM90DynamicTaskInfo
-      * each CTA bin owns ``num_tile_per_cta + 1`` slots (extra trailing
-        terminator)
-      * num_chunks region is a 2D ``[ihead_kv, ibatch]`` table of size
-        ``num_head_kv * max_num_batch``, not per-batch
-      * end-of-bin sentinel: both ``ihead_kv`` and ``ibatch`` are set to -1
-
-    Header (int32 words): ``[num_tile_per_cta+1, num_head_kv, max_num_batch,
-    sched_need_byte_size]``.
-    """
-    # kCTAPerSM must mirror src/attention/decode/sm90/dynamic/decode_dynamic.h.
-    kCTAPerSM = 4
-    kTaskStride = 12  # SM90DynamicTaskInfo (12 × int32 = 48 B)
+def print_attention_decode_task(task_map: Tensor) -> None:
+    """Pretty-print a task_map produced by the sm90 dynamic path."""
+    kTaskStride = 12
 
     task = task_map.view(torch.int32).reshape(-1, kTaskStride).cpu()
 
     num_tile_per_cta_plus1 = int(task[0][0].item())
+    num_total_ctas = int(task[0][1].item())
     num_tile_per_cta = num_tile_per_cta_plus1 - 1
-    num_head_kv = int(task[0][1].item())
-    max_num_batch = int(task[0][2].item())
+    num_head_kv = int(task[0][2].item())
+    max_num_batch = int(task[0][3].item())
 
-    num_sm_count = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
-    num_total_ctas = num_sm_count * kCTAPerSM
-
-    # num_chunks region starts right after the per-CTA task list. Each task slot
-    # is 48 B (one row of `task`), so the region begins at row index
-    # 1 + num_total_ctas * (num_tile_per_cta + 1).
     num_chunks_row_start = 1 + num_total_ctas * num_tile_per_cta_plus1
-    # num_chunks[ihead_kv, ibatch] is stored as int32 — flatten the 2D region
-    # out of the 12-wide row layout.
     num_chunks_flat = task[num_chunks_row_start:].reshape(-1)[: num_head_kv * max_num_batch]
     num_chunks_table = num_chunks_flat.reshape(num_head_kv, max_num_batch)
 
@@ -1088,101 +978,6 @@ def _print_attention_decode_task_sm90_dynamic(task_map: Tensor) -> None:
         )
     empty_bins = int((num_task_per_cta == 0).sum())
     print(f"[idle] {empty_bins}/{num_total_ctas} bins were empty")
-
-
-# ---------------------------------------------------------------------------
-# Public attention-decode task_map API
-#
-# These are arch-dispatching facades over the two internal implementations:
-#   * sm90 (compute capability 9.x) → the "dynamic" flat-bin workspace, 48 B
-#     per SM90DynamicTaskInfo task, kTileN=64, num_chunks table keyed by
-#     (ihead_kv, ibatch).
-#   * other archs                   → the legacy per-SM workspace, 32 B per
-#     TaskScheduleInfo, kTileN=128, num_chunks table keyed by ibatch only.
-#
-# Callers should only use the public names below; the two families are
-# layout-incompatible, so mixing workspace produced by one with assigner /
-# kernels of the other will corrupt memory.
-# ---------------------------------------------------------------------------
-
-
-def _is_sm90() -> bool:
-    """True when the current CUDA device is compute capability 9.x (sm90)."""
-    major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
-    return major == 9
-
-
-def get_attention_decode_task_workspace(
-    max_num_batch: int, max_seqlen: int, num_head_kv: int, min_process_len: int = 512
-):
-    """Allocate task map for attention decode.
-
-    On sm90 this dispatches to the dynamic flat-bin workspace (kTileN=64); on
-    other archs it uses the legacy per-SM workspace (kTileN=128). The returned
-    tensor layout differs between the two — always pair it with
-    ``assign_attention_decode_task`` / the matching attention kernel from the
-    same process, never reuse it across GPUs with different capabilities.
-
-    Args:
-        max_num_batch: max batch size decode will process
-        max_seqlen: max seqlen of service support.
-        num_head_kv:
-        min_process_len: each sm will process at_least 'min_process_len' token.
-
-    Returns:
-        Tensor: Shape [task_map_byte_size], Dtype: int8.
-    """
-    if _is_sm90():
-        return _get_attention_decode_task_workspace_sm90_dynamic(
-            max_num_batch, max_seqlen, num_head_kv, min_process_len
-        )
-    return _get_attention_decode_task_workspace_generic(
-        max_num_batch, max_seqlen, num_head_kv, min_process_len
-    )
-
-
-def assign_attention_decode_task(
-    num_seq_kvcache: Tensor,
-    task_map: Tensor,
-    num_head_kv: int,
-    mtp: int,
-    new_kv_included: bool,
-    min_process_len: int = 512,
-) -> Tensor:
-    """Populate the task_map returned by ``get_attention_decode_task_workspace``.
-
-    Dispatches by device capability to match the allocator: sm90 → dynamic
-    assigner; other archs → legacy per-SM assigner. Both impls support
-    ``num_seq_kvcache`` on either CUDA or CPU; the CPU path is for tests that
-    want to allclose a host reference against the CUDA output.
-
-    Args:
-        num_seq_kvcache: number tokens in kvcache before cur iteration.
-            Shape: [num_batch]
-            Dtype: int32
-        task_map: task_map for store output
-            Shape: [task_map_byte_size]
-            Dtype: int8
-        num_head_kv: num_head_kv.
-        mtp: number draft tokens.
-        new_kv_included: whether ``num_seq_kvcache`` already counts new KV.
-        min_process_len: each sm will process at_least 'min_process_len' token.
-    """
-    if _is_sm90():
-        return _assign_attention_decode_task_sm90_dynamic(
-            num_seq_kvcache, task_map, num_head_kv, mtp, new_kv_included, min_process_len
-        )
-    return _assign_attention_decode_task_generic(
-        num_seq_kvcache, task_map, num_head_kv, mtp, new_kv_included, min_process_len
-    )
-
-
-def print_attention_decode_task(task_map: Tensor) -> None:
-    """Pretty-print an attention-decode task_map, with arch-aware layout."""
-    if _is_sm90():
-        _print_attention_decode_task_sm90_dynamic(task_map)
-    else:
-        _print_attention_decode_task_generic(task_map)
 
 
 @torch.library.register_fake("hpc::attention_prefill_bf16")

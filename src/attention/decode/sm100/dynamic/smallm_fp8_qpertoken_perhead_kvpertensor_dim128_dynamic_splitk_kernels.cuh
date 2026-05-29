@@ -1,7 +1,7 @@
 // Copyright 2025 hpc-ops authors
 
-#ifndef SRC_ATTENTION_DECODE_SM100_SMALLM_FP8_CLC_QKPERTOKEN_PERHEAD_VPERHEAD_KERNELS_CUH_
-#define SRC_ATTENTION_DECODE_SM100_SMALLM_FP8_CLC_QKPERTOKEN_PERHEAD_VPERHEAD_KERNELS_CUH_
+#ifndef SRC_ATTENTION_DECODE_SM100_DYNAMIC_SMALLM_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_DIM128_DYNAMIC_SPLITK_KERNELS_CUH_
+#define SRC_ATTENTION_DECODE_SM100_DYNAMIC_SMALLM_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_DIM128_DYNAMIC_SPLITK_KERNELS_CUH_
 
 #include <cuda.h>
 #include <stdio.h>
@@ -11,28 +11,30 @@
 #include "cute/tensor.hpp"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/arch/reg_reconfig.h"
+#include "src/attention/decode/sched_task_info.h"
 #include "src/attention/decode/sm100/util_kernels.cuh"
 #include "src/utils/tma.cuh"
 #include "src/utils/utils.cuh"
 
 namespace hpc {
 namespace attention {
+namespace decode {
 namespace kernels {
 
 template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int kTileV,
           int kHeadsPerGroup, typename TiledMmaQK, typename TiledMmaSV, typename TmaQ,
-          typename TmaK, typename TmaV, typename TmaY, typename TmaKS, typename SLayoutQ,
-          typename SLayoutK, typename SLayoutP, typename SLayoutS, typename SLayoutV,
-          typename SLayoutY, typename SLayoutKS, int kClusterM, int kClusterN, int kClusterK,
-          int kMmaSM, int kBlockSize, int kStageQ, int kStageK, int kStageP>
+          typename TmaK, typename TmaV, typename TmaY, typename SLayoutQ, typename SLayoutK,
+          typename SLayoutP, typename SLayoutS, typename SLayoutV, typename SLayoutY, int kClusterM,
+          int kClusterN, int kClusterK, int kMmaSM, int kBlockSize, int kStageQ, int kStageK,
+          int kStageP, int kMaxSplitK>
 __global__ void __launch_bounds__(512, 1)
-    attention_decode_fp8_1sm_smallm_clc_qkpertoken_perhead_vperhead_kernel(
+    smallm_attention_decode_fp8_qpertoken_perhead_kvpertensor_dynamic_splitk_kernel(
         const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
-        const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaY tma_y,
-        const __grid_constant__ TmaKS tma_ks, const int *block_ids_ptr,
-        const int *num_seq_kvcache_ptr, const float *qscale_ptr, const float *kscale_ptr,
-        const float *vscale_ptr, bool new_kv_included, int num_batch, int num_seq_q, int num_dim_qk,
-        int num_dim_v, int num_head_q, int num_head_k, int num_head_v, int heads_per_group,
+        const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaY tma_y, float *lse_ptr,
+        const int *task_map_ptr, const int *block_ids_ptr, const int *num_seq_kvcache_ptr,
+        const float *qscale_ptr, const float *kscale_ptr, const float *vscale_ptr,
+        bool new_kv_included, int num_batch, int num_seq_q, int num_dim_qk, int num_dim_v,
+        int num_head_q, int num_head_k, int num_head_v, int heads_per_group,
         int lse_pad_heads_per_group, int num_kvcache_blocks, int num_seq_max_blocks,
         int qscale_pad_stride, float one_over_dk_log2e,
         cutlass::FastDivmod splitk_head_kv_divider) {
@@ -49,14 +51,11 @@ __global__ void __launch_bounds__(512, 1)
   using SMEM_STORE_FP8_ATOM =
       std::conditional_t<(kTileM == 8), SM100_U8x4_STSM_T,
                          std::conditional_t<(kTileM == 16), SM100_U8x8_STSM_T, SM100_U8x16_STSM_T>>;
-  using SMEM_STORE_BF16_ATOM =
-      std::conditional_t<(kTileM == 8), SM90_U16x4_STSM_T, SM90_U16x8_STSM_T>;
 
   // two part store q_stage and each contain 4 area. kTileM * 8.
   // 0. qk output. 1. exp input p. 2. sv input s. 3. sv output. kTileM * 4
   constexpr int kTmemColumns = 512;
   constexpr int kClusterSize = kClusterM * kClusterN * kClusterK;
-  constexpr int kSplitK = 1;
 
   int idx = threadIdx.x;
   int iwarp = idx / 32;
@@ -65,7 +64,7 @@ __global__ void __launch_bounds__(512, 1)
   int iblock = blockIdx.x;
 
   __shared__ float smem_max[kTileM * 4];
-  __shared__ float smem_sum[kStageQ][kTileM * 4];
+  __shared__ float smem_sum[2][kStageQ][kTileM * 4];
   __shared__ float smem_correct_scale[kStageP][kTileM];
   __shared__ TaskInfo smem_task[kStageQ];
 
@@ -94,10 +93,6 @@ __global__ void __launch_bounds__(512, 1)
   __shared__ uint64_t y_writable[kStageQ];
   __shared__ uint32_t y_phase[kStageQ];
 
-  __shared__ uint4 clc_resp alignas(128);
-  __shared__ uint64_t clc_readable;
-  __shared__ uint64_t clc_writable;
-
   __shared__ uint32_t tmem_base_ptr;
 
   extern __shared__ uint8_t shm_data[] alignas(128);
@@ -107,12 +102,8 @@ __global__ void __launch_bounds__(512, 1)
   auto *shm_v = reinterpret_cast<Tin *>(shm_k + cosize(SLayoutK{}));
   auto *shm_p = reinterpret_cast<Tin *>(shm_v + cosize(SLayoutV{}));
   auto *shm_s = shm_p;
-  auto *shm_ks = reinterpret_cast<float *>(shm_p + cosize(SLayoutP{}));
-  auto *shm_y = reinterpret_cast<Tout *>(shm_ks + cosize(SLayoutKS{}));
+  auto *shm_y = reinterpret_cast<Tout *>(shm_p + cosize(SLayoutP{}));
   auto *shm_blkids = reinterpret_cast<int *>(shm_y + cosize(SLayoutY{}));
-
-  constexpr int kScaleByteSize = sizeof(float);
-  const int num_scale_per_row = num_dim_qk / kScaleByteSize;
 
   auto gQ = tma_q.get_tma_tensor(
       make_shape(heads_per_group, num_dim_qk, num_head_k, num_seq_q, num_batch));
@@ -127,9 +118,6 @@ __global__ void __launch_bounds__(512, 1)
       make_tensor(make_gmem_ptr(static_cast<float *>(nullptr)),
                   make_shape(Int<kTileV>{}, Int<kTileM>{}), make_stride(Int<kTileM>{}, Int<1>{}));
 
-  auto gKS = tma_ks.get_tma_tensor(make_shape(kBlockSize / num_scale_per_row, num_scale_per_row,
-                                              num_head_k, num_kvcache_blocks));
-
   // ((_8,_2),(_128,_1),(_1,_2)):((_128,_1024),(_1,_0),(_0,_2048))
   auto sQ = make_tensor(make_smem_ptr(shm_q), SLayoutQ{});
   // ((_8,_16),(_128,_1),(_1,_4)):((_128,_1024),(_1,_0),(_0,_16384))
@@ -141,7 +129,6 @@ __global__ void __launch_bounds__(512, 1)
   auto sS = make_tensor(make_smem_ptr(shm_s), SLayoutS{});
   // ((_64,_2),(_8,_2)):((_1,_512),(_64,_1024))
   auto sY = make_tensor(make_smem_ptr(shm_y), SLayoutY{});
-  auto sKS = make_tensor(make_smem_ptr(shm_ks), SLayoutKS{});
 
   auto cluster_layout =
       tiled_divide(make_layout(make_shape(Int<kClusterM>{}, Int<kClusterN>{}, Int<kClusterK>{})),
@@ -154,7 +141,6 @@ __global__ void __launch_bounds__(512, 1)
 
   constexpr int kTmaThreads = 1;
   constexpr int kMmaThreads = 32;
-  constexpr int kSchedThreads = 1;
   constexpr int kExpThreads = 128;
   constexpr int kRescaleThreads = 128;
   constexpr int kEpiThreads = 128;
@@ -177,16 +163,11 @@ __global__ void __launch_bounds__(512, 1)
       y_phase[i] = 1;
     }
     cutlass::arch::fence_barrier_init();
-  } else if (iwarp == 4 && elected) {
-    constexpr int kTaskFindReady = 1;
-    initialize_barrier(clc_readable, 1);
-    initialize_barrier(clc_writable, kTaskFindReady + kSchedThreads);
-    cutlass::arch::fence_barrier_init();
   } else if (iwarp == 5 && elected) {
 #pragma unroll
     for (int i = 0; i < kStageK; i++) {
       initialize_barrier(k_readable[i], 1);
-      initialize_barrier(k_writable[i], 1 + 128);
+      initialize_barrier(k_writable[i], 1);
     }
     cutlass::arch::fence_barrier_init();
   } else if (iwarp == 6 && elected) {
@@ -227,7 +208,15 @@ __global__ void __launch_bounds__(512, 1)
     cutlass::arch::fence_barrier_init();
   }
 
+  constexpr int kSchedTaskInfoSize = dynamic::kTaskScheduleInfoStride;
+  int num_tiles_per_cta = task_map_ptr[0];
+  int num_total_ctas = task_map_ptr[1];
+  const int *task_map_num_chunks_ptr =
+      task_map_ptr + (num_total_ctas * num_tiles_per_cta + 1) * kSchedTaskInfoSize;
+  task_map_ptr += (1 + iblock * num_tiles_per_cta) * kSchedTaskInfoSize;
   cluster_relaxed_sync();
+
+  cudaGridDependencySynchronize();
 
   TaskInfo task_info;
 
@@ -268,7 +257,6 @@ __global__ void __launch_bounds__(512, 1)
     auto btma_q = tma_q.get_slice(0);
     auto btma_k = tma_k.get_slice(0);
     auto btma_v = tma_v.get_slice(0);
-    auto btma_ks = tma_ks.get_slice(0);
 
     // (((_128,_8),_1),1,1,1,1,1):(((_1@0,_1@1),_0),_8@1,_128@0,_1@2,_1@3,_1@4)
     auto tQg = btma_q.partition_S(gQ);
@@ -276,7 +264,6 @@ __global__ void __launch_bounds__(512, 1)
     auto tKg = btma_k.partition_S(gK);
     // (((_128,_64),_1),1,1,1,76):(((_1@0,_1@1),_0),_128@0,_64@1,_1@2,_1@3)
     auto tVg = btma_v.partition_S(gV);
-    auto tKSg = btma_ks.partition_S(gKS);
 
     // (((_128,_8),_1),_2,_1,(_1,_2)):(((_1,_128),_0),_1024,_0,(_0,_2048))
     auto tQs = btma_q.partition_D(sQ);
@@ -284,7 +271,6 @@ __global__ void __launch_bounds__(512, 1)
     auto tKs = btma_k.partition_D(sK);
     // ((_8192,_1),_1,_2,(_1,_4)):((_1,_0),_0,_8192,(_0,_16384))
     auto tVs = btma_v.partition_D(sV);
-    auto tKSs = btma_ks.partition_S(sKS);
 
     int phase_q = 1;
     int istage_q = 0;
@@ -293,9 +279,9 @@ __global__ void __launch_bounds__(512, 1)
     int phase_v = 1;
     int istage_v = 0;
 
-    bool first_task = true;
-    task_info.valid = get_task_info<kTileN, kBlockSize, kSplitK>(
-        task_info, iblock, splitk_head_kv_divider, num_seq_kvcache_ptr, new_kv_included, num_seq_q);
+    task_info.valid =
+        get_task_info<kTileN, kBlockSize>(task_info, task_map_ptr, task_map_num_chunks_ptr, iblock,
+                                          splitk_head_kv_divider, num_tiles_per_cta, num_seq_q);
     while (true) {
       if (!task_info.valid) {
         break;
@@ -304,33 +290,28 @@ __global__ void __launch_bounds__(512, 1)
       load_q(tma_q, q_readable, q_writable, tQg, tQs, task_info.ihead_kv, task_info.ibatch,
              num_seq_q, kHeadsPerGroup * num_seq_q * num_dim_qk * sizeof(Tin), istage_q, phase_q);
 
-      auto *block_ids = block_ids_ptr + task_info.ibatch * num_seq_max_blocks +
-                        task_info.num_blocks_per_chunk * task_info.ichunk;
+      auto *block_ids =
+          block_ids_ptr + task_info.ibatch * num_seq_max_blocks + task_info.num_blocks_per_chunk;
 
       int itile_seq_k = task_info.num_tile_kv - 1;
       // load Kn
-      load_paged_k_with_scale<kTileN, kBlockSize, kStageK, Tin>(
-          tma_k, tma_ks, k_readable, k_writable, tKg, tKs, tKSg, tKSs, task_info.ihead_kv,
-          num_dim_qk, block_ids, task_info.num_blocks, itile_seq_k, istage_k, phase_k);
+      load_paged_k<kTileN, kBlockSize, kStageK, Tin>(
+          tma_k, k_readable, k_writable, tKg, tKs, task_info.ihead_kv, num_dim_qk, block_ids,
+          task_info.num_blocks, itile_seq_k, istage_k, phase_k);
       itile_seq_k--;
 
 #pragma unroll 1
       for (; itile_seq_k >= 0; --itile_seq_k) {
         // load Ki
-        load_paged_k_with_scale<kTileN, kBlockSize, kStageK, Tin>(
-            tma_k, tma_ks, k_readable, k_writable, tKg, tKs, tKSg, tKSs, task_info.ihead_kv,
-            num_dim_qk, block_ids, task_info.num_blocks, itile_seq_k, istage_k, phase_k);
+        load_paged_k<kTileN, kBlockSize, kStageK, Tin>(
+            tma_k, k_readable, k_writable, tKg, tKs, task_info.ihead_kv, num_dim_qk, block_ids,
+            task_info.num_blocks, itile_seq_k, istage_k, phase_k);
 
         // load Vi+1
         load_paged_v<kTileN, kBlockSize, kStageK, Tin>(
             tma_v, v_readable, v_writable, tVg, tVs, task_info.ihead_kv, num_dim_v, block_ids,
             task_info.num_blocks, itile_seq_k + 1, istage_v, phase_v);
       }
-
-      if (!first_task) {
-        arrive_cluster_barrier(clc_writable);
-      }
-      first_task = false;
 
       // load V0
       load_paged_v<kTileN, kBlockSize, kStageK, Tin>(tma_v, v_readable, v_writable, tVg, tVs,
@@ -355,8 +336,9 @@ __global__ void __launch_bounds__(512, 1)
     int phase_s = 0;
     int istage_s = 0;
 
-    task_info.valid = get_task_info<kTileN, kBlockSize, kSplitK>(
-        task_info, iblock, splitk_head_kv_divider, num_seq_kvcache_ptr, new_kv_included, num_seq_q);
+    task_info.valid =
+        get_task_info<kTileN, kBlockSize>(task_info, task_map_ptr, task_map_num_chunks_ptr, iblock,
+                                          splitk_head_kv_divider, num_tiles_per_cta, num_seq_q);
 
     while (true) {
       if (!task_info.valid) {
@@ -422,31 +404,24 @@ __global__ void __launch_bounds__(512, 1)
     }
   } else if (iwarp == 2 && (block_rank_in_cluster == 0) && elected) {
     // CLC: find next Q
-    int phase_task = 0;
     int phase_q = 1;
     int istage_q = 0;
-    bool has_next_task = true;
+    bool has_next_task = (task_map_ptr[0] >= 0);
     task_info.iblock = iblock;
-    do {
-      wait_barrier(clc_writable, !phase_task);
-      find_next_block(&clc_resp, &clc_readable);
-      set_barrier_transaction_bytes(clc_readable, sizeof(uint4));
-#pragma unroll
-      for (int i = 1; i < kClusterSize; i++) {
-        set_barrier_transaction_bytes_cluster(clc_readable, sizeof(uint4), i);
-      }
 
-      has_next_task = get_next_task<kTileN, kBlockSize, kSplitK>(
-          task_info, &clc_resp, &clc_readable, &clc_writable, phase_task, block_rank_in_cluster,
-          num_seq_kvcache_ptr, new_kv_included, num_seq_q, splitk_head_kv_divider);
+    while (has_next_task) {
+      task_map_ptr += kSchedTaskInfoSize;
+      task_info.valid = get_task_info<kTileN, kBlockSize>(
+          task_info, task_map_ptr, task_map_num_chunks_ptr, iblock, splitk_head_kv_divider,
+          num_tiles_per_cta, num_seq_q);
 
-      if (task_info.valid || !has_next_task) {
-        wait_barrier(task_writable[istage_q], phase_q);
-        TaskInfo::store(task_info, &smem_task[istage_q]);
-        arrive_barrier(task_readable[istage_q]);
-        advance_stage<kStageQ>(istage_q, phase_q);
-      }
-    } while (has_next_task);
+      has_next_task = task_info.valid;
+
+      wait_barrier(task_writable[istage_q], phase_q);
+      TaskInfo::store(task_info, &smem_task[istage_q]);
+      arrive_barrier(task_readable[istage_q]);
+      advance_stage<kStageQ>(istage_q, phase_q);
+    }
   } else if (idx >= 128 && idx < 256) {
     // Exp: tP -> rP -> atmoicmax -> exp -> stsm P -> sttm sum
     cutlass::arch::warpgroup_reg_alloc<184>();
@@ -459,8 +434,6 @@ __global__ void __launch_bounds__(512, 1)
     int istage_p = 0;
     int phase_exp = 1;
     int istage_exp = 0;
-    int istage_k = 0;
-    int phase_k = 0;
 
     auto tmem_exp_tiler = make_tile(Int<kTileN>{}, Int<kTileM>{});
     auto tPt_exp = zipped_divide(tPt, make_tile(tmem_exp_tiler));
@@ -488,35 +461,34 @@ __global__ void __launch_bounds__(512, 1)
     auto tI_nm = retile_fragment(tI);
     constexpr int kN = size<0>(tI_nm);
     constexpr int kM = size<1>(tI_nm);
-    Tensor qscales = make_tensor<float>(Int<kM>{});
-    Tensor kscales = make_tensor<float>(Int<kN>{});
+    Tensor qkscales = make_tensor<float>(Int<kM>{});
+    vec_t<float, kM> gMax;
     vec_t<float, kM> gSoftmaxScale;
     vec_t<float, kM> gSum;
-    vec_t<float, kM> gMax;
     Tensor gCorrectScale = make_tensor<float>(Int<kM>{});
 
-    auto sKS_flatten =
-        make_tensor(sKS.data(), make_layout(make_shape(Int<kTileN>{}, Int<kStageK>{})));
+    float kscale = kscale_ptr[0];
 
-    task_info.valid = get_task_info<kTileN, kBlockSize, kSplitK>(
-        task_info, iblock, splitk_head_kv_divider, num_seq_kvcache_ptr, new_kv_included, num_seq_q);
+    task_info.valid =
+        get_task_info<kTileN, kBlockSize>(task_info, task_map_ptr, task_map_num_chunks_ptr, iblock,
+                                          splitk_head_kv_divider, num_tiles_per_cta, num_seq_q);
 
     while (true) {
       if (!task_info.valid) {
         break;
       }
 
-      auto *qscales_batch = qscale_ptr + task_info.ibatch * num_head_q * num_seq_q +
-                            task_info.ihead_kv * heads_per_group;
+      auto *qscales = qscale_ptr + task_info.ibatch * num_head_q * num_seq_q +
+                      task_info.ihead_kv * heads_per_group;
 #pragma unroll
       for (int i = 0; i < kM; i++) {
         int im = get<1>(tI_nm(0, i));
         int iseqq = im / kHeadsPerGroup;
         int iqhead = im % kHeadsPerGroup;
         if (iqhead < heads_per_group) {
-          qscales(i) = qscales_batch[iseqq * num_head_q + iqhead];
+          qkscales(i) = qscales[iseqq * num_head_q + iqhead] * kscale;
         } else {
-          qscales(i) = 1;
+          qkscales(i) = kscale;
         }
       }
 
@@ -530,14 +502,6 @@ __global__ void __launch_bounds__(512, 1)
 #pragma unroll 1
       for (int itile_seq_k = task_info.num_tile_kv - 1; itile_seq_k >= task_info.num_tile_full;
            --itile_seq_k) {
-        wait_barrier(k_readable[istage_k], phase_k);
-#pragma unroll
-        for (int in = 0; in < kN; in++) {
-          kscales(in) = sKS_flatten(get<0>(tI_nm(in, 0)), istage_k);
-        }
-        arrive_barrier(k_writable[istage_k]);
-        advance_stage<kStageK>(istage_k, phase_k);
-
         tPt4r.data() = tPt4r_base_ptr + istage_p * kTileM;
         tSt4r.data() = tSt4r_base_ptr + istage_exp * kTileM;
         // P from tmem to reg
@@ -547,9 +511,10 @@ __global__ void __launch_bounds__(512, 1)
         cutlass::arch::fence_view_async_tmem_load();
         // get max and do exp
         auto tAttr_nm = retile_fragment(tPr4t);
-        apply_casual_mask_with_scale<kTileN, kHeadsPerGroup>(tAttr_nm, tI_nm, qscales, kscales,
-                                                             itile_seq_k, task_info.num_seq_kvcache,
+        apply_casual_mask_with_scale<kTileN, kHeadsPerGroup>(tAttr_nm, tI_nm, qkscales, itile_seq_k,
+                                                             task_info.num_seq_kvcache,
                                                              task_info.num_seq_kv);
+
         online_softmax<true, kTileM>(tAttr_nm, gMax, gSum, gSoftmaxScale, smem_max,
                                      smem_correct_scale[istage_exp], kBarId, iwarp, ilane);
 
@@ -569,7 +534,10 @@ __global__ void __launch_bounds__(512, 1)
           }
           wait_barrier(y_writable[istage_q], phase_q);
           if (ilane < 4) {
-            store_rC_to_smem<kTileM, kM>(gSum, smem_sum[istage_q], iwarp, ilane);
+            store_rC_to_smem<kTileM, kM>(gSum, smem_sum[0][istage_q], iwarp, ilane);
+            if (iwarp == 0) {
+              store_rC_to_smem<kTileM, kM>(gMax, smem_sum[1][istage_q], 0, ilane);
+            }
           }
           __syncwarp();
         }
@@ -585,16 +553,13 @@ __global__ void __launch_bounds__(512, 1)
         advance_stage<kStageP>(istage_exp, phase_exp);
       }
 
+#pragma unroll
+      for (int i = 0; i < kM; i++) {
+        gSoftmaxScale[i] *= qkscales(i);
+      }
+
 #pragma unroll 1
       for (int itile_seq_k = task_info.num_tile_full - 1; itile_seq_k >= 1; --itile_seq_k) {
-        wait_barrier(k_readable[istage_k], phase_k);
-#pragma unroll
-        for (int in = 0; in < kN; in++) {
-          kscales(in) = sKS_flatten(get<0>(tI_nm(in, 0)), istage_k);
-        }
-        arrive_barrier(k_writable[istage_k]);
-        advance_stage<kStageK>(istage_k, phase_k);
-
         tPt4r.data() = tPt4r_base_ptr + istage_p * kTileM;
         tSt4r.data() = tSt4r_base_ptr + istage_exp * kTileM;
         // P from tmem to reg
@@ -604,13 +569,6 @@ __global__ void __launch_bounds__(512, 1)
         cutlass::arch::fence_view_async_tmem_load();
         // get max and do exp
         auto tAttr_nm = retile_fragment(tPr4t);
-#pragma unroll
-        for (int im = 0; im < kM; ++im) {
-#pragma unroll
-          for (int in = 0; in < kN; ++in) {
-            tAttr_nm(in, im) *= qscales(im) * kscales(in);
-          }
-        }
         online_softmax<false, kTileM>(tAttr_nm, gMax, gSum, gSoftmaxScale, smem_max,
                                       smem_correct_scale[istage_exp], kBarId, iwarp, ilane);
 
@@ -638,14 +596,6 @@ __global__ void __launch_bounds__(512, 1)
       if (task_info.num_tile_full > 0) {
         tPt4r.data() = tPt4r_base_ptr + istage_p * kTileM;
         tSt4r.data() = tSt4r_base_ptr + istage_exp * kTileM;
-        wait_barrier(k_readable[istage_k], phase_k);
-#pragma unroll
-        for (int in = 0; in < kN; in++) {
-          kscales(in) = sKS_flatten(get<0>(tI_nm(in, 0)), istage_k);
-        }
-        arrive_barrier(k_writable[istage_k]);
-        advance_stage<kStageK>(istage_k, phase_k);
-
         // P from tmem to reg
         wait_barrier(p_readable[istage_p], phase_p);
         fence_tmem_after_thread_sync();
@@ -653,13 +603,6 @@ __global__ void __launch_bounds__(512, 1)
         cutlass::arch::fence_view_async_tmem_load();
         // get max and do exp
         auto tAttr_nm = retile_fragment(tPr4t);
-#pragma unroll
-        for (int im = 0; im < kM; ++im) {
-#pragma unroll
-          for (int in = 0; in < kN; ++in) {
-            tAttr_nm(in, im) *= qscales(im) * kscales(in);
-          }
-        }
         online_softmax<false, kTileM>(tAttr_nm, gMax, gSum, gSoftmaxScale, smem_max,
                                       smem_correct_scale[istage_exp], kBarId, iwarp, ilane);
 
@@ -679,7 +622,10 @@ __global__ void __launch_bounds__(512, 1)
         }
         wait_barrier(y_writable[istage_q], phase_q);
         if (ilane < 4) {
-          store_rC_to_smem<kTileM, kM>(gSum, smem_sum[istage_q], iwarp, ilane);
+          store_rC_to_smem<kTileM, kM>(gSum, smem_sum[0][istage_q], iwarp, ilane);
+          if (iwarp == 0) {
+            store_rC_to_smem<kTileM, kM>(gMax, smem_sum[1][istage_q], 0, ilane);
+          }
         }
         __syncwarp();
 
@@ -758,8 +704,9 @@ __global__ void __launch_bounds__(512, 1)
     auto tYr_nm = retile_fragment(tYr4t);
     constexpr int kM = size<1>(tYr_nm);
 
-    task_info.valid = get_task_info<kTileN, kBlockSize, kSplitK>(
-        task_info, iblock, splitk_head_kv_divider, num_seq_kvcache_ptr, new_kv_included, num_seq_q);
+    task_info.valid =
+        get_task_info<kTileN, kBlockSize>(task_info, task_map_ptr, task_map_num_chunks_ptr, iblock,
+                                          splitk_head_kv_divider, num_tiles_per_cta, num_seq_q);
 
     while (true) {
       if (!task_info.valid) {
@@ -869,7 +816,7 @@ __global__ void __launch_bounds__(512, 1)
     auto tYr4t = make_tensor_like<float>(thr_copy_Y_t2r.partition_D(rY_epi));
 
     auto tiled_copy_Y_r2s =
-        make_tiled_copy_D(Copy_Atom<SMEM_STORE_BF16_ATOM, Tout>{}, tiled_copy_Y_t2r);
+        make_tiled_copy_D(Copy_Atom<UniversalCopy<uint32_t>, Tout>{}, tiled_copy_Y_t2r);
     auto thr_copy_Y_r2s = tiled_copy_Y_r2s.get_slice(idx);
     auto tYs4r = thr_copy_Y_r2s.partition_D(sY_epi);
     auto tYr4s = make_tensor_like<Tout>(thr_copy_Y_r2s.partition_S(rY_epi));
@@ -879,15 +826,27 @@ __global__ void __launch_bounds__(512, 1)
     auto tYr_nm = retile_fragment(tYr4t);
     constexpr int kM = size<1>(tYr_nm);
     vec_t<float, kM> gSum;
+    vec_t<float, kM> gMax;
 
-    task_info.valid = get_task_info<kTileN, kBlockSize, kSplitK>(
-        task_info, iblock, splitk_head_kv_divider, num_seq_kvcache_ptr, new_kv_included, num_seq_q);
+    float vscale = vscale_ptr[0];
+    float vscale_eff = vscale * kDecodePScaleInv;
+
+    task_info.valid =
+        get_task_info<kTileN, kBlockSize>(task_info, task_map_ptr, task_map_num_chunks_ptr, iblock,
+                                          splitk_head_kv_divider, num_tiles_per_cta, num_seq_q);
+
+    const int lse_kv_head_stride = num_seq_q * lse_pad_heads_per_group;
+    const int lse_chunk_stride = num_head_k * lse_kv_head_stride;
+    const int lse_batch_stride = kMaxSplitK * lse_chunk_stride;
 
     while (true) {
       if (!task_info.valid) {
         break;
       }
-      float vscale_eff = vscale_ptr[task_info.ihead_kv] * kDecodePScaleInv;
+
+      auto *lse_batch = lse_ptr + task_info.ibatch * lse_batch_stride +
+                        task_info.ichunk * lse_chunk_stride +
+                        task_info.ihead_kv * lse_kv_head_stride;
 
       tYt4r.data() = tYt4r_base_ptr + istage_q * kTileM;
       wait_barrier(q_writable[istage_q], phase_q);
@@ -895,13 +854,19 @@ __global__ void __launch_bounds__(512, 1)
       fence_tmem_after_thread_sync();
       copy(tiled_copy_Y_t2r, tYt4r, tYr4t);
       cutlass::arch::fence_view_async_tmem_load();
-      final_online_softmax<kTileM>(tYr_nm, gSum, smem_sum[istage_q], kBarId, iwarp, ilane);
+      final_online_softmax<kTileM>(tYr_nm, gSum, smem_sum[0][istage_q], kBarId, iwarp, ilane);
+      if (iwarp == 0 && ilane < 4) {
+        load_smem_to_rC<kTileM, kM>(gMax, smem_sum[1][istage_q], 0, ilane);
+      }
       arrive_barrier(y_writable[istage_q]);
+
+      store_lse<kM>(lse_batch, gMax, gSum, heads_per_group, num_seq_q, ilane, iwarp);
 
 #pragma unroll
       for (int i = 0; i < size(tYr4t); i++) {
         tYr4t(i) *= vscale_eff;
       }
+
       // cast to Tout
       cast<Tout, kTileM>(tYr4t, tYr4s);
 
@@ -914,7 +879,7 @@ __global__ void __launch_bounds__(512, 1)
       // tma store
       if (leader_warp) {
         auto gYY = tma_y.get_tma_tensor(
-            make_shape(num_dim_v, heads_per_group, num_head_k, num_seq_q, num_batch));
+            make_shape(num_dim_v, heads_per_group, num_head_k, num_seq_q, kMaxSplitK, num_batch));
         auto btma_y = tma_y.get_slice(0);
 
         // (((_64,_8),_2),_1,_2):(((_1,_64),_512),_0,_1024)
@@ -924,7 +889,7 @@ __global__ void __launch_bounds__(512, 1)
 
         for (int iseqq = 0; iseqq < num_seq_q; iseqq++) {
           cute::copy(tma_y, tYs(_, _, iseqq),
-                     tYg(_, _, 0, task_info.ihead_kv, iseqq, task_info.ibatch));
+                     tYg(_, _, 0, task_info.ihead_kv, iseqq, task_info.ichunk, task_info.ibatch));
         }
         tma_store_arrive();
       }
@@ -941,10 +906,13 @@ __global__ void __launch_bounds__(512, 1)
       tmem_allocator.free(tmem_base_ptr, kTmemColumns);
     }
   }
+
+  cudaTriggerProgrammaticLaunchCompletion();
 }
 
 }  // namespace kernels
+}  // namespace decode
 }  // namespace attention
 }  // namespace hpc
 
-#endif  // SRC_ATTENTION_DECODE_SM100_SMALLM_FP8_CLC_QKPERTOKEN_PERHEAD_VPERHEAD_KERNELS_CUH_
+#endif  // SRC_ATTENTION_DECODE_SM100_DYNAMIC_SMALLM_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_DIM128_DYNAMIC_SPLITK_KERNELS_CUH_

@@ -16,6 +16,7 @@
 
 namespace hpc {
 namespace attention {
+namespace decode {
 namespace kernels {
 
 struct alignas(16) TaskInfo {
@@ -146,18 +147,21 @@ __device__ __forceinline__ bool get_task_info(TaskInfo& task_info, const int* ta
                                               const int& num_tiles_per_sm, const int& num_seq_q) {
   auto v1 = load<int, 4>(task_map_ptr);
   auto v2 = load<int, 4>(task_map_ptr + 4);
+  auto v3 = load<int, 4>(task_map_ptr + 8);
 
-  int ibatch = v1[0];
-  int ichunk = v1[1];
-  int iseq_start = v1[2];
-  int num_seq_kv = v1[3];
+  int ihead_kv = v1[0];
+  int ibatch = v1[1];
+  int ichunk = v1[2];
+  int iseq_start = v1[3];
 
-  int num_seq_kvcache = v2[0];
-  int num_tile_kv = v2[1];
-  int num_tile_full = v2[2];
-  int is_casual_chunk = v2[3];
+  int num_seq_kv = v2[0];
+  int num_seq_kvcache = v2[1];
+  int num_tile_kv = v2[2];
+  int num_tile_full = v2[3];
 
-  if (ibatch < 0) {
+  int is_casual_chunk = v3[0];
+
+  if (ihead_kv < 0 || ibatch < 0) {
     return false;
   }
 
@@ -171,7 +175,7 @@ __device__ __forceinline__ bool get_task_info(TaskInfo& task_info, const int* ta
 
   task_info.iblock = iblock;
   task_info.ibatch = ibatch;
-  task_info.ihead_kv = blockIdx.x;
+  task_info.ihead_kv = ihead_kv;
   task_info.ichunk = ichunk;
   task_info.num_seq_kvcache = num_seq_kvcache;
   task_info.num_seq_kv = num_seq_kv;
@@ -669,6 +673,7 @@ __device__ __forceinline__ void store_lse(float* lse_batch, TensorMax& gMax, Ten
 }
 
 }  // namespace kernels
+}  // namespace decode
 }  // namespace attention
 }  // namespace hpc
 

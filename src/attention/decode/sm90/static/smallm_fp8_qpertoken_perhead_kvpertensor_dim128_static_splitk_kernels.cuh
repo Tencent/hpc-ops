@@ -1,7 +1,7 @@
 // Copyright 2025 hpc-ops authors
 
-#ifndef SRC_ATTENTION_DECODE_SM90_SMALLM_SPLITK_FP8_QKPERTOKEN_PERHEAD_VPERHEAD_KERNELS_CUH_
-#define SRC_ATTENTION_DECODE_SM90_SMALLM_SPLITK_FP8_QKPERTOKEN_PERHEAD_VPERHEAD_KERNELS_CUH_
+#ifndef SRC_ATTENTION_DECODE_SM90_STATIC_SMALLM_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_DIM128_STATIC_SPLITK_KERNELS_CUH_
+#define SRC_ATTENTION_DECODE_SM90_STATIC_SMALLM_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_DIM128_STATIC_SPLITK_KERNELS_CUH_
 
 #include <cuda.h>
 #include <stdio.h>
@@ -17,24 +17,24 @@
 
 namespace hpc {
 namespace attention {
+namespace decode {
 namespace kernels {
 
 template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int kTileV,
           int kHeadsPerGroup, int kWarpGroupN, typename TiledMmaQK, typename TiledMmaSV,
           typename TmaQ, typename TmaK, typename TmaV, typename TmaY, typename TmaSplitY,
-          typename TmaKS, typename SLayoutQ, typename SLayoutK, typename SLayoutP,
-          typename SLayoutS, typename SLayoutVTma, typename SLayoutY, typename SLayoutSplitY,
-          typename SLayoutKS, int kBlockSize, int kStage, int kSplitK, int kSplitMinLen>
-__global__ void attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perhead_vperhead_kernel(
+          typename SLayoutQ, typename SLayoutK, typename SLayoutP, typename SLayoutS,
+          typename SLayoutVTma, typename SLayoutY, typename SLayoutSplitY, int kBlockSize,
+          int kStage, int kSplitK, int kSplitMinLen>
+__global__ void smallm_attention_decode_fp8_qpertoken_perhead_kvpertensor_static_splitk_kernel(
     const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
     const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaY tma_y,
-    const __grid_constant__ TmaSplitY tma_splity, const __grid_constant__ TmaKS tma_ks, Tout *y_ptr,
-    float *split_y_ptr, float *lse_ptr, const int *block_ids_ptr, const int *num_seq_kvcache_ptr,
-    const float *qscale_ptr, const float *kscale_ptr, const float *vscale_ptr, int *split_flag_ptr,
-    bool new_kv_included, int num_batch, int num_seq_q, int num_dim_qk, int num_dim_v,
-    int num_head_q, int num_head_k, int num_head_v, int heads_per_group,
-    int lse_pad_heads_per_group, int num_kvcache_blocks, int num_seq_max_blocks,
-    int qscale_pad_stride, float one_over_dk_log2e) {
+    const __grid_constant__ TmaSplitY tma_splity, Tout *y_ptr, float *split_y_ptr, float *lse_ptr,
+    const int *block_ids_ptr, const int *num_seq_kvcache_ptr, const float *qscale_ptr,
+    const float *kscale_ptr, const float *vscale_ptr, int *split_flag_ptr, bool new_kv_included,
+    int num_batch, int num_seq_q, int num_dim_qk, int num_dim_v, int num_head_q, int num_head_k,
+    int num_head_v, int heads_per_group, int lse_pad_heads_per_group, int num_kvcache_blocks,
+    int num_seq_max_blocks, int qscale_pad_stride, float one_over_dk_log2e) {
   using namespace cute;  // NOLINT
   constexpr float kDecodePScale = 256.0f;
   constexpr float kDecodePScaleInv = 1.0f / kDecodePScale;
@@ -71,10 +71,10 @@ __global__ void attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perh
   const int *block_ids =
       block_ids_ptr + ibatch * num_seq_max_blocks + ichunk * num_blocks_per_chunk;
 
-  // float kscale = kscale_ptr[0];
-  float vscale = vscale_ptr[ihead_kv];
+  float kscale = kscale_ptr[0];
+  float vscale = vscale_ptr[0];
 
-  auto *qscales_batch = qscale_ptr + ibatch * num_head_q * num_seq_q + ihead_kv * heads_per_group;
+  auto *qscales = qscale_ptr + ibatch * num_head_q * num_seq_q + ihead_kv * heads_per_group;
 
   __shared__ uint64_t q_readable;
   __shared__ uint64_t k_writable[kStage];
@@ -87,15 +87,11 @@ __global__ void attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perh
   auto *shm_k = shm_q + cosize(SLayoutQ{});
   auto *shm_vtma = shm_k + cosize(SLayoutK{});
   auto *shm_p = shm_vtma + cosize(SLayoutVTma{});
-  auto *shm_ks = reinterpret_cast<float *>(shm_p + cosize(SLayoutP{}));
-  auto *shm_max = reinterpret_cast<float *>(shm_ks + cosize(SLayoutKS{}));
+  auto *shm_max = reinterpret_cast<float *>(shm_p + cosize(SLayoutP{}));
   auto *shm_kvblk_ids =
       reinterpret_cast<int *>(shm_max + kTileM * kWarpsPerWrapGroup * kWarpGroupN);
   auto *shm_y = reinterpret_cast<Tout *>(shm_data);        // Reuse All
   auto *shm_splity = reinterpret_cast<float *>(shm_data);  // Reuse All
-
-  constexpr int kScaleByteSize = sizeof(float);
-  const int num_scale_per_row = num_dim_qk / kScaleByteSize;
 
   // Tensor Q/K/V/Y
   auto gQ = tma_q.get_tma_tensor(
@@ -107,8 +103,6 @@ __global__ void attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perh
       make_shape(num_dim_v, heads_per_group, num_head_k, num_seq_q, num_batch));
   auto gSplitY = tma_splity.get_tma_tensor(make_shape(num_dim_v, heads_per_group, num_head_k,
                                                       num_seq_q, kSplitK * kWarpGroupN, num_batch));
-  auto gKS = tma_ks.get_tma_tensor(make_shape(kBlockSize / num_scale_per_row, num_scale_per_row,
-                                              num_head_k, num_kvcache_blocks));
 
   auto gAtt =
       make_tensor(make_gmem_ptr(static_cast<float *>(nullptr)),
@@ -125,24 +119,20 @@ __global__ void attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perh
   auto sVTma = make_tensor(make_smem_ptr(shm_vtma), SLayoutVTma{});
   auto sY = make_tensor(make_smem_ptr(shm_y), SLayoutY{});
   auto sSplitY = make_tensor(make_smem_ptr(shm_splity), SLayoutSplitY{});
-  auto sKS = make_tensor(make_smem_ptr(shm_ks), SLayoutKS{});
 
   // Block Level tma
   auto btma_q = tma_q.get_slice(0);
   auto btma_k = tma_k.get_slice(0);
   auto btma_v = tma_v.get_slice(0);
-  auto btma_ks = tma_ks.get_slice(0);
 
   // Thread Level Tensor
   auto tQg = btma_q.partition_S(gQ);  // (TMA, TMA_M, TMA_K, seqlenq, head_kv, batch)
   auto tKg = btma_k.partition_S(gK);  // (TMA, TMA_N, TMA_K, head_kv, batch)
   auto tVg = btma_v.partition_S(gV);  // (TMA, TMA_V, TMA_N, head_kv, batch)
-  auto tKSg = btma_ks.partition_S(gKS);
 
   auto tQs = btma_q.partition_D(sQ);     // (TMA, _1, _1)
   auto tKs = btma_k.partition_D(sK);     // (TMA, _1, _1)
   auto tVs = btma_v.partition_D(sVTma);  // (TMA, _1, _1)
-  auto tKSs = btma_ks.partition_S(sKS);
 
   // init bar
   if (is_leader_in_block) {
@@ -195,10 +185,10 @@ __global__ void attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perh
 #pragma unroll 1
       for (int itile_seq_kv = num_tile_full; itile_seq_kv < num_tile_kv; ++itile_seq_kv) {
         // load k/scale/v
-        load_paged_kv_with_scale<true, kBlockPerTileN, kBlockSize, kStage, Tin>(
-            tma_k, tma_v, tma_ks, k_writable, v_writable, k_readable, v_readable, tKg, tKs, tVg,
-            tVs, tKSg, tKSs, ihead_kv, num_dim_qk, num_dim_v, shm_kvblk_ids, num_blocks,
-            itile_seq_kv, istage_write, phase);
+        load_paged_kv<true, kBlockPerTileN, kBlockSize, kStage, Tin>(
+            tma_k, tma_v, k_writable, v_writable, k_readable, v_readable, tKg, tKs, tVg, tVs,
+            ihead_kv, num_dim_qk, num_dim_v, shm_kvblk_ids, num_blocks, itile_seq_kv, istage_write,
+            phase);
         advance_stage<kStage>(istage_write, phase);
       }
 
@@ -206,10 +196,10 @@ __global__ void attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perh
 #pragma unroll 1
       for (int itile_seq_kv = -kStage + 1; itile_seq_kv < num_tile_full; ++itile_seq_kv) {
         if (iload_tile < num_tile_full) {
-          load_paged_kv_with_scale<false, kBlockPerTileN, kBlockSize, kStage, Tin>(
-              tma_k, tma_v, tma_ks, k_writable, v_writable, k_readable, v_readable, tKg, tKs, tVg,
-              tVs, tKSg, tKSs, ihead_kv, num_dim_qk, num_dim_v, shm_kvblk_ids, num_blocks,
-              iload_tile++, istage_write, phase);
+          load_paged_kv<false, kBlockPerTileN, kBlockSize, kStage, Tin>(
+              tma_k, tma_v, k_writable, v_writable, k_readable, v_readable, tKg, tKs, tVg, tVs,
+              ihead_kv, num_dim_qk, num_dim_v, shm_kvblk_ids, num_blocks, iload_tile++,
+              istage_write, phase);
           advance_stage<kStage>(istage_write, phase);
         }
       }
@@ -254,12 +244,8 @@ __global__ void attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perh
     constexpr int kM = size<1>(tAttr_nm);
     Tensor gMax = make_tensor<float>(Int<kM>{});
     Tensor gSum = make_tensor<float>(Int<kM>{});
-    Tensor qscales = make_tensor<float>(Int<kM>{});
-    Tensor kscales = make_tensor<float>(Int<kN>{});
+    Tensor qkscales = make_tensor<float>(Int<kM>{});
     Tensor gSoftmaxScale = make_tensor<float>(Int<kM>{});
-
-    auto sKS_flatten =
-        make_tensor(sKS.data(), make_layout(make_shape(Int<kTileN>{}, Int<kStage>{})));
 
 #pragma unroll
     for (int i = 0; i < kM; i++) {
@@ -267,9 +253,9 @@ __global__ void attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perh
       int iseqq = im / kHeadsPerGroup;
       int iqhead = im % kHeadsPerGroup;
       if (iqhead < heads_per_group) {
-        qscales(i) = qscales_batch[iseqq * num_head_q + iqhead];
+        qkscales(i) = qscales[iseqq * num_head_q + iqhead];
       } else {
-        qscales(i) = 1;
+        qkscales(i) = 1;
       }
     }
 
@@ -309,17 +295,16 @@ __global__ void attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perh
     lse_batch += iwarpgroup * num_head_k * lse_pad_heads_per_group * num_seq_q;
     bool warpgroup_computed = false;
 
+#pragma unroll
+    for (int i = 0; i < kM; i++) {
+      qkscales(i) *= kscale;
+    }
     // compute casual
 #pragma unroll 1
     for (int itile_seq_kv = num_tile_full + iwarpgroup; itile_seq_kv < num_tile_kv;
          itile_seq_kv += kWarpGroupN) {
       warpgroup_computed = true;
       wait_barrier(k_readable[istage_read], phase);
-
-#pragma unroll
-      for (int in = 0; in < kN; in++) {
-        kscales(in) = sKS_flatten(get<0>(tI_nm(in, 0)), istage_read);
-      }
 
       // P = QK
       qk_gemm(tiled_mma_qk, tQr, tKr, tAttr, istage_read);
@@ -329,8 +314,8 @@ __global__ void attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perh
       }
 
       // do causal mask
-      apply_casual_mask_with_scale<kTileN, kHeadsPerGroup>(
-          tAttr_nm, tI_nm, qscales, kscales, itile_seq_kv, num_seq_kvcache, num_seq_kv);
+      apply_casual_mask_with_scale<kTileN, kHeadsPerGroup>(tAttr_nm, tI_nm, qkscales, itile_seq_kv,
+                                                           num_seq_kvcache, num_seq_kv);
 
       // online softmax
       online_softmax<true, kTileM>(tAttr_nm, gMax, gSum, tYr_nm, gSoftmaxScale, shm_max, iwarpgroup,
@@ -374,6 +359,11 @@ __global__ void attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perh
       warpgroup_fence_operand(tYr);
     }
 
+#pragma unroll
+    for (int i = 0; i < kM; i++) {
+      gSoftmaxScale(i) *= qkscales(i);
+    }
+
     // compute full
 #pragma unroll 1
     for (int itile_seq_kv = (kWarpGroupN - num_tile_causal + iwarpgroup) % kWarpGroupN;
@@ -381,24 +371,11 @@ __global__ void attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perh
       warpgroup_computed = true;
       wait_barrier(k_readable[istage_read], phase);
 
-#pragma unroll
-      for (int in = 0; in < kN; in++) {
-        kscales(in) = sKS_flatten(get<0>(tI_nm(in, 0)), istage_read);
-      }
-
       // P = QK
       qk_gemm(tiled_mma_qk, tQr, tKr, tAttr, istage_read);
 
       if (elected_idx_in_warpgroup) {
         arrive_barrier(k_writable[istage_read]);
-      }
-
-#pragma unroll
-      for (int im = 0; im < kM; ++im) {
-#pragma unroll
-        for (int in = 0; in < kN; ++in) {
-          tAttr_nm(in, im) *= qscales(im) * kscales(in);
-        }
       }
 
       // online softmax
@@ -494,7 +471,8 @@ __global__ void attention_decode_fp8_multistage_ws_smallm_splitk_qkpertoken_perh
 }
 
 }  // namespace kernels
+}  // namespace decode
 }  // namespace attention
 }  // namespace hpc
 
-#endif  // SRC_ATTENTION_DECODE_SM90_SMALLM_SPLITK_FP8_QKPERTOKEN_PERHEAD_VPERHEAD_KERNELS_CUH_
+#endif  // SRC_ATTENTION_DECODE_SM90_STATIC_SMALLM_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_DIM128_STATIC_SPLITK_KERNELS_CUH_

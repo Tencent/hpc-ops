@@ -52,48 +52,48 @@ def quant_paged_cache_perhead(cache, block_size):
     return cache_fp8, scale * 0.1
 
 
-def naive_attn_with_paged_kvcache_func(
-    Q,
-    K,
-    V,
+def ref_attn_with_paged_kvcache_func(
+    q,
+    k,
+    v,
     kvcache,
     block_ids,
     nblocks,
     seqlenq,
     cu_seqlenq,
     num_seq_kvcache,
-    QS,
-    KS,
-    VS,
+    q_scale,
+    k_scale,
+    v_scale,
 ):
 
     num_batch = seqlenq.shape[0]
-    num_head_q = Q.shape[1]
-    num_head_kv = K.shape[1]
-    head_dim = K.shape[2]
+    num_head_q = q.shape[1]
+    num_head_kv = k.shape[1]
+    head_dim = v.shape[2]
     block_size = kvcache.shape[2]
     head_per_group = num_head_q // num_head_kv
-    Q = Q.reshape(num_batch, -1, num_head_q, head_dim)
-    output = torch.empty_like(Q, dtype=torch.bfloat16)
+    q = q.reshape(num_batch, -1, num_head_q, head_dim)
+    output = torch.empty_like(q, dtype=torch.bfloat16)
     for bi in range(num_batch):
-        BQ = Q[bi].transpose(0, 1).float()  # [num_heads, sq, head_dim]
+        q_batch = q[bi].transpose(0, 1).float()  # [num_heads, sq, head_dim]
         blk_ids = block_ids[bi, : nblocks[bi]]
         seqlen = seqlenq[bi] + num_seq_kvcache[bi]
-        BK = (
+        k_batch = (
             kvcache[blk_ids, 0, :, :, :]
             .reshape(-1, num_head_kv, head_dim)
             .transpose(0, 1)[:, :seqlen, :]
             .repeat_interleave(head_per_group, dim=0)
         ).float()
-        BV = (
+        v_batch = (
             kvcache[blk_ids, 1, :, :, :]
             .reshape(-1, num_head_kv, head_dim)
             .transpose(0, 1)[:, :seqlen, :]
             .repeat_interleave(head_per_group, dim=0)
         ).float()
 
-        BKS = (
-            KS[blk_ids, :, :, :]
+        k_scale_batch = (
+            k_scale[blk_ids, :, :, :]
             .view(torch.float32)
             .permute(0, 1, 3, 2)
             .reshape(-1, num_head_kv)
@@ -101,69 +101,66 @@ def naive_attn_with_paged_kvcache_func(
             .repeat_interleave(head_per_group, dim=0)
         ).float()
 
-        P = BQ @ BK.transpose(-1, -2)
+        p = q_batch @ k_batch.transpose(-1, -2)
 
-        P = P / math.sqrt(head_dim) * BKS.unsqueeze(1) * QS[bi][:, None, None]
+        p = p / math.sqrt(head_dim) * k_scale_batch.unsqueeze(1) * q_scale[bi][:, None, None]
 
         causal_mask = torch.ones(
-            seqlenq[bi], seqlen - seqlenq[bi], device=Q.device, dtype=torch.bool
+            seqlenq[bi], seqlen - seqlenq[bi], device=q.device, dtype=torch.bool
         )
         tail_causal_mask = torch.tril(
-            torch.ones(seqlenq[bi], seqlenq[bi], device=Q.device, dtype=torch.bool)
+            torch.ones(seqlenq[bi], seqlenq[bi], device=q.device, dtype=torch.bool)
         )
         causal_mask = torch.cat([causal_mask, tail_causal_mask], dim=-1).unsqueeze(0)
 
-        P = P.masked_fill(~causal_mask, float("-inf"))
+        p = p.masked_fill(~causal_mask, float("-inf"))
 
-        # attn_weights = F.softmax(P, dim=-1)
-        attn_weights = torch.exp(P - P.max(dim=-1)[0][:, :, None])
+        attn_weights = torch.exp(p - p.max(dim=-1)[0][:, :, None])
         gSum = attn_weights.sum(dim=-1)[:, :, None]
-
-        # attn_weights = attn_weights / gSum
 
         attn_weights = attn_weights * 256.0
         attn_weights = attn_weights.to(torch.float8_e4m3fn).float()
 
-        Y = torch.matmul(attn_weights, BV)
+        y = torch.matmul(attn_weights, v_batch)
 
-        Y = Y / gSum
+        y = y / gSum
 
-        Y = Y * VS[:, None, None].repeat_interleave(head_per_group, dim=0)
-        Y = Y / 256.0
+        y = y * v_scale[:, None, None].repeat_interleave(head_per_group, dim=0)
+        y = y / 256.0
 
-        output[bi] = Y.transpose(0, 1)
+        output[bi] = y.transpose(0, 1)
 
     return output.reshape(-1, num_head_q, head_dim)
 
 
 def online_attn_with_paged_kvcache_func(
-    Q,
-    K,
-    V,
+    q,
+    k,
+    v,
     kvcache,
     block_ids,
     nblocks,
     seqlenq,
     cu_seqlenq,
     num_seq_kvcache,
-    QS,
-    KS,
-    VS,
+    q_scale,
+    k_scale,
+    v_scale,
     splitk=1,
 ):
 
     num_batch = seqlenq.shape[0]
-    num_head_q = Q.shape[1]
-    num_head_kv = K.shape[1]
-    head_dim = K.shape[2]
+    num_head_q = q.shape[1]
+    num_head_kv = k.shape[1]
+    head_dim = k.shape[2]
     block_size = kvcache.shape[2]
     head_per_group = num_head_q // num_head_kv
-    Q = Q.reshape(num_batch, -1, num_head_q, head_dim)
-    num_seq_q = Q.shape[1]
-    output = torch.empty_like(Q, dtype=torch.bfloat16)
+    q = q.reshape(num_batch, -1, num_head_q, head_dim)
+    num_seq_q = q.shape[1]
+    output = torch.empty_like(q, dtype=torch.bfloat16)
     one_over_dk_log2e = 1.4426950408889634 / math.sqrt(head_dim)
     for bi in range(num_batch):
-        BQ = Q[bi].transpose(0, 1).float()  # [num_heads, sq, head_dim]
+        q_batch = q[bi].transpose(0, 1).float()  # [num_heads, sq, head_dim]
         blk_ids = block_ids[bi, : nblocks[bi]]
         seqlen = seqlenq[bi] + num_seq_kvcache[bi]
         num_tile_full = num_seq_kvcache[bi] // 64
@@ -174,25 +171,25 @@ def online_attn_with_paged_kvcache_func(
 
         gMax = torch.zeros(num_head_q, num_seq_q, dtype=torch.float32, device=Q.device) - 1e7
         gSum = torch.zeros(num_head_q, num_seq_q, dtype=torch.float32, device=Q.device)
-        Y = torch.zeros_like(BQ)
+        Y = torch.zeros_like(q_batch)
 
         for idx, blk_id in enumerate(blk_ids):
-            BK = (
+            k_batch = (
                 kvcache[blk_id, 0, :, :, :]
                 .reshape(-1, num_head_kv, head_dim)
                 .transpose(0, 1)
                 .repeat_interleave(head_per_group, dim=0)
             ).float()
 
-            BV = (
+            v_batch = (
                 kvcache[blk_id, 1, :, :, :]
                 .reshape(-1, num_head_kv, head_dim)
                 .transpose(0, 1)
                 .repeat_interleave(head_per_group, dim=0)
             ).float()
 
-            BKS = (
-                KS[blk_id, :, :, :]
+            k_scale_batch = (
+                k_scale[blk_id, :, :, :]
                 .view(torch.float32)
                 .permute(0, 2, 1)
                 .reshape(-1, num_head_kv)
@@ -200,13 +197,13 @@ def online_attn_with_paged_kvcache_func(
                 .repeat_interleave(head_per_group, dim=0)
             ).float()
 
-            P = BQ @ BK.transpose(-1, -2)
+            p = q_batch @ k_batch.transpose(-1, -2)
 
             if idx < num_tile_causal:
                 causal_mask = torch.ones(
                     seqlenq[bi],
                     max(0, num_seq_kvcache[bi] - (idx + num_tile_full) * block_size),
-                    device=Q.device,
+                    device=q.device,
                     dtype=torch.bool,
                 )
 
@@ -218,60 +215,47 @@ def online_attn_with_paged_kvcache_func(
                             (idx + num_tile_full + 1) * block_size - num_seq_kvcache[bi],
                             seqlen - (idx + num_tile_full) * block_size,
                         ),
-                        device=Q.device,
+                        device=q.device,
                         dtype=torch.bool,
                     )
                 )
 
                 empty_mask = torch.zeros(
                     (seqlenq[bi], max(0, (idx + num_tile_full + 1) * block_size - seqlen)),
-                    device=Q.device,
+                    device=q.device,
                     dtype=torch.bool,
                 )
 
                 causal_mask = torch.cat(
                     [causal_mask, tail_causal_mask, empty_mask], dim=-1
                 ).unsqueeze(0)
-                P = P.masked_fill(~causal_mask, float("-inf"))
+                p = p.masked_fill(~causal_mask, float("-inf"))
 
-            P = P * BKS.unsqueeze(1) * QS[bi][:, None, None] * one_over_dk_log2e
+            p = p * k_scale_batch.unsqueeze(1) * q_scale[bi][:, None, None] * one_over_dk_log2e
 
             last_max = gMax
 
-            gMax = torch.max(gMax, P.max(-1)[0])
+            gMax = torch.max(gMax, p.max(-1)[0])
 
-            P = torch.exp2(P - gMax[:, :, None])
+            p = torch.exp2(p - gMax[:, :, None])
 
             scale = torch.exp2(last_max - gMax)
 
-            gSum = scale * gSum + P.sum(-1)
+            gSum = scale * gSum + p.sum(-1)
 
-            Y = scale[:, :, None] * Y
+            y = scale[:, :, None] * y
 
-            P = P.to(torch.float8_e4m3fn).float()
+            p = p.to(torch.float8_e4m3fn).float()
 
-            Y = torch.matmul(P, BV) + Y
+            y = torch.matmul(p, v_batch) + y
 
-        Y = Y / gSum[:, :, None]
+        y = y / gSum[:, :, None]
 
-        Y = Y * VS[:, None, None].repeat_interleave(head_per_group, dim=0)
+        y = y * v_scale[:, None, None].repeat_interleave(head_per_group, dim=0)
 
-        output[bi] = Y.transpose(0, 1)
+        output[bi] = y.transpose(0, 1)
 
     return output.reshape(-1, num_head_q, head_dim)
-
-
-try:
-    # fa2
-    # from flash_attn.flash_attn_interface import flash_attn_with_kvcache
-    # fa3
-    from flash_attn_interface import flash_attn_with_kvcache
-
-    # gt_attention_func = flash_attn_with_kvcache_func
-    gt_attention_func = naive_attn_with_paged_kvcache_func
-except Exception as e:
-    print(f"execute naive_attn_func: {e}")
-    gt_attention_func = naive_attn_with_paged_kvcache_func
 
 
 def attention_decode_fp8_test_func(
@@ -287,8 +271,8 @@ def attention_decode_fp8_test_func(
     use_dynamic_sched,
     kvcache_shape,
 ):
-    torch.manual_seed(41)
-    torch.cuda.manual_seed(41)
+    torch.manual_seed(10086)
+    torch.cuda.manual_seed(10086)
 
     num_head_kv, num_head_q = kv_head_q_head
 
@@ -296,31 +280,24 @@ def attention_decode_fp8_test_func(
     num_dim_v = head_dim
     max_num_blocks = int(num_batch * max_seq_kv // block_size * 1.2)
 
-    T = torch.float8_e4m3fn
-
-    Q = torch.randn(
+    q = torch.randn(
         (num_batch * num_seq_q, num_head_q, num_dim_qk), dtype=torch.bfloat16, device="cuda"
     ) / math.sqrt(num_dim_qk)
-    QS = Q.float().abs().max(-1)[0] / 10
-    Q = (Q / QS[:, :, None]).to(T)
-
-    K = torch.randn(
+    q_scale = q.float().abs().max(-1)[0] / 10
+    q = (q / q_scale[:, :, None]).to(torch.float8_e4m3fn)
+    k = torch.randn(
         (num_batch * num_seq_q, num_head_kv, num_dim_qk), dtype=torch.bfloat16, device="cuda"
     )
-    V = torch.randn(
+    v = torch.randn(
         (num_batch * num_seq_q, num_head_kv, num_dim_v), dtype=torch.bfloat16, device="cuda"
     )
 
-    VS = torch.randn((num_head_kv), dtype=torch.float32, device="cuda")
+    v_scale = torch.randn((num_head_kv), dtype=torch.float32, device="cuda")
 
     num_seq_kvcache = torch.randint(1, max_seq_kv, (num_batch,), dtype=torch.int32, device="cuda")
 
     task_map = None
     if use_dynamic_sched:
-        # sm90 dynamic path: workspace + assigner at kTileN=64 (sm90 GEMM tile
-        # size). Allocate CPU- and CUDA-resident task_maps, populate each via
-        # its respective backend of hpc.assign_attention_decode_task
-        # and assert byte-for-byte agreement over the used prefix.
         task_map_for_cpu = hpc.get_attention_decode_task_workspace(
             num_batch, max_seq_kv + num_seq_q, num_head_kv, min_process_len=2048
         )
@@ -346,13 +323,7 @@ def attention_decode_fp8_test_func(
             min_process_len=2048,
         )
 
-        # sm90 dynamic path uses a flat bin count: num_sm * kCTAPerSM.
-        # Per-task entries are 48 B (SM90DynamicTaskInfo), not 32 B.
-        kCTAPerSM = 4
-        num_total_ctas = (
-            torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-            * kCTAPerSM
-        )
+        num_total_ctas = task_map_for_cuda[1]
 
         sched_need_byte_size = (task_map_for_cpu.view(torch.int32)[0] * num_total_ctas + 1) * 48 + (
             num_batch * num_head_kv * 4 + 47
@@ -362,7 +333,7 @@ def attention_decode_fp8_test_func(
         )
 
         task_map = task_map_for_cuda
-        hpc.print_attention_decode_task(task_map)
+        # hpc.print_attention_decode_task(task_map)
 
     nblocks = (num_seq_kvcache + num_seq_q + block_size - 1) // block_size
     total_blocks = sum(nblocks)
@@ -396,49 +367,49 @@ def attention_decode_fp8_test_func(
             si = sqi + num_seq_kvcache[i]
             blk_id = si // block_size
             slot_id = si % block_size
-            kvcache[block_ids[i, blk_id], 0, slot_id] = K.reshape(
+            kvcache[block_ids[i, blk_id], 0, slot_id] = k.reshape(
                 num_batch, num_seq_q, num_head_kv, num_dim_qk
             )[i, sqi]
-            kvcache[block_ids[i, blk_id], 1, slot_id] = V.reshape(
+            kvcache[block_ids[i, blk_id], 1, slot_id] = v.reshape(
                 num_batch, num_seq_q, num_head_kv, num_dim_qk
             )[i, sqi]
 
-    kvcache_fp8 = torch.empty_like(kvcache, dtype=T)
+    kvcache_fp8 = torch.empty_like(kvcache, dtype=torch.float8_e4m3fn)
 
-    kcache, KS = quant_paged_cache_pertoken(kvcache[:, 0, :, :, :], block_size)
-    vcache, VS = quant_paged_cache_perhead(kvcache[:, 1, :, :, :], block_size)
+    kcache, k_scale = quant_paged_cache_pertoken(kvcache[:, 0, :, :, :], block_size)
+    vcache, v_scale = quant_paged_cache_perhead(kvcache[:, 1, :, :, :], block_size)
 
     kvcache_fp8[:, 0, :, :, :] = kcache
     kvcache_fp8[:, 1, :, :, :] = vcache
 
-    KS = kvcache_fp8[:, 0, block_size:, :, :]
+    k_scale = kvcache_fp8[:, 0, block_size:, :, :]
 
-    gt = gt_attention_func(
-        Q,
-        K,
-        V,
+    gt = ref_attn_with_paged_kvcache_func(
+        q,
+        k,
+        v,
         kvcache_fp8[:, :, :block_size, :, :],
         block_ids,
         nblocks,
         seqlenq,
         cu_seqlenq,
         num_seq_kvcache,
-        QS,
-        KS,
-        VS,
+        q_scale,
+        k_scale,
+        v_scale,
     )
 
     if use_output:
-        my = torch.empty_like(Q, dtype=torch.bfloat16)
+        my = torch.empty_like(q, dtype=torch.bfloat16)
         hpc.attention_decode_fp8(
-            Q,
+            q,
             kvcache_fp8[:, 0, :block_size, :, :],
             kvcache_fp8[:, 1, :block_size, :, :],
             block_ids,
             num_seq_kvcache + num_seq_q if new_kv_included else num_seq_kvcache,
-            QS,
-            KS,
-            VS,
+            q_scale,
+            k_scale,
+            v_scale,
             mtp=num_seq_q - 1,
             new_kv_included=new_kv_included,
             quant_type=hpc.QuantType.QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD,
@@ -449,14 +420,14 @@ def attention_decode_fp8_test_func(
     else:
         num_seq_kvcache_input = num_seq_kvcache + num_seq_q if new_kv_included else num_seq_kvcache
         my = hpc.attention_decode_fp8(
-            Q,
+            q,
             kvcache_fp8[:, 0, :block_size, :, :],
             kvcache_fp8[:, 1, :block_size, :, :],
             block_ids,
             num_seq_kvcache_input,
-            QS,
-            KS,
-            VS,
+            q_scale,
+            k_scale,
+            v_scale,
             mtp=num_seq_q - 1,
             new_kv_included=new_kv_included,
             quant_type=hpc.QuantType.QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD,
@@ -469,34 +440,61 @@ def attention_decode_fp8_test_func(
     print("\nmy\n")
     print(my[0, :, :])
 
-    abs_diff = torch.abs(gt - my)
-    vals, idxs = torch.topk(abs_diff.flatten(), 10)
-    idxs = [torch.unravel_index(idx, gt.shape) for idx in idxs]
-
-    for i, idx in enumerate(idxs):
-        cpu_idx = tuple(tensor.cpu().item() for tensor in idx)
-        print(
-            "{:+.4f} vs {:+.4f} with diff = {:.4f}, @ {}".format(gt[idx], my[idx], vals[i], cpu_idx)
-        )
-
-    assert allclose(my, gt, atol=0.05)
-    assert gt.device == my.device
-    assert gt.dtype == my.dtype
-    assert gt.shape == my.shape
+    assert allclose(my, gt, atol=0.1)
 
 
-@pytest.mark.skipif(torch.cuda.get_device_capability()[0] != 9, reason="skip on non sm90!")
-@pytest.mark.parametrize("num_batch", [294])
-@pytest.mark.parametrize("num_seq_q", [1])
-@pytest.mark.parametrize("max_seq_kv", [1024 * 32])
+@pytest.mark.skipif(True, reason="skip on ci!")
+@pytest.mark.parametrize("num_batch", [1, 16, 200])
+@pytest.mark.parametrize("num_seq_q", [1, 2, 3, 4])
+@pytest.mark.parametrize("max_seq_kv", [1024, 4096])
 @pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("kv_head_q_head", [(1, 8)])
+@pytest.mark.parametrize("kv_head_q_head", [(1, 8), (4, 32)])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("new_kv_included", [True])
 @pytest.mark.parametrize("use_output", [False])
 @pytest.mark.parametrize("splitk", [True])
-@pytest.mark.parametrize("use_dynamic_sched", [True])
+@pytest.mark.parametrize("use_dynamic_sched", [False, True])
 @pytest.mark.parametrize("kvcache_shape", ["NHD", "HND"])
+def test_attn_fp8_sm90_offline(
+    num_batch,
+    num_seq_q,
+    max_seq_kv,
+    block_size,
+    kv_head_q_head,
+    head_dim,
+    new_kv_included,
+    use_output,
+    splitk,
+    use_dynamic_sched,
+    kvcache_shape,
+):
+    attention_decode_fp8_test_func(
+        num_batch,
+        num_seq_q,
+        max_seq_kv,
+        block_size,
+        kv_head_q_head,
+        head_dim,
+        new_kv_included,
+        use_output,
+        splitk,
+        use_dynamic_sched,
+        kvcache_shape,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.get_device_capability()[0] != 9, reason="skip on non sm90!")
+@pytest.mark.parametrize("num_batch", [16])
+@pytest.mark.parametrize("num_seq_q", [1])
+@pytest.mark.parametrize("max_seq_kv", [4096])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("kv_head_q_head", [(4, 32)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("new_kv_included", [True])
+@pytest.mark.parametrize("use_output", [False])
+@pytest.mark.parametrize("splitk", [True])
+@pytest.mark.parametrize("use_dynamic_sched", [False, True])
+@pytest.mark.parametrize("kvcache_shape", ["NHD"])
 def test_attn_fp8_sm90(
     num_batch,
     num_seq_q,

@@ -524,7 +524,7 @@ def _bench_shared(case, make_inputs, run_kernel_fn, quant_label):
     )
 
 
-# @pytest.mark.skip()
+@pytest.mark.skip()
 @pytest.mark.parametrize(
     "case", _BENCH_CASES, ids=lambda c: c[0] if isinstance(c, tuple) else str(c)
 )

@@ -13,7 +13,7 @@ namespace hpc {
 namespace attention {
 namespace decode {
 
-bool smallm_splitk_dim128_async(
+bool smallm_bf16_dim128_static_async(
     void *y_ptr, void *lse_ptr, void *splitk_out_ptr, const void *q_ptr, void *kcache_ptr,
     void *vcache_ptr, const int *block_ids_ptr, const int *num_seq_kvcache_ptr, int *split_flag_ptr,
     bool new_kv_included, int splitk, int num_batch, int num_seq_q, int num_head_q, int num_head_k,

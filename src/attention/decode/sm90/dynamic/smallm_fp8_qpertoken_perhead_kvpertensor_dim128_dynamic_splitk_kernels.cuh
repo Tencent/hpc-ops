@@ -1,7 +1,7 @@
 // Copyright 2025 hpc-ops authors
 
-#ifndef SRC_ATTENTION_DECODE_SM90_DYNAMIC_SMALLM_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_DYNAMIC_KERNELS_CUH_  // NOLINT
-#define SRC_ATTENTION_DECODE_SM90_DYNAMIC_SMALLM_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_DYNAMIC_KERNELS_CUH_  // NOLINT
+#ifndef SRC_ATTENTION_DECODE_SM90_DYNAMIC_SMALLM_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_DIM128_DYNAMIC_SPLITK_KERNELS_CUH_
+#define SRC_ATTENTION_DECODE_SM90_DYNAMIC_SMALLM_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_DIM128_DYNAMIC_SPLITK_KERNELS_CUH_
 
 #include <cuda.h>
 #include <stdio.h>
@@ -11,80 +11,22 @@
 #include "cute/tensor.hpp"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/arch/reg_reconfig.h"
-#include "src/attention/decode/sm90/dynamic/dynamic_sched_task_info.h"
-#include "src/attention/decode/sm90/util_kernels.cuh"  // sm90 gemm/softmax/copy utils
+#include "src/attention/decode/sched_task_info.h"
+#include "src/attention/decode/sm90/util_kernels.cuh"
 #include "src/utils/tma.cuh"
 #include "src/utils/utils.cuh"
 
 namespace hpc {
 namespace attention {
 namespace decode {
-namespace dynamic {
 namespace kernels {
-
-// Minimal task descriptor local to the dynamic sm90 path (runtime view of
-// SM90DynamicTaskInfo after parse_task decodes it).
-struct DynamicTaskInfo {
-  int ihead_kv;
-  int ibatch;
-  int ichunk;
-  int num_seq_kvcache;
-  int num_seq_kv;
-  int num_blocks;
-  int num_blocks_per_chunk;
-  int num_tile_kv;
-  int num_tile_full;
-  int num_tile_causal;
-};
-
-// Parse one SM90DynamicTaskInfo (12 ints / 48 B) from the sm90 dynamic
-// task_map. Three int4 loads — the extra load vs the legacy 8-int layout is
-// the cost of carrying ihead_kv in-task, which lets the launcher be a flat
-// `dim3(num_sm × kCTAPerSM)` rather than encoding head via blockIdx.x.
-//
-// Returns false when the slot is a terminator (ihead_kv<0 or ibatch<0).
-template <int kBlockSize>
-__device__ __forceinline__ bool parse_task(DynamicTaskInfo& task_info, const int* task_map_ptr) {
-  using namespace cute;  // NOLINT
-  auto v1 = load<int, 4>(task_map_ptr);
-  auto v2 = load<int, 4>(task_map_ptr + 4);
-  auto v3 = load<int, 4>(task_map_ptr + 8);
-
-  int ihead_kv = v1[0];
-  int ibatch = v1[1];
-  if (ihead_kv < 0 || ibatch < 0) {
-    return false;
-  }
-  int ichunk = v1[2];
-  int iseq_start = v1[3];
-
-  int num_seq_kv = v2[0];
-  int num_seq_kvcache = v2[1];
-  int num_tile_kv = v2[2];
-  int num_tile_full = v2[3];
-
-  int is_casual_chunk = v3[0];
-  // v3[1..3] are pad ints — unused.
-
-  task_info.ihead_kv = ihead_kv;
-  task_info.ibatch = ibatch;
-  task_info.ichunk = ichunk;
-  task_info.num_seq_kvcache = num_seq_kvcache;
-  task_info.num_seq_kv = num_seq_kv;
-  task_info.num_blocks = (num_seq_kv + kBlockSize - 1) / kBlockSize;
-  task_info.num_blocks_per_chunk = (iseq_start + kBlockSize - 1) / kBlockSize;
-  task_info.num_tile_kv = num_tile_kv;
-  task_info.num_tile_full = num_tile_full;
-  task_info.num_tile_causal = is_casual_chunk ? (num_tile_kv - num_tile_full) : 0;
-  return true;
-}
 
 template <typename Tin, typename Tout, int kTileM, int kTileN, int kTileK, int kTileV,
           int kHeadsPerGroup, typename TiledMmaQK, typename TiledMmaSV, typename TmaQ,
           typename TmaK, typename TmaV, typename TmaSplitY, typename SLayoutQ, typename SLayoutK,
           typename SLayoutP, typename SLayoutS, typename SLayoutVTma, typename SLayoutSplitY,
           int kBlockSize, int kStage, int kMaxSplitK>
-__global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertensor_kernel(
+__global__ void smallm_attention_decode_fp8_qpertoken_perhead_kvpertensor_dynamic_splitk_kernel(
     const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
     const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaSplitY tma_splity,
     float* split_y_ptr, float* lse_ptr, const int* task_map_ptr, const int* block_ids_ptr,
@@ -93,18 +35,17 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
     int heads_per_group, int lse_pad_heads_per_group, int num_kvcache_blocks,
     int num_seq_max_blocks, int qscale_pad_stride, float one_over_dk_log2e) {
   using namespace cute;  // NOLINT
-  using TaskInfo = DynamicTaskInfo;
 
   constexpr int kWarpGroupN = 1;
-  constexpr int kMathThreads = size(TiledMmaQK{}) * kWarpGroupN;  // = 128
+  constexpr int kMathThreads = size(TiledMmaQK{}) * kWarpGroupN;
   constexpr int kWarpsPerWrapGroup = 4;
-  constexpr int kTaskStride = kSM90DynamicTaskStride;  // = 12
+  constexpr int kTaskStride = dynamic::kTaskScheduleInfoStride;
 
   int idx = threadIdx.x;
   int elected = cute::elect_one_sync();
   int iwarp = idx / 32;
 
-  int cta_id = blockIdx.x;
+  int iblock = blockIdx.x;
 
   // PDL
   cudaGridDependencySynchronize();
@@ -162,11 +103,6 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
   const float kscale = kscale_ptr[0];
   const float vscale = vscale_ptr[0] / 256;
 
-  // ==========================================================================
-  // One-time mbarrier init (sm100 pattern). Each warp inits its own group of
-  // mbarriers and emits an async-proxy fence; the trailing __syncthreads()
-  // makes them visible to all warps.
-  // ==========================================================================
   if (iwarp == 0 && elected) {
     initialize_barrier(q_readable, 1);
     initialize_barrier(q_writable, 1);
@@ -189,28 +125,20 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
   __syncthreads();
 
   int num_tiles_per_cta = task_map_ptr[0];
-  const int* my_task_ptr = task_map_ptr + (1 + cta_id * num_tiles_per_cta) * kTaskStride;
+  const int* block_task_ptr = task_map_ptr + (1 + iblock * num_tiles_per_cta) * kTaskStride;
 
   if (idx >= kMathThreads) {
     // ====================== Load warp (32 threads) ========================
     const bool is_leader_in_load = ((iwarp == kMathThreads / 32) && elected);
     const int lane = idx & 31;
 
-    // Per-task phase trackers (carry across tasks):
-    //   phase_qw      : q_writable consumer-side. Initial barrier phase = 0,
-    //                   so wait_barrier(q_writable, 1) on the FIRST task
-    //                   returns immediately (no previous user of shm_q).
-    //   kv_istage_w   : producer-side stage cursor for K / V.
-    //   kv_phase_w    : producer-side phase cursor; initial 1 because the
-    //                   freshly-initialized k_writable[i] / v_writable[i]
-    //                   start at phase 0.
-    int phase_qw = 1;
-    int kv_istage_w = 0;
-    int kv_phase_w = 1;
+    int phase_q = 1;
+    int istage_kv = 0;
+    int phase_kv = 1;
 
     while (true) {
       TaskInfo task;
-      if (!parse_task<kBlockSize>(task, my_task_ptr)) {
+      if (!get_task<kBlockSize>(task, block_task_ptr)) {
         break;
       }
 
@@ -220,9 +148,6 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
       const int num_tile_kv = task.num_tile_kv;
       const int num_tile_full = task.num_tile_full;
 
-      // Cooperative block_ids load (32 threads). shm_kvblk_ids does NOT
-      // overlap shm_splity, so this is safe to do concurrently with the
-      // previous task's epilogue.
       const int* block_ids =
           block_ids_ptr + ibatch * num_seq_max_blocks + task.num_blocks_per_chunk;
       for (int i = lane; i < num_blocks; i += 32) {
@@ -231,50 +156,41 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
       __syncwarp();
 
       if (is_leader_in_load) {
-        wait_barrier(q_writable, phase_qw);
-        phase_qw ^= 1;
+        wait_barrier(q_writable, phase_q);
+        phase_q ^= 1;
 
-        // Q TMA — q_readable's transaction count is set per task.
         for (int iseqq = 0; iseqq < num_seq_q; iseqq++) {
           cute::copy(tma_q.with(q_readable), tQg(_, 0, _, ihead_kv, iseqq, ibatch),
                      tQs(_, iseqq, _));
         }
         set_barrier_transaction_bytes(q_readable, sizeof(Tin) * cosize(SLayoutQ{}));
 
-        // K/V TMAs: causal first (high indices), then full (low indices).
-        // Pipeline across kStage stages.
         constexpr int kBlockPerTileN = kTileN / kBlockSize;
         int iload_tile = 0;
 
 #pragma unroll 1
         for (int itile_seq_kv = num_tile_full; itile_seq_kv < num_tile_kv; ++itile_seq_kv) {
-          hpc::attention::kernels::load_paged_kv<true, kBlockPerTileN, kBlockSize, kStage, Tin>(
+          load_paged_kv<true, kBlockPerTileN, kBlockSize, kStage, Tin>(
               tma_k, tma_v, k_writable, v_writable, k_readable, v_readable, tKg, tKs, tVg, tVs,
-              ihead_kv, num_dim_qk, num_dim_v, shm_kvblk_ids, num_blocks, itile_seq_kv, kv_istage_w,
-              kv_phase_w);
-          hpc::attention::kernels::advance_stage<kStage>(kv_istage_w, kv_phase_w);
+              ihead_kv, num_dim_qk, num_dim_v, shm_kvblk_ids, num_blocks, itile_seq_kv, istage_kv,
+              phase_kv);
+          advance_stage<kStage>(istage_kv, phase_kv);
         }
 
 #pragma unroll 1
         for (int itile_seq_kv = -kStage + 1; itile_seq_kv < num_tile_full; ++itile_seq_kv) {
           if (iload_tile < num_tile_full) {
-            hpc::attention::kernels::load_paged_kv<false, kBlockPerTileN, kBlockSize, kStage, Tin>(
+            load_paged_kv<false, kBlockPerTileN, kBlockSize, kStage, Tin>(
                 tma_k, tma_v, k_writable, v_writable, k_readable, v_readable, tKg, tKs, tVg, tVs,
-                ihead_kv, num_dim_qk, num_dim_v, shm_kvblk_ids, num_blocks, iload_tile++,
-                kv_istage_w, kv_phase_w);
-            hpc::attention::kernels::advance_stage<kStage>(kv_istage_w, kv_phase_w);
+                ihead_kv, num_dim_qk, num_dim_v, shm_kvblk_ids, num_blocks, iload_tile++, istage_kv,
+                phase_kv);
+            advance_stage<kStage>(istage_kv, phase_kv);
           }
         }
       }
 
-      // Keep all 32 threads in lockstep before the next iter overwrites
-      // shm_kvblk_ids. Leader's load_paged_kv reads shm_kvblk_ids when issuing
-      // K/V TMAs (the smem→reg load happens at issue time, not async); the
-      // other 31 threads must not start the next task's coop block_ids load
-      // until leader has finished all of its TMA issues for this task.
       __syncwarp();
-
-      my_task_ptr += kTaskStride;
+      block_task_ptr += kTaskStride;
     }
   } else {
     // ===================== Math warpgroup (128 threads) =====================
@@ -285,7 +201,6 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
     const bool is_leader_in_warpgroup = ((iwarp % 4) == 0) && elected;
     constexpr int kIWarpgroup = 0;
 
-    // ---- once-only setup: hoisted out of the per-task while loop ----
     TiledMmaQK tiled_mma_qk;
     TiledMmaSV tiled_mma_sv;
 
@@ -319,12 +234,12 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
     Tensor qkscales = make_tensor<float>(Int<kM>{});
     Tensor gSoftmaxScale = make_tensor<float>(Int<kM>{});
 
-    auto tiled_copy_P_r2s = hpc::attention::kernels::make_tiled_copy_P_interleave<kTileM, Tin>();
+    auto tiled_copy_P_r2s = make_tiled_copy_P_interleave<kTileM, Tin>();
     auto thr_copy_P_r2s = tiled_copy_P_r2s.get_slice(idx_in_warpgroup);
     auto tPr4s = thr_copy_P_r2s.retile_S(tAttAfp8);
     auto tPs4r = thr_copy_P_r2s.partition_D(sP(_, _, kIWarpgroup));
 
-    auto tiled_copy_VT_s2r = hpc::attention::kernels::make_tiled_copy_V_interleave_trans<Tin>();
+    auto tiled_copy_VT_s2r = make_tiled_copy_V_interleave_trans<Tin>();
     auto thr_copy_VT_s2r = tiled_copy_VT_s2r.get_slice(idx_in_warpgroup);
     auto tVTs4r = thr_copy_VT_s2r.partition_S(sVTma);
     auto tVTr4s = make_fragment_like(thr_copy_VT_s2r.partition_D(sVTma(_, _, 0)));
@@ -334,18 +249,17 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
         make_tensor(tVr.data(), left_inverse(tVr.layout()).compose(tVTr4s.layout())));
 
     using R2SCopyAtomSplitY = Copy_Atom<UniversalCopy<uint32_t>, float>;
-    auto tiled_copy_SplitY_r2s =
-        hpc::attention::kernels::make_tiled_copy_Y_interleave<kTileM>(R2SCopyAtomSplitY{});
+    auto tiled_copy_SplitY_r2s = make_tiled_copy_Y_interleave<kTileM>(R2SCopyAtomSplitY{});
 
     float* shm_max_wg = shm_max + kIWarpgroup * kTileM * kWarpsPerWrapGroup;
 
-    int kv_istage_r = kIWarpgroup;
-    int kv_phase_r = 0;
+    int istage_kv = kIWarpgroup;
+    int phase_kv = 0;
     int phase_q = 0;
 
     while (true) {
       TaskInfo task;
-      if (!parse_task<kBlockSize>(task, my_task_ptr)) {
+      if (!get_task<kBlockSize>(task, block_task_ptr)) {
         break;
       }
 
@@ -363,7 +277,7 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
                          ichunk * num_head_k * lse_pad_heads_per_group * num_seq_q +
                          ihead_kv * lse_pad_heads_per_group * num_seq_q;
 
-      const float* qscales =
+      const float* qscales_batch =
           qscale_ptr + ibatch * num_head_q * num_seq_q + ihead_kv * heads_per_group;
 
 #pragma unroll
@@ -372,7 +286,7 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
         int iseqq = im / kHeadsPerGroup;
         int iqhead = im % kHeadsPerGroup;
         if (iqhead < heads_per_group) {
-          qkscales(i) = qscales[iseqq * num_head_q + iqhead];
+          qkscales(i) = qscales_batch[iseqq * num_head_q + iqhead];
         } else {
           qkscales(i) = 1;
         }
@@ -385,7 +299,6 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
       clear(tYr);
       tiled_mma_sv.accumulate_ = GMMA::ScaleOut::One;
 
-      // Wait for load warp's Q TMA (per-task phase toggle).
       wait_barrier(q_readable, phase_q);
       phase_q ^= 1;
 
@@ -396,25 +309,23 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
         qkscales(i) *= kscale;
       }
 
-      // Causal tiles.
 #pragma unroll 1
       for (int itile_seq_kv = num_tile_full + kIWarpgroup; itile_seq_kv < num_tile_kv;
            itile_seq_kv += kWarpGroupN) {
         warpgroup_computed = true;
-        wait_barrier(k_readable[kv_istage_r], kv_phase_r);
+        wait_barrier(k_readable[istage_kv], phase_kv);
 
-        hpc::attention::kernels::qk_gemm(tiled_mma_qk, tQr, tKr, tAttr, kv_istage_r);
+        qk_gemm(tiled_mma_qk, tQr, tKr, tAttr, istage_kv);
 
         if (elected_idx_in_warpgroup) {
-          arrive_barrier(k_writable[kv_istage_r]);
+          arrive_barrier(k_writable[istage_kv]);
         }
 
-        hpc::attention::kernels::apply_casual_mask_with_scale<kTileN, kHeadsPerGroup>(
+        apply_casual_mask_with_scale<kTileN, kHeadsPerGroup>(
             tAttr_nm, tI_nm, qkscales, itile_seq_kv, num_seq_kvcache, num_seq_kv);
 
-        hpc::attention::kernels::online_softmax<true, kTileM>(
-            tAttr_nm, gMax, gSum, tYr_nm, gSoftmaxScale, shm_max_wg, kIWarpgroup,
-            iwarp_in_warpgroup, ilane_in_warpgroup);
+        online_softmax<true, kTileM>(tAttr_nm, gMax, gSum, tYr_nm, gSoftmaxScale, shm_max_wg,
+                                     kIWarpgroup, iwarp_in_warpgroup, ilane_in_warpgroup);
 
 #pragma unroll
         for (int im = 0; im < kM; ++im) {
@@ -424,23 +335,22 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
           }
         }
 
-        hpc::attention::kernels::cast_fp32reg<Tin>(tAttr_nm, tAttAfp8);
-        hpc::attention::kernels::permute_p(tAttAfp8, 0x7520);
+        cast_fp32reg<Tin>(tAttr_nm, tAttAfp8);
+        permute_p(tAttAfp8, 0x7520);
         cute::copy(tiled_copy_P_r2s, tPr4s, tPs4r);
 
-        wait_barrier(v_readable[kv_istage_r], kv_phase_r);
+        wait_barrier(v_readable[istage_kv], phase_kv);
         cutlass::arch::fence_view_async_shared();
-        hpc::syncwarpgroup(kIWarpgroup);
+        syncwarpgroup(kIWarpgroup);
 
-        cute::copy(tiled_copy_VT_s2r, tVTs4r(_, _, _, kv_istage_r), tVTr4s);
-        hpc::attention::kernels::permute_v_sv_gemm(tiled_mma_sv, tSr, tVr, tYr, v_for_trans,
-                                                   vt_for_trans, kIWarpgroup);
+        cute::copy(tiled_copy_VT_s2r, tVTs4r(_, _, _, istage_kv), tVTr4s);
+        permute_v_sv_gemm(tiled_mma_sv, tSr, tVr, tYr, v_for_trans, vt_for_trans, kIWarpgroup);
 
         if (elected_idx_in_warpgroup) {
-          arrive_barrier(v_writable[kv_istage_r]);
+          arrive_barrier(v_writable[istage_kv]);
         }
 
-        hpc::attention::kernels::advance_stage<kStage, kWarpGroupN>(kv_istage_r, kv_phase_r);
+        advance_stage<kStage, kWarpGroupN>(istage_kv, phase_kv);
 
         warpgroup_wait<0>();
         warpgroup_fence_operand(tYr);
@@ -456,17 +366,16 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
       for (int itile_seq_kv = (kWarpGroupN - num_tile_causal + kIWarpgroup) % kWarpGroupN;
            itile_seq_kv < num_tile_full; itile_seq_kv += kWarpGroupN) {
         warpgroup_computed = true;
-        wait_barrier(k_readable[kv_istage_r], kv_phase_r);
+        wait_barrier(k_readable[istage_kv], phase_kv);
 
-        hpc::attention::kernels::qk_gemm(tiled_mma_qk, tQr, tKr, tAttr, kv_istage_r);
+        qk_gemm(tiled_mma_qk, tQr, tKr, tAttr, istage_kv);
 
         if (elected_idx_in_warpgroup) {
-          arrive_barrier(k_writable[kv_istage_r]);
+          arrive_barrier(k_writable[istage_kv]);
         }
 
-        hpc::attention::kernels::online_softmax<false, kTileM>(
-            tAttr_nm, gMax, gSum, tYr_nm, gSoftmaxScale, shm_max_wg, kIWarpgroup,
-            iwarp_in_warpgroup, ilane_in_warpgroup);
+        online_softmax<false, kTileM>(tAttr_nm, gMax, gSum, tYr_nm, gSoftmaxScale, shm_max_wg,
+                                      kIWarpgroup, iwarp_in_warpgroup, ilane_in_warpgroup);
 
 #pragma unroll
         for (int im = 0; im < kM; ++im) {
@@ -476,31 +385,30 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
           }
         }
 
-        hpc::attention::kernels::cast_fp32reg<Tin>(tAttr_nm, tAttAfp8);
-        hpc::attention::kernels::permute_p(tAttAfp8, 0x7520);
+        cast_fp32reg<Tin>(tAttr_nm, tAttAfp8);
+        permute_p(tAttAfp8, 0x7520);
         cute::copy(tiled_copy_P_r2s, tPr4s, tPs4r);
 
-        wait_barrier(v_readable[kv_istage_r], kv_phase_r);
+        wait_barrier(v_readable[istage_kv], phase_kv);
         cutlass::arch::fence_view_async_shared();
-        hpc::syncwarpgroup(kIWarpgroup);
+        syncwarpgroup(kIWarpgroup);
 
-        cute::copy(tiled_copy_VT_s2r, tVTs4r(_, _, _, kv_istage_r), tVTr4s);
-        hpc::attention::kernels::permute_v_sv_gemm(tiled_mma_sv, tSr, tVr, tYr, v_for_trans,
-                                                   vt_for_trans, kIWarpgroup);
+        cute::copy(tiled_copy_VT_s2r, tVTs4r(_, _, _, istage_kv), tVTr4s);
+        permute_v_sv_gemm(tiled_mma_sv, tSr, tVr, tYr, v_for_trans, vt_for_trans, kIWarpgroup);
 
         if (elected_idx_in_warpgroup) {
-          arrive_barrier(v_writable[kv_istage_r]);
+          arrive_barrier(v_writable[istage_kv]);
         }
 
-        hpc::attention::kernels::advance_stage<kStage, kWarpGroupN>(kv_istage_r, kv_phase_r);
+        advance_stage<kStage, kWarpGroupN>(istage_kv, phase_kv);
 
         warpgroup_wait<0>();
         warpgroup_fence_operand(tYr);
       }
 
       if (warpgroup_computed) {
-        hpc::attention::kernels::final_online_softmax<kTileM>(
-            tYr_nm, gSum, shm_max_wg, kIWarpgroup, iwarp_in_warpgroup, ilane_in_warpgroup);
+        final_online_softmax<kTileM>(tYr_nm, gSum, shm_max_wg, kIWarpgroup, iwarp_in_warpgroup,
+                                     ilane_in_warpgroup);
       }
 
 #pragma unroll
@@ -508,13 +416,12 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
         tYr(i) *= vscale;
       }
 
-      hpc::bar_sync<kWarpGroupN * 128>(kWarpGroupN);
+      bar_sync<kWarpGroupN * 128>(kWarpGroupN);
 
-      hpc::attention::kernels::store_output<true, kWarpGroupN>(
-          tiled_copy_SplitY_r2s, tma_splity, tYr, sSplitY, gSplitY, ihead_kv, ibatch, ichunk,
-          num_seq_q, idx_in_warpgroup, kIWarpgroup, is_leader_in_warpgroup);
-      hpc::attention::kernels::store_lse(lse_batch, gMax, gSum, heads_per_group, ilane_in_warpgroup,
-                                         iwarp_in_warpgroup);
+      store_output<true, kWarpGroupN>(tiled_copy_SplitY_r2s, tma_splity, tYr, sSplitY, gSplitY,
+                                      ihead_kv, ibatch, ichunk, num_seq_q, idx_in_warpgroup,
+                                      kIWarpgroup, is_leader_in_warpgroup);
+      store_lse(lse_batch, gMax, gSum, heads_per_group, ilane_in_warpgroup, iwarp_in_warpgroup);
 
       tma_store_wait<0>();
 
@@ -522,19 +429,16 @@ __global__ void attention_decode_fp8_dynamic_smallm_qpertoken_perhead_kvpertenso
         arrive_barrier(q_writable);
       }
 
-      my_task_ptr += kTaskStride;
+      block_task_ptr += kTaskStride;
     }
   }
 
-  // PDL
   cudaTriggerProgrammaticLaunchCompletion();
 }
 
 }  // namespace kernels
-}  // namespace dynamic
 }  // namespace decode
 }  // namespace attention
 }  // namespace hpc
 
-#endif  // SRC_ATTENTION_DECODE_SM90_DYNAMIC_SMALLM_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_DYNAMIC_KERNELS_CUH_
-        // // NOLINT
+#endif  // SRC_ATTENTION_DECODE_SM90_DYNAMIC_SMALLM_FP8_QPERTOKEN_PERHEAD_KVPERTENSOR_DIM128_DYNAMIC_SPLITK_KERNELS_CUH_

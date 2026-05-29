@@ -626,7 +626,7 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   int vcache_head_stride = vcache.stride(2);
   int ldY = y.stride(0);  // num_head_q * num_dim_v;
 
-  bool running = attention_decode_bf16_async(
+  bool running = decode::attention_decode_bf16_async(
       y_ptr, lse_ptr, split_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
       num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, splitk, num_batch, num_seq_q,
       num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,
@@ -636,6 +636,251 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   TORCH_CHECK(running, "attn decode kernel launch failed!");
 
   return y;
+}
+
+torch::Tensor attention_decode_fp8_entry(const torch::Tensor &q, torch::Tensor &kcache,
+                                         torch::Tensor &vcache, const torch::Tensor &block_ids,
+                                         const torch::Tensor &num_seq_kvcache,
+                                         const torch::Tensor &qscale, const torch::Tensor &kscale,
+                                         const torch::Tensor &vscale, int64_t mtp,
+                                         bool new_kv_included, int64_t quant_type, bool use_splitk,
+                                         std::optional<torch::Tensor> task_map,
+                                         std::optional<torch::Tensor> split_flag,
+                                         std::optional<torch::Tensor> output) {
+  auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+
+  TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
+  TORCH_CHECK(kcache.device().is_cuda(), "v tensor must be cuda");
+  TORCH_CHECK(vcache.device().is_cuda(), "v tensor must be cuda");
+  TORCH_CHECK(block_ids.device().is_cuda(), "v tensor must be cuda");
+  TORCH_CHECK(block_ids.is_contiguous(), "block_ids tensor must be contiguous");
+  TORCH_CHECK(num_seq_kvcache.is_contiguous(), "num_seq_kvcache tensor must be contiguous");
+  TORCH_CHECK(q.scalar_type() == torch::kFloat8_e4m3fn, "q dtype must be fp8_e4m3fn");
+  TORCH_CHECK(kcache.dtype().itemsize() == 1, "kcache tensor element type size must be fp8_e4m3");
+  TORCH_CHECK(vcache.dtype().itemsize() == 1, "vcache tensor element type size must be fp8_e4m3");
+  TORCH_CHECK(block_ids.scalar_type() == torch::kInt32, "block_ids dtype must be int32");
+  TORCH_CHECK(num_seq_kvcache.scalar_type() == torch::kInt32,
+              "num_seq_kvcache dtype must be int32");
+  TORCH_CHECK((mtp == 0 || mtp == 1 || mtp == 2 || mtp == 3), "we only support mtp 0, 1, 2, 3.");
+
+  int num_batch = num_seq_kvcache.size(0);
+  int num_seq_q = q.size(0) / num_batch;
+  TORCH_CHECK(num_seq_q == mtp + 1, "every request num_seq_q must be mtp + 1");
+  int num_head_q = q.size(1);
+  int num_dim_qk = q.size(2);
+
+  TORCH_CHECK(num_dim_qk == 128, "we only support head dim 128.");
+
+  int num_kvcache_blocks = kcache.size(0);
+  int block_size = kcache.size(1);
+
+  TORCH_CHECK(block_size == 64, "kvcache paged blocksize must be 64.");
+
+  int num_head_k = kcache.size(2);
+  int num_head_v = vcache.size(2);
+  int num_dim_v = vcache.size(3);
+
+  int num_seq_max_blocks = block_ids.size(1);
+  int qscale_pad_stride = qscale.stride(0);
+
+  int heads_per_group = num_head_q / num_head_k;
+  TORCH_CHECK(heads_per_group == 4 || heads_per_group == 8,
+              "we only support num_head_q / num_head_k == 4 or 8.");
+
+  const auto *q_ptr = q.const_data_ptr();
+  auto *kcache_ptr = kcache.mutable_data_ptr();
+  auto *vcache_ptr = vcache.mutable_data_ptr();
+  const int *block_ids_ptr = block_ids.const_data_ptr<int>();
+  const int *num_seq_kvcache_ptr = num_seq_kvcache.const_data_ptr<int>();
+  const float *qscale_ptr = qscale.const_data_ptr<float>();
+  const float *kscale_ptr = reinterpret_cast<const float *>(kscale.data_ptr());
+  const float *vscale_ptr = vscale.const_data_ptr<float>();
+
+  auto options = q.options().dtype(torch::kBFloat16);
+  torch::Tensor y;
+  if (output.has_value()) {
+    y = output.value();
+  } else {
+    y = torch::empty({num_batch * num_seq_q, num_head_q, num_dim_v}, options);
+  }
+
+  torch::Tensor lse;
+  torch::Tensor split_out;
+  torch::Tensor split_flag_tensor;
+
+  int splitk = 1;
+  int splitk_min_len = 0;
+  int consumers = 1;
+
+  // small batch increase splitk number to maximize sm usage.
+  const int *task_map_ptr = nullptr;
+  if (task_map.has_value()) {
+    task_map_ptr = reinterpret_cast<const int *>(task_map.value().data_ptr());
+  }
+
+  int sm_major_version = get_sm_major_version();
+  if (sm_major_version == 10) {
+    use_splitk &= (task_map_ptr != nullptr);
+  }
+  // small batch increase splitk number to maximize sm usage.
+  if (use_splitk) {
+    if (task_map_ptr) {
+      // use dynamic splitk
+      splitk = decode::dynamic::kCtaPerSmMap.at(sm_major_version)[num_seq_q - 1] * get_sm_count();
+
+      if (splitk != 78 * 2 && splitk != 78 * 3 && splitk != 78 * 4 && splitk != 148) {
+        splitk = 64;
+      }
+
+      int pad_heads_per_group = ((heads_per_group + 7) / 8) * 8;
+      lse = torch::empty({num_batch, splitk, num_head_k, num_seq_q, pad_heads_per_group},
+                         q.options().dtype(torch::kFloat32));
+      split_out = torch::empty({num_batch, splitk, num_seq_q, num_head_q, num_dim_v},
+                               q.options().dtype(torch::kFloat32));
+    } else {
+      if (num_batch <= 32) {
+        splitk = 4;
+        splitk_min_len = 512;
+      } else {
+        splitk = 4;
+        splitk_min_len = 4096;
+      }
+
+      consumers = 2;
+      if (num_batch <= 156) {
+        consumers = 2;
+      } else if (num_batch <= 234) {
+        consumers = 1;
+      } else {
+        consumers = 2;
+      }
+
+      int pad_heads_per_group = ((heads_per_group + 7) / 8) * 8;
+      int split_chunks = splitk * consumers;
+      lse = torch::empty({num_batch, split_chunks, num_head_k, num_seq_q, pad_heads_per_group},
+                         q.options().dtype(torch::kFloat32));
+      split_out = torch::empty({num_batch, split_chunks, num_seq_q, num_head_q, num_dim_v},
+                               q.options().dtype(torch::kFloat32));
+    }
+
+    if (split_flag.has_value()) {
+      split_flag_tensor = split_flag.value();
+    } else {
+      split_flag_tensor = torch::zeros({num_batch, num_head_k}, q.options().dtype(torch::kInt32));
+    }
+  }
+
+  void *lse_ptr = use_splitk ? lse.mutable_data_ptr() : nullptr;
+  void *split_out_ptr = use_splitk ? split_out.mutable_data_ptr() : nullptr;
+  int *split_flag_ptr = use_splitk ? split_flag_tensor.mutable_data_ptr<int>() : nullptr;
+
+  auto *y_ptr = y.mutable_data_ptr();
+
+  int ldQ = q.stride(0);  // num_head_q * num_dim_qk;
+  int kcache_block_stride = kcache.stride(0);
+  int vcache_block_stride = vcache.stride(0);
+
+  int kcache_token_stride = kcache.stride(1);
+  int vcache_token_stride = vcache.stride(1);
+
+  int kcache_head_stride = kcache.stride(2);
+  int vcache_head_stride = vcache.stride(2);
+  int ldY = y.stride(0);  // num_head_q * num_dim_v;
+
+  bool running = decode::attention_decode_fp8_async(
+      y_ptr, lse_ptr, split_out_ptr, task_map_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
+      num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr, new_kv_included,
+      splitk, splitk_min_len, consumers, quant_type, num_batch, num_seq_q, num_head_q, num_head_k,
+      num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size, num_seq_max_blocks,
+      qscale_pad_stride, ldY, ldQ, kcache_block_stride, kcache_token_stride, kcache_head_stride,
+      vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
+
+  TORCH_CHECK(running, "attn decode kernel launch failed!");
+
+  return y;
+}
+
+torch::Tensor assign_attention_decode_task_cpu_entry(const torch::Tensor &num_seq_kvcache,
+                                                     int64_t num_head_kv, int64_t num_seq_q,
+                                                     bool new_kv_included, int64_t min_process_len,
+                                                     std::optional<torch::Tensor> placehold) {
+  TORCH_CHECK(num_seq_kvcache.device().is_cpu(), "num_seq_kvcache tensor must be cpu");
+  int num_batch = num_seq_kvcache.size(0);
+
+  const int *num_seq_kvcache_ptr = num_seq_kvcache.const_data_ptr<int>();
+
+  int sm_major_version = get_sm_major_version();
+  int tilen = 0;
+  if (sm_major_version == 9) {
+    tilen = 64;
+  } else if (sm_major_version == 10) {
+    tilen = 128;
+  }
+
+  int num_total_ctas =
+      decode::dynamic::kCtaPerSmMap.at(sm_major_version)[num_seq_q - 1] * get_sm_count();
+
+  auto tasks_pair = decode::assign_attention_decode_task_sync(
+      num_seq_kvcache_ptr, num_total_ctas, num_batch, num_head_kv, num_seq_q, tilen,
+      new_kv_included, min_process_len);
+  auto tasks = tasks_pair.first;
+  auto num_chunks = tasks_pair.second;
+  int num_tile_per_cta = num_chunks[num_head_kv * num_batch];
+
+  constexpr int kTaskInfoSize = sizeof(decode::dynamic::TaskScheduleInfo);
+  int num_task = tasks.size();
+  auto options = num_seq_kvcache.options().dtype(torch::kInt8);
+
+  int num_chunks_bytes = num_head_kv * num_batch * sizeof(int);
+  int task_map_shape0 = 1 + num_task + (num_chunks_bytes + kTaskInfoSize - 1) / kTaskInfoSize;
+  auto task_map = torch::zeros({task_map_shape0, kTaskInfoSize}, options);
+  uint8_t *task_map_ptr = reinterpret_cast<uint8_t *>(task_map.mutable_data_ptr());
+
+  memcpy(task_map_ptr, &num_tile_per_cta, sizeof(int));
+  memcpy(task_map_ptr + sizeof(int), &num_total_ctas, sizeof(int));
+  memcpy(task_map_ptr + kTaskInfoSize, tasks.data(), kTaskInfoSize * num_task);
+  memcpy(task_map_ptr + kTaskInfoSize * (num_task + 1), num_chunks.data(), num_chunks_bytes);
+
+  return task_map;
+}
+
+torch::Tensor assign_attention_decode_task_cuda_entry(const torch::Tensor &num_seq_kvcache,
+                                                      int64_t num_head_kv, int64_t num_seq_q,
+                                                      bool new_kv_included, int64_t min_process_len,
+                                                      std::optional<torch::Tensor> task_map) {
+  TORCH_CHECK(num_seq_kvcache.device().is_cuda(), "num_seq_kvcache tensor must be cuda");
+  int num_batch = num_seq_kvcache.size(0);
+
+  auto stream = at::cuda::getCurrentCUDAStream(num_seq_kvcache.get_device());
+  constexpr int kMaxNumBatch = 2048;
+
+  TORCH_CHECK(num_batch <= kMaxNumBatch,
+              "assign_attention_decode_task_cuda only support batch_size <= 2048");
+
+  const int *num_seq_kvcache_ptr = num_seq_kvcache.const_data_ptr<int>();
+  TORCH_CHECK(task_map.has_value(), "assign_attention_decode_task_cuda must use task_map output.")
+
+  auto task_map_tensor = task_map.value();
+
+  int *task_map_ptr = reinterpret_cast<int *>(task_map_tensor.mutable_data_ptr());
+
+  int sm_major_version = get_sm_major_version();
+  int num_total_ctas =
+      decode::dynamic::kCtaPerSmMap.at(sm_major_version)[num_seq_q - 1] * get_sm_count();
+
+  int tilen = 0;
+  if (sm_major_version == 9) {
+    tilen = 64;
+  } else if (sm_major_version == 10) {
+    tilen = 128;
+  }
+  auto running = decode::assign_attention_decode_task_async(
+      task_map_ptr, num_seq_kvcache_ptr, num_total_ctas, num_batch, num_head_kv, num_seq_q, tilen,
+      new_kv_included, min_process_len, stream);
+
+  TORCH_CHECK(running, "launch assign_attention_decode_task_async failed");
+
+  return task_map_tensor;
 }
 
 torch::Tensor attention_mla_with_kvcache_bf16_entry(const torch::Tensor &q,
@@ -826,66 +1071,6 @@ torch::Tensor mla_prefill_bf16_entry(const torch::Tensor &q, const torch::Tensor
                          ldY, ldQ, ldKV, stream);
 
   return y;
-}
-
-torch::Tensor assign_attention_decode_task_cpu_entry(const torch::Tensor &num_seq_kvcache,
-                                                     int64_t num_head_kv, int64_t num_seq_q,
-                                                     bool new_kv_included, int64_t min_process_len,
-                                                     std::optional<torch::Tensor> placehold) {
-  TORCH_CHECK(num_seq_kvcache.device().is_cpu(), "num_seq_kvcache tensor must be cpu");
-  int num_batch = num_seq_kvcache.size(0);
-
-  const int *num_seq_kvcache_ptr = num_seq_kvcache.const_data_ptr<int>();
-
-  auto tasks_pair = assign_attention_decode_task_sync(num_seq_kvcache_ptr, num_batch, num_head_kv,
-                                                      num_seq_q, new_kv_included, min_process_len);
-  auto tasks = tasks_pair.first;
-  auto num_chunks = tasks_pair.second;
-  int num_tile_per_sm = num_chunks[num_batch];
-
-  constexpr int kTaskInfoSize = sizeof(TaskScheduleInfo);
-  int num_task = tasks.size();
-  auto options = num_seq_kvcache.options().dtype(torch::kInt8);
-
-  int task_map_shape0 =
-      1 + num_task + (num_batch * sizeof(int) + kTaskInfoSize - 1) / kTaskInfoSize;
-  auto task_map = torch::zeros({task_map_shape0, kTaskInfoSize}, options);
-  uint8_t *task_map_ptr = reinterpret_cast<uint8_t *>(task_map.mutable_data_ptr());
-
-  memcpy(task_map_ptr, &num_tile_per_sm, sizeof(int));
-  memcpy(task_map_ptr + kTaskInfoSize, tasks.data(), kTaskInfoSize * num_task);
-  memcpy(task_map_ptr + kTaskInfoSize * (num_task + 1), num_chunks.data(), sizeof(int) * num_batch);
-
-  return task_map;
-}
-
-torch::Tensor assign_attention_decode_task_cuda_entry(const torch::Tensor &num_seq_kvcache,
-                                                      int64_t num_head_kv, int64_t num_seq_q,
-                                                      bool new_kv_included, int64_t min_process_len,
-                                                      std::optional<torch::Tensor> task_map) {
-  TORCH_CHECK(num_seq_kvcache.device().is_cuda(), "num_seq_kvcache tensor must be cuda");
-  int num_batch = num_seq_kvcache.size(0);
-
-  auto stream = at::cuda::getCurrentCUDAStream(num_seq_kvcache.get_device());
-  constexpr int kMaxNumBatch = 2048;
-
-  TORCH_CHECK(num_batch <= kMaxNumBatch,
-              "assign_attention_decode_task_cuda only support batch_size <= 2048");
-
-  const int *num_seq_kvcache_ptr = num_seq_kvcache.const_data_ptr<int>();
-  TORCH_CHECK(task_map.has_value(), "assign_attention_decode_task_cuda must use task_map output.")
-
-  auto task_map_tensor = task_map.value();
-
-  int *task_map_ptr = reinterpret_cast<int *>(task_map_tensor.mutable_data_ptr());
-
-  auto running =
-      assign_attention_decode_task_async(task_map_ptr, num_seq_kvcache_ptr, num_batch, num_head_kv,
-                                         num_seq_q, new_kv_included, min_process_len, stream);
-
-  TORCH_CHECK(running, "launch assign_attention_decode_task_async failed");
-
-  return task_map_tensor;
 }
 
 namespace {
@@ -1097,6 +1282,13 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "mla_prefill_bf16(Tensor q, Tensor kv, Tensor seqlens_q, Tensor cu_seqlens_q, "
       "int num_dim_qk, int num_dim_v, int max_seqlens_q, Tensor? output) -> (Tensor)");
   m.impl("mla_prefill_bf16", torch::kCUDA, &hpc::attention::mla_prefill_bf16_entry);
+
+  m.def(
+      "attention_decode_fp8(Tensor q, Tensor! kcache, Tensor! vcache, Tensor block_ids, Tensor "
+      "num_seq_kvcache, Tensor qscale, Tensor kscale, Tensor vscale, int mtp, bool "
+      "new_kv_included, int quant_type, bool "
+      "use_splitk, Tensor? task_map, Tensor? split_flag, Tensor? output) -> (Tensor)");
+  m.impl("attention_decode_fp8", torch::kCUDA, &hpc::attention::attention_decode_fp8_entry);
 
   m.def(
       "assign_attention_decode_task(Tensor num_seq_kvcache, int num_head_kv, int num_seq_q, bool "

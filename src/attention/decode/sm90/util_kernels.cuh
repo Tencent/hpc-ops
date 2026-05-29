@@ -16,7 +16,21 @@
 
 namespace hpc {
 namespace attention {
+namespace decode {
 namespace kernels {
+
+struct alignas(16) TaskInfo {
+  int ihead_kv;
+  int ibatch;
+  int ichunk;
+  int num_seq_kvcache;
+  int num_seq_kv;
+  int num_blocks;
+  int num_blocks_per_chunk;
+  int num_tile_kv;
+  int num_tile_full;
+  int num_tile_causal;
+};
 
 template <int kTileN, int kBlockSize, int kSplitK, int kSplitMinLen>
 __device__ __forceinline__ bool get_task(const int* num_seq_kvcache_ptr, bool new_kv_included,
@@ -76,6 +90,42 @@ __device__ __forceinline__ bool get_task(const int* num_seq_kvcache_ptr, bool ne
     num_tile_causal = 0;
   }
   num_tile_full = num_tile_kv - num_tile_causal;
+
+  return true;
+}
+
+template <int kBlockSize>
+__device__ __forceinline__ bool get_task(TaskInfo& task_info, const int* task_map_ptr) {
+  auto v1 = load<int, 4>(task_map_ptr);
+  auto v2 = load<int, 4>(task_map_ptr + 4);
+  auto v3 = load<int, 4>(task_map_ptr + 8);
+
+  int ihead_kv = v1[0];
+  int ibatch = v1[1];
+  if (ihead_kv < 0 || ibatch < 0) {
+    return false;
+  }
+
+  int ichunk = v1[2];
+  int iseq_start = v1[3];
+
+  int num_seq_kv = v2[0];
+  int num_seq_kvcache = v2[1];
+  int num_tile_kv = v2[2];
+  int num_tile_full = v2[3];
+
+  int is_casual_chunk = v3[0];
+
+  task_info.ihead_kv = ihead_kv;
+  task_info.ibatch = ibatch;
+  task_info.ichunk = ichunk;
+  task_info.num_seq_kvcache = num_seq_kvcache;
+  task_info.num_seq_kv = num_seq_kv;
+  task_info.num_blocks = (num_seq_kv + kBlockSize - 1) / kBlockSize;
+  task_info.num_blocks_per_chunk = (iseq_start + kBlockSize - 1) / kBlockSize;
+  task_info.num_tile_kv = num_tile_kv;
+  task_info.num_tile_full = num_tile_full;
+  task_info.num_tile_causal = is_casual_chunk ? (num_tile_kv - num_tile_full) : 0;
 
   return true;
 }
@@ -761,6 +811,7 @@ __device__ __forceinline__ auto make_tiled_copy_Y_interleave(R2SCopyAtom const& 
 }
 
 }  // namespace kernels
+}  // namespace decode
 }  // namespace attention
 }  // namespace hpc
 

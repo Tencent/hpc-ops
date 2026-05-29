@@ -7,21 +7,16 @@
 #include <iostream>
 
 #include "cute/tensor.hpp"
-#include "cutlass/fast_math.h"
-#include "src/attention/decode/sm90/dynamic/decode_dynamic.h"
-#include "src/attention/decode/sm90/dynamic/smallm_combine_dynamic_kernels.cuh"
-#include "src/attention/decode/sm90/dynamic/smallm_fp8_qkpertoken_perhead_vperhead_dynamic_kernels.cuh"  // NOLINT
-#include "src/utils/utils.h"
+#include "src/attention/decode/sm90/dynamic/smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_splitk_kernels.cuh"
+#include "src/attention/decode/smallm_dim128.h"
+#include "src/attention/decode/splitk_combine_kernels.cuh"
 
 namespace hpc {
 namespace attention {
 namespace decode {
-namespace dynamic {
-
-namespace {
 
 template <int kTileM, bool kAInReg>
-constexpr auto mma_selector_fp8() {
+static constexpr auto mma_selector_fp8() {
   using namespace cute;  // NOLINT
   if constexpr (kAInReg) {
     if constexpr (kTileM == 8) {
@@ -46,11 +41,9 @@ constexpr auto mma_selector_fp8() {
   }
 }
 
-}  // namespace
-
-template <int kTileM, int kTileN, int kTileK, int kTileV, int kBlockSize>
-static void launch_qk_persistent_and_combine(
-    void *y_ptr, void *splitk_out_ptr, void *lse_ptr, int *task_map_ptr, const void *q_ptr,
+template <int kTileM, int kTileN, int kTileK, int kTileV, int kBlockSize, int kMaxSplitK>
+static void launch_smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_splitk_kernel(
+    void *y_ptr, void *splitk_out_ptr, void *lse_ptr, const int *task_map_ptr, const void *q_ptr,
     void *kcache_ptr, void *vcache_ptr, const int *block_ids_ptr, const float *qscale_ptr,
     const float *kscale_ptr, const float *vscale_ptr, int num_batch, int num_seq_q, int num_head_q,
     int num_head_k, int num_head_v, int heads_per_group, int num_dim_qk, int num_dim_v,
@@ -62,14 +55,11 @@ static void launch_qk_persistent_and_combine(
 
   constexpr int kStage = 2;
   constexpr int kHeadsPerGroup = 8;
-  // kMaxSplitK is shared across assigner / attention / combine / entry — see
-  // decode_dynamic.h for rationale.
   constexpr int kWarpGroupN = 1;
 
   using Tin = cute::float_e4m3_t;
   using Tout = cute::bfloat16_t;
 
-  // ---- gmem tensors for TMA descriptors ----
   auto Q = make_tensor(
       make_gmem_ptr(reinterpret_cast<const Tin *>(q_ptr)),
       make_shape(heads_per_group, num_dim_qk, num_head_k, num_seq_q, num_batch),
@@ -92,9 +82,6 @@ static void launch_qk_persistent_and_combine(
                   num_dim_v * num_head_q * num_seq_q,
                   num_dim_v * num_head_q * num_seq_q * kMaxSplitK));
 
-  // K-scale: kscale_ptr aliases kcache as fp32 — strides are the byte-strides
-  // of kcache divided by sizeof(float). Shape drops the last qk-dim down to
-  // one scale per row chunk.
   constexpr int kScaleByteSize = sizeof(float);
   const int num_scale_per_row = num_dim_qk / kScaleByteSize;
   auto KS = make_tensor(
@@ -103,7 +90,6 @@ static void launch_qk_persistent_and_combine(
       make_stride(kcache_token_stride / kScaleByteSize, Int<1>{},
                   kcache_head_stride / kScaleByteSize, kcache_block_stride / kScaleByteSize));
 
-  // ---- shared-memory layouts ----
   auto slayout_q =
       tile_to_shape(GMMA::Layout_K_SW128_Atom<Tin>{}, make_shape(Int<kTileM>{}, Int<kTileK>{}));
   auto slayout_k = tile_to_shape(GMMA::Layout_K_SW128_Atom<Tin>{},
@@ -122,7 +108,6 @@ static void launch_qk_persistent_and_combine(
       make_layout(make_shape(Int<kTileN / kTileScale>{}, Int<kTileScale>{}, Int<kStage>{}),
                   make_stride(Int<kTileScale>{}, Int<1>{}, Int<kTileN>{}));
 
-  // ---- TMA copy layouts ----
   auto tma_copy_layout_q = tile_to_shape(GMMA::Layout_K_SW128_Atom<Tin>{},
                                          make_shape(Int<kHeadsPerGroup>{}, Int<kTileK>{}));
   auto tma_copy_layout_k =
@@ -144,7 +129,6 @@ static void launch_qk_persistent_and_combine(
   using TiledMmaQK = decltype(make_tiled_mma(qk_mma_atom));
   using TiledMmaSV = decltype(make_tiled_mma(sv_mma_atom));
 
-  // ---- shared-memory size (qkv + ks + blk_ids; epilogue reuses the same region) ----
   constexpr int kWarpsPerWrapGroup = 4;
   int shm_qkv = (cosize(slayout_q) + cosize(slayout_k) + cosize(slayout_vtma) + cosize(slayout_p)) *
                     sizeof(Tin) +
@@ -157,20 +141,14 @@ static void launch_qk_persistent_and_combine(
   constexpr float kLog2e = 1.4426950408889634f;
   float one_over_dk_log2e = 1.f / sqrtf(float(num_dim_qk)) * kLog2e;
 
-  // ---- persistent attention kernel (flat grid) ----
-  // See kvpertensor launcher for rationale.
   int num_sm = get_sm_count();
-  int num_total_ctas = num_sm * kCTAPerSM;
+  int num_total_ctas = num_sm * dynamic::kCtaPerSmMap.at(9)[num_seq_q - 1];
 
   dim3 grid(num_total_ctas);
   dim3 block(size(TiledMmaQK{}) * kWarpGroupN + 32);
 
-  // kHasPScale is a compile-time template parameter — only the selected kernel
-  // variant gets instantiated and registered with cudaFuncSetAttribute. The
-  // runtime dispatch on `p_scale_ptr == nullptr` happens at the entry-point
-  // (smallm_dim128_fp8_qkpertoken_perhead_vperhead_dynamic_async).
   auto kernel =
-      kernels::attention_decode_fp8_dynamic_smallm_qkpertoken_perhead_vperhead_kernel<  // NOLINT
+      kernels::smallm_attention_decode_fp8_qkpertoken_perhead_vperhead_dynamic_splitk_kernel<
           Tin, Tout, kTileM, kTileN, kTileK, kTileV, kHeadsPerGroup, TiledMmaQK, TiledMmaSV,
           decltype(tma_q), decltype(tma_k), decltype(tma_v), decltype(tma_splity), decltype(tma_ks),
           decltype(slayout_q), decltype(slayout_k), decltype(slayout_p), decltype(slayout_s),
@@ -181,7 +159,6 @@ static void launch_qk_persistent_and_combine(
 
   int pad_heads_per_group = ((heads_per_group + 7) / 8) * 8;
 
-  // PDL launch: see kvpertensor launcher for the overlap rationale.
   cudaLaunchConfig_t attn_config;
   memset(&attn_config, 0, sizeof(attn_config));
   attn_config.gridDim = grid;
@@ -208,7 +185,7 @@ static void launch_qk_persistent_and_combine(
   cutlass::FastDivmod hpg_divider(heads_per_group);
 
   auto combine_kernel =
-      kernels::attention_decode_smallm_combine_dynamic_kernel<__nv_bfloat16, kCombineWarps,
+      kernels::attention_decode_dynamic_splitk_combine_kernel<__nv_bfloat16, kCombineWarps,
                                                               kMaxSplitK>;
 
   cudaLaunchConfig_t combine_config;
@@ -226,53 +203,48 @@ static void launch_qk_persistent_and_combine(
   cudaLaunchKernelEx(&combine_config, combine_kernel, reinterpret_cast<__nv_bfloat16 *>(y_ptr),
                      reinterpret_cast<const float *>(splitk_out_ptr),
                      reinterpret_cast<const float *>(lse_ptr), task_map_ptr, num_total_ctas,
-                     num_seq_q, num_head_q, num_head_k, pad_heads_per_group, num_dim_v,
+                     num_batch, num_seq_q, num_head_q, num_head_k, pad_heads_per_group, num_dim_v,
                      hpg_divider);
 }
 
-bool smallm_dim128_fp8_qkpertoken_perhead_vperhead_dynamic_async(
-    void *y_ptr, void *lse_ptr, void *splitk_out_ptr, int *task_map_ptr, const void *q_ptr,
+bool smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_async(
+    void *y_ptr, void *lse_ptr, void *splitk_out_ptr, const int *task_map_ptr, const void *q_ptr,
     void *kcache_ptr, void *vcache_ptr, const int *block_ids_ptr, const int *num_seq_kvcache_ptr,
-    const float *qscale_ptr, const float *kscale_ptr, const float *vscale_ptr, bool new_kv_included,
-    int num_batch, int num_seq_q, int num_head_q, int num_head_k, int num_head_v, int num_dim_qk,
-    int num_dim_v, int num_kvcache_blocks, int block_size, int num_seq_max_blocks,
-    int qscale_pad_stride, int ldY, int ldQ, int64_t kcache_block_stride,
-    int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
-    int64_t vcache_token_stride, int64_t vcache_head_stride, cudaStream_t stream) {
+    const float *qscale_ptr, const float *kscale_ptr, const float *vscale_ptr, int *split_flag_ptr,
+    bool new_kv_included, int splitk, int splitk_min_len, int consumers, int num_batch,
+    int num_seq_q, int num_head_q, int num_head_k, int num_head_v, int num_dim_qk, int num_dim_v,
+    int num_kvcache_blocks, int block_size, int num_seq_max_blocks, int qscale_pad_stride, int ldY,
+    int ldQ, int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
+    int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
+    cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   constexpr int kTileN = 64;
   constexpr int kTileK = 128;
   constexpr int kTileV = 128;
 
-  if (num_dim_qk != kTileK || num_dim_v != kTileV || (block_size != 32 && block_size != 64)) {
-    std::cout << "launch smallm_dim128_fp8_qkpertoken_perhead_vperhead_dynamic_async "
-                 "failed with num_dim_qk: "
-              << num_dim_qk << ", num_dim_v: " << num_dim_v << ", block_size:" << block_size
-              << std::endl;
+  if (num_dim_qk != kTileK || num_dim_v != kTileV || (block_size != 32 && block_size != 64) ||
+      (consumers != 1 && consumers != 2)) {
+    std::cout << "launch launch_attention_decode_bf16_dim128_smallm_fp8 failed with "
+              << "  num_dim_qk: " << num_dim_qk << ", num_dim_v: " << num_dim_v
+              << ", block_size:" << block_size << std::endl;
     return false;
   }
 
   int heads_per_group = num_head_q / num_head_k;
   if (heads_per_group != 8 && heads_per_group != 4) {
-    std::cout << "launch smallm_dim128_fp8_qkpertoken_perhead_vperhead_dynamic_async "
-                 "failed with heads_per_group:"
-              << heads_per_group << ", num_head_q:" << num_head_q << ", num_head_k:" << num_head_k
-              << std::endl;
+    std::cout << "launch launch_attention_decode_bf16_dim128_smallm_fp8 failed with "
+              << " heads_per_group:" << heads_per_group << ", num_head_q:" << num_head_q
+              << ", num_head_k:" << num_head_k << std::endl;
     return false;
   }
 
-  // Caller is expected to have populated `task_map_ptr` via
-  // hpc::attention::assign_attention_decode_task_async (kTileN=128 bucketing).
-  // The persistent kernel re-derives kTileN=64 tile counts at runtime.
-  //
-  // The (num_seq_q, block_size, has_p_scale) triplet is dispatched here so
-  // launch_qk_persistent_and_combine only needs to compile one kernel variant
-  // per instantiation. has_p_scale is decided by `p_scale_ptr == nullptr`.
-  auto launch = [&](auto tilem_tag, auto bs_tag) {
+  auto launch = [&](auto splitk_tag, auto tilem_tag, auto block_size_tag) {
     constexpr int kTileM = decltype(tilem_tag)::value;
-    constexpr int kBlockSize = decltype(bs_tag)::value;
-    launch_qk_persistent_and_combine<kTileM, kTileN, kTileK, kTileV, kBlockSize>(
+    constexpr int kBlockSize = decltype(block_size_tag)::value;
+    constexpr int kSplitK = decltype(splitk_tag)::value;
+    launch_smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_splitk_kernel<
+        kTileM, kTileN, kTileK, kTileV, kBlockSize, kSplitK>(
         y_ptr, splitk_out_ptr, lse_ptr, task_map_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
         qscale_ptr, kscale_ptr, vscale_ptr, num_batch, num_seq_q, num_head_q, num_head_k,
         num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, num_seq_max_blocks,
@@ -280,41 +252,39 @@ bool smallm_dim128_fp8_qkpertoken_perhead_vperhead_dynamic_async(
         vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
   };
 
-  if (num_seq_q == 1) {
+  auto dispatch_block_size = [&](auto splitk_tag, auto tilem_tag) {
     if (block_size == 32) {
-      launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{});
-    } else {
-      launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 64>{});
+      launch(splitk_tag, tilem_tag, std::integral_constant<int, 32>{});
+    } else if (block_size == 64) {
+      launch(splitk_tag, tilem_tag, std::integral_constant<int, 64>{});
     }
-  } else if (num_seq_q == 2) {
-    if (block_size == 32) {
-      launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 32>{});
-    } else {
-      launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 64>{});
+  };
+
+  auto dispatch_mtp = [&](auto splitk_tag) {
+    if (num_seq_q == 1) {
+      dispatch_block_size(splitk_tag, std::integral_constant<int, 8>{});
+    } else if (num_seq_q == 2) {
+      dispatch_block_size(splitk_tag, std::integral_constant<int, 16>{});
+    } else if (num_seq_q == 3) {
+      dispatch_block_size(splitk_tag, std::integral_constant<int, 24>{});
+    } else if (num_seq_q == 4) {
+      dispatch_block_size(splitk_tag, std::integral_constant<int, 32>{});
     }
-  } else if (num_seq_q == 3) {
-    if (block_size == 32) {
-      launch(std::integral_constant<int, 24>{}, std::integral_constant<int, 32>{});
-    } else {
-      launch(std::integral_constant<int, 24>{}, std::integral_constant<int, 64>{});
-    }
-  } else if (num_seq_q == 4) {
-    if (block_size == 32) {
-      launch(std::integral_constant<int, 32>{}, std::integral_constant<int, 32>{});
-    } else {
-      launch(std::integral_constant<int, 32>{}, std::integral_constant<int, 64>{});
-    }
+  };
+
+  if (splitk == 78 * 4) {
+    dispatch_mtp(std::integral_constant<int, 78 * 4>{});
+  } else if (splitk == 78 * 3) {
+    dispatch_mtp(std::integral_constant<int, 78 * 3>{});
+  } else if (splitk == 78 * 2) {
+    dispatch_mtp(std::integral_constant<int, 78 * 2>{});
   } else {
-    std::cout << "smallm_dim128_fp8_qkpertoken_perhead_vperhead_dynamic_async "
-                 "unsupported num_seq_q: "
-              << num_seq_q << std::endl;
-    return false;
+    dispatch_mtp(std::integral_constant<int, 64>{});
   }
 
   return true;
 }
 
-}  // namespace dynamic
 }  // namespace decode
 }  // namespace attention
 }  // namespace hpc

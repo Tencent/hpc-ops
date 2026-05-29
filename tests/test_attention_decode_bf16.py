@@ -96,16 +96,7 @@ except Exception as e:
     gt_attention_func = naive_attn_with_paged_kvcache_func
 
 
-@pytest.mark.parametrize("num_batch", [1, 16, 200])
-@pytest.mark.parametrize("num_seq_q", [1, 2, 3])
-@pytest.mark.parametrize("max_seq_kv", [1024, 4096])
-@pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("kv_head_q_head", [(2, 8), (4, 32)])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("new_kv_included", [True, False])
-@pytest.mark.parametrize("use_output", [True, False])
-@pytest.mark.parametrize("splitk", [True, False])
-def test_attention_decode_bf16(
+def attention_decode_bf16_test_func(
     num_batch,
     num_seq_q,
     max_seq_kv,
@@ -201,3 +192,71 @@ def test_attention_decode_bf16(
     print(my[0, :, :])
 
     assert allclose(gt, my, atol=0.016)
+
+
+@pytest.mark.skipif(True, reason="skip on ci!")
+@pytest.mark.parametrize("num_batch", [1, 16, 200])
+@pytest.mark.parametrize("num_seq_q", [1, 2, 3])
+@pytest.mark.parametrize("max_seq_kv", [1024, 4096])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("kv_head_q_head", [(2, 8), (4, 32)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("new_kv_included", [True, False])
+@pytest.mark.parametrize("use_output", [True, False])
+@pytest.mark.parametrize("splitk", [True, False])
+def test_attn_bf16_sm90(
+    num_batch,
+    num_seq_q,
+    max_seq_kv,
+    block_size,
+    kv_head_q_head,
+    head_dim,
+    new_kv_included,
+    use_output,
+    splitk,
+):
+    attention_decode_bf16_test_func(
+        num_batch,
+        num_seq_q,
+        max_seq_kv,
+        block_size,
+        kv_head_q_head,
+        head_dim,
+        new_kv_included,
+        use_output,
+        splitk,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.get_device_capability()[0] != 9, reason="skip on non sm90!")
+@pytest.mark.parametrize("num_batch", [200])
+@pytest.mark.parametrize("num_seq_q", [3])
+@pytest.mark.parametrize("max_seq_kv", [1024])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("kv_head_q_head", [(2, 8), (4, 32)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("new_kv_included", [False])
+@pytest.mark.parametrize("use_output", [False])
+@pytest.mark.parametrize("splitk", [True])
+def test_attn_bf16_sm90(
+    num_batch,
+    num_seq_q,
+    max_seq_kv,
+    block_size,
+    kv_head_q_head,
+    head_dim,
+    new_kv_included,
+    use_output,
+    splitk,
+):
+    attention_decode_bf16_test_func(
+        num_batch,
+        num_seq_q,
+        max_seq_kv,
+        block_size,
+        kv_head_q_head,
+        head_dim,
+        new_kv_included,
+        use_output,
+        splitk,
+    )
