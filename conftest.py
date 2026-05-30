@@ -153,6 +153,50 @@ def get_checks():
 # to enable memcheck etc.
 
 
+# ---------------------------------------------------------------------------
+# Auto-skip multi-GPU tests when running on a single GPU.
+#
+# Detection: if a test file contains `set_device` (indicating multi-GPU usage),
+# the entire file will be skipped.
+#
+# Control via environment variable SKIP_MULTI_GPU:
+#   export SKIP_MULTI_GPU=0   -> do NOT skip (force run multi-GPU tests)
+#   Any other value or unset  -> skip multi-GPU tests
+# ---------------------------------------------------------------------------
+
+
+def _should_skip_multi_gpu() -> bool:
+    """Determine whether multi-GPU tests should be skipped."""
+    env_val = os.getenv("SKIP_MULTI_GPU")
+    if env_val is not None and env_val.strip() == "0":
+        return False
+    return True
+
+
+def _file_contains_set_device(filepath: str) -> bool:
+    """Check if a test file contains 'set_device' (multi-GPU indicator)."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return "set_device" in f.read()
+    except Exception:
+        return False
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-skip multi-GPU test files based on set_device detection."""
+    if not _should_skip_multi_gpu():
+        return
+
+    skip_marker = pytest.mark.skip(
+        reason="Skipped: multi-GPU test (set_device detected), " "set SKIP_MULTI_GPU=0 to force run"
+    )
+
+    for item in items:
+        test_file = str(item.fspath)
+        if _file_contains_set_device(test_file):
+            item.add_marker(skip_marker)
+
+
 def pytest_configure(config):
     checks = get_checks()
     hooker = TraceHook(checks, "hpc")

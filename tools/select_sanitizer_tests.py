@@ -14,7 +14,7 @@ Pipeline (per Makefile `sanitizer-incremental`):
      failure -> full fallback.
   2. If D hits the (narrow) GLOBAL_IMPACT list -> full fallback.
      GLOBAL_IMPACT still covers: build system (setup.py, CMakeLists.txt),
-     test infra (conftest.py, tests/utils.py), shared C/C++
+     test infra (tests/utils.py), shared C/C++
      (src/C|utils|communicator), and vendored deps (3rd/**).
      Makefile / .ci/** / tools/** are still considered no-impact.
   3. Classify D into (top_src_dirs, direct_tests, touched_hpc_modules).
@@ -88,7 +88,6 @@ GLOBAL_IMPACT_REGEX: List[Tuple[str, re.Pattern]] = [
     (label, re.compile(pat)) for label, pat in [
         ("setup.py",             r"^setup\.py$"),
         ("CMakeLists.txt",       r"^CMakeLists\.txt$"),
-        ("conftest.py",          r"^conftest\.py$"),
         ("tests/utils.py",       r"^tests/utils\.py$"),
         ("src/C/**",             r"^src/C/.*$"),
         ("src/utils/**",         r"^src/utils/.*$"),
