@@ -505,52 +505,80 @@ bool gemm_bf16xfp32_async(void *y_ptr, void *splitk_y_ptr, void *split_flag_ptr,
     }
   };
 
+  auto launch_tile16 = [&](auto wgn_tag) {
+    constexpr int kWGN = decltype(wgn_tag)::value;
+    switch (splitk) {
+      case 8:
+        launch(LaunchCfg<16, 64, 128, 3, kWGN, 8>{});
+        return true;
+      case 4:
+        launch(LaunchCfg<16, 64, 128, 3, kWGN, 4>{});
+        return true;
+      case 2:
+        launch(LaunchCfg<16, 64, 128, 3, kWGN, 2>{});
+        return true;
+      case 1:
+        launch(LaunchCfg<16, 64, 128, 3, kWGN, 1>{});
+        return true;
+      default:
+        return false;
+    }
+  };
+
+  auto launch_tile64_wgn2 = [&]() {
+    launch(LaunchCfg<64, 64, 64, 2, 2, 1>{});
+    return true;
+  };
+
+  auto launch_tile64_wgn1_fixed = [&](auto stage_tag, auto splitk_tag) {
+    constexpr int kStage = decltype(stage_tag)::value;
+    constexpr int kSplitK = decltype(splitk_tag)::value;
+    launch(LaunchCfg<64, 64, 64, kStage, 1, kSplitK>{});
+    return true;
+  };
+
+  auto normalized_m = [&]() {
+    constexpr int kRefN = 192;
+    constexpr int kRefK = 4096;
+    return static_cast<int>((static_cast<long long>(m) * n * kRefK + static_cast<long long>(kRefN) * k - 1) /
+                            (static_cast<long long>(kRefN) * k));
+  };
+
+  auto launch_tile16_by_occupancy = [&](int split_k) {
+    constexpr int kTileM = 16;
+    constexpr int kTileN = 64;
+    constexpr int kWgn2 = 2;
+    constexpr int kTargetTiles = 64;
+    const int tiles_with_wgn2 =
+        ((m + kTileM - 1) / kTileM) * ((n + kTileN * kWgn2 - 1) / (kTileN * kWgn2)) * split_k;
+    if (tiles_with_wgn2 < kTargetTiles) {
+      return launch_tile16(cute::Int<1>{});
+    }
+    return launch_tile16(cute::Int<2>{});
+  };
+
   // config: n = 192
   if (n == 192) {
-    if (m <= 32) {
-      launch(LaunchCfg<16, 64, 128, 3, 2, 8>{});
-    } else if (m <= 48) {
-      launch(LaunchCfg<16, 64, 128, 3, 1, 8>{});
-    } else if (m <= 64) {
-      launch(LaunchCfg<16, 64, 128, 3, 2, 8>{});
-    } else if (m <= 96) {
-      launch(LaunchCfg<16, 64, 128, 3, 1, 4>{});
-    } else if (m <= 144) {
-      launch(LaunchCfg<16, 64, 128, 3, 2, 4>{});
-    } else if (m <= 208) {
-      launch(LaunchCfg<16, 64, 128, 3, 1, 2>{});
-    } else if (m <= 304) {
-      launch(LaunchCfg<16, 64, 128, 3, 2, 2>{});
-    } else if (m <= 416) {
-      launch(LaunchCfg<16, 64, 128, 3, 1, 1>{});
-    } else if (m <= 624) {
-      launch(LaunchCfg<16, 64, 128, 3, 2, 1>{});
-    } else if (m <= 832) {
-      launch(LaunchCfg<64, 64, 64, 3, 1, 2>{});
-    } else if (m <= 1024) {
-      launch(LaunchCfg<16, 64, 128, 3, 2, 1>{});
-    } else if (m <= 2048) {
-      launch(LaunchCfg<64, 64, 64, 5, 1, 4>{});
-    } else {
-      launch(LaunchCfg<64, 64, 64, 3, 1, 1>{});
+    const int norm_m = normalized_m();
+    if (norm_m > 624 && norm_m <= 832) {
+      return launch_tile64_wgn1_fixed(cute::Int<3>{}, cute::Int<2>{});
     }
-    return true;
+    if (norm_m > 1024 && norm_m <= 2048) {
+      return launch_tile64_wgn1_fixed(cute::Int<5>{}, cute::Int<4>{});
+    }
+    if (norm_m > 2048) {
+      return launch_tile64_wgn1_fixed(cute::Int<3>{}, cute::Int<1>{});
+    }
+
+    return launch_tile16_by_occupancy(splitk);
   }
 
   // fallback
   if (m > 128) {
-    launch(LaunchCfg<64, 64, 64, 2, 2, 1>{});
-  } else if (splitk == 8) {
-    launch(LaunchCfg<16, 64, 128, 3, 2, 8>{});
-  } else if (splitk == 4) {
-    launch(LaunchCfg<16, 64, 128, 3, 2, 4>{});
-  } else if (splitk == 2) {
-    launch(LaunchCfg<16, 64, 128, 3, 2, 2>{});
-  } else {
-    launch(LaunchCfg<16, 64, 128, 3, 2, 1>{});
+    return launch_tile64_wgn2();
   }
 
-  return true;
+  return launch_tile16(cute::Int<2>{});
 }
 
 }  // namespace gemm

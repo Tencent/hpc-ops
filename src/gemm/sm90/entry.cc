@@ -16,28 +16,38 @@ struct KernelConfig {
   int kTileM;  // 16 for small-m MMA, 64 for large-m MMA
 };
 
-struct Segment {
-  int m_max;
-  KernelConfig cfg;
-};
+static inline int ceil_div_int(int a, int b) { return (a + b - 1) / b; }
 
-static constexpr std::array<Segment, 13> kN192Segments = {{
-    {32, {8, 2, 16}},
-    {48, {8, 1, 16}},
-    {64, {8, 2, 16}},
-    {96, {4, 1, 16}},
-    {144, {4, 2, 16}},
-    {208, {2, 1, 16}},
-    {304, {2, 2, 16}},
-    {416, {1, 1, 16}},
-    {624, {1, 2, 16}},
-    {832, {2, 1, 64}},
-    {1024, {1, 2, 16}},
-    {2048, {4, 1, 64}},
-    {0x7fffffff, {1, 1, 64}},  // sentinel: catches anything larger
-}};
+static inline int normalized_m(int m, int n, int k) {
+  constexpr int kRefN = 192;
+  constexpr int kRefK = 4096;
+  return static_cast<int>((static_cast<long long>(m) * n * kRefK + static_cast<long long>(kRefN) * k - 1) /
+                          (static_cast<long long>(kRefN) * k));
+}
 
-static inline KernelConfig select_config(int m, int n, bool use_splitk) {
+static inline int select_split_k_by_work(int norm_m) {
+  if (norm_m <= 64) {
+    return 8;
+  }
+  if (norm_m <= 144) {
+    return 4;
+  }
+  if (norm_m <= 304) {
+    return 2;
+  }
+  return 1;
+}
+
+static inline int select_tile16_wgn(int m, int n, int split_k) {
+  constexpr int kTileM = 16;
+  constexpr int kTileN = 64;
+  constexpr int kWgn2 = 2;
+  constexpr int kTargetTiles = 64;
+  const int tiles_with_wgn2 = ceil_div_int(m, kTileM) * ceil_div_int(n, kTileN * kWgn2) * split_k;
+  return tiles_with_wgn2 < kTargetTiles ? 1 : 2;
+}
+
+static inline KernelConfig select_config(int m, int n, int k, bool use_splitk) {
   constexpr int kN192 = 192;
   constexpr int kN512 = 512;
   constexpr int kN1024 = 1024;
@@ -48,18 +58,23 @@ static inline KernelConfig select_config(int m, int n, bool use_splitk) {
   constexpr int kDefaultSk8 = 8;
   constexpr int kDefaultSk4 = 4;
   constexpr int kDefaultSk2 = 2;
-  constexpr int kDefaultSk1 = 1;
   constexpr int kDefaultWgn = 2;
-  constexpr int kDefaultWg1 = 1;
   constexpr int kDefaultKtmForLargeM = 64;
 
   if (n == kN192) {
-    for (const auto &seg : kN192Segments) {
-      if (m <= seg.m_max) {
-        return seg.cfg;
-      }
+    const int norm_m = normalized_m(m, n, k);
+    if (norm_m > 624 && norm_m <= 832) {
+      return {kDefaultSk2, 1, kDefaultKtm64};
     }
-    return {kDefaultSk1, kDefaultWg1, kDefaultKtm64};
+    if (norm_m > 1024 && norm_m <= 2048) {
+      return {kDefaultSk4, 1, kDefaultKtm64};
+    }
+    if (norm_m > 2048) {
+      return {1, 1, kDefaultKtm64};
+    }
+
+    const int split_k = select_split_k_by_work(norm_m);
+    return {split_k, select_tile16_wgn(m, n, split_k), kDefaultKtm16};
   }
 
   // Fallback for n != 192: preserve the original heuristic.
@@ -105,7 +120,7 @@ torch::Tensor gemm_bf16xfp32_entry(const torch::Tensor &x, const torch::Tensor &
     out_dtype = torch::kFloat32;
   }
 
-  KernelConfig cfg = select_config(m, n, use_splitk);
+  KernelConfig cfg = select_config(m, n, k, use_splitk);
 
   torch::Tensor split_y;
   torch::Tensor split_flag_tensor;
