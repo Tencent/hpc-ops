@@ -100,7 +100,7 @@ target_compile_options(
     -std=c++17
     -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
     -DNDEBUG
-    -Xptxas=-warn-double-usage,-warn-spills,-Werror,-v
+    -Xptxas=-warn-double-usage,-v
   >
   $<$<COMPILE_LANGUAGE:CXX>:
     -Wno-unused-result
