@@ -21,8 +21,9 @@ static inline int ceil_div_int(int a, int b) { return (a + b - 1) / b; }
 static inline int normalized_m(int m, int n, int k) {
   constexpr int kRefN = 192;
   constexpr int kRefK = 4096;
-  return static_cast<int>((static_cast<long long>(m) * n * kRefK + static_cast<long long>(kRefN) * k - 1) /
-                          (static_cast<long long>(kRefN) * k));
+  return static_cast<int>(
+      (static_cast<long long>(m) * n * kRefK + static_cast<long long>(kRefN) * k - 1) /
+      (static_cast<long long>(kRefN) * k));
 }
 
 static inline int select_split_k_by_work(int norm_m) {
@@ -48,51 +49,33 @@ static inline int select_tile16_wgn(int m, int n, int split_k) {
 }
 
 static inline KernelConfig select_config(int m, int n, int k, bool use_splitk) {
-  constexpr int kN192 = 192;
-  constexpr int kN512 = 512;
-  constexpr int kN1024 = 1024;
-  constexpr int kN2048 = 2048;
-  constexpr int kMThreshold128 = 128;
-  constexpr int kDefaultKtm64 = 64;
-  constexpr int kDefaultKtm16 = 16;
-  constexpr int kDefaultSk8 = 8;
-  constexpr int kDefaultSk4 = 4;
-  constexpr int kDefaultSk2 = 2;
-  constexpr int kDefaultWgn = 2;
-  constexpr int kDefaultKtmForLargeM = 64;
+  const int norm_m = normalized_m(m, n, k);
 
-  if (n == kN192) {
-    const int norm_m = normalized_m(m, n, k);
-    if (norm_m > 624 && norm_m <= 832) {
-      return {kDefaultSk2, 1, kDefaultKtm64};
-    }
-    if (norm_m > 1024 && norm_m <= 2048) {
-      return {kDefaultSk4, 1, kDefaultKtm64};
-    }
-    if (norm_m > 2048) {
-      return {1, 1, kDefaultKtm64};
-    }
-
-    const int split_k = select_split_k_by_work(norm_m);
-    return {split_k, select_tile16_wgn(m, n, split_k), kDefaultKtm16};
+  if (norm_m > 624 && norm_m <= 832) {
+    return {2, 1, 64};
+  }
+  if (norm_m > 832 && norm_m <= 896) {
+    return {2, 2, 16};
+  }
+  if (norm_m > 1024 && norm_m <= 1088) {
+    return {1, 2, 16};
+  }
+  if (norm_m > 1088 && norm_m <= 1152) {
+    return {4, 1, 64};
+  }
+  if (norm_m > 1152 && norm_m <= 1536) {
+    return {1, 1, 64};
+  }
+  if (norm_m > 1536 && norm_m <= 2048) {
+    return {4, 1, 64};
+  }
+  if (norm_m > 2048) {
+    return {1, 1, 64};
   }
 
-  // Fallback for n != 192: preserve the original heuristic.
-  int sk = 1;
-  if (use_splitk && m <= kMThreshold128) {
-    if (n == kN512) {
-      sk = kDefaultSk8;
-    } else if (n == kN1024) {
-      sk = kDefaultSk4;
-    } else if (n == kN2048) {
-      sk = kDefaultSk2;
-    }
-  }
-
-  int wgn = kDefaultWgn;
-  int ktm = (m > kMThreshold128) ? kDefaultKtmForLargeM : kDefaultKtm16;
-
-  return {sk, wgn, ktm};
+  // kTileM=16 path: select split_k by workload, then wgn by occupancy.
+  const int split_k = select_split_k_by_work(norm_m);
+  return {split_k, select_tile16_wgn(m, n, split_k), 16};
 }
 
 torch::Tensor gemm_bf16xfp32_entry(const torch::Tensor &x, const torch::Tensor &w_high,
@@ -148,9 +131,9 @@ torch::Tensor gemm_bf16xfp32_entry(const torch::Tensor &x, const torch::Tensor &
   const auto *w_low_ptr = w_low.const_data_ptr();
   auto *y_ptr = y.mutable_data_ptr();
 
-  bool running =
-      gemm_bf16xfp32_async(y_ptr, split_y_ptr, split_flag_ptr, x_ptr, w_high_ptr, w_low_ptr, m, n,
-                           k, scale, use_fp32_output, cfg.split_k, stream);
+  bool running = gemm_bf16xfp32_async(y_ptr, split_y_ptr, split_flag_ptr, x_ptr, w_high_ptr,
+                                      w_low_ptr, m, n, k, scale, use_fp32_output, cfg.split_k,
+                                      cfg.kTileM, cfg.k_warpgroup_n, stream);
 
   TORCH_CHECK(running, "gemm_bf16xfp32 launch failed!");
 

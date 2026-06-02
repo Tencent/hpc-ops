@@ -487,7 +487,8 @@ struct LaunchCfg {
 
 bool gemm_bf16xfp32_async(void *y_ptr, void *splitk_y_ptr, void *split_flag_ptr, const void *x_ptr,
                           const void *w_high_ptr, const void *w_low_ptr, int m, int n, int k,
-                          float scale, bool use_fp32_output, int splitk, cudaStream_t stream) {
+                          float scale, bool use_fp32_output, int splitk, int kTileM, int wgn,
+                          cudaStream_t stream) {
   using bf16 = cute::bfloat16_t;
 
   auto launch = [&](auto cfg_tag) {
@@ -525,11 +526,6 @@ bool gemm_bf16xfp32_async(void *y_ptr, void *splitk_y_ptr, void *split_flag_ptr,
     }
   };
 
-  auto launch_tile64_wgn2 = [&]() {
-    launch(LaunchCfg<64, 64, 64, 2, 2, 1>{});
-    return true;
-  };
-
   auto launch_tile64_wgn1_fixed = [&](auto stage_tag, auto splitk_tag) {
     constexpr int kStage = decltype(stage_tag)::value;
     constexpr int kSplitK = decltype(splitk_tag)::value;
@@ -537,47 +533,23 @@ bool gemm_bf16xfp32_async(void *y_ptr, void *splitk_y_ptr, void *split_flag_ptr,
     return true;
   };
 
-  auto normalized_m = [&]() {
-    constexpr int kRefN = 192;
-    constexpr int kRefK = 4096;
-    return static_cast<int>((static_cast<long long>(m) * n * kRefK + static_cast<long long>(kRefN) * k - 1) /
-                            (static_cast<long long>(kRefN) * k));
-  };
-
-  auto launch_tile16_by_occupancy = [&](int split_k) {
-    constexpr int kTileM = 16;
-    constexpr int kTileN = 64;
-    constexpr int kWgn2 = 2;
-    constexpr int kTargetTiles = 64;
-    const int tiles_with_wgn2 =
-        ((m + kTileM - 1) / kTileM) * ((n + kTileN * kWgn2 - 1) / (kTileN * kWgn2)) * split_k;
-    if (tiles_with_wgn2 < kTargetTiles) {
-      return launch_tile16(cute::Int<1>{});
+  // Unified dispatch driven by (kTileM, wgn, splitk) from entry.cc's picker.
+  if (kTileM == 64) {
+    // kTileM=64 path: select kStage based on splitk.
+    switch (splitk) {
+      case 4:
+        return launch_tile64_wgn1_fixed(cute::Int<5>{}, cute::Int<4>{});
+      case 2:
+        return launch_tile64_wgn1_fixed(cute::Int<3>{}, cute::Int<2>{});
+      default:
+        return launch_tile64_wgn1_fixed(cute::Int<3>{}, cute::Int<1>{});
     }
-    return launch_tile16(cute::Int<2>{});
-  };
-
-  // config: n = 192
-  if (n == 192) {
-    const int norm_m = normalized_m();
-    if (norm_m > 624 && norm_m <= 832) {
-      return launch_tile64_wgn1_fixed(cute::Int<3>{}, cute::Int<2>{});
-    }
-    if (norm_m > 1024 && norm_m <= 2048) {
-      return launch_tile64_wgn1_fixed(cute::Int<5>{}, cute::Int<4>{});
-    }
-    if (norm_m > 2048) {
-      return launch_tile64_wgn1_fixed(cute::Int<3>{}, cute::Int<1>{});
-    }
-
-    return launch_tile16_by_occupancy(splitk);
   }
 
-  // fallback
-  if (m > 128) {
-    return launch_tile64_wgn2();
+  // kTileM=16 path: dispatch by wgn.
+  if (wgn == 1) {
+    return launch_tile16(cute::Int<1>{});
   }
-
   return launch_tile16(cute::Int<2>{});
 }
 
