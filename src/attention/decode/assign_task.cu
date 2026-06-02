@@ -80,6 +80,32 @@ __global__ void assign_attention_decode_task_kernel(int* task_map_ptr, const int
     task_map_ptr[1] = num_total_ctas;
   }
 
+  constexpr int kTaskStride = dynamic::kTaskScheduleInfoStride;
+  int num_chunks_entries = max_num_batch * num_head_kv;
+  int max_num_batch_pad_local = (num_chunks_entries + kTaskStride - 1) / kTaskStride * kTaskStride;
+  int num_cta_count_pad_local = (num_total_ctas + kTaskStride - 1) / kTaskStride * kTaskStride;
+  int* chunk_clear_ptr = task_map_ptr + kTaskStride * ((num_tile_per_cta + 1) * num_total_ctas + 1);
+  int* finish_flag_ptr_global = chunk_clear_ptr + max_num_batch_pad_local;
+  int* clear_sentinel_ptr = finish_flag_ptr_global + (num_cta_count_pad_local - 1);
+
+  if (icta == 0) {
+    for (int i = idx; i < num_chunks_entries; i += blockDim.x) {
+      chunk_clear_ptr[i] = 0;
+    }
+    __syncthreads();
+    if (idx == 0) {
+      __threadfence();
+      *clear_sentinel_ptr = 1;
+    }
+  } else {
+    if (idx == 0) {
+      while (load_global_volatile(clear_sentinel_ptr) == 0) {
+      }
+      __threadfence();
+    }
+  }
+  __syncthreads();
+
   if (idx != 0) {
     return;
   }
@@ -134,7 +160,6 @@ __global__ void assign_attention_decode_task_kernel(int* task_map_ptr, const int
     }
   }
 
-  constexpr int kTaskStride = dynamic::kTaskScheduleInfoStride;
   int max_num_batch_with_head = max_num_batch * num_head_kv;
   int max_num_batch_with_head_pad =
       (max_num_batch_with_head + kTaskStride - 1) / kTaskStride * kTaskStride;
@@ -166,9 +191,9 @@ __global__ void assign_attention_decode_task_kernel(int* task_map_ptr, const int
         ibatch = 0;
         ihead_kv++;
       }
-      num_tile = num_tiles[ibatch];
-      if (num_tile == 0) {
-        task_map_chunk_ptr[ibatch] = 0;
+      num_tile = (ihead_kv < num_head_kv) ? num_tiles[ibatch] : 0;
+      if (num_tile == 0 && ihead_kv < num_head_kv) {
+        task_map_chunk_ptr[ihead_kv * num_batch + ibatch] = 0;
       }
       continue;
     }
@@ -228,7 +253,10 @@ __global__ void assign_attention_decode_task_kernel(int* task_map_ptr, const int
         ibatch = 0;
         ihead_kv++;
       }
-      num_tile = num_tiles[ibatch];
+      num_tile = (ihead_kv < num_head_kv) ? num_tiles[ibatch] : 0;
+      if (num_tile == 0 && ihead_kv < num_head_kv) {
+        task_map_chunk_ptr[ihead_kv * num_batch + ibatch] = 0;
+      }
       num_chunks = 0;
       start_tiles = 0;
     }
@@ -291,6 +319,7 @@ __global__ void assign_attention_decode_task_kernel(int* task_map_ptr, const int
     for (int i = 0; i < (num_total_ctas + 3) / 4; i++) {
       store(task_map_sm_finish_ptr + 4 * i, zeros);
     }
+    *clear_sentinel_ptr = 0;
   }
 }
 
