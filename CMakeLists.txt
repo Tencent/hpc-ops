@@ -8,6 +8,9 @@ find_package(CUDAToolkit REQUIRED)
 find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 
 file(GLOB_RECURSE SOURCES "src/*/*.cu" "src/*/*.cc")
+file(GLOB CP_ASYNC_SOURCES "src/fuse_moe/cp_async/*.cu" "src/group_gemm/cp_async/*.cu"
+                           "src/group_gemm/cp_async/*.cc")
+list(APPEND SOURCES ${CP_ASYNC_SOURCES})
 list(FILTER SOURCES EXCLUDE REGEX ".*test.*")
 
 

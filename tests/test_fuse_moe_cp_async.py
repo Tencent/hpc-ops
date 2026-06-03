@@ -1,23 +1,15 @@
 # Copyright (C) 2026 Tencent.
 
-import os
 import sys
+import os
 from pathlib import Path
 
 sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
 
-import math
-from pathlib import Path
-
-import pytest
-import torch
-
 import hpc
+import torch
+import pytest
 from utils import allclose
-
-# Set random seed for reproducibility
-torch.manual_seed(41)
-torch.cuda.manual_seed(41)
 
 
 def naive_gather_expert_inputs(x, topk_ids, num_expert, rank_ep):
@@ -71,13 +63,11 @@ def naive_gather_expert_inputs(x, topk_ids, num_expert, rank_ep):
 
 
 def naive_group_gemm(x, w, cu_seqlens, scale, expert_ids):
-
     m, k = x.shape
     num_group, n, _ = w.shape
 
     y = torch.zeros((m, n), dtype=torch.bfloat16, device=x.device)
 
-    start_idx = 0
     for i in range(num_group):
         start_idx = cu_seqlens[i].item()
         end_idx = cu_seqlens[i + 1].item()
@@ -97,22 +87,23 @@ def naive_group_gemm(x, w, cu_seqlens, scale, expert_ids):
     return y
 
 
-def naive_act_mul_and_quant(gate_up, scale):
-
+def naive_act_mul_and_quant(gate_up, scale, use_bf16_mul):
     def silu(x):
         return x / (1 + (-x).exp())
 
     gate, up = torch.chunk(gate_up.float(), 2, dim=1)
-    out = (silu(gate).to(torch.bfloat16) * up.to(torch.bfloat16)).float() * scale
+    if use_bf16_mul:
+        out = (silu(gate).to(torch.bfloat16) * up.to(torch.bfloat16)).float() * scale
+    else:
+        out = silu(gate) * up * scale
     outfp8 = out.to(torch.float8_e4m3fn)
     return outfp8
 
 
 def naive_reduce(x_bf16, topk_pos, topk_scale, shared_output=None):
     num_seq, num_topk = topk_pos.shape
-    total_num_seq, hidden_size = x_bf16.shape
 
-    y_bf16 = torch.zeros((num_seq, hidden_size), dtype=torch.bfloat16, device=x_bf16.device)
+    y_bf16 = torch.zeros((num_seq, x_bf16.shape[1]), dtype=torch.bfloat16, device=x_bf16.device)
     for i in range(num_seq):
         y_bf16[i] = torch.sum(x_bf16[topk_pos[i]] * topk_scale[i].unsqueeze(1), dim=0)
         if shared_output is not None:
@@ -131,40 +122,39 @@ def naive_fuse_moe_pertensor_fp8(
     topk_ids,
     topk_scale,
     rank_ep,
+    use_bf16_mul,
     shared_output=None,
 ):
     num_expert = gate_up_weight.size(0)
-    # count_and_gather
     gate_up_input, topk_pos, seqlens, cu_seqlens, expert_ids = naive_gather_expert_inputs(
         x, topk_ids, num_expert, rank_ep
     )
 
-    # gate_up_proj
     gate_up_output = naive_group_gemm(
         gate_up_input, gate_up_weight, cu_seqlens, gate_up_scale, expert_ids
     )
 
-    # act_and_mul
-    down_input = naive_act_mul_and_quant(gate_up_output, act_and_mul_scale)
+    down_input = naive_act_mul_and_quant(gate_up_output, act_and_mul_scale, use_bf16_mul)
 
-    # down_proj
     down_output = naive_group_gemm(down_input, down_weight, cu_seqlens, down_scale, expert_ids)
 
-    # reduce
     y = naive_reduce(down_output, topk_pos, topk_scale, shared_output)
 
     return y
 
 
+# hunyuan-v3 TP=8 EP=1 shape: E=192, topk=8, H=4096, I=192 (= 1536/8)
 @pytest.mark.parametrize("num_seq", [128])
 @pytest.mark.parametrize("num_topk", [8])
-@pytest.mark.parametrize("hidden_size", [512])
-@pytest.mark.parametrize("intermediate_size", [512])
-@pytest.mark.parametrize("num_expert", [128])
+@pytest.mark.parametrize("hidden_size", [4096])
+@pytest.mark.parametrize("intermediate_size", [192])
+@pytest.mark.parametrize("num_expert", [192])
 @pytest.mark.parametrize("rank_ep", [0, 1])
 @pytest.mark.parametrize("size_ep", [1, 4, 8])
 @pytest.mark.parametrize("has_shared_output", [False, True])
-def test_fuse_moe_pertensor_fp8(
+@pytest.mark.parametrize("use_output", [False, True])
+@pytest.mark.parametrize("use_bf16_mul", [False, True])
+def test_fuse_moe_cp_async(
     num_seq,
     num_topk,
     hidden_size,
@@ -173,7 +163,10 @@ def test_fuse_moe_pertensor_fp8(
     rank_ep,
     size_ep,
     has_shared_output,
+    use_output,
+    use_bf16_mul,
 ):
+    torch.manual_seed(0)
     dtype = torch.float8_e4m3fn
 
     topk_ids = torch.randint(0, num_expert, (num_seq, num_topk), dtype=torch.int32, device="cuda")
@@ -199,19 +192,39 @@ def test_fuse_moe_pertensor_fp8(
     else:
         shared_output = None
 
-    my = hpc.fuse_moe_pertensor_fp8(
-        x,
-        gate_up_weight,
-        down_weight,
-        gate_up_scale,
-        down_scale,
-        act_and_mul_scale,
-        topk_ids,
-        topk_scale,
-        rank_ep,
-        num_expert // size_ep,
-        shared_output=shared_output,
-    )
+    if use_output:
+        output = torch.empty_like(x, dtype=torch.bfloat16)
+        hpc.fuse_moe(
+            x,
+            gate_up_weight,
+            down_weight,
+            gate_up_scale,
+            down_scale,
+            act_and_mul_scale,
+            topk_ids,
+            topk_scale,
+            rank_ep,
+            num_expert,
+            use_bf16_mul=use_bf16_mul,
+            shared_output=shared_output,
+            output=output,
+        )
+        actual_output = output
+    else:
+        actual_output = hpc.fuse_moe(
+            x,
+            gate_up_weight,
+            down_weight,
+            gate_up_scale,
+            down_scale,
+            act_and_mul_scale,
+            topk_ids,
+            topk_scale,
+            rank_ep,
+            num_expert,
+            use_bf16_mul=use_bf16_mul,
+            shared_output=shared_output,
+        )
     gt = naive_fuse_moe_pertensor_fp8(
         x,
         gate_up_weight,
@@ -222,7 +235,8 @@ def test_fuse_moe_pertensor_fp8(
         topk_ids,
         topk_scale,
         rank_ep,
+        use_bf16_mul,
         shared_output,
     )
 
-    assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.08, atol=0.1)
+    assert allclose(gt.to(torch.float32), actual_output.to(torch.float32), rtol=0.08, atol=0.1)

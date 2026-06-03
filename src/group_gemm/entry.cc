@@ -8,22 +8,28 @@
 #include <tuple>
 
 #include "src/group_gemm/group_gemm.h"
+#include "src/utils/utils.h"
 
 namespace hpc {
 namespace group_gemm {
 
-torch::Tensor group_gemm_pertensor_fp8_entry(const torch::Tensor &x, const torch::Tensor &weight,
-                                             const torch::Tensor &seqlens,
-                                             const torch::Tensor &cu_seqlens,
-                                             const torch::Tensor &y_scale,
-                                             const int64_t num_seq_per_group_avg,
-                                             std::optional<torch::Tensor> output,
-                                             std::optional<torch::Tensor> tma_desc) {
+torch::Tensor group_gemm_fp8_entry(const torch::Tensor &x, const torch::Tensor &weight,
+                                   const torch::Tensor &seqlens, const torch::Tensor &cu_seqlens,
+                                   const torch::Tensor &y_scale,
+                                   const int64_t num_seq_per_group_avg,
+                                   std::optional<torch::Tensor> output,
+                                   std::optional<torch::Tensor> tma_desc,
+                                   std::optional<torch::Tensor> task_map_workspace) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
   TORCH_CHECK(weight.device().is_cuda(), "weight tensor must be cuda");
   TORCH_CHECK(seqlens.device().is_cuda(), "seqlens tensor must be cuda");
   TORCH_CHECK(cu_seqlens.device().is_cuda(), "cu_seqlens tensor must be cuda");
+  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn && weight.dtype() == torch::kFloat8_e4m3fn,
+              "x and weight dtype must be fp8_e4m3");
+  TORCH_CHECK(seqlens.dtype() == torch::kInt32 && cu_seqlens.dtype() == torch::kInt32,
+              "seqlens and cu_seqlens dtype must be int32");
+  TORCH_CHECK(y_scale.dtype() == torch::kFloat32, "y_scale dtype must be float32");
   TORCH_CHECK(x.is_contiguous(), "x tensor a must be contiguous");
   TORCH_CHECK(weight.is_contiguous(), "weight tensor a must be contiguous");
   TORCH_CHECK(seqlens.size(0) == weight.size(0),
@@ -52,6 +58,15 @@ torch::Tensor group_gemm_pertensor_fp8_entry(const torch::Tensor &x, const torch
     tmas = torch::empty({num_group * 2, 128}, options);
   }
 
+  int num_waves = 0;
+  torch::Tensor task_map;
+  void *task_map_ptr = nullptr;
+
+  if (num_seq_per_group_avg <= 8 && update_tma && task_map_workspace.has_value()) {
+    num_waves = task_map_workspace.value().size(0);
+    task_map_ptr = task_map_workspace.value().mutable_data_ptr();
+  }
+
   torch::Tensor tiles = torch::empty({num_group}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({num_group + 1}, options.dtype(torch::kInt32));
 
@@ -66,9 +81,9 @@ torch::Tensor group_gemm_pertensor_fp8_entry(const torch::Tensor &x, const torch
   auto *tiles_ptr = tiles.mutable_data_ptr();
   auto *cu_tiles_ptr = cu_tiles.mutable_data_ptr();
 
-  group_gemm_pertensor_fp8_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, yscale_ptr,
-                                 tmas_ptr, tiles_ptr, cu_tiles_ptr, num_group, m, n, k,
-                                 num_seq_per_group_avg, update_tma, stream);
+  group_gemm_fp8_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, yscale_ptr, tmas_ptr,
+                       tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k,
+                       num_seq_per_group_avg, update_tma, false, stream);
 
   return y;
 }
@@ -77,7 +92,7 @@ torch::Tensor group_gemm_blockwise_fp8_entry(
     const torch::Tensor &x, const torch::Tensor &weight, const torch::Tensor &seqlens,
     const torch::Tensor &cu_seqlens, const torch::Tensor &x_scale, const torch::Tensor &w_scale,
     const int64_t num_seq_per_group_avg, std::optional<torch::Tensor> output,
-    std::optional<torch::Tensor> tma_desc) {
+    std::optional<torch::Tensor> tma_desc, std::optional<torch::Tensor> task_map_workspace) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
   TORCH_CHECK(weight.device().is_cuda(), "weight tensor must be cuda");
@@ -85,6 +100,12 @@ torch::Tensor group_gemm_blockwise_fp8_entry(
   TORCH_CHECK(cu_seqlens.device().is_cuda(), "cu_seqlens tensor must be cuda");
   TORCH_CHECK(x.is_contiguous(), "x tensor a must be contiguous");
   TORCH_CHECK(weight.is_contiguous(), "weight tensor a must be contiguous");
+  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn && weight.dtype() == torch::kFloat8_e4m3fn,
+              "x and weight dtype must be fp8_e4m3");
+  TORCH_CHECK(seqlens.dtype() == torch::kInt32 && cu_seqlens.dtype() == torch::kInt32,
+              "seqlens and cu_seqlens dtype must be int32");
+  TORCH_CHECK(x_scale.dtype() == torch::kFloat32 && w_scale.dtype() == torch::kFloat32,
+              "x_scale and w_scale dtype must be float32");
   TORCH_CHECK(seqlens.size(0) == weight.size(0),
               "seqlens and weight must share the same num_group");
   TORCH_CHECK(x.size(1) == weight.size(2), "x and weight must share the same k");
@@ -114,6 +135,15 @@ torch::Tensor group_gemm_blockwise_fp8_entry(
     tmas = torch::empty({num_group * 2, 128}, options);
   }
 
+  int num_waves = 0;
+  torch::Tensor task_map;
+  void *task_map_ptr = nullptr;
+
+  if (num_seq_per_group_avg <= 8 && update_tma && task_map_workspace.has_value()) {
+    num_waves = task_map_workspace.value().size(0);
+    task_map_ptr = task_map_workspace.value().mutable_data_ptr();
+  }
+
   torch::Tensor tiles = torch::empty({num_group}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({num_group + 1}, options.dtype(torch::kInt32));
 
@@ -130,9 +160,9 @@ torch::Tensor group_gemm_blockwise_fp8_entry(
   auto *cu_tiles_ptr = cu_tiles.mutable_data_ptr();
 
   group_gemm_blockwise_fp8_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr,
-                                 wscale_ptr, tmas_ptr, tiles_ptr, cu_tiles_ptr, num_group, m, n, k,
-                                 m_pad, num_block_k_pad4, num_seq_per_group_avg, update_tma,
-                                 stream);
+                                 wscale_ptr, tmas_ptr, tiles_ptr, cu_tiles_ptr, task_map_ptr,
+                                 num_waves, num_group, m, n, k, m_pad, num_block_k_pad4,
+                                 num_seq_per_group_avg, update_tma, false, stream);
 
   return y;
 }
@@ -151,22 +181,26 @@ torch::Tensor reformat_x_scale_entry(const torch::Tensor &x_scale, const torch::
 
   int m = x_scale.size(0);
   int n = x_scale.size(1);
-  TORCH_CHECK(n == 16 || n == 32, "n must be 16 or 32(for dsv4 group gemm k=2048 or 4096)");
+  TORCH_CHECK(n == 16 || n == 32 || n == 56,
+              "n must be 16, 32 or 56(for group gemm k=2048, k=4096 or k=7168)");
 
   int num_group = seqlens.size(0);
   int tilem = 0;
-  // careful!!! here logit must be corresponds with group_gemm_blockwise_fp8_async
-  if (num_seq_per_group_avg <= 16) {
+  if (num_seq_per_group_avg <= 8) {
+    tilem = 8;
+  } else if (num_seq_per_group_avg <= 16) {
     tilem = 16;
   } else if (num_seq_per_group_avg <= 32) {
     tilem = 32;
+  } else if (num_seq_per_group_avg <= 48) {
+    tilem = 48;
   } else {
     tilem = 64;
   }
   int num_seq_pad_per_group = m / num_group;
   TORCH_CHECK(num_seq_pad_per_group % tilem == 0,
               "The sparse pad length of x_scale for each group must be aligned to multiple of "
-              "16/32/64 according to num_seq_per_group_avg");
+              "8/16/32/48/64 according to num_seq_per_group_avg");
 
   torch::Tensor output;
   if (out_x_scale.has_value()) {
@@ -191,16 +225,22 @@ torch::Tensor reformat_x_scale_entry(const torch::Tensor &x_scale, const torch::
 
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
+      "group_gemm_fp8(Tensor x, Tensor weight, Tensor seqlens, Tensor cu_seqlens, Tensor y_scale, "
+      "int num_seq_per_group_avg, Tensor? output, Tensor? tma_desc, Tensor? task_map_workspace) -> "
+      "(Tensor)");
+  m.impl("group_gemm_fp8", torch::kCUDA, &hpc::group_gemm::group_gemm_fp8_entry);
+
+  m.def(
       "group_gemm_pertensor_fp8(Tensor x, Tensor weight, Tensor seqlens, Tensor cu_seqlens, Tensor "
-      "y_scale, "
-      "int num_seq_per_group_avg, Tensor? output, Tensor? tma_desc) -> (Tensor)");
-  m.impl("group_gemm_pertensor_fp8", torch::kCUDA,
-         &hpc::group_gemm::group_gemm_pertensor_fp8_entry);
+      "y_scale, int num_seq_per_group_avg, Tensor? output, Tensor? tma_desc, Tensor? "
+      "task_map_workspace) -> (Tensor)");
+  m.impl("group_gemm_pertensor_fp8", torch::kCUDA, &hpc::group_gemm::group_gemm_fp8_entry);
 
   m.def(
       "group_gemm_blockwise_fp8(Tensor x, Tensor weight, Tensor seqlens, Tensor cu_seqlens, Tensor "
       "xscale, Tensor wscale,"
-      "int num_seq_per_group_avg, Tensor? output, Tensor? tma_desc) -> (Tensor)");
+      "int num_seq_per_group_avg, Tensor? output, Tensor? tma_desc, Tensor? task_map_workspace) -> "
+      "(Tensor)");
   m.impl("group_gemm_blockwise_fp8", torch::kCUDA,
          &hpc::group_gemm::group_gemm_blockwise_fp8_entry);
 
