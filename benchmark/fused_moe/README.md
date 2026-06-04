@@ -1,6 +1,6 @@
 # FusedMoE Benchmark
 
-This directory contains a per-tensor FP8 FusedMoE benchmark for HPC-Ops,
+This directory contains a blockwise FP8 FusedMoE benchmark for HPC-Ops,
 vLLM Triton, vLLM CUTLASS, and SGLang.
 
 ## Requirements
@@ -22,7 +22,7 @@ export SGLANG_ROOT=/path/to/sglang
 Run TP mode:
 
 ```bash
-python3 bench.py \
+python3 benchmark_fuse_moe.py \
   --tp 8 --ep 1 \
   --gpu 0 \
   --backends hpcops vllm vllm_cutlass sglang
@@ -31,7 +31,7 @@ python3 bench.py \
 Run EP mode:
 
 ```bash
-python3 bench.py \
+python3 benchmark_fuse_moe.py \
   --tp 1 --ep 8 \
   --gpu 0 \
   --backends hpcops vllm vllm_cutlass sglang
@@ -40,7 +40,7 @@ python3 bench.py \
 Run a smaller smoke test:
 
 ```bash
-python3 bench.py \
+python3 benchmark_fuse_moe.py \
   --tp 8 --ep 1 \
   --models qwen3-235b \
   --bs 16 32 \
@@ -51,7 +51,7 @@ python3 bench.py \
 By default, outputs are written under `./log/<tag>/`. Override this with:
 
 ```bash
-python3 bench.py --output-dir /path/to/output ...
+python3 benchmark_fuse_moe.py --output-dir /path/to/output ...
 ```
 
 ## Defaults

@@ -48,16 +48,16 @@ ALL_BACKENDS = [
 ]
 
 DISPLAY = {
-    "hpcops":       "hpc-ops",
+    "hpcops":       "HPC-Ops",
     "sglang":       "SGLang",
-    "vllm":         "vLLM-Triton",
-    "vllm_cutlass": "vLLM-CUTLASS",
+    "vllm":         "vLLM Triton",
+    "vllm_cutlass": "vLLM CUTLASS",
 }
 
 BS_TP = [4, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 BS_EP = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
-DEFAULT_MODELS = ["hunyuan-v3", "deepseek-v3", "qwen3-235b"]
+DEFAULT_MODELS = ["qwen3-235b", "hunyuan-v3", "deepseek-v3"]
 
 
 # ---------------------------------------------------------------------------
