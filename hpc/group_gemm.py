@@ -342,3 +342,210 @@ def group_gemm_blockwise_fp8_fake(
     task_map_workspace,
 ):
     return torch.empty((x.shape[0], weight.shape[1]), dtype=torch.bfloat16)
+
+
+def prepack_mxfp8_scale(
+    sfx: Optional[Tensor],
+    sfw: Optional[Tensor],
+    cu_seqlens: Optional[Tensor],
+    num_seq_per_group_avg: int,
+) -> Tuple[Tensor, Tensor]:
+    """Prepack raw MXFP8 block scales (UE8M0) into the UTCCP-friendly layout
+    consumed by ``group_gemm_mxfp8``.
+
+    Either ``sfx`` or ``sfw`` (or both) may be None to skip that side's prepack:
+      - Pass ``sfw=None`` to only prepack SFX (online, every forward pass).
+      - Pass ``sfx=None, cu_seqlens=None`` to only prepack SFW (offline, once at
+        model load).
+      - Pass both to prepack everything (legacy usage, backward compatible).
+
+    The skipped side returns an empty tensor (numel=0).
+
+    Args:
+        sfx: Raw input-side scale, uint8 (UE8M0 raw bits), or None to skip.
+            Shape: [m_total, k // 32]
+        sfw: Raw weight-side scale, uint8 (UE8M0 raw bits), or None to skip.
+            Shape: [num_group, n, k // 32]
+        cu_seqlens: Cumulative seqlens, int32, shape [num_group + 1].
+            Required when sfx is provided; can be None when only prepacking SFW.
+        num_seq_per_group_avg: Average seq per group, used to derive kTileM
+            and the worst-case SFX buffer size.
+
+    Returns:
+        sfx_packed: Prepacked SFX, uint8 (1-D buffer), or empty if sfx is None.
+        sfw_packed: Prepacked SFW, uint8 (1-D buffer), or empty if sfw is None.
+    """
+    return torch.ops.hpc.prepack_mxfp8_scale(sfx, sfw, cu_seqlens, num_seq_per_group_avg)
+
+
+def group_gemm_mxfp8(
+    x: Tensor,
+    weight: Tensor,
+    sfx_packed: Tensor,
+    sfw_packed: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    num_seq_per_group_avg: int,
+    output: Optional[Tensor] = None,
+    tma_desc: Optional[Tensor] = None,
+) -> Tensor:
+    """MXFP8 (block-scaled FP8) group GEMM.
+
+    Use ``prepack_mxfp8_scale`` first to obtain prepacked SFX/SFW.
+
+    Args:
+        x: Input activation, fp8_e4m3, shape [m_total, k]
+        weight: Weight tensor, fp8_e4m3, shape [num_group, n, k]
+        sfx_packed: Prepacked input-side SF (uint8 buffer from ``prepack_mxfp8_scale``)
+        sfw_packed: Prepacked weight-side SF (uint8 buffer from ``prepack_mxfp8_scale``)
+        seqlens: Per-group sequence lengths, int32, shape [num_group]
+        cu_seqlens: Cumulative seqlens, int32, shape [num_group + 1]
+        num_seq_per_group_avg: Used to dispatch kTileM (must match the value passed
+            to ``prepack_mxfp8_scale``).
+        output: Optional output tensor, bf16, shape [m_total, n]
+        tma_desc: Optional TMA descriptor workspace, shape [num_group * 2, 128]
+
+    Returns:
+        y: Output tensor, bf16, shape [m_total, n]
+    """
+    return torch.ops.hpc.group_gemm_mxfp8(
+        x,
+        weight,
+        sfx_packed,
+        sfw_packed,
+        seqlens,
+        cu_seqlens,
+        num_seq_per_group_avg,
+        output,
+        tma_desc,
+    )
+
+
+def group_gemm_cp_async_mxfp8(
+    x: Tensor,
+    weight: Tensor,
+    sfx_packed: Tensor,
+    sfw_packed: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    num_seq_per_group_avg: int,
+    x_row_map: Optional[Tensor] = None,
+    output: Optional[Tensor] = None,
+    tma_desc: Optional[Tensor] = None,
+) -> Tensor:
+    """MXFP8 group GEMM where A (activation) is loaded via cp.async + row_map
+    indirection. When ``x_row_map`` is provided, ``x`` is treated as the raw
+    un-permuted source — the kernel gathers per-row on-the-fly. This lets
+    fuse_moe skip the physical gather kernel.
+
+    SFA/SFW still use TMA + offline-prepacked layout (use ``prepack_mxfp8_scale``
+    to produce them).
+
+    Args:
+        x: fp8_e4m3 activation. Shape is either [m_total, k] (no row_map) or
+           [num_orig_rows, k] (with row_map; gathered logically to [m_total, k]).
+        weight: fp8_e4m3 weight, [num_group, n, k]
+        sfx_packed/sfw_packed: prepacked SF (use ``prepack_mxfp8_scale``)
+        seqlens / cu_seqlens: per-group counters (post-permutation)
+        num_seq_per_group_avg: dispatch hint
+        x_row_map: optional int32 [m_total] inverse permutation (post-row → src-row)
+        output, tma_desc: optional reusable buffers
+
+    Returns:
+        bf16 [m_total, n]
+    """
+    x_num_rows = x.shape[0] if x_row_map is None else x_row_map.shape[0]
+    return torch.ops.hpc.group_gemm_cp_async_mxfp8(
+        x,
+        weight,
+        sfx_packed,
+        sfw_packed,
+        seqlens,
+        cu_seqlens,
+        num_seq_per_group_avg,
+        x_row_map,
+        x.shape[0],
+        output,
+        tma_desc,
+    )
+
+
+@torch.library.register_fake("hpc::group_gemm_cp_async_mxfp8")
+def group_gemm_cp_async_mxfp8_fake(
+    x,
+    weight,
+    sfx_packed,
+    sfw_packed,
+    seqlens,
+    cu_seqlens,
+    num_seq_per_group_avg,
+    x_row_map,
+    x_num_rows,
+    output,
+    tma_desc,
+):
+    if x_row_map is not None:
+        m_total = x_row_map.shape[0]
+    else:
+        m_total = x.shape[0]
+    n = weight.shape[1]
+    return torch.empty((m_total, n), dtype=torch.bfloat16, device=x.device)
+
+
+@torch.library.register_fake("hpc::prepack_mxfp8_scale")
+def prepack_mxfp8_scale_fake(sfx, sfw, cu_seqlens, num_seq_per_group_avg):
+    # Derive k_sf and num_group from whichever tensor is present
+    k_sf = 0
+    num_group = 0
+    n = 0
+    m_total = 0
+
+    if sfw is not None:
+        num_group = sfw.shape[0]
+        n = sfw.shape[1]
+        k_sf = sfw.shape[2]
+    if sfx is not None:
+        m_total = sfx.shape[0]
+        if k_sf == 0:
+            k_sf = sfx.shape[1]
+        if num_group == 0 and cu_seqlens is not None:
+            num_group = cu_seqlens.shape[0] - 1
+
+    # mirror LAUNCH_MXFP8 dispatch table in group_gemm_mxfp8_async
+    kTileM = 256
+    for ktm in (8, 16, 32, 48, 64, 96, 128, 160, 192, 224):
+        if num_seq_per_group_avg <= ktm:
+            kTileM = ktm
+            break
+    kSFAlignM = 128 if kTileM <= 128 else 256
+
+    # SFX output
+    if sfx is not None:
+        sfx_max_tiles = m_total // kTileM + num_group
+        sfx_padded_max = sfx_max_tiles * kSFAlignM
+        sfx_out = torch.empty(sfx_padded_max * k_sf, dtype=torch.uint8)
+    else:
+        sfx_out = torch.empty(0, dtype=torch.uint8)
+
+    # SFW output
+    if sfw is not None:
+        sfw_out = torch.empty(num_group * n * k_sf, dtype=torch.uint8)
+    else:
+        sfw_out = torch.empty(0, dtype=torch.uint8)
+
+    return (sfx_out, sfw_out)
+
+
+@torch.library.register_fake("hpc::group_gemm_mxfp8")
+def group_gemm_mxfp8_fake(
+    x,
+    weight,
+    sfx_packed,
+    sfw_packed,
+    seqlens,
+    cu_seqlens,
+    num_seq_per_group_avg,
+    output,
+    tma_desc,
+):
+    return torch.empty((x.shape[0], weight.shape[1]), dtype=torch.bfloat16)

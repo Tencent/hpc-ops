@@ -559,3 +559,53 @@ def fuse_moe_cp_async(
         use_bf16_mul,
         output,
     )
+
+
+def fuse_moe_mxfp8(
+    x: Tensor,
+    x_scale: Tensor,
+    gate_up_weight: Tensor,
+    gate_up_weight_scale_packed: Tensor,
+    down_weight: Tensor,
+    down_weight_scale_packed: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    rank_ep: int,
+    num_expert_total: int,
+    shared_output: Tensor = None,
+    output: Tensor = None,
+) -> Tensor:
+    """MXFP8 fused MoE forward.
+
+    Args:
+        x: Input activation, fp8_e4m3, [num_seq, hidden]
+        x_scale: Per-32K UE8M0 scale, uint8, [num_seq, hidden//32]
+        gate_up_weight: fp8_e4m3, [num_expert_local, intermediate, hidden]
+        gate_up_weight_scale_packed: uint8, prepacked SFW (1-D buffer)
+        down_weight: fp8_e4m3, [num_expert_local, hidden, intermediate//2]
+        down_weight_scale_packed: uint8, prepacked SFW (1-D buffer)
+        topk_ids: int32, [num_seq, num_topk] (GLOBAL expert ids; out-of-rank ids
+            are filtered)
+        topk_scale: float32, [num_seq, num_topk]
+        rank_ep: int — this rank within the EP group
+        num_expert_total: int — total experts across all EP ranks
+        shared_output: optional bf16, [num_seq, hidden] (added before topk reduce)
+        output: optional bf16, [num_seq, hidden]
+
+    Returns:
+        bf16 tensor [num_seq, hidden]
+    """
+    return torch.ops.hpc.fuse_moe_mxfp8(
+        x,
+        x_scale,
+        gate_up_weight,
+        gate_up_weight_scale_packed,
+        down_weight,
+        down_weight_scale_packed,
+        topk_ids,
+        topk_scale,
+        shared_output,
+        rank_ep,
+        num_expert_total,
+        output,
+    )

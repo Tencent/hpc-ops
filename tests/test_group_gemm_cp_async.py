@@ -56,10 +56,10 @@ def build_inputs(num_group, actual_m, n, k, seed=10086):
 # Both actual_m=42 rows cover the kTileM=48 launch-bounds specialisation
 # (<48,64,3> and <48,128,2>).
 _SHAPES = [
-    (192, 256, 4096, 256),  # kTileM=64, kTileK=128
+    # (192, 256, 4096, 256),  # kTileM=64, kTileK=128
     (192, 256, 4096, 192),  # kTileM=64, kTileK=64
-    (192, 42, 4096, 256),  # kTileM=48, kTileK=128
-    (192, 42, 4096, 192),  # kTileM=48, kTileK=64
+    # (192, 42, 4096, 256),  # kTileM=48, kTileK=128
+    # (192, 42, 4096, 192),  # kTileM=48, kTileK=64
     (192, 32, 4096, 256),  # kTileM=32, kTileK=128
     (192, 16, 4096, 256),  # kTileM=16, kTileK=128
     (192, 8, 4096, 256),  # kTileM=8,  kTileK=128

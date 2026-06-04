@@ -305,6 +305,38 @@ torch::Tensor group_gemm_groupwise_w4a8_mma_entry(const torch::Tensor &x,
   return y;
 }
 
+[[noreturn]] static void unsupported_on_sm90(const char *op_name) {
+  TORCH_CHECK(false, op_name,
+              " is not supported on sm90 (Hopper). It is only available on sm100 (Blackwell).");
+}
+
+std::tuple<torch::Tensor, torch::Tensor> prepack_mxfp8_scale_entry(
+    const std::optional<torch::Tensor> & /*sfx*/, const std::optional<torch::Tensor> & /*sfw*/,
+    const std::optional<torch::Tensor> & /*cu_seqlens*/, const int64_t /*num_seq_per_group_avg*/) {
+  unsupported_on_sm90("prepack_mxfp8_scale");
+}
+
+torch::Tensor group_gemm_mxfp8_entry(const torch::Tensor & /*x*/, const torch::Tensor & /*weight*/,
+                                     const torch::Tensor & /*sfx_packed*/,
+                                     const torch::Tensor & /*sfw_packed*/,
+                                     const torch::Tensor & /*seqlens*/,
+                                     const torch::Tensor & /*cu_seqlens*/,
+                                     const int64_t /*num_seq_per_group_avg*/,
+                                     std::optional<torch::Tensor> /*output*/,
+                                     std::optional<torch::Tensor> /*tma_desc*/) {
+  unsupported_on_sm90("group_gemm_mxfp8");
+}
+
+torch::Tensor group_gemm_cp_async_mxfp8_entry(
+    const torch::Tensor & /*x*/, const torch::Tensor & /*weight*/,
+    const torch::Tensor & /*sfx_packed*/, const torch::Tensor & /*sfw_packed*/,
+    const torch::Tensor & /*seqlens*/, const torch::Tensor & /*cu_seqlens*/,
+    const int64_t /*num_seq_per_group_avg*/, std::optional<torch::Tensor> /*x_row_map*/,
+    const int64_t /*x_num_rows*/, std::optional<torch::Tensor> /*output*/,
+    std::optional<torch::Tensor> /*tma_desc*/) {
+  unsupported_on_sm90("group_gemm_cp_async_mxfp8");
+}
+
 }  // namespace group_gemm
 }  // namespace hpc
 
@@ -333,4 +365,25 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "Tensor y_scales, int group_size, Tensor? output) -> (Tensor)");
   m.impl("group_gemm_groupwise_w4a8_mma", torch::kCUDA,
          &hpc::group_gemm::group_gemm_groupwise_w4a8_mma_entry);
+
+  // MXFP8 schema stubs — sm100-only ops, registered here so python-side
+  // register_fake calls succeed on sm90. The CUDA impls TORCH_CHECK(false).
+  m.def(
+      "prepack_mxfp8_scale(Tensor? sfx, Tensor? sfw, Tensor? cu_seqlens, "
+      "int num_seq_per_group_avg) "
+      "-> (Tensor, Tensor)");
+  m.impl("prepack_mxfp8_scale", torch::kCUDA, &hpc::group_gemm::prepack_mxfp8_scale_entry);
+
+  m.def(
+      "group_gemm_mxfp8(Tensor x, Tensor weight, Tensor sfx_packed, Tensor sfw_packed, "
+      "Tensor seqlens, Tensor cu_seqlens, int num_seq_per_group_avg, "
+      "Tensor? output, Tensor? tma_desc) -> (Tensor)");
+  m.impl("group_gemm_mxfp8", torch::kCUDA, &hpc::group_gemm::group_gemm_mxfp8_entry);
+
+  m.def(
+      "group_gemm_cp_async_mxfp8(Tensor x, Tensor weight, Tensor sfx_packed, Tensor sfw_packed, "
+      "Tensor seqlens, Tensor cu_seqlens, int num_seq_per_group_avg, "
+      "Tensor? x_row_map, int x_num_rows, Tensor? output, Tensor? tma_desc) -> (Tensor)");
+  m.impl("group_gemm_cp_async_mxfp8", torch::kCUDA,
+         &hpc::group_gemm::group_gemm_cp_async_mxfp8_entry);
 }

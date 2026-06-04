@@ -58,7 +58,6 @@ torch::Tensor group_gemm_fp8_entry(const torch::Tensor &x, const torch::Tensor &
     tmas = torch::empty({num_group * 2, 128}, options);
   }
 
-  int num_sm = get_sm_count();
   int num_waves = 0;
   torch::Tensor task_map;
   void *task_map_ptr = nullptr;
@@ -82,10 +81,9 @@ torch::Tensor group_gemm_fp8_entry(const torch::Tensor &x, const torch::Tensor &
   auto *tiles_ptr = tiles.mutable_data_ptr();
   auto *cu_tiles_ptr = cu_tiles.mutable_data_ptr();
 
-  group_gemm_cp_async_fp8_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, yscale_ptr,
-                                tmas_ptr, tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves,
-                                num_group, m, n, k, num_seq_per_group_avg, update_tma, false,
-                                stream);
+  group_gemm_fp8_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr, yscale_ptr, tmas_ptr,
+                       tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k,
+                       num_seq_per_group_avg, update_tma, false, stream);
 
   return y;
 }
@@ -137,7 +135,6 @@ torch::Tensor group_gemm_blockwise_fp8_entry(
     tmas = torch::empty({num_group * 2, 128}, options);
   }
 
-  int num_sm = get_sm_count();
   int num_waves = 0;
   torch::Tensor task_map;
   void *task_map_ptr = nullptr;
@@ -233,6 +230,231 @@ torch::Tensor group_gemm_groupwise_w4a8_mma_entry(const torch::Tensor &x,
   return torch::empty({x.size(0), weight.size(1)}, x.options().dtype(torch::kBFloat16));
 }
 
+std::tuple<torch::Tensor, torch::Tensor> prepack_mxfp8_scale_entry(
+    const std::optional<torch::Tensor> &sfx, const std::optional<torch::Tensor> &sfw,
+    const std::optional<torch::Tensor> &cu_seqlens, const int64_t num_seq_per_group_avg) {
+  TORCH_CHECK(sfx.has_value() || sfw.has_value(), "at least one of sfx/sfw must be provided");
+
+  // Derive common parameters from whichever tensor is present.
+  constexpr int kSfVec = 32;
+  int k_sf = 0;
+  int num_group = 0;
+  int n = 0;
+  int m_total = 0;
+  torch::Device device = torch::kCUDA;
+
+  if (sfw.has_value()) {
+    TORCH_CHECK(sfw->device().is_cuda(), "sfw must be cuda");
+    TORCH_CHECK(sfw->dtype() == torch::kUInt8, "sfw dtype must be uint8 (UE8M0 raw bits)");
+    TORCH_CHECK(sfw->is_contiguous(), "sfw must be contiguous");
+    TORCH_CHECK(sfw->dim() == 3, "sfw must be (num_group, n, k/kSfVec)");
+    num_group = static_cast<int>(sfw->size(0));
+    n = static_cast<int>(sfw->size(1));
+    k_sf = static_cast<int>(sfw->size(2));
+    TORCH_CHECK(n % 128 == 0, "n must be multiple of 128");
+    device = sfw->device();
+  }
+
+  if (sfx.has_value()) {
+    TORCH_CHECK(sfx->device().is_cuda(), "sfx must be cuda");
+    TORCH_CHECK(sfx->dtype() == torch::kUInt8, "sfx dtype must be uint8 (UE8M0 raw bits)");
+    TORCH_CHECK(sfx->is_contiguous(), "sfx must be contiguous");
+    TORCH_CHECK(sfx->dim() == 2, "sfx must be (m_total, k/kSfVec)");
+    TORCH_CHECK(cu_seqlens.has_value(), "cu_seqlens is required when sfx is provided");
+    TORCH_CHECK(cu_seqlens->dtype() == torch::kInt32, "cu_seqlens dtype must be int32");
+    m_total = static_cast<int>(sfx->size(0));
+    if (k_sf == 0) {
+      k_sf = static_cast<int>(sfx->size(1));
+    } else {
+      TORCH_CHECK(sfx->size(1) == k_sf, "sfx/sfw k_sf mismatch");
+    }
+    if (num_group == 0) {
+      num_group = static_cast<int>(cu_seqlens->numel()) - 1;
+    }
+    TORCH_CHECK(cu_seqlens->numel() == num_group + 1, "cu_seqlens must have num_group+1 elements");
+    device = sfx->device();
+  }
+
+  TORCH_CHECK(k_sf > 0, "k_sf must be > 0");
+  int k = k_sf * kSfVec;
+  TORCH_CHECK(k % 32 == 0, "k must be multiple of 32 (SF_VEC)");
+
+  // For kTileM dispatch, we need n. When only sfx is provided, n is unknown;
+  // use 128 (1SM path) as default since the caller knows is_2sm from context.
+  int n_for_dispatch = (n > 0) ? n : 128;
+  int kTileM = mxfp8_dispatch_kTileM(static_cast<int>(num_seq_per_group_avg), n_for_dispatch);
+  bool is_smallm = (kTileM <= 128);
+  int kSFAlignM = is_smallm ? 128 : 256;
+  bool is_2sm = (n % 256 == 0) && (kTileM > 32) && (n > 0);
+
+  auto stream = at::cuda::getCurrentCUDAStream(device.index());
+  auto u8_opts = torch::dtype(torch::kUInt8).device(device);
+  int64_t k_sf_padded = static_cast<int64_t>((k_sf + 3) / 4) * 4;
+
+  // Allocate and prepack SFX (if provided)
+  torch::Tensor sfx_packed;
+  if (sfx.has_value()) {
+    int sfx_max_tiles = m_total / kTileM + num_group;
+    int64_t sfx_padded_max = static_cast<int64_t>(sfx_max_tiles) * kSFAlignM;
+    int64_t sfx_buf_sz = sfx_padded_max * k_sf_padded;
+    sfx_packed = torch::empty({sfx_buf_sz}, u8_opts);
+    prepack_mxfp8_x_scale_async(sfx_packed.mutable_data_ptr(), sfx->const_data_ptr(),
+                                cu_seqlens->const_data_ptr(), num_group, m_total, k, kTileM,
+                                is_smallm, stream);
+  } else {
+    sfx_packed = torch::empty({0}, u8_opts);
+  }
+
+  // Allocate and prepack SFW (if provided)
+  torch::Tensor sfw_packed;
+  if (sfw.has_value()) {
+    int64_t sfw_buf_sz = static_cast<int64_t>(num_group) * n * k_sf_padded;
+    sfw_packed = torch::empty({sfw_buf_sz}, u8_opts);
+    prepack_mxfp8_w_scale_async(sfw_packed.mutable_data_ptr(), sfw->const_data_ptr(), num_group, n,
+                                k, is_2sm, stream);
+  } else {
+    sfw_packed = torch::empty({0}, u8_opts);
+  }
+
+  return std::make_tuple(sfx_packed, sfw_packed);
+}
+
+torch::Tensor group_gemm_mxfp8_entry(const torch::Tensor &x, const torch::Tensor &weight,
+                                     const torch::Tensor &sfx_packed,
+                                     const torch::Tensor &sfw_packed, const torch::Tensor &seqlens,
+                                     const torch::Tensor &cu_seqlens,
+                                     const int64_t num_seq_per_group_avg,
+                                     std::optional<torch::Tensor> output,
+                                     std::optional<torch::Tensor> tma_desc) {
+  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
+  TORCH_CHECK(x.device().is_cuda(), "x must be cuda");
+  TORCH_CHECK(weight.device().is_cuda(), "weight must be cuda");
+  TORCH_CHECK(seqlens.device().is_cuda(), "seqlens must be cuda");
+  TORCH_CHECK(cu_seqlens.device().is_cuda(), "cu_seqlens must be cuda");
+  TORCH_CHECK(sfx_packed.device().is_cuda() && sfw_packed.device().is_cuda(),
+              "sfx_packed/sfw_packed must be cuda");
+  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn && weight.dtype() == torch::kFloat8_e4m3fn,
+              "x and weight dtype must be fp8_e4m3");
+  TORCH_CHECK(sfx_packed.dtype() == torch::kUInt8 && sfw_packed.dtype() == torch::kUInt8,
+              "prepacked sfx/sfw dtype must be uint8");
+  TORCH_CHECK(seqlens.dtype() == torch::kInt32 && cu_seqlens.dtype() == torch::kInt32,
+              "seqlens/cu_seqlens dtype must be int32");
+  TORCH_CHECK(x.is_contiguous() && weight.is_contiguous(), "x/weight must be contiguous");
+  TORCH_CHECK(seqlens.size(0) == weight.size(0),
+              "seqlens and weight must share the same num_group");
+  TORCH_CHECK(x.size(1) == weight.size(2), "x and weight must share the same k");
+
+  int m = static_cast<int>(x.size(0));
+  int k = static_cast<int>(x.size(1));
+  int n = static_cast<int>(weight.size(1));
+  int num_group = static_cast<int>(seqlens.size(0));
+
+  auto options = x.options();
+  torch::Tensor y;
+  if (output.has_value()) {
+    y = output.value();
+  } else {
+    y = torch::empty({m, n}, options.dtype(torch::kBFloat16));
+  }
+
+  torch::Tensor tmas;
+  bool update_tma = true;
+  if (tma_desc.has_value()) {
+    tmas = tma_desc.value();
+    update_tma = false;
+  } else {
+    // num_group * 2 TmaDescriptors (X / Y per group; SFX/SFW use static desc), 128B each
+    tmas = torch::empty({num_group * 2, 128}, options);
+  }
+
+  torch::Tensor tiles = torch::empty({num_group}, options.dtype(torch::kInt32));
+  torch::Tensor cu_tiles = torch::empty({num_group + 1}, options.dtype(torch::kInt32));
+
+  group_gemm_mxfp8_async(y.mutable_data_ptr(), x.const_data_ptr(), weight.const_data_ptr(),
+                         sfx_packed.const_data_ptr(), sfw_packed.const_data_ptr(),
+                         seqlens.const_data_ptr(), cu_seqlens.const_data_ptr(),
+                         tmas.mutable_data_ptr(), tiles.mutable_data_ptr(),
+                         cu_tiles.mutable_data_ptr(), num_group, m, n, k,
+                         static_cast<int>(num_seq_per_group_avg), update_tma, stream);
+
+  return y;
+}
+
+torch::Tensor group_gemm_cp_async_mxfp8_entry(
+    const torch::Tensor &x, const torch::Tensor &weight, const torch::Tensor &sfx_packed,
+    const torch::Tensor &sfw_packed, const torch::Tensor &seqlens, const torch::Tensor &cu_seqlens,
+    const int64_t num_seq_per_group_avg, std::optional<torch::Tensor> x_row_map, int64_t x_num_rows,
+    std::optional<torch::Tensor> output, std::optional<torch::Tensor> tma_desc) {
+  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
+  TORCH_CHECK(x.device().is_cuda() && weight.device().is_cuda(), "x/weight must be cuda");
+  TORCH_CHECK(seqlens.device().is_cuda() && cu_seqlens.device().is_cuda(),
+              "seqlens/cu_seqlens must be cuda");
+  TORCH_CHECK(sfx_packed.device().is_cuda() && sfw_packed.device().is_cuda(),
+              "sfx_packed/sfw_packed must be cuda");
+  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn && weight.dtype() == torch::kFloat8_e4m3fn,
+              "x and weight dtype must be fp8_e4m3");
+  TORCH_CHECK(sfx_packed.dtype() == torch::kUInt8 && sfw_packed.dtype() == torch::kUInt8,
+              "prepacked sfx/sfw dtype must be uint8");
+  TORCH_CHECK(seqlens.dtype() == torch::kInt32 && cu_seqlens.dtype() == torch::kInt32,
+              "seqlens/cu_seqlens dtype must be int32");
+  TORCH_CHECK(x.is_contiguous() && weight.is_contiguous(), "x/weight must be contiguous");
+  TORCH_CHECK(seqlens.size(0) == weight.size(0),
+              "seqlens and weight must share the same num_group");
+  TORCH_CHECK(x.size(1) == weight.size(2), "x and weight must share the same k");
+
+  int k = static_cast<int>(x.size(1));
+  int n = static_cast<int>(weight.size(1));
+  int num_group = static_cast<int>(seqlens.size(0));
+
+  // m = total post-permutation rows (the shape the kernel pretends to see).
+  // When x_row_map is provided, `x.size(0)` is the un-permuted row count
+  // (== x_num_rows); the post-permutation count comes from cu_seqlens[-1].
+  int m;
+  const void *x_row_map_ptr = nullptr;
+  int x_num_rows_int = static_cast<int>(x_num_rows);
+  if (x_row_map.has_value()) {
+    auto rm = x_row_map.value();
+    TORCH_CHECK(rm.dtype() == torch::kInt32, "x_row_map dtype must be int32");
+    TORCH_CHECK(rm.is_cuda() && rm.is_contiguous(), "x_row_map must be cuda + contiguous");
+    x_row_map_ptr = rm.const_data_ptr();
+    m = static_cast<int>(rm.size(0));  // post-permutation row count
+    TORCH_CHECK(x_num_rows_int == static_cast<int>(x.size(0)),
+                "x_num_rows must equal x.size(0) when row_map is provided");
+  } else {
+    m = static_cast<int>(x.size(0));
+    x_num_rows_int = m;
+  }
+
+  auto options = x.options();
+  torch::Tensor y;
+  if (output.has_value()) {
+    y = output.value();
+  } else {
+    y = torch::empty({m, n}, options.dtype(torch::kBFloat16));
+  }
+
+  torch::Tensor tmas;
+  bool update_tma = true;
+  if (tma_desc.has_value()) {
+    tmas = tma_desc.value();
+    update_tma = false;
+  } else {
+    tmas = torch::empty({num_group * 2, 128}, options);
+  }
+
+  torch::Tensor tiles = torch::empty({num_group}, options.dtype(torch::kInt32));
+  torch::Tensor cu_tiles = torch::empty({num_group + 1}, options.dtype(torch::kInt32));
+
+  group_gemm_cp_async_mxfp8_async(
+      y.mutable_data_ptr(), x.const_data_ptr(), weight.const_data_ptr(),
+      sfx_packed.const_data_ptr(), sfw_packed.const_data_ptr(), seqlens.const_data_ptr(),
+      cu_seqlens.const_data_ptr(), tmas.mutable_data_ptr(), tiles.mutable_data_ptr(),
+      cu_tiles.mutable_data_ptr(), num_group, m, n, k, static_cast<int>(num_seq_per_group_avg),
+      update_tma, stream, x_row_map_ptr, x_num_rows_int);
+
+  return y;
+}
+
 }  // namespace group_gemm
 }  // namespace hpc
 
@@ -261,4 +483,23 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "Tensor y_scales, int group_size, Tensor? output) -> (Tensor)");
   m.impl("group_gemm_groupwise_w4a8_mma", torch::kCUDA,
          &hpc::group_gemm::group_gemm_groupwise_w4a8_mma_entry);
+
+  m.def(
+      "prepack_mxfp8_scale(Tensor? sfx, Tensor? sfw, Tensor? cu_seqlens, "
+      "int num_seq_per_group_avg) "
+      "-> (Tensor, Tensor)");
+  m.impl("prepack_mxfp8_scale", torch::kCUDA, &hpc::group_gemm::prepack_mxfp8_scale_entry);
+
+  m.def(
+      "group_gemm_mxfp8(Tensor x, Tensor weight, Tensor sfx_packed, Tensor sfw_packed, "
+      "Tensor seqlens, Tensor cu_seqlens, int num_seq_per_group_avg, "
+      "Tensor? output, Tensor? tma_desc) -> (Tensor)");
+  m.impl("group_gemm_mxfp8", torch::kCUDA, &hpc::group_gemm::group_gemm_mxfp8_entry);
+
+  m.def(
+      "group_gemm_cp_async_mxfp8(Tensor x, Tensor weight, Tensor sfx_packed, Tensor sfw_packed, "
+      "Tensor seqlens, Tensor cu_seqlens, int num_seq_per_group_avg, "
+      "Tensor? x_row_map, int x_num_rows, Tensor? output, Tensor? tma_desc) -> (Tensor)");
+  m.impl("group_gemm_cp_async_mxfp8", torch::kCUDA,
+         &hpc::group_gemm::group_gemm_cp_async_mxfp8_entry);
 }
