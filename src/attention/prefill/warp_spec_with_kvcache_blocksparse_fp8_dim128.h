@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Tencent.
 
-#ifndef SRC_ATTENTION_PREFILL_WARP_SPEC_WITH_KVCACHE_FP8_DIM128_H_
-#define SRC_ATTENTION_PREFILL_WARP_SPEC_WITH_KVCACHE_FP8_DIM128_H_
+#ifndef SRC_ATTENTION_PREFILL_WARP_SPEC_WITH_KVCACHE_BLOCKSPARSE_FP8_DIM128_H_
+#define SRC_ATTENTION_PREFILL_WARP_SPEC_WITH_KVCACHE_BLOCKSPARSE_FP8_DIM128_H_
 
 #include <cuda_runtime_api.h>
 #include <stdint.h>
@@ -10,16 +10,16 @@ namespace hpc {
 namespace attention {
 namespace prefill {
 
-void warp_spec_with_kvcache_qpertoken_perhead_kvpertensor_fp8_dim128_async(
+void warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8_dim128_async(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
     void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
     int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV,
-    int ldV1, int ldV2, cudaStream_t stream);
+    int ldV1, int ldV2, const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream);
 
-void warp_spec_with_kvcache_qkpertoken_perhead_vperhead_fp8_dim128_async(
+void warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_dim128_async(
     void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
     const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
     const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
@@ -27,10 +27,10 @@ void warp_spec_with_kvcache_qkpertoken_perhead_vperhead_fp8_dim128_async(
     int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
     int block_size, int scale_block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK,
     int ldK1, int ldK2, int ldV, int ldV1, int ldV2, int ldKS, int ldKS1, int ldKS2,
-    cudaStream_t stream);
+    const void *block_mask_ptr, int num_tile_kv_in_mask, cudaStream_t stream);
 
 }  // namespace prefill
 }  // namespace attention
 }  // namespace hpc
 
-#endif  // SRC_ATTENTION_PREFILL_WARP_SPEC_WITH_KVCACHE_FP8_DIM128_H_
+#endif  // SRC_ATTENTION_PREFILL_WARP_SPEC_WITH_KVCACHE_BLOCKSPARSE_FP8_DIM128_H_
