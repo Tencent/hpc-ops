@@ -26,9 +26,9 @@ python3 benchmark/fuse_allreduce_rmsorm/bench_allreduce_rmsnorm.py \
 The benchmark spawns 8 local worker processes itself, so `torchrun` is not required.
 The default timing path is aligned with the FusedMoE replay methodology at the
 CUDA Graph level: warmup, graph capture, replay warmup, then per-step median
-latency. Use `--no-graph` for eager event timing. An experimental
-`--timing nsys` path is available, but Nsight Systems can be unstable with this
-8-process collective worker in some environments.
+latency. Use `--no-graph` for eager event timing. Nsight Systems profiling is
+not enabled by default because this benchmark launches 8 local collective
+worker processes.
 
 ## Output Fields
 

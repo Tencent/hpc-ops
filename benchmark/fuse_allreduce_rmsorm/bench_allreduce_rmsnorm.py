@@ -15,8 +15,8 @@ device time; pass ``--no-graph`` for eager timing (includes host dispatch).
 
 Example:
 
-  cd hpc-ops
-  python3 benchmark/fuse_allreduce_rmsorm/bench_allreduce_rmsnorm.py --hidden 7168 \
+  cd hpc-ops/benchmark
+  python3 fuse_allreduce_rmsorm/bench_allreduce_rmsnorm.py --hidden 7168 \
       --tokens 8 32 128 512 4096 8192 16384 32768
 """
 
@@ -26,9 +26,7 @@ import json
 import math
 import multiprocessing
 import os
-import subprocess
 import sys
-import time
 from pathlib import Path
 from statistics import median
 
@@ -492,128 +490,6 @@ def write_jsonl(path, rows, hidden, fi_backend, timing):
             f.write(json.dumps(item) + "\n")
 
 
-def extract_nvtx_rows(report_prefix, tokens, hidden, fi_backend):
-    cmd = [
-        "nsys",
-        "stats",
-        "--report",
-        "nvtx_gpu_proj_trace",
-        "--force-export=true",
-        "-q",
-        "-f",
-        "json",
-        str(report_prefix) + ".nsys-rep",
-    ]
-    out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-    raw = json.loads(out.decode())
-    data = raw[0]["data"] if isinstance(raw, list) and raw and "data" in raw[0] else raw
-    samples = {}
-    for entry in data:
-        name = entry.get("Name", "").strip().strip('"')
-        if name.startswith(":"):
-            name = name[1:]
-        if not name.startswith("step:"):
-            continue
-        label = name[len("step:"):]
-        try:
-            dur_us = float(entry["Projected Duration (ns)"]) / 1000.0
-        except Exception:
-            continue
-        samples.setdefault(label, []).append(dur_us)
-
-    results = {N: {"token": N} for N in tokens}
-    for label, vals in samples.items():
-        if "_N" not in label:
-            continue
-        key, token_text = label.rsplit("_N", 1)
-        try:
-            token = int(token_text)
-        except ValueError:
-            continue
-        if token not in results:
-            continue
-        vals = sorted(vals)
-        # Match the FusedMoE post-processing convention: drop early replay samples.
-        vals = vals[2:] if len(vals) > 2 else vals
-        if vals:
-            results[token][key] = float(median(vals))
-    return enrich_rows([results[N] for N in tokens])
-
-
-def run_nsys_driver(args):
-    tag = args.tag or f"allreduce_rmsnorm_{int(time.time())}"
-    out_dir = Path(args.output_dir) / tag if args.output_dir else Path(__file__).resolve().parent / "log" / tag
-    out_dir.mkdir(parents=True, exist_ok=True)
-    report_prefix = out_dir / "allreduce_rmsnorm"
-    report_file = str(report_prefix) + ".nsys-rep"
-    if os.path.exists(report_file):
-        os.remove(report_file)
-
-    cmd = [
-        "nsys",
-        "profile",
-        "-f",
-        "true",
-        "-o",
-        str(report_prefix),
-        "--capture-range=cudaProfilerApi",
-        "--capture-range-end=stop-shutdown",
-        "--cuda-graph-trace=node",
-        "-t",
-        "cuda,nvtx",
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--nsys-worker",
-        "--hidden",
-        str(args.hidden),
-        "--tokens",
-        *[str(t) for t in args.tokens],
-        "--num-max-blocks",
-        str(args.num_max_blocks),
-        "--warmup",
-        str(args.warmup),
-        "--iters",
-        str(args.iters),
-        "--master-port",
-        str(args.master_port),
-        "--fi-backend",
-        args.fi_backend,
-    ]
-    if args.no_check:
-        cmd.append("--no-check")
-    if args.skip:
-        cmd += ["--skip", *args.skip]
-    if not args.graph:
-        cmd.append("--no-graph")
-
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=os.environ.copy(),
-            start_new_session=True,
-        )
-        stdout, stderr_bytes = proc.communicate(timeout=args.nsys_timeout)
-    except subprocess.TimeoutExpired as exc:
-        try:
-            os.killpg(proc.pid, 15)
-        except Exception:
-            pass
-        raise RuntimeError("nsys profile timeout") from exc
-
-    if not os.path.exists(report_file) and proc.returncode != 0:
-        stderr = stderr_bytes.decode(errors="replace").strip().splitlines()
-        raise RuntimeError(stderr[-1] if stderr else "nsys profile failed")
-
-    rows = extract_nvtx_rows(report_prefix, args.tokens, args.hidden, args.fi_backend)
-    print(format_table(args.hidden, rows, args.fi_backend))
-    write_csv(args.csv, rows, args.hidden, args.fi_backend, "nsys_graph_nvtx_median")
-    write_jsonl(args.jsonl, rows, args.hidden, args.fi_backend, "nsys_graph_nvtx_median")
-    print(f"nsys report: {report_file}")
-    return rows
-
-
 def run_task(rank, world_size, master_port, tokens, H, num_max_blocks, warmup, iters, do_check, skip, fi_backend, use_graph, csv_path, jsonl_path, profile):
     device = torch.device("cuda", rank)
     torch.cuda.set_device(rank)
@@ -771,22 +647,14 @@ def main():
     )
     parser.add_argument(
         "--timing",
-        choices=["event", "nsys"],
+        choices=["event"],
         default="event",
-        help="event: reduced CUDA event timing; nsys: FusedMoE-style nsys/NVTX graph replay median.",
+        help="event: reduced CUDA event timing around CUDA Graph replay, reported as per-step median.",
     )
-    parser.add_argument("--output-dir", default="", help="Output directory for nsys reports.")
-    parser.add_argument("--tag", default="", help="Subdirectory name for nsys reports.")
-    parser.add_argument("--nsys-timeout", type=int, default=600)
     parser.add_argument("--csv", default="", help="Optional CSV output path written by rank 0.")
     parser.add_argument("--jsonl", default="", help="Optional JSONL output path written by rank 0.")
-    parser.add_argument("--nsys-worker", action="store_true", help=argparse.SUPPRESS)
     parser.set_defaults(graph=True)
     args = parser.parse_args()
-
-    if args.timing == "nsys" and not args.nsys_worker:
-        run_nsys_driver(args)
-        return
 
     world_size = 8
     ctx = multiprocessing.get_context("spawn")
@@ -809,7 +677,7 @@ def main():
                 args.graph,
                 args.csv,
                 args.jsonl,
-                args.nsys_worker,
+                False,
             ),
         )
         procs.append(p)
