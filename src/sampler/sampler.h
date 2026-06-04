@@ -7,7 +7,6 @@
 
 namespace hpc {
 namespace sampler {
-int fused_sampler_nmax(int max_topk);
 
 // fused_sampler: 2-kernel pipeline — rp / temperature / [softmax1] / topk /
 // [softmax2] / topp / Gumbel-max sampling + penalty_mask writeback.
@@ -23,12 +22,8 @@ void fused_sampler_async(int32_t* token_ids_out, const void* logits_ptr, int log
                          const float* temperature_ptr, float temperature_val, int softmax_policy,
                          const void* topk_ptr, int topk_int_bytes, int topk_val,
                          const float* topp_ptr, float topp_val, const float* gumbel_noise_ptr,
-                         float* partial_max_ptr, float* partial_sum_ptr, float* mid_logits_ptr,
-                         int32_t* mid_tokens_ptr, int batch_size, int vocab_size,
-                         int logits_row_stride, int max_topk, uint64_t rng_seed,
-                         cudaStream_t stream);
-
-int fused_sampler_temperature_n_max_per_row();
+                         int batch_size, int vocab_size, int logits_row_stride, int max_topk,
+                         uint64_t rng_seed, cudaStream_t stream);
 
 // fused_sampler_temperature: temperature-only fast-path. token = argmax_v
 // (logit/temperature + Gumbel(0)).
@@ -38,12 +33,13 @@ int fused_sampler_temperature_n_max_per_row();
 //   draft_token_ids_ptr: nullable [B] int64 speculative-decoding mask. b's
 //     entry != -1 → logits[b, that token] treated as -inf (tensor unmodified);
 //     -1 → unmasked. nullptr → zero-overhead no-mask specialization.
+// Concurrency: not safe to call concurrently on multiple streams of the same
+// device (the per-device scratch workspace is shared across streams).
 void fused_sampler_temperature_async(int32_t* token_ids_out, const void* logits_ptr,
                                      int logits_dtype, int logits_row_stride,
                                      const float* temperature_arr, float temperature_val,
                                      const float* gumbel_noise_ptr,
-                                     const int64_t* draft_token_ids_ptr, float* scratch_score,
-                                     int32_t* scratch_tok, int32_t* counter, int batch_size,
+                                     const int64_t* draft_token_ids_ptr, int batch_size,
                                      int vocab_size, uint64_t rng_seed, cudaStream_t stream);
 
 }  // namespace sampler

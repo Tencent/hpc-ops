@@ -349,6 +349,89 @@ static_assert(::hpc::sampler::rng::kPerLaunchOffsetIncrement >=
                   static_cast<uint64_t>(kMaxItersPerBlock * kItemsPerThread),
               "Philox offset advance must cover all per-thread draws per launch");
 
+// Per-device workspace, lazily grown 2×. Counter is zero-initialized on
+// (re)alloc; the kernel maintains counter[*] == 0 across launches via per-row
+// self-reset, so no host memset is needed. scratch_score/tok are
+// write-before-read each launch. n_max_per_row is captured at first acquire
+// (= get_sm_count()) so the device stride matches pick_n_blocks_per_row's cap.
+//
+// CONCURRENCY CONSTRAINT: this workspace (scratch + counter) is shared per
+// device across all streams. The counter==0 invariant and the last-block
+// reduction only hold under single-stream serial use. Concurrent invocations of
+// this sampler on multiple streams of the SAME device are NOT supported — they
+// would race on the shared scratch/counter. Use one stream per device, or
+// serialize calls.
+struct WorkspaceCache {
+  std::mutex mu;
+  float* scratch_score = nullptr;  // [max_B * n_max_per_row]
+  int32_t* scratch_tok = nullptr;  // [max_B * n_max_per_row]
+  int32_t* counter = nullptr;      // [max_B]
+  int max_B = 0;
+  int n_max_per_row = 0;
+  int device_id = -1;
+};
+
+constexpr int kMaxDevices = 16;
+static WorkspaceCache g_ws[kMaxDevices];
+
+// Acquire the workspace for `device_id`, growing it if needed to hold
+// `batch_size` rows at the requested `n_max_per_row` stride. Returned
+// pointers are valid until the next grow on the same device.
+WorkspaceCache* acquire_workspace(int device_id, int batch_size, int n_max_per_row,
+                                  cudaStream_t stream) {
+  if (device_id < 0 || device_id >= kMaxDevices) {
+    throw std::runtime_error("fused_sampler_temperature: device_id out of range: " +
+                             std::to_string(device_id));
+  }
+  WorkspaceCache& c = g_ws[device_id];
+  std::lock_guard<std::mutex> lk(c.mu);
+  if (c.scratch_score != nullptr && batch_size <= c.max_B && n_max_per_row == c.n_max_per_row) {
+    return &c;
+  }
+  int new_max = batch_size;
+  if (c.max_B * 2 > new_max) {
+    new_max = c.max_B * 2;
+  }
+
+  if (c.scratch_score) {
+    cudaStreamSynchronize(stream);
+    cudaFree(c.scratch_score);
+    cudaFree(c.scratch_tok);
+    cudaFree(c.counter);
+  }
+
+  cudaError_t err;
+  err = cudaMalloc(&c.scratch_score, static_cast<size_t>(new_max) * n_max_per_row * sizeof(float));
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("fused_sampler_temperature: cudaMalloc(scratch_score) "
+                                         "failed: ") +
+                             cudaGetErrorString(err));
+  }
+  err = cudaMalloc(&c.scratch_tok, static_cast<size_t>(new_max) * n_max_per_row * sizeof(int32_t));
+  if (err != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("fused_sampler_temperature: cudaMalloc(scratch_tok) failed: ") +
+        cudaGetErrorString(err));
+  }
+  err = cudaMalloc(&c.counter, static_cast<size_t>(new_max) * sizeof(int32_t));
+  if (err != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("fused_sampler_temperature: cudaMalloc(counter) failed: ") +
+        cudaGetErrorString(err));
+  }
+  // Establish counter[*] == 0 invariant; kernel maintains it from here on.
+  err = cudaMemsetAsync(c.counter, 0, static_cast<size_t>(new_max) * sizeof(int32_t), stream);
+  if (err != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("fused_sampler_temperature: cudaMemsetAsync(counter) failed: ") +
+        cudaGetErrorString(err));
+  }
+  c.max_B = new_max;
+  c.n_max_per_row = n_max_per_row;
+  c.device_id = device_id;
+  return &c;
+}
+
 // Pick N blocks per row: ceil(SMs / B) clamped to [kNMin, n_max_per_row].
 inline int pick_n_blocks_per_row(int batch_size, int n_max_per_row) {
   int n = (n_max_per_row + batch_size - 1) / batch_size;
@@ -397,8 +480,7 @@ void fused_sampler_temperature_async(int32_t* token_ids_out, const void* logits_
                                      int logits_dtype, int logits_row_stride,
                                      const float* temperature_arr, float temperature_val,
                                      const float* gumbel_noise_ptr,
-                                     const int64_t* draft_token_ids_ptr, float* scratch_score,
-                                     int32_t* scratch_tok, int32_t* counter, int batch_size,
+                                     const int64_t* draft_token_ids_ptr, int batch_size,
                                      int vocab_size, uint64_t rng_seed, cudaStream_t stream) {
   const bool has_external_gumbel = (gumbel_noise_ptr != nullptr);
   const bool has_draft_mask = (draft_token_ids_ptr != nullptr);
@@ -411,13 +493,20 @@ void fused_sampler_temperature_async(int32_t* token_ids_out, const void* logits_
 
   // n_max_per_row = SM count, also the upper clamp on N. The last-block reduce
   // loads N partials with `if (tid < N)`, so require N ≤ kThreadsPerBlock.
-  // Must match fused_sampler_temperature_n_max_per_row() used by the host to
-  // size the scratch buffers.
   const int n_max_per_row = ::hpc::get_sm_count();
   if (n_max_per_row > kThreadsPerBlock) {
     throw std::runtime_error("fused_sampler_temperature: device SM count exceeds kThreadsPerBlock");
   }
   const int n_blocks_per_row = pick_n_blocks_per_row(batch_size, n_max_per_row);
+
+  int device_id = -1;
+  if (cudaGetDevice(&device_id) != cudaSuccess) {
+    device_id = 0;
+  }
+  WorkspaceCache* ws = acquire_workspace(device_id, batch_size, n_max_per_row, stream);
+  float* scratch_score = ws->scratch_score;
+  int32_t* scratch_tok = ws->scratch_tok;
+  int32_t* counter = ws->counter;
 
   auto launch = [&](auto dtype_tag, auto vocab_tag, auto gumbel_tag, auto mask_tag) {
     using DType = typename decltype(dtype_tag)::type;
@@ -469,20 +558,16 @@ void fused_sampler_temperature_async(int32_t* token_ids_out, const void* logits_
 
 }  // namespace fused_sampler_temperature
 
-int fused_sampler_temperature_n_max_per_row() { return ::hpc::get_sm_count(); }
-
 // Public entry for the header — forwards to the detail namespace.
 void fused_sampler_temperature_async(int32_t* token_ids_out, const void* logits_ptr,
                                      int logits_dtype, int logits_row_stride,
                                      const float* temperature_arr, float temperature_val,
                                      const float* gumbel_noise_ptr,
-                                     const int64_t* draft_token_ids_ptr, float* scratch_score,
-                                     int32_t* scratch_tok, int32_t* counter, int batch_size,
+                                     const int64_t* draft_token_ids_ptr, int batch_size,
                                      int vocab_size, uint64_t rng_seed, cudaStream_t stream) {
   fused_sampler_temperature::fused_sampler_temperature_async(
       token_ids_out, logits_ptr, logits_dtype, logits_row_stride, temperature_arr, temperature_val,
-      gumbel_noise_ptr, draft_token_ids_ptr, scratch_score, scratch_tok, counter, batch_size,
-      vocab_size, rng_seed, stream);
+      gumbel_noise_ptr, draft_token_ids_ptr, batch_size, vocab_size, rng_seed, stream);
 }
 
 }  // namespace sampler
