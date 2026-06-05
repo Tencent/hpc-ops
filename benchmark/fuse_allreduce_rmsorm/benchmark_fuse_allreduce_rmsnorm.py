@@ -12,22 +12,26 @@ self-contained: it spawns its own processes and bootstraps both the hpc
 multicast communicator and a NCCL process group, so it runs like a test (no
 torchrun needed). Timing uses CUDA-graph replay by default, which measures pure
 device time; pass ``--no-graph`` for eager timing (includes host dispatch).
+The fused kernels currently support hidden sizes 4096, 5120, and 7168.
 
 Example:
 
-  cd hpc-ops
-  python3 benchmark/bench_allreduce_rmsnorm.py --hidden 7168 \
-      --tokens 8 16 32 64 128 256 512 4096 8192 16384 32768
+  cd hpc-ops/benchmark
+  python3 fuse_allreduce_rmsorm/bench_allreduce_rmsnorm.py --hidden 7168 \
+      --tokens 8 32 128 512 4096 8192 16384 32768
 """
 
 import argparse
+import csv
+import json
 import math
 import multiprocessing
 import os
 import sys
 from pathlib import Path
+from statistics import median
 
-sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
+sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../../build/lib.*/"))[0]))
 
 import hpc
 import torch
@@ -44,6 +48,7 @@ except Exception as e:  # pragma: no cover
 
 NUM_LAMPORT_BUFFERS = 3
 SEED = 10001
+SUPPORTED_HIDDEN_SIZES = (4096, 5120, 7168)
 
 
 def rmsnorm(x, w, eps):
@@ -65,6 +70,14 @@ def _reduce_max_us(local_us):
     return t.item()
 
 
+def _reduce_max_us_list(local_us):
+    if not local_us:
+        return []
+    t = torch.tensor(local_us, device="cuda", dtype=torch.float64)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return t.cpu().tolist()
+
+
 def bench_us(step_fn, warmup, iters, nvtx_label=None):
     """Per-call latency (us), reduced across ranks via MAX.
 
@@ -80,22 +93,24 @@ def bench_us(step_fn, warmup, iters, nvtx_label=None):
         torch.cuda.synchronize()
         dist.barrier()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    total_ms = 0.0
+    events = [
+        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        for _ in range(iters)
+    ]
     for _ in range(iters):
         torch.cuda.synchronize()
         dist.barrier()
+        start, end = events[_]
         if nvtx_label is not None:
-            torch.cuda.nvtx.range_push(nvtx_label)
+            torch.cuda.nvtx.range_push(f"step:{nvtx_label}")
         start.record()
         step_fn()
         end.record()
         if nvtx_label is not None:
             torch.cuda.nvtx.range_pop()
-        torch.cuda.synchronize()
-        total_ms += start.elapsed_time(end)
-    return _reduce_max_us(total_ms * 1000.0 / iters)
+    torch.cuda.synchronize()
+    local_us = [start.elapsed_time(end) * 1000.0 for start, end in events]
+    return median(_reduce_max_us_list(local_us))
 
 
 def bench_us_graph(step_fn, warmup, iters, nvtx_label=None):
@@ -131,20 +146,36 @@ def bench_us_graph(step_fn, warmup, iters, nvtx_label=None):
         torch.cuda.synchronize()
         dist.barrier()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
     torch.cuda.synchronize()
     dist.barrier()
-    if nvtx_label is not None:
-        torch.cuda.nvtx.range_push(nvtx_label)
-    start.record()
+    events = [
+        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        for _ in range(iters)
+    ]
     for _ in range(iters):
+        torch.cuda.synchronize()
+        dist.barrier()
+        start, end = events[_]
+        if nvtx_label is not None:
+            torch.cuda.nvtx.range_push(f"step:{nvtx_label}")
+        start.record()
         g.replay()
-    end.record()
-    if nvtx_label is not None:
-        torch.cuda.nvtx.range_pop()
+        end.record()
+        if nvtx_label is not None:
+            torch.cuda.nvtx.range_pop()
     torch.cuda.synchronize()
-    return _reduce_max_us(start.elapsed_time(end) * 1000.0 / iters)
+    local_us = [start.elapsed_time(end) * 1000.0 for start, end in events]
+    return median(_reduce_max_us_list(local_us))
+
+
+def bench_stable(bench_fn, step_fn, warmup, iters, rounds, nvtx_label=None):
+    values = []
+    for round_idx in range(rounds):
+        label = f"{nvtx_label}_r{round_idx}" if nvtx_label is not None else None
+        values.append(bench_fn(step_fn, warmup, iters, nvtx_label=label))
+        torch.cuda.synchronize()
+        dist.barrier()
+    return min(values), values
 
 
 def check(name, got, ref, rank, atol=1e-1, rtol=1e-1):
@@ -386,7 +417,94 @@ def format_table(hidden, rows, fi_backend):
     return "\n".join(lines)
 
 
-def run_task(rank, world_size, master_port, tokens, H, num_max_blocks, warmup, iters, do_check, skip, fi_backend, use_graph):
+def enrich_rows(rows):
+    enriched = []
+    for row in rows:
+        item = dict(row)
+        hpc_vals = [item[k] for k in ("hpc_ops_ht", "hpc_ops_ll") if item.get(k)]
+        base_vals = [item[k] for k in ("nccl", "flashinfer") if item.get(k)]
+        item["hpc_best_us"] = min(hpc_vals) if hpc_vals else None
+        item["baseline_best_us"] = min(base_vals) if base_vals else None
+        item["hpc_best_speedup"] = (
+            item["baseline_best_us"] / item["hpc_best_us"]
+            if item["hpc_best_us"] and item["baseline_best_us"]
+            else None
+        )
+        enriched.append(item)
+    return enriched
+
+
+def timing_name(timing):
+    if isinstance(timing, bool):
+        return "cuda_graph_median" if timing else "eager_median"
+    return timing
+
+
+def write_csv(path, rows, hidden, fi_backend, timing):
+    if not path:
+        return
+    fieldnames = [
+        "tokens",
+        "hidden",
+        "dtype",
+        "world_size",
+        "timing",
+        "fi_backend",
+        "hpc_ops_ht_us",
+        "hpc_ops_ll_us",
+        "nccl_us",
+        "flashinfer_us",
+        "hpc_best_us",
+        "baseline_best_us",
+        "hpc_best_speedup",
+    ]
+    with Path(path).open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "tokens": row["token"],
+                    "hidden": hidden,
+                    "dtype": "bfloat16",
+                    "world_size": 8,
+                    "timing": timing_name(timing),
+                    "fi_backend": fi_backend,
+                    "hpc_ops_ht_us": row.get("hpc_ops_ht"),
+                    "hpc_ops_ll_us": row.get("hpc_ops_ll"),
+                    "nccl_us": row.get("nccl"),
+                    "flashinfer_us": row.get("flashinfer"),
+                    "hpc_best_us": row.get("hpc_best_us"),
+                    "baseline_best_us": row.get("baseline_best_us"),
+                    "hpc_best_speedup": row.get("hpc_best_speedup"),
+                }
+            )
+
+
+def write_jsonl(path, rows, hidden, fi_backend, timing):
+    if not path:
+        return
+    with Path(path).open("w") as f:
+        for row in rows:
+            item = {
+                "tokens": row["token"],
+                "hidden": hidden,
+                "dtype": "bfloat16",
+                "world_size": 8,
+                "timing": timing_name(timing),
+                "fi_backend": fi_backend,
+                "hpc_ops_ht_us": row.get("hpc_ops_ht"),
+                "hpc_ops_ll_us": row.get("hpc_ops_ll"),
+                "nccl_us": row.get("nccl"),
+                "flashinfer_us": row.get("flashinfer"),
+                "hpc_best_us": row.get("hpc_best_us"),
+                "baseline_best_us": row.get("baseline_best_us"),
+                "hpc_best_speedup": row.get("hpc_best_speedup"),
+            }
+            f.write(json.dumps(item) + "\n")
+
+
+def run_task(rank, world_size, master_port, tokens, H, num_max_blocks, warmup, iters, rounds, do_check, skip, fi_backend, use_graph, csv_path, jsonl_path, profile):
     device = torch.device("cuda", rank)
     torch.cuda.set_device(rank)
     torch.set_default_device(device)
@@ -408,6 +526,11 @@ def run_task(rank, world_size, master_port, tokens, H, num_max_blocks, warmup, i
     torch.cuda.synchronize()
 
     comm = hpc.MulticastCommunicator(rank, world_size, rank, f"hpc_bench_ws{world_size}.sock")
+    if profile:
+        dist.barrier()
+        if rank == 0:
+            torch.cuda.cudart().cudaProfilerStart()
+        dist.barrier()
 
     # Largest token count flashinfer can serve at this hidden size.
     if fi_backend == "trtllm":
@@ -451,6 +574,11 @@ def run_task(rank, world_size, master_port, tokens, H, num_max_blocks, warmup, i
         else:
             check(key, r.norm_out[:N, :], ref_norm, rank)
 
+    def all_ranks_ok(ok):
+        flag = torch.tensor([1 if ok else 0], device=device, dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+        return bool(flag.item())
+
     # Benchmark one implementation fully (all token sizes) before moving to the
     # next, with a hard barrier between groups. Each implementation drives a
     # different collective stack (NVLink multicast, flashinfer IPC, NCCL);
@@ -468,36 +596,114 @@ def run_task(rank, world_size, master_port, tokens, H, num_max_blocks, warmup, i
     for key in kernel_order:
         if rank == 0:
             print(f"=== {key} ===", flush=True)
+        method_failed = False
         for N in tokens:
+            if method_failed:
+                continue
             if key == "flashinfer" and N > fi_max_tokens:
                 if rank == 0:
                     print(f"  tokens={N}: skip (>fi_{fi_backend} cap {fi_max_tokens})", flush=True)
                 continue
             input_rank, residual, weight, ref_norm = make_inputs(N)
-            r = make_runner(key, N)
-            r.load(input_rank, residual, weight)
+            r = None
+            err = None
+            ok = True
+            try:
+                r = make_runner(key, N)
+                r.load(input_rank, residual, weight)
+            except Exception as exc:
+                ok = False
+                err = repr(exc)
+            if not all_ranks_ok(ok):
+                if rank == 0:
+                    print(f"  tokens={N}: skip {key} setup failed: {err or 'see peer rank'}", flush=True)
+                method_failed = True
+                if r is not None:
+                    try:
+                        r.free()
+                    except Exception:
+                        pass
+                torch.cuda.synchronize()
+                dist.barrier()
+                continue
             comm.Barrier()
 
             if do_check:
-                r.step()
-                torch.cuda.synchronize()
-                check_runner(key, r, N, ref_norm)
-                r.load(input_rank, residual, weight)
+                ok = True
+                err = None
+                try:
+                    r.step()
+                    torch.cuda.synchronize()
+                    check_runner(key, r, N, ref_norm)
+                    r.load(input_rank, residual, weight)
+                except Exception as exc:
+                    ok = False
+                    err = repr(exc)
+                if not all_ranks_ok(ok):
+                    if rank == 0:
+                        print(f"  tokens={N}: skip {key} check failed: {err or 'see peer rank'}", flush=True)
+                    method_failed = True
+                    try:
+                        r.free()
+                    except Exception:
+                        pass
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    continue
                 comm.Barrier()
 
             bench_fn = bench_us_graph if use_graph else bench_us
-            results[N][key] = bench_fn(r.step, warmup, iters, nvtx_label=f"{key}_N{N}")
+            ok = True
+            err = None
+            try:
+                results[N][key], round_values = bench_stable(
+                    bench_fn,
+                    r.step,
+                    warmup,
+                    iters,
+                    rounds,
+                    nvtx_label=f"{key}_N{N}",
+                )
+            except Exception as exc:
+                ok = False
+                err = repr(exc)
+            if not all_ranks_ok(ok):
+                if rank == 0:
+                    print(f"  tokens={N}: skip {key} benchmark failed: {err or 'see peer rank'}", flush=True)
+                method_failed = True
+                try:
+                    r.free()
+                except Exception:
+                    pass
+                torch.cuda.synchronize()
+                dist.barrier()
+                continue
             r.free()
             if rank == 0:
-                print(f"  tokens={N}: {results[N][key]:.2f}us", flush=True)
+                if rounds > 1:
+                    round_text = ", ".join(f"{v:.2f}" for v in round_values)
+                    print(
+                        f"  tokens={N}: {results[N][key]:.2f}us "
+                        f"(best of {rounds}: [{round_text}])",
+                        flush=True,
+                    )
+                else:
+                    print(f"  tokens={N}: {results[N][key]:.2f}us", flush=True)
 
         # Fully drain this collective stack before starting the next one.
         torch.cuda.synchronize()
         dist.barrier()
 
     if rank == 0:
-        print(format_table(H, [results[N] for N in tokens], fi_backend))
+        rows = enrich_rows([results[N] for N in tokens])
+        print(format_table(H, rows, fi_backend))
+        write_csv(csv_path, rows, H, fi_backend, use_graph)
+        write_jsonl(jsonl_path, rows, H, fi_backend, use_graph)
 
+    if profile:
+        dist.barrier()
+        if rank == 0:
+            torch.cuda.cudart().cudaProfilerStop()
     dist.barrier()
     dist.destroy_process_group()
 
@@ -505,14 +711,19 @@ def run_task(rank, world_size, master_port, tokens, H, num_max_blocks, warmup, i
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hidden", type=int, default=7168)
-    # decode: 8..512 ; chunked-prefill: 4k/8k/16k/32k
     parser.add_argument(
         "--tokens", type=int, nargs="+",
-        default=[8, 16, 32, 64, 128, 256, 512, 4096, 8192, 16384, 32768],
+        default=[8, 32, 128, 512, 4096, 8192, 16384, 32768],
     )
     parser.add_argument("--num-max-blocks", type=int, default=78)
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iters", type=int, default=50)
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=3,
+        help="repeat timing rounds and report the best median to reduce occasional collective jitter",
+    )
     parser.add_argument("--master-port", type=int, default=29570)
     parser.add_argument("--no-check", action="store_true")
     parser.add_argument(
@@ -529,8 +740,23 @@ def main():
         help="use eager timing (includes host dispatch overhead) instead of the "
              "default CUDA-graph replay (pure device time).",
     )
+    parser.add_argument(
+        "--timing",
+        choices=["event"],
+        default="event",
+        help="event: reduced CUDA event timing around CUDA Graph replay, reported as per-step median.",
+    )
+    parser.add_argument("--csv", default="", help="Optional CSV output path written by rank 0.")
+    parser.add_argument("--jsonl", default="", help="Optional JSONL output path written by rank 0.")
     parser.set_defaults(graph=True)
     args = parser.parse_args()
+    if args.hidden not in SUPPORTED_HIDDEN_SIZES:
+        parser.error(
+            f"unsupported hidden size {args.hidden}; supported values are "
+            f"{', '.join(str(x) for x in SUPPORTED_HIDDEN_SIZES)}. "
+            "The underlying fused kernels enforce "
+            "TORCH_CHECK(hidden_size == 4096 || hidden_size == 5120 || hidden_size == 7168)."
+        )
 
     world_size = 8
     ctx = multiprocessing.get_context("spawn")
@@ -547,10 +773,14 @@ def main():
                 args.num_max_blocks,
                 args.warmup,
                 args.iters,
+                args.rounds,
                 not args.no_check,
                 args.skip,
                 args.fi_backend,
                 args.graph,
+                args.csv,
+                args.jsonl,
+                False,
             ),
         )
         procs.append(p)
