@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Tencent.
+
 import argparse
 import csv
 import json

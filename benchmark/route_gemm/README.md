@@ -1,6 +1,6 @@
 # HPC-Ops Benchmarks
 
-This directory contains standalone benchmarks used to reproduce the open-source performance figures.
+This directory contains standalone benchmarks of Route GEMM.
 
 ## Route GEMM BF16xFP32
 
