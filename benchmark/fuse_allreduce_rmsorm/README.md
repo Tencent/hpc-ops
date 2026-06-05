@@ -8,7 +8,20 @@ This directory reproduces the AllReduce + Residual + RMSNorm latency data used b
 - Hardware expectation: single 8-GPU SM90/H20 node with NVLink/NVSwitch
 - Default dtype: BF16
 - Default hidden size: `7168`
+- Supported hidden sizes: `4096`, `5120`, `7168`
 - Timing mode: CUDA Graph replay with per-step median latency by default
+- Default samples: `--warmup 5 --iters 50 --rounds 3`
+
+The underlying HPC-Ops kernels enforce:
+
+```cpp
+TORCH_CHECK(hidden_size == 4096 || hidden_size == 5120 || hidden_size == 7168,
+            "unsupported hidden_size");
+```
+
+Passing any other `--hidden` value is rejected by the benchmark before workers
+are launched, so users see the supported shape list directly instead of a lower
+level kernel error.
 
 ## Recommended Reproduction Command
 
@@ -26,9 +39,18 @@ python3 benchmark/fuse_allreduce_rmsorm/bench_allreduce_rmsnorm.py \
 The benchmark spawns 8 local worker processes itself, so `torchrun` is not required.
 The default timing path is aligned with the FusedMoE replay methodology at the
 CUDA Graph level: warmup, graph capture, replay warmup, then per-step median
-latency. Use `--no-graph` for eager event timing. Nsight Systems profiling is
-not enabled by default because this benchmark launches 8 local collective
-worker processes.
+latency. Each measured graph replay is preceded by a rank-level synchronize and
+barrier. This keeps collective kernels in lockstep so peer launch jitter is not
+counted as device latency. The benchmark repeats timing for several rounds and
+reports the best round median, while printing all round medians in the log. This
+reduces sensitivity to occasional OS scheduling or fabric noise. Use `--no-graph`
+for eager event timing. Nsight Systems profiling is not enabled by default because
+this benchmark launches 8 local collective worker processes.
+
+If a provider is not explicitly listed in `--skip` but fails to import, initialize,
+or run in the current environment, the benchmark prints a warning and skips that
+provider instead of aborting the whole sweep. This is useful when FlashInfer or
+NCCL/HPC-Ops dependencies are not available in a local reproduction environment.
 
 ## Output Fields
 
