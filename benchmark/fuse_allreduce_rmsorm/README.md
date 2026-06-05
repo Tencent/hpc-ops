@@ -1,6 +1,6 @@
 # Fused AllReduce + RMSNorm Benchmark
 
-This directory reproduces the AllReduce + Residual + RMSNorm latency data used by the open-source performance figures.
+This directory reproduces the AllReduce + Residual + RMSNorm latency.
 
 ## Figure Mapping
 
@@ -28,7 +28,8 @@ level kernel error.
 Run from the repository root:
 
 ```bash
-python3 benchmark/fuse_allreduce_rmsorm/bench_allreduce_rmsnorm.py \
+cd benchmark/fuse_allreduce_rmsorm/
+python3 bench_allreduce_rmsnorm.py \
   --hidden 7168 \
   --tokens 8 32 128 512 4096 8192 16384 32768 \
   --fi-backend mnnvl \
