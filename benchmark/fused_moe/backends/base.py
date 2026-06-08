@@ -67,6 +67,29 @@ def scaled_fp8_quant_local(x: torch.Tensor, scale: torch.Tensor | None = None) -
     return (x.float() / scale).to(DTYPE_FP8), scale
 
 
+try:
+    from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant as _sglang_scaled_fp8_quant
+    SGLANG_FP8_QUANT_AVAILABLE = True
+except ImportError:
+    _sglang_scaled_fp8_quant = None
+    SGLANG_FP8_QUANT_AVAILABLE = False
+
+try:
+    from vllm import _custom_ops as ops
+    VLLM_AVAILABLE = True
+except ImportError:
+    ops = None
+    VLLM_AVAILABLE = False
+
+
+def get_scaled_fp8_quant():
+    if SGLANG_FP8_QUANT_AVAILABLE:
+        return _sglang_scaled_fp8_quant
+    if VLLM_AVAILABLE:
+        return ops.scaled_fp8_quant
+    return scaled_fp8_quant_local
+
+
 def build_fp8_weights(
     num_expert_local: int,
     intermediate_per_rank: int,
@@ -86,6 +109,7 @@ def build_fp8_weights(
     """
     g = torch.Generator(device="cuda").manual_seed(seed)
     E, N, K = num_expert_local, intermediate_per_rank, hidden
+    scaled_fp8_quant = get_scaled_fp8_quant()
 
     w1_half = torch.randn(
         (E, 2 * N, K), dtype=torch.float, device="cuda", generator=g,
@@ -99,8 +123,8 @@ def build_fp8_weights(
     w1_scale = torch.empty((E, 1, 1), device="cuda", dtype=torch.float32)
     w2_scale = torch.empty((E, 1, 1), device="cuda", dtype=torch.float32)
     for e in range(E):
-        w1_fp8[e], s1 = scaled_fp8_quant_local(w1_half[e])
-        w2_fp8[e], s2 = scaled_fp8_quant_local(w2_half[e])
+        w1_fp8[e], s1 = scaled_fp8_quant(w1_half[e])
+        w2_fp8[e], s2 = scaled_fp8_quant(w2_half[e])
         w1_scale[e, 0, 0] = s1
         w2_scale[e, 0, 0] = s2
     return w1_fp8, w2_fp8, w1_scale, w2_scale

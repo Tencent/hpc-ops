@@ -22,6 +22,20 @@ vLLM and SGLang are optional comparison providers. If a provider cannot be
 imported or initialized in the local environment, the benchmark prints a warning
 and continues with the remaining providers.
 
+## Environment
+
+For stable results, provide all three checkout roots explicitly:
+
+```bash
+export HPCOPS_ROOT=/workspace/hpc_cp_bench
+export VLLM_ROOT=/workspace/vllm
+export SGLANG_ROOT=/workspace/sglang
+```
+
+FP8 quantization prefers SGLang's `scaled_fp8_quant`. If SGLang is unavailable,
+the benchmark falls back to vLLM `_custom_ops.scaled_fp8_quant`; if that is also
+unavailable, it uses a local torch fallback.
+
 ## Usage
 
 TP sweep:
