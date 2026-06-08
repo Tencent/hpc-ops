@@ -140,28 +140,6 @@ torch::Tensor fused_sampler_entry(
   int logits_dtype = (logits.scalar_type() == torch::kFloat32) ? 0 : 1;
   auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
 
-  const int nmax = hpc::sampler::fused_sampler_nmax(static_cast<int>(max_topk));
-  TORCH_CHECK(nmax > 0, "fused_sampler: invalid max_topk=", max_topk);
-  const auto f32_opts = torch::dtype(torch::kFloat32).device(logits.device());
-  const auto i32_opts = torch::dtype(torch::kInt32).device(logits.device());
-
-  torch::Tensor mid_logits =
-      torch::empty({batch_size, nmax * static_cast<int>(max_topk)}, f32_opts);
-  torch::Tensor mid_tokens =
-      torch::empty({batch_size, nmax * static_cast<int>(max_topk)}, i32_opts);
-
-  // partial_max/sum only needed for BEFORE_TOPK; otherwise pass nullptr.
-  torch::Tensor partial_max;
-  torch::Tensor partial_sum;
-  float* partial_max_ptr = nullptr;
-  float* partial_sum_ptr = nullptr;
-  if (softmax_policy == 1 /* BEFORE_TOPK */) {
-    partial_max = torch::empty({batch_size, nmax}, f32_opts);
-    partial_sum = torch::empty({batch_size, nmax}, f32_opts);
-    partial_max_ptr = partial_max.mutable_data_ptr<float>();
-    partial_sum_ptr = partial_sum.mutable_data_ptr<float>();
-  }
-
   // RNG seed required (> 0) only when no external gumbel_noise is supplied.
   uint64_t rng_seed = 0;
   if (gumbel_noise_ptr == nullptr) {
@@ -176,9 +154,8 @@ torch::Tensor fused_sampler_entry(
       slot_id_ptr, rp_arr, static_cast<float>(repetition_penalty_val), temp_arr,
       static_cast<float>(temperature_val), static_cast<int>(softmax_policy), topk_ptr,
       topk_int_bytes, static_cast<int>(topk_val), topp_arr, static_cast<float>(topp_val),
-      gumbel_noise_ptr, partial_max_ptr, partial_sum_ptr, mid_logits.mutable_data_ptr<float>(),
-      mid_tokens.mutable_data_ptr<int32_t>(), batch_size, vocab_size,
-      static_cast<int>(logits_row_stride), static_cast<int>(max_topk), rng_seed, stream);
+      gumbel_noise_ptr, batch_size, vocab_size, static_cast<int>(logits_row_stride),
+      static_cast<int>(max_topk), rng_seed, stream);
 
   return token_ids;
 }
@@ -267,19 +244,10 @@ torch::Tensor fused_sampler_temperature_sample_entry(const torch::Tensor& logits
   const int logits_dtype = (logits.scalar_type() == torch::kFloat32) ? 0 : 1;
   auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
 
-  const int n_max_per_row = hpc::sampler::fused_sampler_temperature_n_max_per_row();
-  const auto f32_opts = torch::dtype(torch::kFloat32).device(logits.device());
-  const auto i32_opts = torch::dtype(torch::kInt32).device(logits.device());
-  torch::Tensor scratch_score = torch::empty({batch_size, n_max_per_row}, f32_opts);
-  torch::Tensor scratch_tok = torch::empty({batch_size, n_max_per_row}, i32_opts);
-  torch::Tensor counter = torch::zeros({batch_size}, i32_opts);
-
   fused_sampler_temperature_async(
       token_ids.mutable_data_ptr<int32_t>(), logits.data_ptr(), logits_dtype,
       static_cast<int>(logits_row_stride), temperature_ptr, static_cast<float>(temperature_val),
-      gumbel_noise_ptr, draft_token_ids_ptr, scratch_score.mutable_data_ptr<float>(),
-      scratch_tok.mutable_data_ptr<int32_t>(), counter.mutable_data_ptr<int32_t>(), batch_size,
-      vocab_size, rng_seed, stream);
+      gumbel_noise_ptr, draft_token_ids_ptr, batch_size, vocab_size, rng_seed, stream);
   return token_ids;
 }
 

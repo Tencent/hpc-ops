@@ -579,6 +579,33 @@ __global__ void stage2_kernel(int32_t* token_ids_out,    // [B]
 }
 
 // ---------------------------------------------------------------------------
+// Scratch buffer RAII wrapper (cudaMallocAsync / cudaFreeAsync).
+// ---------------------------------------------------------------------------
+struct ScratchBuf {
+  void* ptr = nullptr;
+  cudaStream_t stream = nullptr;
+
+  ScratchBuf() = default;
+  ScratchBuf(size_t bytes, cudaStream_t s) : stream(s) {
+    if (bytes > 0) {
+      cudaMallocAsync(&ptr, bytes, stream);
+    }
+  }
+  ~ScratchBuf() {
+    if (ptr) {
+      cudaFreeAsync(ptr, stream);
+    }
+  }
+  ScratchBuf(const ScratchBuf&) = delete;
+  ScratchBuf& operator=(const ScratchBuf&) = delete;
+
+  template <typename T>
+  T* as() {
+    return reinterpret_cast<T*>(ptr);
+  }
+};
+
+// ---------------------------------------------------------------------------
 // Dynamic block-count: N = clamp(floor(SMs/B), kNMin, Nmax).
 //
 // K1 is limited to 1 block/SM, so floor(SMs/B) is the largest N keeping B*N ≤ SMs
@@ -606,28 +633,30 @@ void launch_pipeline(int32_t* token_ids_out, const void* logits_ptr, uint8_t* pe
                      const int32_t* slot_id_ptr, const float* rp_arr, float rp_val,
                      const float* temp_arr, float temp_val, int softmax_policy,
                      const void* topk_ptr, int topk_int_bytes, int topk_val, const float* topp_ptr,
-                     float topp_val, const float* gumbel_noise_ptr, float* partial_max_ptr,
-                     float* partial_sum_ptr, float* mid_logits_ptr, int32_t* mid_tokens_ptr,
-                     int batch_size, int vocab_size, int logits_row_stride, int max_topk,
-                     uint64_t rng_seed, cudaStream_t stream) {
+                     float topp_val, const float* gumbel_noise_ptr, int batch_size, int vocab_size,
+                     int logits_row_stride, int max_topk, uint64_t rng_seed, cudaStream_t stream) {
   const int penalty_row_bytes = (vocab_size + 7) / 8;
 
   // Nmax = compile-time cap; N = runtime value ≤ Nmax.
   constexpr int kNmax = kMaxBlocksPerBatch<kMaxTopK>;
   const int n_blocks_per_row = pick_n_blocks_per_row(batch_size, ::hpc::get_sm_count(), kNmax);
 
-  // Scratch is provided by the host (entry.cc, torch::empty), sized by Nmax
-  // (static strides); K1 writes first N slots, K2 masks the rest.
-  // partial_max/sum are non-null only for BEFORE_TOPK.
+  // Scratch sized by Nmax (static strides); K1 writes first N slots, K2 masks
+  // the rest. partial_max/sum only needed for BEFORE_TOPK.
+  constexpr bool kNeedPartial = (kSoftmaxPolicy == kSoftmaxBeforeTopk);
+  ScratchBuf partial_max_buf(kNeedPartial ? sizeof(float) * batch_size * kNmax : 0, stream);
+  ScratchBuf partial_sum_buf(kNeedPartial ? sizeof(float) * batch_size * kNmax : 0, stream);
+  ScratchBuf mid_logits_buf(sizeof(float) * batch_size * kNmax * kMaxTopK, stream);
+  ScratchBuf mid_tokens_buf(sizeof(int) * batch_size * kNmax * kMaxTopK, stream);
 
   // --- Launch K1 ---
   dim3 grid1(n_blocks_per_row, batch_size);
   fused_scan_topk_kernel<DType, kVocabSize, kMaxTopK, kSoftmaxPolicy>
       <<<grid1, kThreadsPerBlock, 0, stream>>>(
-          mid_logits_ptr, mid_tokens_ptr, partial_max_ptr, partial_sum_ptr,
-          reinterpret_cast<const DType*>(logits_ptr), logits_row_stride, penalty_mask_ptr,
-          slot_id_ptr, rp_arr, rp_val, temp_arr, temp_val, penalty_row_bytes, n_blocks_per_row,
-          kNmax);
+          mid_logits_buf.as<float>(), mid_tokens_buf.as<int>(), partial_max_buf.as<float>(),
+          partial_sum_buf.as<float>(), reinterpret_cast<const DType*>(logits_ptr),
+          logits_row_stride, penalty_mask_ptr, slot_id_ptr, rp_arr, rp_val, temp_arr, temp_val,
+          penalty_row_bytes, n_blocks_per_row, kNmax);
 
   // --- Launch K2 ---
   constexpr int kThreadsPerBlock2 = kNmax * kMaxTopK;
@@ -639,9 +668,10 @@ void launch_pipeline(int32_t* token_ids_out, const void* logits_ptr, uint8_t* pe
   }
 
   stage2_kernel<kMaxTopK, kSoftmaxPolicy, kHasTopP><<<batch_size, kThreadsPerBlock2, 0, stream>>>(
-      token_ids_out, mid_logits_ptr, mid_tokens_ptr, partial_max_ptr, partial_sum_ptr, topk_ptr,
-      topk_int_bytes, topk_val, topp_ptr, topp_val, gumbel_noise_ptr, vocab_size, penalty_mask_ptr,
-      slot_id_ptr, rp_arr, rp_val, penalty_row_bytes, rng_seed, rng_base_offset, n_blocks_per_row);
+      token_ids_out, mid_logits_buf.as<float>(), mid_tokens_buf.as<int>(),
+      partial_max_buf.as<float>(), partial_sum_buf.as<float>(), topk_ptr, topk_int_bytes, topk_val,
+      topp_ptr, topp_val, gumbel_noise_ptr, vocab_size, penalty_mask_ptr, slot_id_ptr, rp_arr,
+      rp_val, penalty_row_bytes, rng_seed, rng_base_offset, n_blocks_per_row);
 }
 
 // ---------------------------------------------------------------------------
@@ -664,10 +694,8 @@ void fused_sampler_async(int32_t* token_ids_out, const void* logits_ptr, int log
                          const float* temperature_ptr, float temperature_val, int softmax_policy,
                          const void* topk_ptr, int topk_int_bytes, int topk_val,
                          const float* topp_ptr, float topp_val, const float* gumbel_noise_ptr,
-                         float* partial_max_ptr, float* partial_sum_ptr, float* mid_logits_ptr,
-                         int32_t* mid_tokens_ptr, int batch_size, int vocab_size,
-                         int logits_row_stride, int max_topk, uint64_t rng_seed,
-                         cudaStream_t stream) {
+                         int batch_size, int vocab_size, int logits_row_stride, int max_topk,
+                         uint64_t rng_seed, cudaStream_t stream) {
   using fused_sampler_kernels::launch_pipeline;
   using fused_sampler_kernels::type_tag;
   namespace kernels = fused_sampler_kernels;
@@ -685,9 +713,8 @@ void fused_sampler_async(int32_t* token_ids_out, const void* logits_ptr, int log
     launch_pipeline<DType, kVocabSize, kMaxTopK, kSoftmaxPolicy, kHasTopP>(
         token_ids_out, logits_ptr, penalty_mask_ptr, slot_id_ptr, repetition_penalty_ptr,
         repetition_penalty_val, temperature_ptr, temperature_val, softmax_policy, topk_ptr,
-        topk_int_bytes, topk_val, topp_ptr, topp_val, gumbel_noise_ptr, partial_max_ptr,
-        partial_sum_ptr, mid_logits_ptr, mid_tokens_ptr, batch_size, vocab_size, logits_row_stride,
-        max_topk, rng_seed, stream);
+        topk_int_bytes, topk_val, topp_ptr, topp_val, gumbel_noise_ptr, batch_size, vocab_size,
+        logits_row_stride, max_topk, rng_seed, stream);
   };
 
   auto dispatch_topp = [&](auto dtype_tag, auto vocab_tag, auto topk_tag, auto policy_tag) {
@@ -742,19 +769,6 @@ void fused_sampler_async(int32_t* token_ids_out, const void* logits_ptr, int log
   } else {
     dispatch_vocab(type_tag<__nv_bfloat16>{});
   }
-}
-
-// Host helper: Nmax for a given max_topk. Single source of truth for the
-// kernel's kMaxBlocksPerBatch so entry.cc can size scratch without duplicating
-// the constant. Returns 0 for unsupported max_topk.
-int fused_sampler_nmax(int max_topk) {
-  if (max_topk == 32) {
-    return fused_sampler_kernels::kMaxBlocksPerBatch<32>;
-  }
-  if (max_topk == 64) {
-    return fused_sampler_kernels::kMaxBlocksPerBatch<64>;
-  }
-  return 0;
 }
 
 }  // namespace sampler
