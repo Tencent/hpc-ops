@@ -1,4 +1,4 @@
-# Copyright (C) 2025 Tencent.
+# Copyright (C) 2026 Tencent.
 
 """vLLM CUTLASS FusedMoE backend."""
 from __future__ import annotations

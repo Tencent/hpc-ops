@@ -1,4 +1,4 @@
-# Copyright (C) 2025 Tencent.
+# Copyright (C) 2026 Tencent.
 
 """Shared base classes and helpers for all FusedMoE backends."""
 from __future__ import annotations

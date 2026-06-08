@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (C) 2025 Tencent.
+# Copyright (C) 2026 Tencent.
 
 """FusedMoE FP8 benchmark.
 
