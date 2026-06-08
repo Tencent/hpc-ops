@@ -10,7 +10,7 @@ import torch
 from . import register
 from .base import (
     A_SCALE_VALUE, Backend, BenchSpec, build_a_scale, build_activation,
-    build_fp8_weights, build_routing, get_scaled_fp8_quant,
+    build_fp8_weights, build_routing,
 )
 
 
@@ -26,7 +26,7 @@ class HpcBackend(Backend):
         E = spec.num_expert_local
         N = spec.intermediate_per_rank
         K = spec.hidden
-        scaled_fp8_quant = get_scaled_fp8_quant()
+        scaled_fp8_quant = lambda x, scale=None: torch.ops.hpc.scaled_fp8_quant(x, scale, None)
 
         a_half = build_activation(spec.num_seq, K, seed=spec.seed)
         a_scale = build_a_scale()

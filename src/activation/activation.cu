@@ -1,12 +1,15 @@
 // Copyright (C) 2026 Tencent.
 
 #include <cuda.h>
+#include <cuda_fp16.h>
 #include <stdio.h>
 
 #include "cutlass/fast_math.h"
 #include "src/activation/activation.h"
 #include "src/utils/utils.cuh"
 #include "src/utils/utils.h"
+
+#include <type_traits>
 
 namespace hpc {
 namespace activation {
@@ -428,6 +431,91 @@ __global__ void masked_act_mul_and_blockwise_quant_kernel(
   }  // irow0
 }
 
+template <typename T>
+__device__ __forceinline__ float quant_to_float(T value) {
+  return static_cast<float>(value);
+}
+
+template <>
+__device__ __forceinline__ float quant_to_float<__nv_bfloat16>(__nv_bfloat16 value) {
+  return __bfloat162float(value);
+}
+
+template <>
+__device__ __forceinline__ float quant_to_float<__half>(__half value) {
+  return __half2float(value);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ float load_quant_value(const scalar_t *ptr) {
+  return quant_to_float(*ptr);
+}
+
+template <>
+__device__ __forceinline__ float load_quant_value<float>(const float *ptr) {
+  return *ptr;
+}
+
+template <typename scalar_t>
+__global__ void scaled_fp8_quant_kernel(__nv_fp8_e4m3 *__restrict__ output,
+                                        const scalar_t *__restrict__ input,
+                                        const float *__restrict__ scale,
+                                        int64_t numel) {
+  const float inv_scale = 1.0f / scale[0];
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+  if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+    int64_t elem_idx = idx * 8;
+    const int64_t vec_end = numel / 8 * 8;
+    for (; elem_idx < vec_end; elem_idx += static_cast<int64_t>(blockDim.x) * gridDim.x * 8) {
+      auto in = to<float>(load<__nv_bfloat162, 4>(input + elem_idx));
+      vec_t<float, 8> out;
+#pragma unroll
+      for (int i = 0; i < size(out); ++i) {
+        out[i] = in[i] * inv_scale;
+      }
+      auto out_fp8 = to<__nv_fp8x4_e4m3>(out);
+      store(output + elem_idx, out_fp8);
+    }
+  } else if constexpr (std::is_same_v<scalar_t, __half>) {
+    int64_t elem_idx = idx * 8;
+    const int64_t vec_end = numel / 8 * 8;
+    for (; elem_idx < vec_end; elem_idx += static_cast<int64_t>(blockDim.x) * gridDim.x * 8) {
+      auto in = to<float>(load<__half2, 4>(input + elem_idx));
+      vec_t<float, 8> out;
+#pragma unroll
+      for (int i = 0; i < size(out); ++i) {
+        out[i] = in[i] * inv_scale;
+      }
+      auto out_fp8 = to<__nv_fp8x4_e4m3>(out);
+      store(output + elem_idx, out_fp8);
+    }
+  } else {
+    int64_t elem_idx = idx * 4;
+    const int64_t vec_end = numel / 4 * 4;
+    for (; elem_idx < vec_end; elem_idx += static_cast<int64_t>(blockDim.x) * gridDim.x * 4) {
+      vec_t<float, 4> out;
+#pragma unroll
+      for (int i = 0; i < size(out); ++i) {
+        out[i] = input[elem_idx + i] * inv_scale;
+      }
+      auto out_fp8 = to<__nv_fp8x4_e4m3>(out);
+      store(output + elem_idx, out_fp8);
+    }
+  }
+
+  int64_t tail_begin;
+  if constexpr (std::is_same_v<scalar_t, float>) {
+    tail_begin = numel / 4 * 4;
+  } else {
+    tail_begin = numel / 8 * 8;
+  }
+  for (int64_t tail_idx = tail_begin + idx; tail_idx < numel;
+       tail_idx += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    output[tail_idx] = __nv_fp8_e4m3(load_quant_value(input + tail_idx) * inv_scale);
+  }
+}
+
 }  // namespace kernels
 
 void act_mul_and_quant_async(__nv_fp8_e4m3 *out_ptr, const __nv_bfloat16 *gate_up_ptr,
@@ -681,6 +769,31 @@ void masked_act_mul_and_blockwise_quant_async(__nv_fp8_e4m3 *output_ptr, float *
       output_ptr, output_scale_ptr, input_ptr, num_per_expert_ptr, num_total_tokens,
       num_intermediate_size, num_intermediate_size / 128, num_tokens_per_expert, Block2YX,
       Row2EandT, num_block_row);
+}
+
+template <typename scalar_t>
+void scaled_fp8_quant_async_impl(__nv_fp8_e4m3 *output_ptr, const scalar_t *input_ptr,
+                                 const float *scale_ptr, int64_t numel,
+                                 cudaStream_t stream) {
+  dim3 block(256);
+  dim3 grid(std::min<int64_t>((numel + block.x - 1) / block.x, get_sm_count() * 8));
+  kernels::scaled_fp8_quant_kernel<<<grid, block, 0, stream>>>(output_ptr, input_ptr, scale_ptr,
+                                                               numel);
+}
+
+void scaled_fp8_quant_async(__nv_fp8_e4m3 *output_ptr, const __nv_bfloat16 *input_ptr,
+                            const float *scale_ptr, int64_t numel, cudaStream_t stream) {
+  scaled_fp8_quant_async_impl(output_ptr, input_ptr, scale_ptr, numel, stream);
+}
+
+void scaled_fp8_quant_async(__nv_fp8_e4m3 *output_ptr, const __half *input_ptr,
+                            const float *scale_ptr, int64_t numel, cudaStream_t stream) {
+  scaled_fp8_quant_async_impl(output_ptr, input_ptr, scale_ptr, numel, stream);
+}
+
+void scaled_fp8_quant_async(__nv_fp8_e4m3 *output_ptr, const float *input_ptr,
+                            const float *scale_ptr, int64_t numel, cudaStream_t stream) {
+  scaled_fp8_quant_async_impl(output_ptr, input_ptr, scale_ptr, numel, stream);
 }
 
 }  // namespace activation

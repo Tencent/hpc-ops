@@ -5,6 +5,7 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <limits>
 #include <tuple>
 #include <vector>
 
@@ -154,6 +155,51 @@ std::tuple<torch::Tensor, torch::Tensor> masked_act_mul_and_blockwise_quant_entr
   return std::make_tuple(output_tensor, output_scale_tensor);
 }
 
+std::tuple<torch::Tensor, torch::Tensor> scaled_fp8_quant_entry(
+    const torch::Tensor &input, std::optional<torch::Tensor> scale,
+    std::optional<torch::Tensor> output) {
+  auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+  TORCH_CHECK(input.device().is_cuda(), "input must be a CUDA tensor");
+  TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+  TORCH_CHECK(input.numel() > 0, "input must be non-empty");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat32 || input.scalar_type() == torch::kFloat16 ||
+                  input.scalar_type() == torch::kBFloat16,
+              "input dtype must be float32, float16, or bfloat16");
+
+  auto output_tensor =
+      output.has_value() ? output.value() : torch::empty_like(input, input.options().dtype(torch::kFloat8_e4m3fn));
+  TORCH_CHECK(output_tensor.device().is_cuda(), "output must be a CUDA tensor");
+  TORCH_CHECK(output_tensor.is_contiguous(), "output must be contiguous");
+  TORCH_CHECK(output_tensor.sizes() == input.sizes(), "output shape must match input shape");
+  TORCH_CHECK(output_tensor.scalar_type() == torch::kFloat8_e4m3fn,
+              "output dtype must be float8_e4m3fn");
+
+  TORCH_CHECK(scale.has_value(), "scale is required for scaled_fp8_quant");
+  torch::Tensor scale_tensor = scale.value();
+  TORCH_CHECK(scale_tensor.device().is_cuda(), "scale must be a CUDA tensor");
+  TORCH_CHECK(scale_tensor.scalar_type() == torch::kFloat32, "scale dtype must be float32");
+  TORCH_CHECK(scale_tensor.numel() == 1, "scale must contain one element");
+
+  using Tout = __nv_fp8_e4m3;
+  auto *output_ptr = reinterpret_cast<Tout *>(output_tensor.mutable_data_ptr());
+  auto *scale_ptr = scale_tensor.mutable_data_ptr<float>();
+  const int64_t numel = input.numel();
+
+  if (input.scalar_type() == torch::kBFloat16) {
+    const auto *input_ptr = reinterpret_cast<const __nv_bfloat16 *>(input.const_data_ptr());
+    scaled_fp8_quant_async(output_ptr, input_ptr, scale_ptr, numel, stream);
+  } else if (input.scalar_type() == torch::kFloat16) {
+    const auto *input_ptr = reinterpret_cast<const __half *>(input.const_data_ptr());
+    scaled_fp8_quant_async(output_ptr, input_ptr, scale_ptr, numel, stream);
+  } else {
+    const auto *input_ptr = input.const_data_ptr<float>();
+    scaled_fp8_quant_async(output_ptr, input_ptr, scale_ptr, numel, stream);
+  }
+
+  return std::make_tuple(output_tensor, scale_tensor);
+}
+
 }  // namespace activation
 }  // namespace hpc
 
@@ -173,4 +219,6 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "Tensor output_scale)");
   m.impl("masked_act_mul_and_blockwise_quant", torch::kCUDA,
          &hpc::activation::masked_act_mul_and_blockwise_quant_entry);
+  m.def("scaled_fp8_quant(Tensor input, Tensor? scale, Tensor? output) -> (Tensor, Tensor)");
+  m.impl("scaled_fp8_quant", torch::kCUDA, &hpc::activation::scaled_fp8_quant_entry);
 }

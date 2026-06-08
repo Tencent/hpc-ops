@@ -193,7 +193,6 @@ def build_env(backend: str, roots: Roots, gpu_id: int) -> dict:
         env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
     return env
 
-
 # ---------------------------------------------------------------------------
 # Dry-run probe (fast import check)
 # ---------------------------------------------------------------------------

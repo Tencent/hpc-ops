@@ -32,9 +32,10 @@ export VLLM_ROOT=/workspace/vllm
 export SGLANG_ROOT=/workspace/sglang
 ```
 
-FP8 quantization prefers SGLang's `scaled_fp8_quant`. If SGLang is unavailable,
-the benchmark falls back to vLLM `_custom_ops.scaled_fp8_quant`; if that is also
-unavailable, it uses a local torch fallback.
+For the HPC-Ops provider, activation quantization uses the local
+`hpc.scaled_fp8_quant` operator. Shared FP8 weight construction still prefers
+SGLang's `scaled_fp8_quant`, then vLLM `_custom_ops.scaled_fp8_quant`, and
+finally a local torch fallback.
 
 ## Usage
 

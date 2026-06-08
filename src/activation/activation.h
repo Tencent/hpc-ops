@@ -4,6 +4,7 @@
 #define SRC_ACTIVATION_ACTIVATION_H_
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
 #include <stdint.h>
@@ -41,6 +42,15 @@ void masked_act_mul_and_blockwise_quant_async(__nv_fp8_e4m3 *output_ptr, float *
                                               const int *num_per_expert_ptr, int num_total_tokens,
                                               int num_intermediate_size, int num_tokens_per_expert,
                                               cudaStream_t stream);
+
+void scaled_fp8_quant_async(__nv_fp8_e4m3 *output_ptr, const __nv_bfloat16 *input_ptr,
+                            const float *scale_ptr, int64_t numel, cudaStream_t stream);
+
+void scaled_fp8_quant_async(__nv_fp8_e4m3 *output_ptr, const __half *input_ptr,
+                            const float *scale_ptr, int64_t numel, cudaStream_t stream);
+
+void scaled_fp8_quant_async(__nv_fp8_e4m3 *output_ptr, const float *input_ptr,
+                            const float *scale_ptr, int64_t numel, cudaStream_t stream);
 
 }  // namespace activation
 }  // namespace hpc
