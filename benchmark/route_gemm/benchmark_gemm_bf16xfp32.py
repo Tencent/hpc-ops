@@ -1,10 +1,12 @@
-# Copyright (C) 2026 Tencent.
+# Copyright (C) 2025 Tencent.
 
 import argparse
 import csv
 import json
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from statistics import median
 
@@ -53,6 +55,48 @@ def bench_cuda_events(fn, flush, warmup, iters):
     return median(times), percentile(times, 90), out
 
 
+def run_nsys_steps(fn, warmup, iters):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    torch.cuda.cudart().cudaProfilerStart()
+    for _ in range(iters):
+        torch.cuda.nvtx.range_push("step")
+        try:
+            fn()
+        finally:
+            torch.cuda.nvtx.range_pop()
+    torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStop()
+
+
+def extract_nvtx_us(report_prefix: Path):
+    cmd = [
+        "nsys",
+        "stats",
+        "--report",
+        "nvtx_gpu_proj_trace",
+        "--force-export=true",
+        "-q",
+        "-f",
+        "json",
+        str(report_prefix) + ".nsys-rep",
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+        raw = json.loads(out.decode())
+        data = raw[0]["data"] if isinstance(raw, list) and raw and "data" in raw[0] else raw
+        samples = []
+        for entry in data:
+            name = entry.get("Name", "").strip().strip('"')
+            if name in ("step", ":step"):
+                samples.append(float(entry["Projected Duration (ns)"]) / 1000.0)
+        return samples
+    except Exception:
+        return []
+
+
 def error_metrics(out, ref):
     out = out.float()
     ref = ref.float()
@@ -86,6 +130,75 @@ def build_runner(provider, x, w, w_high, w_low, scale, split_flag):
     raise ValueError(f"unknown provider: {provider}")
 
 
+def run_nsys_worker(args):
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    scale = 1.0 / 256.0
+    x, w, w_high, w_low = make_inputs(args.worker_m, args.n, args.k, scale, "cuda")
+    split_flag = hpc.get_gemm_bf16xfp32_workspace(args.n)
+    torch.backends.cuda.matmul.allow_tf32 = args.worker_provider == "TF32(cuBLAS)"
+    run = build_runner(args.worker_provider, x, w, w_high, w_low, scale, split_flag)
+    run_nsys_steps(run, args.warmup, args.iters)
+
+
+def bench_nsys_provider(provider, m, n, k, args, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_prefix = out_dir / f"m{m}_{provider_key(provider)}"
+    report_file = str(report_prefix) + ".nsys-rep"
+    if os.path.exists(report_file):
+        os.remove(report_file)
+
+    cmd = [
+        "nsys",
+        "profile",
+        "-f",
+        "true",
+        "-o",
+        str(report_prefix),
+        "--sample=none",
+        "--cpuctxsw=none",
+        "--capture-range=cudaProfilerApi",
+        "--capture-range-end=stop-shutdown",
+        "-t",
+        "cuda,nvtx",
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--worker",
+        "--worker-m",
+        str(m),
+        "--worker-provider",
+        provider,
+        "--n",
+        str(n),
+        "--k",
+        str(k),
+        "--warmup",
+        str(args.warmup),
+        "--iters",
+        str(args.iters),
+        "--seed",
+        str(args.seed),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=args.nsys_timeout,
+            env=os.environ.copy(),
+        )
+    except subprocess.TimeoutExpired:
+        return None, None, 0, "nsys profile timeout"
+    if proc.returncode != 0 and not os.path.exists(report_file):
+        stderr = proc.stderr.decode(errors="replace").strip().splitlines()
+        return None, None, 0, stderr[-1] if stderr else "nsys profile failed"
+
+    vals = extract_nvtx_us(report_prefix)
+    if not vals:
+        return None, None, 0, "no step samples in nsys output"
+    return float(median(vals)), float(percentile(vals, 90)), len(vals), None
+
+
 def benchmark_shape(m, n, k, providers, args, flush):
     scale = 1.0 / 256.0
     x, w, w_high, w_low = make_inputs(m, n, k, scale, "cuda")
@@ -100,11 +213,20 @@ def benchmark_shape(m, n, k, providers, args, flush):
     for provider in providers:
         torch.backends.cuda.matmul.allow_tf32 = provider == "TF32(cuBLAS)"
         run = build_runner(provider, x, w, w_high, w_low, scale, split_flag)
-        us, p90_us, out = bench_cuda_events(run, flush, args.warmup, args.iters)
+        if args.timing == "event":
+            us, p90_us, out = bench_cuda_events(run, flush, args.warmup, args.iters)
+            samples = args.iters
+            err = None
+        else:
+            us, p90_us, samples, err = bench_nsys_provider(provider, m, n, k, args, args._nsys_out_dir)
+            out = run()
+            torch.cuda.synchronize()
         results[provider] = {
             "us": us,
             "p90_us": p90_us,
-            "tflops": tflops(m, n, k, us),
+            "tflops": tflops(m, n, k, us) if us else None,
+            "samples": samples,
+            "error": err,
         }
         outputs[provider] = out
 
@@ -125,6 +247,7 @@ def benchmark_shape(m, n, k, providers, args, flush):
                 )
 
     row = {"m": m, "n": n, "k": k}
+    row["timing"] = "event_cuda_median" if args.timing == "event" else "nsys_eager_nvtx_median"
     for provider in PROVIDERS:
         if provider not in results:
             continue
@@ -132,14 +255,18 @@ def benchmark_shape(m, n, k, providers, args, flush):
         row[f"{prefix}_us"] = results[provider]["us"]
         row[f"{prefix}_p90_us"] = results[provider]["p90_us"]
         row[f"{prefix}_tflops"] = results[provider]["tflops"]
+        row[f"{prefix}_samples"] = results[provider]["samples"]
+        row[f"{prefix}_error"] = results[provider]["error"]
         row[f"{prefix}_max_abs"] = errors[provider]["max_abs"]
         row[f"{prefix}_mean_abs"] = errors[provider]["mean_abs"]
         row[f"{prefix}_cosine"] = errors[provider]["cosine"]
 
     if "hpc-ops-bf16xfp32" in results and "FP32(cuBLAS)" in results:
-        row["hpc_vs_fp32_speedup"] = results["FP32(cuBLAS)"]["us"] / results["hpc-ops-bf16xfp32"]["us"]
+        if results["FP32(cuBLAS)"]["us"] and results["hpc-ops-bf16xfp32"]["us"]:
+            row["hpc_vs_fp32_speedup"] = results["FP32(cuBLAS)"]["us"] / results["hpc-ops-bf16xfp32"]["us"]
     if "hpc-ops-bf16xfp32" in results and "TF32(cuBLAS)" in results:
-        row["hpc_vs_tf32_speedup"] = results["TF32(cuBLAS)"]["us"] / results["hpc-ops-bf16xfp32"]["us"]
+        if results["TF32(cuBLAS)"]["us"] and results["hpc-ops-bf16xfp32"]["us"]:
+            row["hpc_vs_tf32_speedup"] = results["TF32(cuBLAS)"]["us"] / results["hpc-ops-bf16xfp32"]["us"]
     return row
 
 
@@ -159,7 +286,8 @@ def print_tflops_table(rows, providers):
     for row in rows:
         values = [str(row["m"])]
         for provider in providers:
-            values.append(f"{row[provider_key(provider) + '_tflops']:.2f}")
+            value = row.get(provider_key(provider) + "_tflops")
+            values.append(f"{value:.2f}" if isinstance(value, (int, float)) else "ERR")
         print("  ".join(v.rjust(w) for v, w in zip(values, widths)))
 
 
@@ -214,6 +342,13 @@ def write_csv(path, rows):
         "hpc_cosine",
         "torch_fp32_cosine",
         "torch_tf32_cosine",
+        "hpc_samples",
+        "torch_fp32_samples",
+        "torch_tf32_samples",
+        "hpc_error",
+        "torch_fp32_error",
+        "torch_tf32_error",
+        "timing",
     ]
     with Path(path).open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -235,22 +370,32 @@ def parse_args():
     parser.add_argument("--m-list", default=",".join(str(x) for x in DEFAULT_M_LIST))
     parser.add_argument("--n", type=int, default=192)
     parser.add_argument("--k", type=int, default=4096)
+    parser.add_argument("--timing", choices=["nsys", "event"], default="nsys")
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--seed", type=int, default=10086)
     parser.add_argument("--flush-mb", type=int, default=128)
     parser.add_argument("--providers", nargs="+", default=PROVIDERS, choices=PROVIDERS)
+    parser.add_argument("--output-dir", default="", help="Output directory for nsys reports.")
+    parser.add_argument("--tag", default="", help="Subdirectory name for nsys reports.")
+    parser.add_argument("--nsys-timeout", type=int, default=300)
     parser.add_argument("--csv", type=str, default="", help="Optional output CSV path.")
     parser.add_argument("--jsonl", type=str, default="", help="Optional output JSONL path.")
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-abs-tol", type=float, default=0.01)
     parser.add_argument("--mean-abs-tol", type=float, default=0.001)
     parser.add_argument("--print-csv", action="store_true", help="Print machine-readable CSV rows.")
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-m", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-provider", choices=PROVIDERS, default="hpc-ops-bf16xfp32", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.worker:
+        run_nsys_worker(args)
+        return
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     if torch.cuda.get_device_capability()[0] != 9:
@@ -261,6 +406,12 @@ def main():
 
     m_values = parse_int_list(args.m_list)
     flush = torch.empty(args.flush_mb * 1024 * 1024 // 4, dtype=torch.int32, device="cuda")
+    tag = args.tag or f"route_gemm_{int(time.time())}"
+    args._nsys_out_dir = (
+        Path(args.output_dir) / tag
+        if args.output_dir
+        else Path(__file__).resolve().parent / "log" / tag
+    )
     old_tf32 = torch.backends.cuda.matmul.allow_tf32
     rows = []
     try:
@@ -278,7 +429,12 @@ def main():
         write_csv(args.csv, rows)
     if args.jsonl:
         write_jsonl(args.jsonl, rows)
+    if args.timing == "nsys":
+        print(f"\nnsys reports: {args._nsys_out_dir}")
+    if args.csv:
         print(f"\nWrote CSV: {args.csv}")
+    if args.jsonl:
+        print(f"Wrote JSONL: {args.jsonl}")
     print("\nBenchmark finished!")
 
 
