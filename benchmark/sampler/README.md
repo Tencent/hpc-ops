@@ -1,8 +1,9 @@
 # Sampler Benchmark
 
-This directory contains the benchmark entry used to reproduce the sampler latency results.
+Benchmark HPC-Ops sampler kernels against PyTorch/vLLM-style and FlashInfer paths.
 
-## Figure Mapping
+## Overview
+
 - Operator: HPC-Ops Sampler
 - Providers:
   - `HPC-Ops`
@@ -10,18 +11,18 @@ This directory contains the benchmark entry used to reproduce the sampler latenc
   - `FlashInfer`
 - Timing unit: microseconds per sampler call
 - Timing modes:
-  - `--timing nsys`: release-style timing using `nsys`, NVTX `step`, eager sampler calls, and median latency. This keeps the profiler/post-processing style aligned with FusedMoE while avoiding CUDA Graph capture paths that are not safe for sampler APIs in this environment.
-  - `--timing event`: quick CUDA event timing with eager sampler calls by default. `--graph` is available only for experiments because some sampler paths are not CUDA-graph-capture safe.
+  - `--timing nsys`: release-style timing using `nsys`, NVTX ranges, eager sampler calls, and median latency from NVTX GPU projected duration. The worker does not synchronize inside each timed step.
+  - `--timing event`: quick CUDA event timing with eager sampler calls.
 - Default config: vocab size `120832`, BF16 logits, batch sizes `1,8,16,32,64,128,256,512`.
 
-## Scenario Names
+## Scenarios
 
 - `temperature`: `Temperature Sampling`, temperature-only fast path.
 - `full`: `Full Sampling`, repetition penalty + temperature + topk/topp + sampling.
 
-## Reproduction Commands
+## Usage
 
-Full sweep with the FusedMoE-aligned `nsys` timing path:
+Full sweep:
 
 ```bash
 python3 benchmark_sampler.py \
@@ -31,7 +32,7 @@ python3 benchmark_sampler.py \
   --jsonl sampler_latency.jsonl
 ```
 
-Fast smoke test with CUDA event timing:
+Smoke test:
 
 ```bash
 python3 benchmark_sampler.py \
@@ -42,5 +43,7 @@ python3 benchmark_sampler.py \
   --warmup 1 \
   --iters 3
 ```
+
+## Notes
 
 If FlashInfer is unavailable or its API is incompatible with the local environment, the benchmark records the provider error and continues with the remaining providers.
