@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
-# Copyright (C) 2026 Tencent.
+# Copyright (C) 2025 Tencent.
 
-"""Unified FusedMoE bench driver.
+"""FusedMoE FP8 benchmark.
 
 Usage:
-    python3 bench.py --tp 8 --ep 1                       # TP=8 sweep
-    python3 bench.py --tp 1 --ep 8                       # EP=8 sweep
-    python3 bench.py --tp 1 --ep 8 --bs 4 16 64 256      # custom batches
-    python3 bench.py --tp 1 --ep 8 --models hunyuan-v3   # one model
-    python3 bench.py --tp 1 --ep 8 --backends hpcops vllm vllm_cutlass sglang
+    python3 benchmark/fused_moe/benchmark_fuse_moe.py --tp 8 --ep 1
+    python3 benchmark/fused_moe/benchmark_fuse_moe.py --tp 1 --ep 8 --bs 4 16 64
 
-Path discovery (CLI required, env vars as fallback):
+Path discovery (CLI args override env vars):
     --vllm-root        / $VLLM_ROOT
     --sglang-root      / $SGLANG_ROOT
     --hpcops-root      / $HPCOPS_ROOT
 
-If a backend is unavailable, the driver skips it with an explicit reason.
+Unavailable comparison backends are skipped with an explicit warning.
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import subprocess
@@ -34,30 +32,39 @@ import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# (E, topk, hidden, intermediate_full)
-MODELS = {
+@dataclass(frozen=True)
+class ModelSpec:
+    experts: int
+    topk: int
+    hidden: int
+    intermediate: int
+
+
+# name -> (experts, topk, hidden, intermediate_full)
+MODEL_PRESETS = {
     "qwen3-235b":  (128, 8, 4096, 1536),
     "hunyuan-v1":  (64,  8, 4096, 3072),
     "hunyuan-v2":  (128, 8, 4096, 4096),
     "hunyuan-v3":  (192, 8, 4096, 1536),
     "deepseek-v3": (256, 8, 7168, 2048),
 }
+MODELS = {name: ModelSpec(*shape) for name, shape in MODEL_PRESETS.items()}
 
 ALL_BACKENDS = [
     "hpcops", "sglang", "vllm", "vllm_cutlass",
 ]
 
 DISPLAY = {
-    "hpcops":       "hpc-ops",
+    "hpcops":       "HPC-Ops",
     "sglang":       "SGLang",
-    "vllm":         "vLLM-Triton",
-    "vllm_cutlass": "vLLM-CUTLASS",
+    "vllm":         "vLLM Triton",
+    "vllm_cutlass": "vLLM CUTLASS",
 }
 
-BS_TP = [4, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-BS_EP = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+DEFAULT_TP_BATCHES = "4,16,32,64,128,256,512,1024,2048,4096,8192,16384"
+DEFAULT_EP_BATCHES = "4,8,16,32,64,128,256,512,1024,2048"
 
-DEFAULT_MODELS = ["hunyuan-v3", "deepseek-v3", "qwen3-235b"]
+DEFAULT_MODELS = ["qwen3-235b", "hunyuan-v3", "deepseek-v3"]
 
 
 # ---------------------------------------------------------------------------
@@ -70,27 +77,78 @@ class Roots:
     hpcops: Optional[str]
 
 
+def _candidate_roots() -> list[Path]:
+    candidates: list[Path] = []
+    for path in (SCRIPT_DIR, *SCRIPT_DIR.parents):
+        candidates.append(path)
+
+    deduped = []
+    seen = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved not in seen:
+            deduped.append(resolved)
+            seen.add(resolved)
+    return deduped
+
+
+def _discover_hpcops_root() -> Optional[str]:
+    for root in _candidate_roots():
+        if list((root / "hpc").glob("_C*.so")):
+            return str(root)
+        if list(root.glob("build/lib.*/hpc/_C*.so")) and (root / "hpc").is_dir():
+            return str(root)
+    return None
+
+
 def resolve_roots(args) -> Roots:
-    def _pick(cli_val, env_var):
+    def _pick(cli_val, env_var, discover=None):
         if cli_val:
             return cli_val
-        return os.environ.get(env_var)
+        env_val = os.environ.get(env_var)
+        if env_val:
+            return env_val
+        return discover() if discover is not None else None
     return Roots(
         vllm=_pick(args.vllm_root, "VLLM_ROOT"),
         sglang=_pick(args.sglang_root, "SGLANG_ROOT"),
-        hpcops=_pick(args.hpcops_root, "HPCOPS_ROOT"),
+        hpcops=_pick(args.hpcops_root, "HPCOPS_ROOT", _discover_hpcops_root),
     )
 
 
 def required_roots(backend: str) -> list[str]:
     """Which source roots a backend needs."""
     if backend == "hpcops":
-        return ["hpcops", "vllm", "sglang"]
+        return ["hpcops"]
     if backend in ("vllm", "vllm_cutlass"):
-        return ["vllm"]
+        return []
     if backend == "sglang":
-        return ["vllm", "sglang"]
+        return []
     raise ValueError(backend)
+
+
+def parse_int_list(value: str) -> list[int]:
+    items = value.replace(",", " ").split()
+    if not items:
+        raise argparse.ArgumentTypeError("expected at least one integer")
+    try:
+        return [int(item) for item in items]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid integer list: {value}") from exc
+
+
+def parse_model_shape(value: str) -> tuple[str, ModelSpec]:
+    parts = value.split(":")
+    if len(parts) != 5:
+        raise argparse.ArgumentTypeError(
+            "model shape must be name:experts:topk:hidden:intermediate"
+        )
+    name = parts[0]
+    try:
+        spec = ModelSpec(*(int(item) for item in parts[1:]))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid model shape: {value}") from exc
+    return name, spec
 
 
 # ---------------------------------------------------------------------------
@@ -103,20 +161,25 @@ def build_env(backend: str, roots: Roots, gpu_id: int) -> dict:
 
     if backend == "hpcops":
         hpc_root = roots.hpcops
-        pp_parts.append(hpc_root)
+        build_libs = [str(p) for p in Path(hpc_root).glob("build/lib.*") if (p / "hpc").is_dir()]
+        pp_parts.extend(build_libs)
+        if list((Path(hpc_root) / "hpc").glob("_C*.so")):
+            pp_parts.append(hpc_root)
         nvshmem = os.path.join(hpc_root, "3rd/ucl/nvshmem/lib")
         if os.path.isdir(nvshmem):
             ld_parts.append(nvshmem)
 
     if roots.vllm:
         pp_parts.append(roots.vllm)
-    if backend in ("sglang", "hpcops") and roots.sglang:
+    if backend == "sglang" and roots.sglang:
         pp_parts.append(os.path.join(roots.sglang, "python"))
     pp_parts.append(str(SCRIPT_DIR))
 
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     env["PYTHONPATH"] = ":".join(p for p in pp_parts if p)
+    if backend == "hpcops" and roots.hpcops:
+        env["HPC_OPS_ROOT"] = roots.hpcops
     if ld_parts:
         env["LD_LIBRARY_PATH"] = ":".join(
             ld_parts + ([env["LD_LIBRARY_PATH"]] if "LD_LIBRARY_PATH" in env else [])
@@ -125,7 +188,7 @@ def build_env(backend: str, roots: Roots, gpu_id: int) -> dict:
     if compat and os.path.exists(compat):
         env["LD_PRELOAD"] = compat
 
-    if backend in ("sglang", "hpcops") and roots.sglang:
+    if backend == "sglang" and roots.sglang:
         env["SGLANG_ROOT"] = roots.sglang
         env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
     return env
@@ -134,21 +197,30 @@ def build_env(backend: str, roots: Roots, gpu_id: int) -> dict:
 # ---------------------------------------------------------------------------
 # Dry-run probe (fast import check)
 # ---------------------------------------------------------------------------
-def dry_run(backend: str, roots: Roots, gpu_id: int) -> tuple[bool, str]:
+def dry_run(
+    backend: str, roots: Roots, gpu_id: int,
+    *, num_seq: int, hidden: int, intermediate_per_rank: int,
+    num_experts: int, topk: int, warmup: int, timeout: int,
+) -> tuple[bool, str]:
     """Try a 1-step kernel call at minimal shape to confirm the backend
     actually works.  Returns (ok, message).
     """
     cmd = [
         sys.executable, str(SCRIPT_DIR / "worker.py"),
         "--backend", backend,
-        "--num-seq", "8", "--hidden", "128", "--intermediate-per-rank", "128",
-        "--num-expert-local", "2", "--num-expert-total", "2", "--num-topk", "1",
+        "--num-seq", str(num_seq),
+        "--hidden", str(hidden),
+        "--intermediate-per-rank", str(intermediate_per_rank),
+        "--num-expert-local", str(num_experts),
+        "--num-expert-total", str(num_experts),
+        "--num-topk", str(topk),
+        "--warmup", str(warmup),
         "--n-timed", "1",
     ]
     env = build_env(backend, roots, gpu_id)
     try:
         out = subprocess.run(
-            cmd, env=env, timeout=60,
+            cmd, env=env, timeout=timeout,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         if out.returncode == 0:
@@ -180,6 +252,8 @@ def run_nsys_profile(
 
     nsys_cmd = [
         "nsys", "profile", "-f", "true", "-o", report_file,
+        "--sample=none",
+        "--cpuctxsw=none",
         "--capture-range=cudaProfilerApi",
         "--capture-range-end=stop-shutdown",
         "--cuda-graph-trace=node",
@@ -212,7 +286,7 @@ def extract_nvtx(report_file: str) -> list[int]:
         raw = json.loads(out.decode())
         data = raw[0]["data"] if isinstance(raw, list) and "data" in raw[0] else raw
         stats = [int(e["Projected Duration (ns)"]) for e in data
-                 if e.get("Name", "").strip().strip('"') == ":step"]
+                 if e.get("Name", "").strip().strip('"') in ("step", ":step")]
         return stats[2:]  # drop first 2 warmup-spill replays
     except Exception:
         return []
@@ -248,8 +322,11 @@ def profile_one(
     backend: str, roots: Roots, gpu_id: int,
     model: str, bs: int, tp: int, ep: int,
     output_dir: Path, tag: str,
+    models: dict[str, ModelSpec],
+    *, warmup: int, iters: int, seed: int, nsys_attempts: int, nsys_timeout: int,
 ) -> CellResult:
-    E_total, topk, H, N_full = MODELS[model]
+    spec = models[model]
+    E_total, topk, H, N_full = spec.experts, spec.topk, spec.hidden, spec.intermediate
     if E_total % ep != 0:
         return CellResult(
             model=model, bs=bs, backend=backend, tp=tp, ep=ep,
@@ -278,13 +355,17 @@ def profile_one(
         "--num-expert-total", str(E_local),  # EP-rank-0 simulation
         "--num-topk", str(topk),
         "--model", model, "--tp", str(tp), "--ep", str(ep),
+        "--seed", str(seed),
+        "--warmup", str(warmup),
+        "--n-timed", str(iters),
     ]
 
     attempts = run_nsys_profile(
         backend, roots, gpu_id, worker_args,
         report_file=rpath, meta_out=meta_path,
+        attempts=nsys_attempts, timeout=nsys_timeout,
     )
-    if attempts > 3:
+    if attempts > nsys_attempts:
         return CellResult(
             model=model, bs=bs, backend=backend, tp=tp, ep=ep,
             n_expert_total=E_total, n_expert_local=E_local, topk=topk,
@@ -292,7 +373,7 @@ def profile_one(
             avg_per_group=avg,
             median_us=None, mean_us=None, p10_us=None, n_samples=0,
             sgl_cfg_source=None, nsys_attempts=attempts,
-            error="nsys profile failed after 3 attempts",
+            error=f"nsys profile failed after {nsys_attempts} attempts",
         )
 
     ns = extract_nvtx(rpath)
@@ -331,42 +412,133 @@ def profile_one(
     )
 
 
+def print_table(rows: list[dict]) -> None:
+    print("")
+    print("=" * 132)
+    print("FusedMoE FP8 latency | us per call (lower is better)")
+    print("-" * 132)
+    print(
+        f"{'model':>14} | {'mode':>9} | {'bs':>6} | {'backend':>12} | "
+        f"{'median_us':>10} | {'mean_us':>10} | {'samples':>7} | {'avg/group':>9} | {'error':>18}"
+    )
+    print("-" * 132)
+    for row in rows:
+        med = f"{row['median_us']:.2f}" if isinstance(row.get("median_us"), (int, float)) else "ERR"
+        avg = f"{row['mean_us']:.2f}" if isinstance(row.get("mean_us"), (int, float)) else "ERR"
+        err = row.get("error") or ""
+        mode = f"tp{row['tp']}_ep{row['ep']}"
+        print(
+            f"{row['model']:>14} | {mode:>9} | {row['bs']:6d} | {DISPLAY[row['backend']]:>12} | "
+            f"{med:>10} | {avg:>10} | {row['n_samples']:7d} | {row['avg_per_group']:9.2f} | {err[:18]:>18}"
+        )
+    print("=" * 132)
+
+
+def write_csv(path: str, rows: list[dict]) -> None:
+    if not path or not rows:
+        return
+    with Path(path).open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_jsonl(path: str, rows: list[dict]) -> None:
+    if not path:
+        return
+    with Path(path).open("w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="Unified FusedMoE bench driver",
+        description="Benchmark FusedMoE FP8 backends.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--tp", type=int, default=8)
     p.add_argument("--ep", type=int, default=1)
     p.add_argument("--bs", type=int, nargs="+",
-                   help="Batch sizes (default: TP=8 -> BS_TP, EP>1 -> BS_EP)")
+                   help="Batch sizes. Overrides --tp-batches/--ep-batches.")
+    p.add_argument("--tp-batches", type=parse_int_list, default=parse_int_list(DEFAULT_TP_BATCHES),
+                   help=f"Default batch list when ep=1. Default: {DEFAULT_TP_BATCHES}")
+    p.add_argument("--ep-batches", type=parse_int_list, default=parse_int_list(DEFAULT_EP_BATCHES),
+                   help=f"Default batch list when ep>1. Default: {DEFAULT_EP_BATCHES}")
     p.add_argument("--models", nargs="+", default=DEFAULT_MODELS,
-                   choices=list(MODELS.keys()))
-    p.add_argument("--backends", nargs="+", default=ALL_BACKENDS,
-                   choices=ALL_BACKENDS)
+                   help="Model names from presets or --model-shape.")
+    p.add_argument(
+        "--model-shape", action="append", type=parse_model_shape, default=[],
+        metavar="NAME:E:TOPK:HIDDEN:INTERMEDIATE",
+        help="Add or override a model shape, e.g. custom:128:8:4096:1536.",
+    )
+    p.add_argument("--providers", dest="backends", nargs="+",
+                   default=ALL_BACKENDS, choices=ALL_BACKENDS)
+    p.add_argument("--backends", dest="backends", nargs="+",
+                   choices=ALL_BACKENDS, help=argparse.SUPPRESS)
+    p.add_argument("--timing", choices=["nsys"], default="nsys",
+                   help="nsys: CUDA Graph replay under NVTX step ranges, reported as median latency.")
+    p.add_argument("--warmup", type=int, default=3,
+                   help="Warmup calls before graph capture and replay warmup count.")
+    p.add_argument("--iters", type=int, default=52,
+                   help="NVTX-marked graph replays. The first two samples are dropped when reading nsys.")
+    p.add_argument("--seed", type=int, default=0,
+                   help="Random seed used by worker tensor builders.")
+    p.add_argument("--nsys-attempts", type=int, default=3,
+                   help="Retry count for each nsys profile cell.")
+    p.add_argument("--nsys-timeout", type=int, default=600,
+                   help="Timeout in seconds for each nsys profile attempt.")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("-o", "--output-dir",
-                   default=None,
-                   help="Output directory; default: ./log next to bench.py")
-    p.add_argument("--tag", default=None,
+                   default="",
+                   help="Output directory for nsys reports; default: ./log next to benchmark_fuse_moe.py")
+    p.add_argument("--tag", default="",
                    help="Subdir under output-dir; default: tp{tp}_ep{ep}_<ts>")
+    p.add_argument("--csv", default="", help="Optional CSV output path.")
+    p.add_argument("--jsonl", default="", help="Optional JSONL output path.")
 
     g = p.add_argument_group("backend roots (CLI overrides env)")
     g.add_argument("--vllm-root", help="default: $VLLM_ROOT")
     g.add_argument("--sglang-root", help="default: $SGLANG_ROOT")
     g.add_argument("--hpcops-root", help="default: $HPCOPS_ROOT")
 
+    d = p.add_argument_group("dry-run probe")
+    d.add_argument("--dry-run-num-seq", type=int, default=8)
+    d.add_argument("--dry-run-hidden", type=int, default=128)
+    d.add_argument("--dry-run-intermediate", type=int, default=128)
+    d.add_argument("--dry-run-experts", type=int, default=2)
+    d.add_argument("--dry-run-topk", type=int, default=1)
+    d.add_argument("--dry-run-timeout", type=int, default=60)
+
     args = p.parse_args()
+    if args.warmup < 0:
+        p.error("--warmup must be >= 0")
+    if args.iters <= 2:
+        p.error("--iters must be > 2 because the first two nsys samples are dropped")
+    if args.nsys_attempts < 1:
+        p.error("--nsys-attempts must be >= 1")
+    if args.nsys_timeout < 1 or args.dry_run_timeout < 1:
+        p.error("timeouts must be >= 1 second")
+    if args.dry_run_topk > args.dry_run_experts:
+        p.error("--dry-run-topk must be <= --dry-run-experts")
+    models = dict(MODELS)
+    for name, spec in args.model_shape:
+        models[name] = spec
+    unknown_models = [name for name in args.models if name not in models]
+    if unknown_models:
+        p.error(
+            f"unknown model(s): {', '.join(unknown_models)}. "
+            "Use --model-shape NAME:E:TOPK:HIDDEN:INTERMEDIATE to add custom shapes."
+        )
     roots = resolve_roots(args)
     output_dir = Path(args.output_dir) if args.output_dir else SCRIPT_DIR / "log"
 
     # Default batch size by mode.
     bs_list = args.bs
     if bs_list is None:
-        bs_list = BS_EP if args.ep > 1 else BS_TP
+        bs_list = args.ep_batches if args.ep > 1 else args.tp_batches
 
     tag = args.tag or f"tp{args.tp}_ep{args.ep}_{int(time.time())}"
     out_root = output_dir / tag
@@ -382,65 +554,57 @@ def main() -> int:
         if missing:
             skipped[b] = f"missing roots: {missing}"
             continue
-        ok, msg = dry_run(b, roots, args.gpu)
+        ok, msg = dry_run(
+            b, roots, args.gpu,
+            num_seq=args.dry_run_num_seq,
+            hidden=args.dry_run_hidden,
+            intermediate_per_rank=args.dry_run_intermediate,
+            num_experts=args.dry_run_experts,
+            topk=args.dry_run_topk,
+            warmup=args.warmup,
+            timeout=args.dry_run_timeout,
+        )
         if not ok:
             skipped[b] = f"dry_run failed: {msg}"
             continue
         avail.append(b)
 
-    width = 22 + 14 * len(avail) + 14
-    print("=" * width)
-    print(f"Bench: TP={args.tp}  EP={args.ep}")
-    print(f"Output: {out_root}")
-    print(f"Backends ok: {[DISPLAY[b] for b in avail]}")
     if skipped:
-        print(f"Backends skipped:")
         for b, why in skipped.items():
-            print(f"  {DISPLAY[b]:>14}  {why}")
-    print(f"Models: {args.models}")
-    print(f"BS:     {bs_list}")
-    print("=" * width)
+            print(f"[warn] skip {DISPLAY[b]}: {why}", file=sys.stderr)
     if not avail:
         print("No backends available; aborting.", file=sys.stderr)
         return 2
 
-    hdr = f"{'Model':<14} {'BS':>6}"
-    for b in avail:
-        hdr += f"  {DISPLAY[b]:>12}"
-    hdr += f"  {'avg/group':>10}"
-    print(hdr)
-    print("-" * width)
-
-    results_path = out_root / "results.jsonl"
+    rows = []
     log_path = out_root / "bench.log"
-    with open(results_path, "w") as rf, open(log_path, "w") as lf:
-        def _log(line: str):
-            print(line, flush=True)
-            lf.write(line + "\n"); lf.flush()
-
+    with open(log_path, "w") as lf:
         for model in args.models:
             for bs in bs_list:
-                row_us: dict[str, Optional[float]] = {}
-                avg = 0.0
                 for b in avail:
                     res = profile_one(
                         b, roots, args.gpu, model, bs, args.tp, args.ep,
-                        output_dir, tag,
+                        output_dir, tag, models,
+                        warmup=args.warmup, iters=args.iters, seed=args.seed,
+                        nsys_attempts=args.nsys_attempts,
+                        nsys_timeout=args.nsys_timeout,
                     )
-                    row_us[b] = res.median_us
-                    avg = res.avg_per_group
-                    rf.write(json.dumps(asdict(res)) + "\n"); rf.flush()
-                row = f"{model:<14} {bs:>6}"
-                for b in avail:
-                    v = row_us[b]
-                    row += f"  {v:>12.1f}" if v is not None else f"  {'ERR':>12}"
-                row += f"  {avg:>10.2f}"
-                _log(row)
+                    row = asdict(res)
+                    row["timing"] = "nsys_graph_nvtx_median"
+                    rows.append(row)
+                    med = f"{res.median_us:.2f}us" if res.median_us is not None else "ERR"
+                    lf.write(f"{model} bs={bs} {DISPLAY[b]} {med}\n")
+                    lf.flush()
 
-    print("-" * width)
-    print(f"All times in µs (median of 50 :step replays).")
-    print(f"JSONL: {results_path}")
-    print(f"Log  : {log_path}")
+    print_table(rows)
+    write_csv(args.csv, rows)
+    write_jsonl(args.jsonl, rows)
+    print(f"nsys reports: {out_root}")
+    if args.csv:
+        print(f"CSV: {args.csv}")
+    if args.jsonl:
+        print(f"JSONL: {args.jsonl}")
+    print(f"Log: {log_path}")
     return 0
 
 

@@ -1,4 +1,4 @@
-# Copyright (C) 2026 Tencent.
+# Copyright (C) 2025 Tencent.
 
 """hpc-ops FusedMoE backend."""
 from __future__ import annotations
@@ -10,7 +10,7 @@ import torch
 from . import register
 from .base import (
     A_SCALE_VALUE, Backend, BenchSpec, build_a_scale, build_activation,
-    build_fp8_weights, build_routing,
+    build_fp8_weights, build_routing, scaled_fp8_quant_local,
 )
 
 
@@ -22,18 +22,15 @@ class HpcBackend(Backend):
 
     def setup(self, spec: BenchSpec) -> Callable[[], None]:
         import hpc
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            scaled_fp8_quant,
-        )
 
         E = spec.num_expert_local
         N = spec.intermediate_per_rank
         K = spec.hidden
 
-        a_half = build_activation(spec.num_seq, K)
+        a_half = build_activation(spec.num_seq, K, seed=spec.seed)
         a_scale = build_a_scale()
 
-        w1_fp8, w2_fp8, w1_scale, w2_scale = build_fp8_weights(E, N, K)
+        w1_fp8, w2_fp8, w1_scale, w2_scale = build_fp8_weights(E, N, K, seed=spec.seed + 1)
 
         gate_up_scale = (w1_scale.flatten() * A_SCALE_VALUE).contiguous()
         down_scale = (w2_scale.flatten() * A_SCALE_VALUE).contiguous()
@@ -42,14 +39,14 @@ class HpcBackend(Backend):
         )
 
         topk_ids, topk_w = build_routing(
-            spec.num_seq, spec.num_expert_total, spec.num_topk,
+            spec.num_seq, spec.num_expert_total, spec.num_topk, seed=spec.seed + 2,
         )
 
         rank_ep = 0
         num_expert_total = spec.num_expert_total
 
         def call_fn():
-            x_fp8, _ = scaled_fp8_quant(a_half, a_scale)
+            x_fp8, _ = scaled_fp8_quant_local(a_half, a_scale)
             hpc.fuse_moe(
                 x_fp8, w1_fp8, w2_fp8,
                 gate_up_scale, down_scale, act_and_mul_scale,
