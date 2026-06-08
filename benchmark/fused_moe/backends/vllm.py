@@ -1,4 +1,4 @@
-# Copyright (C) 2026 Tencent.
+# Copyright (C) 2025 Tencent.
 
 """vLLM Triton FusedMoE backend."""
 from __future__ import annotations
@@ -41,15 +41,16 @@ class TritonBackend(Backend):
         N = spec.intermediate_per_rank
         K = spec.hidden
 
-        w1_fp8, w2_fp8, w1_scale, w2_scale = build_fp8_weights(E, N, K)
-        a_half = build_activation(spec.num_seq, K)
+        w1_fp8, w2_fp8, w1_scale, w2_scale = build_fp8_weights(E, N, K, seed=spec.seed + 1)
+        a_half = build_activation(spec.num_seq, K, seed=spec.seed)
         a_scale = build_a_scale()
         # vllm's per-tensor a-scale tensor uses the same shape convention.
         a2_scale = build_a_scale()
 
+        g = torch.Generator(device="cuda").manual_seed(spec.seed + 2)
         score = torch.randn(
             (spec.num_seq, spec.num_expert_total), dtype=torch.half,
-            device="cuda",
+            device="cuda", generator=g,
         )
         topk_w, topk_ids, _ = fused_topk(
             a_half, score, spec.num_topk, renormalize=False,

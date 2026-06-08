@@ -1,4 +1,4 @@
-# Copyright (C) 2026 Tencent.
+# Copyright (C) 2025 Tencent.
 
 """SGLang Triton FusedMoE backend."""
 from __future__ import annotations
@@ -27,17 +27,16 @@ class SglangBackend(Backend):
         import triton.language as tl
 
         sgl_root = os.environ.get("SGLANG_ROOT")
-        if not sgl_root:
-            raise RuntimeError("SGLANG_ROOT env var must be set")
-        sgl_python = os.path.join(sgl_root, "python")
-        if not os.path.isdir(os.path.join(sgl_python, "sglang")):
-            raise RuntimeError(
-                "SGLANG_ROOT must point to a local sglang checkout containing "
-                "python/sglang"
-            )
-        os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
-        if sgl_python not in sys.path:
-            sys.path.insert(0, sgl_python)
+        if sgl_root:
+            sgl_python = os.path.join(sgl_root, "python")
+            if not os.path.isdir(os.path.join(sgl_python, "sglang")):
+                raise RuntimeError(
+                    "SGLANG_ROOT must point to a local sglang checkout containing "
+                    "python/sglang"
+                )
+            os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+            if sgl_python not in sys.path:
+                sys.path.insert(0, sgl_python)
 
         from sglang.srt.server_args import set_global_server_args_for_scheduler
         set_global_server_args_for_scheduler(types.SimpleNamespace(
@@ -71,13 +70,14 @@ class SglangBackend(Backend):
         K = spec.hidden
         M = spec.num_seq
 
-        w1_fp8, w2_fp8, w1_scale, w2_scale = build_fp8_weights(E, N, K)
-        a_half = build_activation(M, K)
+        w1_fp8, w2_fp8, w1_scale, w2_scale = build_fp8_weights(E, N, K, seed=spec.seed + 1)
+        a_half = build_activation(M, K, seed=spec.seed)
         a1s = build_a_scale()
         a2s = build_a_scale()
 
+        g = torch.Generator(device="cuda").manual_seed(spec.seed + 2)
         score = torch.randn((M, spec.num_expert_total), dtype=torch.half,
-                            device="cuda")
+                            device="cuda", generator=g)
         topk_w, topk_ids, _ = fused_topk(
             a_half, score, spec.num_topk, renormalize=False,
         )

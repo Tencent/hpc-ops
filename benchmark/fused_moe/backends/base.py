@@ -1,4 +1,4 @@
-# Copyright (C) 2026 Tencent.
+# Copyright (C) 2025 Tencent.
 
 """Shared base classes and helpers for all FusedMoE backends."""
 from __future__ import annotations
@@ -31,6 +31,7 @@ class BenchSpec:
     model: str = ""
     tp: int = 1
     ep: int = 1
+    seed: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,12 @@ DTYPE_FP8 = torch.float8_e4m3fn
 DTYPE_HALF = torch.half
 
 
+def scaled_fp8_quant_local(x: torch.Tensor, scale: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    if scale is None:
+        scale = x.float().abs().max().clamp_min(1e-6) / 448.0
+    return (x.float() / scale).to(DTYPE_FP8), scale
+
+
 def build_fp8_weights(
     num_expert_local: int,
     intermediate_per_rank: int,
@@ -77,8 +84,6 @@ def build_fp8_weights(
     Returns the same 4 tensors regardless of backend; HPC reshapes/views
     these to its own per-expert layout in its own backend module.
     """
-    from vllm import _custom_ops as ops
-
     g = torch.Generator(device="cuda").manual_seed(seed)
     E, N, K = num_expert_local, intermediate_per_rank, hidden
 
@@ -94,8 +99,8 @@ def build_fp8_weights(
     w1_scale = torch.empty((E, 1, 1), device="cuda", dtype=torch.float32)
     w2_scale = torch.empty((E, 1, 1), device="cuda", dtype=torch.float32)
     for e in range(E):
-        w1_fp8[e], s1 = ops.scaled_fp8_quant(w1_half[e])
-        w2_fp8[e], s2 = ops.scaled_fp8_quant(w2_half[e])
+        w1_fp8[e], s1 = scaled_fp8_quant_local(w1_half[e])
+        w2_fp8[e], s2 = scaled_fp8_quant_local(w2_half[e])
         w1_scale[e, 0, 0] = s1
         w2_scale[e, 0, 0] = s2
     return w1_fp8, w2_fp8, w1_scale, w2_scale
@@ -152,11 +157,14 @@ def build_a_scale() -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Method C timing harness
 # ---------------------------------------------------------------------------
-def run_method_c(call_fn: Callable[[], None], *, n_timed: int = 52):
-    """Run warmup, graph capture, replay warmup, and timed graph replays."""
-    import nvtx  # imported lazily so backends that error during setup don't fail on import
+def run_method_c(call_fn: Callable[[], None], *, warmup: int = 3, n_timed: int = 52):
+    """Run warmup, graph capture, replay warmup, and timed graph replays.
 
-    for _ in range(3):
+    Timing is read from Nsight Systems' NVTX GPU projected duration. Do not
+    synchronize inside each timed range; synchronize once after all measured
+    ranges have been submitted.
+    """
+    for _ in range(warmup):
         call_fn()
     torch.cuda.synchronize()
 
@@ -164,15 +172,18 @@ def run_method_c(call_fn: Callable[[], None], *, n_timed: int = 52):
     with torch.cuda.graph(graph):
         call_fn()
 
-    for _ in range(3):
+    for _ in range(warmup):
         graph.replay()
     torch.cuda.synchronize()
 
     torch.cuda.cudart().cudaProfilerStart()
     for _ in range(n_timed):
-        with nvtx.annotate("step"):
+        torch.cuda.nvtx.range_push("step")
+        try:
             graph.replay()
-            torch.cuda.synchronize()
+        finally:
+            torch.cuda.nvtx.range_pop()
+    torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
 
 
@@ -180,7 +191,7 @@ def run_method_c(call_fn: Callable[[], None], *, n_timed: int = 52):
 # Spec serialization (worker stdin <-> driver)
 # ---------------------------------------------------------------------------
 def spec_to_argv(spec: BenchSpec) -> list[str]:
-    """Serialize a BenchSpec to argv (used by bench.py to invoke worker.py)."""
+    """Serialize a BenchSpec to argv for invoking worker.py."""
     return [
         "--num-seq", str(spec.num_seq),
         "--hidden", str(spec.hidden),
@@ -191,6 +202,7 @@ def spec_to_argv(spec: BenchSpec) -> list[str]:
         "--model", spec.model,
         "--tp", str(spec.tp),
         "--ep", str(spec.ep),
+        "--seed", str(spec.seed),
     ]
 
 
@@ -205,4 +217,5 @@ def spec_from_args(args) -> BenchSpec:
         model=args.model,
         tp=args.tp,
         ep=args.ep,
+        seed=args.seed,
     )

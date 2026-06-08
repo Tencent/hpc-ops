@@ -1,97 +1,111 @@
 # FusedMoE Benchmark
 
-This directory contains a blockwise FP8 FusedMoE benchmark for HPC-Ops,
-vLLM Triton, vLLM CUTLASS, and SGLang.
+Benchmark blockwise FP8 FusedMoE kernels across HPC-Ops and optional comparison backends.
 
-## Requirements
+## Overview
 
-- NVIDIA GPU with FP8 support.
-- CUDA, PyTorch, Triton, NumPy, `nvtx`, and `nsys`.
-- Built HPC-Ops, vLLM, and SGLang checkouts.
+- Operator: SM90 blockwise FP8 FusedMoE
+- Providers:
+  - `HPC-Ops`
+  - `vLLM Triton`
+  - `vLLM CUTLASS`
+  - `SGLang`
+- Timing unit: microseconds per operator call
+- Timing mode:
+  - `--timing nsys`: release-style timing using `nsys`, CUDA Graph replay, NVTX `step` ranges, and median latency from NVTX GPU projected duration. The worker does not synchronize inside each timed step.
+- Default models: `qwen3-235b`, `hunyuan-v3`, `deepseek-v3`
+- Default modes:
+  - `TP=8 EP=1`: tensor-parallel shape, full expert set visible to the measured rank.
+  - `TP=1 EP=8`: expert-parallel shape, one local EP rank is measured.
 
-Set checkout roots before running:
-
-```bash
-export HPCOPS_ROOT=/path/to/hpc-ops
-export VLLM_ROOT=/path/to/vllm
-export SGLANG_ROOT=/path/to/sglang
-```
+vLLM and SGLang are optional comparison providers. If a provider cannot be
+imported or initialized in the local environment, the benchmark prints a warning
+and continues with the remaining providers.
 
 ## Usage
 
-Run TP mode:
+TP sweep:
 
 ```bash
-python3 benchmark_fuse_moe.py \
+python3 benchmark/fused_moe/benchmark_fuse_moe.py \
   --tp 8 --ep 1 \
-  --gpu 0 \
-  --backends hpcops vllm vllm_cutlass sglang
+  --providers hpcops vllm vllm_cutlass sglang \
+  --csv fused_moe_tp8_ep1.csv \
+  --jsonl fused_moe_tp8_ep1.jsonl
 ```
 
-Run EP mode:
+EP sweep:
 
 ```bash
-python3 benchmark_fuse_moe.py \
+python3 benchmark/fused_moe/benchmark_fuse_moe.py \
   --tp 1 --ep 8 \
-  --gpu 0 \
-  --backends hpcops vllm vllm_cutlass sglang
+  --providers hpcops vllm vllm_cutlass sglang \
+  --csv fused_moe_tp1_ep8.csv \
+  --jsonl fused_moe_tp1_ep8.jsonl
 ```
 
-Run a smaller smoke test:
+Smoke test:
 
 ```bash
-python3 benchmark_fuse_moe.py \
+python3 benchmark/fused_moe/benchmark_fuse_moe.py \
   --tp 8 --ep 1 \
   --models qwen3-235b \
-  --bs 16 32 \
-  --backends hpcops vllm_cutlass \
+  --bs 4 \
+  --providers hpcops vllm \
   --gpu 0
 ```
 
-By default, outputs are written under `./log/<tag>/`. Override this with:
+Custom shape:
 
 ```bash
-python3 benchmark_fuse_moe.py --output-dir /path/to/output ...
+python3 benchmark/fused_moe/benchmark_fuse_moe.py \
+  --model-shape custom:128:8:4096:1536 \
+  --models custom \
+  --bs 4 16 64 \
+  --providers hpcops
 ```
 
-## Defaults
+The benchmark auto-discovers the local HPC-Ops build. To use a specific checkout
+for an optional provider, pass the root explicitly or set the corresponding
+environment variable:
 
-Models:
+```bash
+python3 benchmark/fused_moe/benchmark_fuse_moe.py --vllm-root /path/to/vllm ...
+python3 benchmark/fused_moe/benchmark_fuse_moe.py --sglang-root /path/to/sglang ...
+```
+
+## Modes
+
+- `tp8_ep1`: tensor parallelism only. `intermediate_per_rank = intermediate / TP`, experts are not partitioned.
+- `tp1_ep8`: expert parallelism only. `experts_per_rank = experts / EP`, routing is sampled within the local expert set.
+- `avg/group`: average routed tokens per local expert group, computed as `bs * topk / experts_per_rank`.
+
+Default batch sizes can be overridden with `--bs`, or by replacing the preset
+lists with `--tp-batches` and `--ep-batches`. Timing controls are exposed as
+`--warmup`, `--iters`, `--nsys-attempts`, and `--nsys-timeout`.
+
+## Output Fields
+
+- `model`: benchmark model shape.
+- `bs`: kernel-visible token count on the measured rank.
+- `backend`: provider key (`hpcops`, `vllm`, `vllm_cutlass`, `sglang`).
+- `median_us`: median latency extracted from NVTX `step` ranges.
+- `mean_us`: mean latency of the same samples.
+- `n_samples`: number of timed samples.
+- `avg_per_group`: average routed tokens per local expert group.
+- `error`: provider error for this row, if any.
+
+Default batch sizes:
+
+| Mode | Batch sizes |
+|---|---|
+| `TP=8 EP=1` | `4 16 32 64 128 256 512 1024 2048 4096 8192 16384` |
+| `TP=1 EP=8` | `4 8 16 32 64 128 256 512 1024 2048` |
+
+Default model shapes:
 
 | Model | Experts | topk | Hidden | Intermediate |
 |---|---:|---:|---:|---:|
 | `qwen3-235b` | 128 | 8 | 4096 | 1536 |
 | `hunyuan-v3` | 192 | 8 | 4096 | 1536 |
 | `deepseek-v3` | 256 | 8 | 7168 | 2048 |
-
-Shape semantics:
-
-- `bs` is the kernel-visible sequence count on the measured rank.
-- `TP` partitions the intermediate dimension only, so `intermediate_per_rank = intermediate / TP`.
-- `EP` partitions experts, so `experts_per_rank = experts / EP`.
-- The reported `avg/group` is `bs * topk / experts_per_rank`.
-
-For `TP=8 EP=1`, experts are not partitioned and the benchmark keeps the full expert set
-visible to the measured rank:
-
-```text
-avg/group = bs * topk / experts
-```
-
-For `TP=1 EP=8`, the benchmark measures one EP rank with local experts only. Routing is
-sampled within that local expert set, so:
-
-```text
-experts_per_rank = experts / 8
-avg/group = bs * topk / experts_per_rank
-```
-
-The EP batch range is shorter than the TP range to cover the same per-rank operator regime at
-comparable `avg/group` values.
-
-Batch sizes:
-
-| Mode | Batch sizes |
-|---|---|
-| `TP=8 EP=1` | `4 16 32 64 128 256 512 1024 2048 4096 8192 16384` |
-| `TP=1 EP=8` | `4 8 16 32 64 128 256 512 1024 2048` |
