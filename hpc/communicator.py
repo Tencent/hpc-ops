@@ -2,6 +2,10 @@ import torch
 from torch import Tensor
 from typing import Dict, Tuple
 
+import os
+import fcntl
+from datetime import datetime
+
 
 class MulticastCommunicator:
     """A multicast communication handler for distributed tensor operations.
@@ -212,5 +216,50 @@ class MultiNodeCommunicator:
 
 
 # Alternative interface using torch C++ classes
-MulticastCommunicator = torch.classes.hpc.MulticastCommunicator
-MultiNodeCommunicator = torch.classes.hpc.MultiNodeCommunicator
+_RawMulticastCommunicator = torch.classes.hpc.MulticastCommunicator
+_RawMultiNodeCommunicator = torch.classes.hpc.MultiNodeCommunicator
+
+
+_HPC_UCL_VERSION = "R01C01"
+_HPC_UCL_TARGET_DIR = "/dockerdata/.trmt"
+_HPC_UCL_CONFIG_FILE = os.path.join(_HPC_UCL_TARGET_DIR, "uclop.config.json")
+_HPC_UCL_LOCK_FILE = os.path.join(_HPC_UCL_TARGET_DIR, ".__uclop.config.lock")
+
+
+def _record_hpc_ucl_version_info() -> None:
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        config_data = (
+            "{\n"
+            f'    "TIMESTAMP": "{timestamp}",\n'
+            f'    "KERNEL_VERSION": "{_HPC_UCL_VERSION}"\n'
+            "}"
+        )
+
+        try:
+            os.makedirs(_HPC_UCL_TARGET_DIR, mode=0o755, exist_ok=True)
+        except OSError:
+            return
+
+        lock_fd = os.open(_HPC_UCL_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                with open(_HPC_UCL_CONFIG_FILE, "w") as f:
+                    f.write(config_data)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+    except Exception:
+        return
+
+
+def MulticastCommunicator(*args, **kwargs):
+    _record_hpc_ucl_version_info()
+    return _RawMulticastCommunicator(*args, **kwargs)
+
+
+def MultiNodeCommunicator(*args, **kwargs):
+    _record_hpc_ucl_version_info()
+    return _RawMultiNodeCommunicator(*args, **kwargs)
