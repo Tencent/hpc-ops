@@ -522,6 +522,14 @@ torch::Tensor fuse_moe_blockwise_entry(
     aligned_size = 32;
   } else if (num_tokens_per_group_avg <= 48) {
     aligned_size = 48;
+  } else if (num_tokens_per_group_avg <= 64) {
+    aligned_size = 64;
+  } else if (num_tokens_per_group_avg <= 96) {
+    aligned_size = 48;
+  } else if (num_tokens_per_group_avg <= 128) {
+    aligned_size = 32;
+  } else if (num_tokens_per_group_avg <= 144) {
+    aligned_size = 48;
   } else {
     aligned_size = 64;
   }

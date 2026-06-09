@@ -702,6 +702,7 @@ void act_mul_and_blockwise_quant_async(void *output_ptr, void *output_scale_ptr,
   int num_block_per_row = (intermediate_size / 8 + block.x - 1) / block.x;
   cutlass::FastDivmod block1D22D(num_block_per_row);
   dim3 grid(num_row * num_block_per_row);
+
   int ktile_m = 0;
   if (num_tokens_per_group_avg <= 8) {
     ktile_m = 8;
@@ -710,6 +711,14 @@ void act_mul_and_blockwise_quant_async(void *output_ptr, void *output_scale_ptr,
   } else if (num_tokens_per_group_avg <= 32) {
     ktile_m = 32;
   } else if (num_tokens_per_group_avg <= 48) {
+    ktile_m = 48;
+  } else if (num_tokens_per_group_avg <= 64) {
+    ktile_m = 64;
+  } else if (num_tokens_per_group_avg <= 96) {
+    ktile_m = 48;
+  } else if (num_tokens_per_group_avg <= 128) {
+    ktile_m = 32;
+  } else if (num_tokens_per_group_avg <= 144) {
     ktile_m = 48;
   } else {
     ktile_m = 64;

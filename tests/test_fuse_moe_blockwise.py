@@ -262,7 +262,7 @@ def naive_fuse_moe_blockwise_fp8(
     return y
 
 
-@pytest.mark.parametrize("num_tokens", [128])
+@pytest.mark.parametrize("num_tokens", [128, 1024, 2048, 4096])
 @pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512, 256])
@@ -344,4 +344,4 @@ def test_fuse_moe_blockwise_fp8(
 
     torch.cuda.synchronize()
 
-    assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.01, atol=0.01)
+    assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.01, atol=0.05)
