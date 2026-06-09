@@ -75,6 +75,7 @@ void launch_group_gemm_1sm_mxfp8(void *y_ptr, const void *x_ptr, const void *w_p
   using namespace cute;  // NOLINT
 
   using Tin = typename GemmConfig::Tin;
+  using TinB = typename GemmConfig::TinB;
   using Tout = typename GemmConfig::Tout;
   using Tsf = typename GemmConfig::Tsf;
   constexpr int kTileM = GemmConfig::kTileM;
@@ -88,7 +89,7 @@ void launch_group_gemm_1sm_mxfp8(void *y_ptr, const void *x_ptr, const void *w_p
 
   auto A = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x_ptr)), make_shape(m, k),
                        make_stride(k, Int<1>{}));
-  auto B = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(w_ptr)),
+  auto B = make_tensor(make_gmem_ptr(reinterpret_cast<const TinB *>(w_ptr)),
                        make_shape(n, k, num_group), make_stride(k, Int<1>{}, n * k));
   auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(y_ptr)), make_shape(n, m),
                        make_stride(Int<1>{}, n));
@@ -179,6 +180,7 @@ void launch_group_gemm_2sm_mxfp8(void *y_ptr, const void *x_ptr, const void *w_p
   using namespace cute;  // NOLINT
 
   using Tin = typename GemmConfig::Tin;
+  using TinB = typename GemmConfig::TinB;
   using Tout = typename GemmConfig::Tout;
   using Tsf = typename GemmConfig::Tsf;
   constexpr int kTileM = GemmConfig::kTileM;
@@ -193,7 +195,7 @@ void launch_group_gemm_2sm_mxfp8(void *y_ptr, const void *x_ptr, const void *w_p
 
   auto A = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x_ptr)), make_shape(m, k),
                        make_stride(k, Int<1>{}));
-  auto B = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(w_ptr)),
+  auto B = make_tensor(make_gmem_ptr(reinterpret_cast<const TinB *>(w_ptr)),
                        make_shape(n, k, num_group), make_stride(k, Int<1>{}, n * k));
   auto Y = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(y_ptr)), make_shape(n, m),
                        make_stride(Int<1>{}, n));
@@ -284,11 +286,12 @@ void group_gemm_mxfp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                             const void *seqlens_ptr, const void *cu_seqlens_ptr, void *tmas_ptr,
                             void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m, int n, int k,
                             int num_seq_per_group_avg, bool update_tma, cudaStream_t stream,
-                            bool use_pdl) {
+                            bool use_pdl, bool is_fp4) {
   int kTileM_dispatch = mxfp8_dispatch_kTileM(num_seq_per_group_avg, n);
   bool use_2sm = (n % 256 == 0) && (num_seq_per_group_avg > 32);
 
   using Tin = cute::float_e4m3_t;
+  using TinB_fp4 = cutlass::detail::float_e2m1_unpacksmem_t;
   using Tout = cute::bfloat16_t;
   using Tsf = cutlass::float_ue8m0_t;
 
@@ -324,106 +327,86 @@ void group_gemm_mxfp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
 
   assert(k % 32 == 0 && "group_gemm_mxfp8: k must be a multiple of 32 (SF_VEC)");
 
+  constexpr int kTileK = 128;
+
+  // 1SM dispatch table, parameterized by TinB (TinB=Tin for fp8, TinB=float_e2m1_unpacksmem_t
+  //   for fp4). The Config's 12th template parameter = TinB.
+  auto dispatch_1sm = [&](auto tinb_tag) {
+    using TinB = typename decltype(tinb_tag)::type;
+    constexpr int kMmaSM = 1;
+    constexpr int kTileN = 128;
+    switch (kTileM_dispatch) {
+      // Tin, Tout, Tsf, KTM, kTileN, kTileK, EPI, STAGE, STAGE_TMA, kMmaSM, STAGE_TILE, TinB
+      case 16:
+        return launch_1sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 16, kTileN, kTileK, 16, 2, 4,
+                                                       kMmaSM, 4, TinB>>{},
+                          IC3{});
+      case 32:
+        return launch_1sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, kTileN, kTileK, 32, 2, 4,
+                                                       kMmaSM, 4, TinB>>{},
+                          IC3{});
+      case 48:
+        return launch_1sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 48, kTileN, kTileK, 16, 6, 4,
+                                                       kMmaSM, 4, TinB>>{},
+                          IC1{});
+      case 64:
+        return launch_1sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, kTileN, kTileK, 64, 6, 4,
+                                                       kMmaSM, 4, TinB>>{},
+                          IC1{});
+      case 128:
+        return launch_1sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, kTileN, kTileK, 64, 5,
+                                                       3, kMmaSM, 3, TinB>>{},
+                          IC1{});
+      default:
+        return launch_1sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, kTileN, kTileK, 64, 3,
+                                                       2, kMmaSM, 1, TinB>>{},
+                          IC1{});
+    }
+  };
+
   if (use_2sm) {
-    if (k % 128 == 0) {
-      // 2SM, kTileK=128
+    // 2SM, kTileK=128 (TinB=Tin for fp8, TinB=float_e2m1_unpacksmem_t for fp4).
+    //   The Config's 12th template parameter = TinB.
+    auto dispatch_2sm = [&](auto tinb_tag) {
+      using TinB = typename decltype(tinb_tag)::type;
+      constexpr int kMmaSM = 2;
+      constexpr int kTileN = 256;
       switch (kTileM_dispatch) {
-        //        <Tin, Tout, Tsf, KTM, kTileN, KTK, EPI, STAGE, STAGE_TMA, kMmaSM, STAGE_TILE>
+        // Tin, Tout, Tsf, KTM, kTileN, kTileK, EPI, STAGE, STAGE_TMA, kMmaSM, STAGE_TILE, TinB
         case 32:
-          return launch_2sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, 256, 128, 32, 6, 4, 2, 4>>{});
+          return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, kTileN, kTileK, 32, 6,
+                                                         4, kMmaSM, 4, TinB>>{});
         case 64:
-          return launch_2sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, 256, 128, 32, 6, 4, 2, 4>>{});
+          return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, kTileN, kTileK, 32, 6,
+                                                         4, kMmaSM, 4, TinB>>{});
         case 96:
-          return launch_2sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 96, 256, 128, 32, 6, 4, 2, 4>>{});
+          return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 96, kTileN, kTileK, 32, 6,
+                                                         4, kMmaSM, 4, TinB>>{});
         case 128:
-          return launch_2sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, 256, 128, 32, 6, 4, 2, 3>>{});
+          return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, kTileN, kTileK, 32, 6,
+                                                         4, kMmaSM, 3, TinB>>{});
         case 160:
-          return launch_2sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 160, 256, 128, 32, 6, 4, 2, 2>>{});
+          return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 160, kTileN, kTileK, 32, 6,
+                                                         4, kMmaSM, 2, TinB>>{});
         case 192:
-          return launch_2sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 192, 256, 128, 32, 6, 2, 2, 2>>{});
+          return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 192, kTileN, kTileK, 32, 6,
+                                                         2, kMmaSM, 2, TinB>>{});
         default:
-          return launch_2sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, 256, 128, 64, 5, 2, 2, 1>>{});
+          return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, kTileN, kTileK, 64, 5,
+                                                         2, kMmaSM, 1, TinB>>{});
       }
+    };
+
+    if (is_fp4) {
+      return dispatch_2sm(type_id<TinB_fp4>{});
     } else {
-      // 2SM, kTileK=64
-      switch (kTileM_dispatch) {
-        case 32:
-          return launch_2sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, 256, 64, 32, 10, 4, 2, 4>>{});
-        case 64:
-          return launch_2sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, 256, 64, 32, 10, 4, 2, 4>>{});
-        case 96:
-          return launch_2sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 96, 256, 64, 32, 10, 4, 2, 4>>{});
-        case 128:
-          return launch_2sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, 256, 64, 32, 8, 4, 2, 3>>{});
-        case 160:
-          return launch_2sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 160, 256, 64, 32, 8, 4, 2, 2>>{});
-        case 192:
-          return launch_2sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 192, 256, 64, 32, 8, 2, 2, 2>>{});
-        default:
-          return launch_2sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, 256, 64, 64, 8, 2, 2, 1>>{});
-      }
+      return dispatch_2sm(type_id<Tin>{});
     }
   } else {
-    if (k % 128 == 0) {
-      // 1SM, kTileK=128
-      switch (kTileM_dispatch) {
-        case 16:
-          return launch_1sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 16, 128, 128, 16, 2, 4, 1, 4>>{}, IC3{});
-        case 32:
-          return launch_1sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, 128, 128, 32, 2, 4, 1, 4>>{}, IC3{});
-        case 48:
-          return launch_1sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 48, 128, 128, 16, 6, 4, 1, 4>>{}, IC1{});
-        case 64:
-          return launch_1sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, 128, 128, 64, 6, 4, 1, 4>>{}, IC1{});
-        case 128:
-          return launch_1sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, 128, 128, 64, 5, 3, 1, 3>>{},
-              IC1{});
-        default:
-          return launch_1sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, 128, 128, 64, 3, 2, 1, 1>>{},
-              IC1{});
-      }
+    if (is_fp4) {
+      return dispatch_1sm(type_id<TinB_fp4>{});
     } else {
-      // 1SM, kTileK=64
-      switch (kTileM_dispatch) {
-        case 16:
-          return launch_1sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 16, 128, 64, 16, 4, 4, 1, 4>>{}, IC3{});
-        case 32:
-          return launch_1sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, 128, 64, 32, 4, 4, 1, 4>>{}, IC3{});
-        case 48:
-          return launch_1sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 48, 128, 64, 16, 10, 4, 1, 4>>{}, IC1{});
-        case 64:
-          return launch_1sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, 128, 64, 64, 10, 4, 1, 4>>{}, IC1{});
-        case 128:
-          return launch_1sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, 128, 64, 64, 8, 3, 1, 3>>{}, IC1{});
-        default:
-          return launch_1sm(
-              type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, 128, 64, 64, 6, 2, 1, 1>>{}, IC1{});
-      }
+      return dispatch_1sm(type_id<Tin>{});
     }
   }
 }

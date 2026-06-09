@@ -1,22 +1,9 @@
-"""Bench mxfp8_group_gemm vs fp8_group_gemm.
-NUM_GROUP = 192
-tp8 gate_up: (m = TM * 192 / 8,  n = 384,   k = 4096)
-tp8 down:    (m = TM * 192 / 8,  n = 4096,  k = 192)
-tp4 gate_up: (m = TM * 192 / 8,  n = 768,   k = 4096)
-tp4 down:    (m = TM * 192 / 8,  n = 4096,  k = 384)
-
-"""
-
 import os
 import sys
 from pathlib import Path
 
-sys.path.insert(
-    0,
-    os.path.realpath(
-        sorted([p for p in Path(__file__).parent.glob("../build/lib.*/") if "linux" in str(p)])[0]
-    ),
-)
+sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
+
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -24,14 +11,21 @@ import torch.cuda.nvtx as nvtx
 import hpc
 
 
-NUM_GROUP = 192
-TM_CASES = [8, 16, 32, 64, 128, 256]
+NUM_EXPERT_TOTAL = 256
+NUM_TOPK = 8
 
+# Total token counts (m = num_seq) to sweep.
+M_CASES = [256, 512, 1024, 2048, 4096, 8192]
+
+# hy4.0
+# (label, n, k, num_group)
 SHAPES = [
-    ("gate_up_tp8", 384, 4096),
-    ("down_tp8", 4096, 192),
-    ("gate_up_tp4", 768, 4096),
-    ("down_tp4", 4096, 384),
+    ("gate_up_tp8", 512, 6144, 256),
+    ("down_tp8", 6144, 256, 256),
+    ("gate_up_tp4", 1024, 6144, 256),
+    ("down_tp4", 6144, 512, 256),
+    ("gate_up_ep8", 4096, 6144, 32),
+    ("down_ep8", 6144, 2048, 32),
 ]
 
 SF_VEC = 32
@@ -110,22 +104,80 @@ def _build_mxfp8(num_group, seq, n, k, device):
     return run
 
 
+def _build_mxfp4(num_group, seq, n, k, device):
+    # mxfp8 activation x mxfp4 weight. Same kernel/binding as mxfp8: the
+    # binding auto-detects fp4 from weight.size(2) == k/2. Requires k % 32 == 0.
+    if k % SF_VEC != 0:
+        return None  # not supported
+
+    seqlens, cu_seqlens, x_fp8, _ = _build_common(num_group, seq, n, k, device)
+
+    # W: fp4 (e2m1) packed two-per-byte → [num_group, n, k/2] uint8.
+    lo = torch.randint(0, 16, (num_group, n, k // 2), dtype=torch.uint8, device=device)
+    hi = torch.randint(0, 16, (num_group, n, k // 2), dtype=torch.uint8, device=device)
+    w_fp4_packed = ((hi << 4) | lo).contiguous()
+
+    sfx = torch.full(
+        (int(cu_seqlens[-1].item()), k // SF_VEC), 127, dtype=torch.uint8, device=device
+    )
+    sfw = torch.full((num_group, n, k // SF_VEC), 127, dtype=torch.uint8, device=device)
+
+    sfx_packed, sfw_packed = hpc.prepack_mxfp8_scale(
+        sfx,
+        sfw,
+        cu_seqlens,
+        num_seq_per_group_avg=seq,
+    )
+
+    def run():
+        return hpc.group_gemm_mxfp8(
+            x_fp8,
+            w_fp4_packed,
+            sfx_packed,
+            sfw_packed,
+            seqlens,
+            cu_seqlens,
+            num_seq_per_group_avg=seq,
+        )
+
+    return run
+
+
 def _bench(label: str, fn) -> float:
-    """Returns mean per-call latency in microseconds."""
+    """Returns mean per-call latency in microseconds (CUDA graph when possible)."""
     for _ in range(WARMUP):
         fn()
     torch.cuda.synchronize()
+
+    # Try CUDA graph capture; fall back to eager if capture fails.
+    graph = None
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fn()
+        torch.cuda.synchronize()
+    except Exception:
+        graph = None
+        torch.cuda.synchronize()
 
     nvtx.range_push(label)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(ITER):
-        fn()
+        if graph is not None:
+            graph.replay()
+        else:
+            fn()
     end.record()
     torch.cuda.synchronize()
     nvtx.range_pop()
     elapsed_ms = start.elapsed_time(end)
+
+    # Release graph to avoid interfering with subsequent captures from other libraries.
+    del graph
+    torch.cuda.synchronize()
+
     return elapsed_ms * 1e3 / ITER  # us
 
 
@@ -133,65 +185,59 @@ def main():
     device = torch.device("cuda:0")
     torch.manual_seed(2026)
 
-    # results[shape_label][TM] = (mxfp8_us, fp8_us)
-    results = {label: {} for label, _, _ in SHAPES}
+    # results[shape_label][num_seq] = (mxfp8_us, mxfp4_us, fp8_us)
+    results = {label: {} for label, _, _, _ in SHAPES}
 
-    for shape_label, n, k in SHAPES:
-        print(f"\n=== shape={shape_label}  n={n}  k={k} ===", flush=True)
-        for tm in TM_CASES:
-            m = tm * NUM_GROUP // 8
+    for shape_label, n, k, num_group in SHAPES:
+        print(f"\n=== shape={shape_label}  n={n}  k={k}  num_group={num_group} ===", flush=True)
+        for num_seq in M_CASES:
+            # seq = tokens per group (expert) in the group_gemm
+            seq = num_seq * NUM_TOPK // NUM_EXPERT_TOTAL
 
             # mxfp8
-            run_mx = _build_mxfp8(NUM_GROUP, tm, n, k, device)
+            run_mx = _build_mxfp8(num_group, seq, n, k, device)
             if run_mx is None:
                 t_mx = None
             else:
-                lab = f"mxfp8/{shape_label}/m{m}"
-                t_mx = _bench(lab, run_mx)
+                t_mx = _bench(f"mxfp8/{shape_label}/m{num_seq}", run_mx)
+
+            # mxfp8 x mxfp4
+            run_mx4 = _build_mxfp4(num_group, seq, n, k, device)
+            if run_mx4 is None:
+                t_mx4 = None
+            else:
+                t_mx4 = _bench(f"mxfp8_mxfp4/{shape_label}/m{num_seq}", run_mx4)
 
             # fp8 per-tensor
-            run_fp = _build_fp8(NUM_GROUP, tm, n, k, device)
-            lab = f"fp8/{shape_label}/m{m}"
-            t_fp = _bench(lab, run_fp)
+            run_fp = _build_fp8(num_group, seq, n, k, device)
+            t_fp = _bench(f"fp8/{shape_label}/m{num_seq}", run_fp)
 
-            results[shape_label][tm] = (t_mx, t_fp)
+            results[shape_label][num_seq] = (t_mx, t_mx4, t_fp)
             mx_str = f"{t_mx:7.2f}" if t_mx is not None else "    N/A"
+            mx4_str = f"{t_mx4:7.2f}" if t_mx4 is not None else "    N/A"
             print(
-                f"  m={m:>5d}  seq_per_group={tm:>3d}  mxfp8={mx_str} us   fp8={t_fp:7.2f} us",
+                f"  m={num_seq:>5d}  seq/grp={seq:>4d}  "
+                f"mxfp8={mx_str} us   mxfp8_mxfp4={mx4_str} us   fp8={t_fp:7.2f} us",
                 flush=True,
             )
 
-    # Markdown summary tables (one per tp config to keep each narrow).
-    tp_groups = {}
-    for shape_label, _, _ in SHAPES:
-        # split off trailing "_tpN" suffix to group; fall back to single group otherwise
-        tp = shape_label.rsplit("_", 1)[-1] if "_tp" in shape_label else "all"
-        tp_groups.setdefault(tp, []).append(shape_label)
-
-    for tp, labels in tp_groups.items():
+    # Markdown summary tables (one table per shape to keep each narrow).
+    for shape_label, _, _, num_group in SHAPES:
         print()
-        print(f"### {tp}")
-        header1 = ["m     ", "seq_per_grp"]
-        header2 = ["      ", "           "]
-        sep = ["------", "------"]
-        for shape_label in labels:
-            header1 += [shape_label, "", ""]
-            header2 += ["mxfp8", "fp8_per_tensor", "speedup"]
-            sep += ["------", "------", "------"]
-        print("| " + " | ".join(c.ljust(14) for c in header1) + " |")
-        print("| " + " | ".join(c.ljust(14) for c in header2) + " |")
-        print("|-" + "-|-".join(c.ljust(14, "-") for c in sep) + "-|")
-        for tm in TM_CASES:
-            m = tm * NUM_GROUP // 8
-            cells = [str(m), str(tm)]
-            for shape_label in labels:
-                t_mx, t_fp = results[shape_label][tm]
-                if t_mx is None:
-                    cells += ["N/A", f"{t_fp:.2f}", "N/A"]
-                else:
-                    speedup = t_fp / t_mx
-                    cells += [f"{t_mx:.2f}", f"{t_fp:.2f}", f"{speedup:.2f}"]
-            print("| " + " | ".join(c.ljust(14) for c in cells) + " |")
+        print(f"### {shape_label}")
+        header = ["m", "seq/grp", "mxfp8", "mxfp8_mxfp4", "fp8", "mxfp8_sp", "mxfp4_sp"]
+        sep = ["------"] * len(header)
+        print("| " + " | ".join(c.ljust(12) for c in header) + " |")
+        print("|-" + "-|-".join(c.ljust(12, "-") for c in sep) + "-|")
+        for num_seq in M_CASES:
+            seq = num_seq * NUM_TOPK // NUM_EXPERT_TOTAL
+            t_mx, t_mx4, t_fp = results[shape_label][num_seq]
+            mx_cell = f"{t_mx:.2f}" if t_mx is not None else "N/A"
+            mx4_cell = f"{t_mx4:.2f}" if t_mx4 is not None else "N/A"
+            mx_sp = f"{t_fp / t_mx:.2f}" if t_mx is not None else "N/A"
+            mx4_sp = f"{t_fp / t_mx4:.2f}" if t_mx4 is not None else "N/A"
+            cells = [str(num_seq), str(seq), mx_cell, mx4_cell, f"{t_fp:.2f}", mx_sp, mx4_sp]
+            print("| " + " | ".join(c.ljust(12) for c in cells) + " |")
 
 
 if __name__ == "__main__":

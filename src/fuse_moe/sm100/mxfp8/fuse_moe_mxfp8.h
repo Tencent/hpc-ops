@@ -49,7 +49,7 @@ void fuse_moe_mxfp8_async(void *output_ptr,
                           void *gateup_x_row_map_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
                           void *tiles_ptr, void *cu_tiles_ptr, const void *shared_output_ptr,
                           int num_seq, int hidden_size, int intermediate_size, int num_topk,
-                          int num_expert_total, int num_expert_local, int rank_ep,
+                          int num_expert_total, int num_expert_local, int rank_ep, bool is_fp4,
                           cudaStream_t stream);
 
 }  // namespace fuse_moe

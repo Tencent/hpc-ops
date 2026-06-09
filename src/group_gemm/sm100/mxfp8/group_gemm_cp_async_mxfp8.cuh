@@ -237,11 +237,18 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
   for (int i = idx; i <= num_group; i += blockDim.x) {
     shm_cu_tiles[i] = cu_tiles_ptr[i];
   }
+
+  // fp4 weight
+  if constexpr (GemmConfig::kNeedPreZeroB) {
+    for (int i = idx; i < static_cast<int>(cosize(SLayoutB{})); i += blockDim.x) {
+      reinterpret_cast<uint8_t *>(shm_b)[i] = 0;
+    }
+  }
   __syncthreads();
 
   tCt.data() = make_tmem_ptr<float>(s_tmem_base);
 
-  constexpr uint32_t kExpectedBytesB = (cosize(SLayoutB{}) / kStage) * sizeof(Tin);
+  constexpr uint32_t kExpectedBytesB = GemmConfig::kExpectedBytesB;
   constexpr uint32_t kExpectedBytesSF = 32 * 16 + kSfxRows * 16;
 
   if (idx >= 256) {

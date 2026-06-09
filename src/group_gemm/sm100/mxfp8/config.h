@@ -14,6 +14,8 @@
 #include "cute/atom/mma_traits_sm100.hpp"
 #include "cute/tensor.hpp"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
+#include "cutlass/float8.h"
+#include "cutlass/float_subbyte.h"
 #include "cutlass/numeric_types.h"
 
 namespace hpc {
@@ -21,20 +23,20 @@ namespace group_gemm {
 
 using namespace cute;  // NOLINT
 
-template <int kMmaSM_, typename Tin, typename Tsf, int kTileM, int kTileN>
+template <int kMmaSM_, typename Tin, typename TinB, typename Tsf, int kTileM, int kTileN>
 struct MxFp8MmaAtomSelector;
 
-// swapAB
-template <typename Tin, typename Tsf, int kTileM, int kTileN>
-struct MxFp8MmaAtomSelector<1, Tin, Tsf, kTileM, kTileN> {
-  using type = decltype(make_tiled_mma(SM100_MMA_MXF8F6F4_SS<Tin, Tin, float, Tsf, kTileN, kTileM,
+// swapAB: MMA-A operand = B(weight, TinB), MMA-B operand = A(activation, Tin)
+template <typename Tin, typename TinB, typename Tsf, int kTileM, int kTileN>
+struct MxFp8MmaAtomSelector<1, Tin, TinB, Tsf, kTileM, kTileN> {
+  using type = decltype(make_tiled_mma(SM100_MMA_MXF8F6F4_SS<TinB, Tin, float, Tsf, kTileN, kTileM,
                                                              UMMA::Major::K, UMMA::Major::K>{}));
 };
 
-template <typename Tin, typename Tsf, int kTileM, int kTileN>
-struct MxFp8MmaAtomSelector<2, Tin, Tsf, kTileM, kTileN> {
+template <typename Tin, typename TinB, typename Tsf, int kTileM, int kTileN>
+struct MxFp8MmaAtomSelector<2, Tin, TinB, Tsf, kTileM, kTileN> {
   using type =
-      decltype(make_tiled_mma(SM100_MMA_MXF8F6F4_2x1SM_SS<Tin, Tin, float, Tsf, kTileN, kTileM,
+      decltype(make_tiled_mma(SM100_MMA_MXF8F6F4_2x1SM_SS<TinB, Tin, float, Tsf, kTileN, kTileM,
                                                           UMMA::Major::K, UMMA::Major::K>{}));
 };
 
@@ -42,9 +44,11 @@ struct MxFp8MmaAtomSelector<2, Tin, Tsf, kTileM, kTileN> {
 // but each extra slot costs kTileM TMEM cols.
 // kStageTile * kTileM + kScaleColsPerTile ≤ 512.
 template <typename Tin_, typename Tout_, typename Tsf_, int kTileM_, int kTileN_, int kTileK_,
-          int kEpiTileM_, int kStage_, int kStageTMA_, int kMmaSM_ = 1, int kStageTile_ = 2>
+          int kEpiTileM_, int kStage_, int kStageTMA_, int kMmaSM_ = 1, int kStageTile_ = 2,
+          typename TinB_ = Tin_>
 struct GroupGEMMMxFp8Config {
   using Tin = Tin_;
+  using TinB = TinB_;  // B(weight) gmem element type: fp8 (== Tin) or fp4 (float_e2m1_unpacksmem_t)
   using Tout = Tout_;
   using Tsf = Tsf_;
   using Tacc = float;
@@ -70,6 +74,10 @@ struct GroupGEMMMxFp8Config {
   static constexpr int kSfxRows = kSmallTM ? 32 : 64;
   static constexpr int kSFAlignM = kSmallTM ? 128 : 256;
   static constexpr int kScaleColsPerTile = kSmallTM ? 8 : 12;
+
+  // B(weight) is sub-byte (fp4)?
+  static constexpr bool kBSubByte = (cute::sizeof_bits_v<TinB> < 8);
+  static constexpr bool kNeedPreZeroB = kBSubByte;
 
   static_assert(kMmaSM == 1 || kMmaSM == 2, "kMmaSM must be 1 or 2");
   static_assert(kTileN == 128 * kMmaSM, "kTileN must be 128 (1SM) or 256 (2SM)");
@@ -107,7 +115,7 @@ struct GroupGEMMMxFp8Config {
       decltype(tile_to_shape(UMMA::Layout_MN_SW128_Atom<Tout>{},
                              make_shape(Int<kCtaTileN>{}, Int<kEpiTileM>{}, Int<kStageTMA>{})));
 
-  using TiledMma = typename MxFp8MmaAtomSelector<kMmaSM, Tin, Tsf, kTileM, kTileN>::type;
+  using TiledMma = typename MxFp8MmaAtomSelector<kMmaSM, Tin, TinB, Tsf, kTileM, kTileN>::type;
 
   // cp.async copy for A (activation): used by group_gemm_cp_async_mxfp8 to
   // load X from gmem directly into SMEM (with optional row_map indirection),
@@ -173,6 +181,11 @@ struct GroupGEMMMxFp8Config {
 
   static_assert(shm_size <= 228 * 1024,
                 "Per-CTA dynamic SHM exceeds 228 KB: reduce kStage / kStageTMA / kEpiTileM");
+
+  // TMA transaction bytes (per AB stage):
+  static constexpr uint32_t kExpectedBytesA = (cosize(SLayoutA{}) / kStage) * sizeof(Tin);
+  static constexpr uint32_t kExpectedBytesB = kCtaTileN * kTileK * cute::sizeof_bits_v<TinB> / 8;
+  static constexpr uint32_t kExpectedBytesAB = kExpectedBytesA + kExpectedBytesB;
 
   auto get_shm_size() { return shm_size; }
 };

@@ -86,7 +86,6 @@ __global__ __launch_bounds__(256, 1) void group_gemm_1sm_mxfp8_kernel(
 
   constexpr int kTileM = GemmConfig::kTileM;
   constexpr int kTileN = GemmConfig::kTileN;
-  constexpr int kTileK = GemmConfig::kTileK;
   constexpr int kEpiTileM = GemmConfig::kEpiTileM;
   constexpr int kStage = GemmConfig::kStage;
   constexpr int kStageTMA = GemmConfig::kStageTMA;
@@ -97,7 +96,6 @@ __global__ __launch_bounds__(256, 1) void group_gemm_1sm_mxfp8_kernel(
   constexpr int kSfxRows = GemmConfig::kSfxRows;
   constexpr int kMmaSM = GemmConfig::kMmaSM;
   constexpr int kScaleColsPerTile = GemmConfig::kScaleColsPerTile;
-  constexpr int kABPerSF = GemmConfig::kABPerSF;
 
   int idx = threadIdx.x;
   int iwarp = idx / 32;
@@ -255,16 +253,22 @@ __global__ __launch_bounds__(256, 1) void group_gemm_1sm_mxfp8_kernel(
   for (int i = idx; i <= num_group; i += blockDim.x) {
     shm_cu_tiles[i] = cu_tiles_ptr[i];
   }
+
+  // fp4 weight: TMA scatter-unpack does not fill every byte of SMEM B, so pre-zero it.
+  if constexpr (GemmConfig::kNeedPreZeroB) {
+    for (int i = idx; i < static_cast<int>(cosize(SLayoutB{})); i += blockDim.x) {
+      reinterpret_cast<uint8_t *>(shm_b)[i] = 0;
+    }
+  }
   __syncthreads();
 
   tCt.data() = make_tmem_ptr<float>(s_tmem_base);
 
-  constexpr uint32_t kExpectedBytesAB =
-      (cosize(SLayoutB{}) / kStage + cosize(SLayoutA{}) / kStage) * sizeof(Tin);
+  constexpr uint32_t kExpectedBytesAB = GemmConfig::kExpectedBytesA + GemmConfig::kExpectedBytesB;
   constexpr uint32_t kExpectedBytesSF = 32 * 16 + kSfxRows * 16;
 
   if (iwarp == 0 && elected) {
-    // TMA warp: loads AB (per kTileK tile) and SF (per 128-K packed tile).
+    // TMA warp: loads AB and SF
     int phase_ab = 1;  // ab_writable phase
     int phase_sf = 1;  // sf_writable phase
     int istage_ab = 0;
@@ -285,45 +289,32 @@ __global__ __launch_bounds__(256, 1) void group_gemm_1sm_mxfp8_kernel(
         auto *td_a = td_ay + igroup * 2;
         prefetch_tma_descriptor(td_a);
 
-        int ntile_k_ab = ntile_k;
-        for (int itile_k = 0; itile_k < ntile_k_ab; ++itile_k) {
-          int iab_in_sf = itile_k % kABPerSF;
-          int itile_sf = itile_k / kABPerSF;  // SF tile index into gmem
-
-          // Wait for AB SMEM slot to be reusable
-          wait_barrier(ab_writable[istage_ab], phase_ab);
-
-          if (iab_in_sf == 0) {
-            // First AB in this SF batch: also load SF
-            wait_barrier(sf_writable[istage_sf], phase_sf);
-
-            int sfb_flat_n = igroup * (n / 128) + itile_n;
-            int sfa_tile_global = shm_cu_tiles[igroup] + itile_m;
-            copy(tma_sfb.with(sf_readable[istage_sf], 0, TMA::CacheHintSm90::EVICT_FIRST),
-                 tSFBg(_, 0, 0, sfb_flat_n, itile_sf), tSFBs(_, 0, 0, istage_sf));
-            copy(tma_sfa.with(sf_readable[istage_sf], 0, TMA::CacheHintSm90::EVICT_FIRST),
-                 tSFAg(_, 0, 0, sfa_tile_global, itile_sf), tSFAs(_, 0, 0, istage_sf));
-            set_barrier_transaction_bytes(sf_readable[istage_sf], kExpectedBytesSF);
-          }
-
+        for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
           // load A/B
+          wait_barrier(ab_writable[istage_ab], phase_ab);
           copy(tma_b.with(ab_readable[istage_ab], 0, TMA::CacheHintSm90::EVICT_FIRST),
                tBg(_, itile_n, itile_k, igroup), tBs(_, 0, 0, istage_ab));
           copy(tma_a.with(td_a, ab_readable[istage_ab], 0, TMA::CacheHintSm90::EVICT_FIRST),
                tAg(_, itile_m, itile_k), tAs(_, 0, 0, istage_ab));
           set_barrier_transaction_bytes(ab_readable[istage_ab], kExpectedBytesAB);
 
+          // load SFA/SFB
+          int sfb_flat_n = igroup * (n / 128) + itile_n;
+          int sfa_tile_global = shm_cu_tiles[igroup] + itile_m;
+          wait_barrier(sf_writable[istage_sf], phase_sf);
+          copy(tma_sfb.with(sf_readable[istage_sf], 0, TMA::CacheHintSm90::EVICT_FIRST),
+               tSFBg(_, 0, 0, sfb_flat_n, itile_k), tSFBs(_, 0, 0, istage_sf));
+          copy(tma_sfa.with(sf_readable[istage_sf], 0, TMA::CacheHintSm90::EVICT_FIRST),
+               tSFAg(_, 0, 0, sfa_tile_global, itile_k), tSFAs(_, 0, 0, istage_sf));
+          set_barrier_transaction_bytes(sf_readable[istage_sf], kExpectedBytesSF);
+
           istage_ab++;
+          istage_sf++;
           if (istage_ab == kStage) {
-            phase_ab ^= 1;
             istage_ab = 0;
-          }
-          if (iab_in_sf == kABPerSF - 1 || itile_k == ntile_k - 1) {
-            istage_sf++;
-            if (istage_sf == kStage) {
-              phase_sf ^= 1;
-              istage_sf = 0;
-            }
+            phase_ab ^= 1;
+            istage_sf = 0;
+            phase_sf ^= 1;
           }
         }
       }
@@ -345,7 +336,7 @@ __global__ __launch_bounds__(256, 1) void group_gemm_1sm_mxfp8_kernel(
       }
     }
   } else if (iwarp == 1) {
-    // UTCCP warp: SF SMEM -> SF TMEM. Iterates over SF tiles (128-K granularity).
+    // UTCCP warp: SF SMEM -> SF TMEM.
     int phase_sf_r = 0;  // sf_readable phase
     int phase_sf_w = 1;  // sf_writable phase
     int istage_sf = 0;
@@ -365,8 +356,7 @@ __global__ __launch_bounds__(256, 1) void group_gemm_1sm_mxfp8_kernel(
 
     while (true) {
       if (igroup >= 0) {
-        int ntile_k_sf = (ntile_k + kABPerSF - 1) / kABPerSF;
-        for (int isf = 0; isf < ntile_k_sf; ++isf) {
+        for (int isf = 0; isf < ntile_k; ++isf) {
           wait_barrier(sf_writable[istage_sf], phase_sf_w);
           wait_barrier(sf_readable[istage_sf], phase_sf_r);
 
@@ -386,9 +376,9 @@ __global__ __launch_bounds__(256, 1) void group_gemm_1sm_mxfp8_kernel(
 
           istage_sf++;
           if (istage_sf == kStage) {
+            istage_sf = 0;
             phase_sf_r ^= 1;
             phase_sf_w ^= 1;
-            istage_sf = 0;
           }
         }
       }
@@ -410,13 +400,15 @@ __global__ __launch_bounds__(256, 1) void group_gemm_1sm_mxfp8_kernel(
       }
     }
   } else if (iwarp == 2) {
-    // MMA warp: decoupled AB/SF pipeline. SF TMEM persists for kABPerSF AB iterations.
+    // MMA warp
     int phase_ab = 0;          // ab_readable phase
     int phase_utccp_done = 0;  // utccp_done phase (SF TMEM ready)
+
     int istage_ab = 0;
     int istage_sf = 0;
-    int istage_tile = 0;
+
     int phase_tile = 1;
+    int istage_tile = 0;
 
     int phase_task = 0;
     int istage_task = 0;
@@ -439,26 +431,17 @@ __global__ __launch_bounds__(256, 1) void group_gemm_1sm_mxfp8_kernel(
         uint32_t sf_base = s_tmem_base + kStageTile * kTileM;
 
         wait_barrier(tmem_writable[istage_tile], phase_tile);
-
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
-          int iab_in_sf = itile_k % kABPerSF;
-
-          // Wait for SF TMEM (once per SF tile, i.e. when iab_in_sf==0)
-          if (iab_in_sf == 0) {
-            wait_barrier(utccp_done[istage_sf], phase_utccp_done);
-          }
+          // Wait for SF TMEM
+          wait_barrier(utccp_done[istage_sf], phase_utccp_done);
           // Wait for AB SMEM data.
           wait_barrier(ab_readable[istage_ab], phase_ab);
 
           uint32_t sf_slot = sf_base + istage_sf * kScaleColsPerTile;
-
 #pragma unroll
           for (uint32_t ik = 0; ik < size<2>(tBr); ik++) {
-            // SF sub-index: offset by iab_in_sf*(kTileK/32) so that kTileK=64
-            // uses ik=0,1 on first AB tile, ik=2,3 on second.
-            uint32_t sf_ik = iab_in_sf * (kTileK / kSfVec) + ik;
-            uint32_t sfb_addr_ki = (sf_slot & 0x3FFFFFFFu) | (sf_ik << 30);
-            uint32_t sfa_addr_ki = ((sf_slot + 4) & 0x3FFFFFFFu) | (sf_ik << 30);
+            uint32_t sfb_addr_ki = (sf_slot & 0x3FFFFFFFu) | (ik << 30);
+            uint32_t sfa_addr_ki = ((sf_slot + 4) & 0x3FFFFFFFu) | (ik << 30);
             auto sfb_ki = make_tensor(make_tmem_ptr<cutlass::float_ue8m0_t>(sfb_addr_ki),
                                       make_layout(make_shape(1)));
             auto sfa_ki = make_tensor(make_tmem_ptr<cutlass::float_ue8m0_t>(sfa_addr_ki),
@@ -470,24 +453,16 @@ __global__ __launch_bounds__(256, 1) void group_gemm_1sm_mxfp8_kernel(
 
           // Release AB SMEM
           cutlass::arch::umma_arrive(&ab_writable[istage_ab]);
-
-          // Release SF SMEM+TMEM after the last AB in this SF batch
-          // (or on the final k-tile if ntile_k is not a multiple of kABPerSF)
-          if (iab_in_sf == kABPerSF - 1 || itile_k == ntile_k - 1) {
-            cutlass::arch::umma_arrive(&sf_writable[istage_sf]);
-          }
+          // Release SF SMEM+TMEM
+          cutlass::arch::umma_arrive(&sf_writable[istage_sf]);
 
           istage_ab++;
+          istage_sf++;
           if (istage_ab == kStage) {
-            phase_ab ^= 1;
             istage_ab = 0;
-          }
-          if (iab_in_sf == kABPerSF - 1 || itile_k == ntile_k - 1) {
-            istage_sf++;
-            if (istage_sf == kStage) {
-              phase_utccp_done ^= 1;
-              istage_sf = 0;
-            }
+            phase_ab ^= 1;
+            istage_sf = 0;
+            phase_utccp_done ^= 1;
           }
         }
 
@@ -517,7 +492,7 @@ __global__ __launch_bounds__(256, 1) void group_gemm_1sm_mxfp8_kernel(
       }
     }
   } else if (iwarp == 3 && elected) {
-    // Warp 6: Find task
+    // Find task
     int phase_task_write = 1;
     int istage_task = 0;
 
@@ -700,7 +675,6 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
 
   constexpr int kTileM = GemmConfig::kTileM;
   constexpr int kTileN = GemmConfig::kTileN;
-  constexpr int kTileK = GemmConfig::kTileK;
   constexpr int kCtaTileN = GemmConfig::kCtaTileN;
   constexpr int kEpiTileM = GemmConfig::kEpiTileM;
   constexpr int kStage = GemmConfig::kStage;
@@ -712,9 +686,6 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
   constexpr int kSfxRows = GemmConfig::kSfxRows;
   constexpr int kMmaSM = GemmConfig::kMmaSM;
   constexpr int kScaleColsPerTile = GemmConfig::kScaleColsPerTile;
-  constexpr int kABPerSF = GemmConfig::kABPerSF;
-
-  // TMEM budget enforcement: handled by static_assert in Config (config.h).
 
   int idx = threadIdx.x;
   int iwarp = idx / 32;
@@ -748,19 +719,12 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
   // Global tensors
   TmaA tma_a;
   TmaY tma_y;
-  auto gA = tma_a.get_tma_tensor(make_shape(m, k));  // X (m, k), per-group desc (td_ay[g*2+0])
+  auto gA = tma_a.get_tma_tensor(make_shape(m, k));
   auto gB = tma_b.get_tma_tensor(make_shape(n, k, num_group));
-  // SFB static desc; the 3rd dim is "global GEMM m-tile index" (flat across groups).
-  // sfx_max_tiles = m / kTileM + num_group   (worst-case)
   int sfx_max_tiles = m / kTileM + num_group;
-  // Ksf_tiles = ceil(k_sf / 4) where k_sf = k / kSfVec. When k % 128 != 0 the
-  // trailing SF tile is partial: prepack zero-pads it, AB TMA OOB-loads zeros,
-  // so the inner_k MMA iterations covering the OOB SF lanes contribute 0.
   int k_sf_tiles = (k / kSfVec + 3) / 4;
   auto gSFA =
       tma_sfa.get_tma_tensor(make_shape(Int<kSfxRows>{}, Int<16>{}, sfx_max_tiles, k_sf_tiles));
-  // SFB n-tile dim uses n/256 (kTileN granularity); the prepack ROWS_PER_TILE=256
-  // on the 2SM SFW path keeps shape (64, 16, num_group * (n/256), Ksf_tiles).
   auto gSFB = tma_sfb.get_tma_tensor(
       make_shape(Int<64>{}, Int<16>{}, num_group * (n / kTileN), k_sf_tiles));
   auto gY =
@@ -787,14 +751,14 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
 
   int ntile_k = size<2>(tBg);
 
-  // TiledMma partition (SwapAB: math B → MMA-A, math A → MMA-B; sm_idx-aware)
+  // TiledMma partition
   TiledMma tiled_mma;
   auto cta_mma = tiled_mma.get_slice(sm_idx);
   auto tBr = cta_mma.make_fragment_A(cta_mma.partition_A(sB));
   auto tAr = cta_mma.make_fragment_B(cta_mma.partition_B(sA));
   auto tCt = cta_mma.make_fragment_C(cta_mma.partition_C(gY));
 
-  // SF UTCCP descriptors (pre-built for all SF stages; one per packed 128-K SF tile)
+  // SF UTCCP descriptors
   uint64_t sfb_desc[kStage];
   uint64_t sfa_low_desc[kStage];
   uint64_t sfa_high_desc[kStage];  // only used when !kSmallTM
@@ -840,13 +804,14 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
       next_power2(std::integral_constant<int, kStageTile * kTileM + kStage * kScaleColsPerTile>{});
 
   __shared__ uint32_t s_tmem_base;
-  __shared__ uint64_t tma_readable[kStage];
-  __shared__ uint64_t ab_writable[kStage];
-  __shared__ uint64_t tma_sf_readable[kStage];
-  __shared__ uint64_t sf_writable[kStage];
+  __shared__ uint64_t ab_readable[kStage];  // AB SMEM data ready
+  __shared__ uint64_t ab_writable[kStage];  // AB SMEM reusable
+  __shared__ uint64_t sf_readable[kStage];  // SF SMEM ready
+  __shared__ uint64_t sf_writable[kStage];  // SF SMEM+TMEM reusable
   __shared__ uint64_t utccp_done[kStage];
   __shared__ uint64_t tmem_readable[kStageTile];
   __shared__ uint64_t tmem_writable[kStageTile];
+
   __shared__ int task_shm[kStageTask][4];
   __shared__ uint64_t task_readable[kStageTask];
   __shared__ uint64_t task_writable[kStageTask];
@@ -854,9 +819,9 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
   if (iwarp == 0 && elected) {
 #pragma unroll
     for (int i = 0; i < kStage; i++) {
-      initialize_barrier(tma_readable[i], 2);
+      initialize_barrier(ab_readable[i], 2);
       initialize_barrier(ab_writable[i], 1);
-      initialize_barrier(tma_sf_readable[i], 3);
+      initialize_barrier(sf_readable[i], 3);
       initialize_barrier(sf_writable[i], 1);
       initialize_barrier(utccp_done[i], 1);
     }
@@ -887,26 +852,37 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
   for (int i = idx; i <= num_group; i += blockDim.x) {
     shm_cu_tiles[i] = cu_tiles_ptr[i];
   }
+  // fp4 weight: TMA scatter-unpack does not fill every byte of SMEM B, so pre-zero it
+  // (each CTA clears its own shm_b).
+  if constexpr (GemmConfig::kNeedPreZeroB) {
+    for (int i = idx; i < static_cast<int>(cosize(SLayoutB{})); i += blockDim.x) {
+      reinterpret_cast<uint8_t *>(shm_b)[i] = 0;
+    }
+  }
   // __syncthreads();
   cluster_relaxed_sync();
 
   tCt.data() = make_tmem_ptr<float>(s_tmem_base);
 
   // Per-CTA byte counts (after sm_idx slice).
-  constexpr uint32_t kBytesAB =
-      (cosize(SLayoutA{}) / kStage + cosize(SLayoutB{}) / kStage) * sizeof(Tin);
-  constexpr uint32_t kExpectedBytesAB = kMmaSM * kBytesAB;
+  // A is Tin (fp8); B may be sub-byte (fp4) -> size it by TinB bit-width.
+  using TinB = typename GemmConfig::TinB;
+  constexpr uint32_t kBytesA = (cosize(SLayoutA{}) / kStage) * sizeof(Tin);
+  constexpr uint32_t kBytesB = (cosize(SLayoutB{}) / kStage) * cute::sizeof_bits_v<TinB> / 8;
+  constexpr uint32_t kExpectedBytesAB = kMmaSM * (kBytesA + kBytesB);
   constexpr uint32_t kExpectedBytesSFB = kMmaSM * (32 * 16);  // 2 CTAs × 32×16
   constexpr uint32_t kExpectedBytesSFA = kSfxRows * 16;
 
   if (iwarp == 0 && elected) {
     // TMA warp (both CTAs)
-    int phase_ab = 1;
-    int phase_sf = 1;
+    int phase_ab = 1;  // ab_writable phase
+    int phase_sf = 1;  // sf_writable phase
     int istage_ab = 0;
     int istage_sf = 0;
+
     int phase_task = 0;
     int istage_task = 0;
+
     int igroup = 0;
     int sum_tile_m = 0;
     int itile_m, itile_n;
@@ -920,61 +896,49 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
         prefetch_tma_descriptor(td_a);
 
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
-          int iab_in_sf = itile_k % kABPerSF;
-          int itile_sf = itile_k / kABPerSF;  // SF K-tile index into gmem
-
-          // Wait for AB SMEM slot
+          // load A/B, A/B cooperative loads
           wait_barrier(ab_writable[istage_ab], phase_ab);
-
-          // SF TMA: load only on first AB of each SF batch
-          if (iab_in_sf == 0) {
-            wait_barrier(sf_writable[istage_sf], phase_sf);
-
-            int sfb_flat_n = igroup * (n / kTileN) + itile_n;
-            copy(tma_sfb.with(tma_sf_readable[istage_sf], 0, TMA::CacheHintSm100::EVICT_FIRST),
-                 tSFBg(_, 0, 0, sfb_flat_n, itile_sf), tSFBs(_, 0, 0, istage_sf));
-            if (elected_cta) {
-              set_barrier_transaction_bytes(tma_sf_readable[istage_sf], kExpectedBytesSFB);
-            } else {
-              arrive_cluster_barrier(tma_sf_readable[istage_sf], 0);
-            }
-
-            int sfa_tile_global = shm_cu_tiles[igroup] + itile_m;
-            if constexpr (kSmallTM) {
-              if (elected_cta) {
-                copy(tma_sfa.with(tma_sf_readable[istage_sf], mcast_mask),
-                     tSFAg(_, 0, 0, sfa_tile_global, itile_sf), tSFAs(_, 0, 0, istage_sf));
-              }
-              set_barrier_transaction_bytes(tma_sf_readable[istage_sf], kExpectedBytesSFA);
-            } else {
-              copy(tma_sfa.with(tma_sf_readable[istage_sf], mcast_mask),
-                   tSFAg(_, sm_idx, 0, sfa_tile_global, itile_sf), tSFAs(_, sm_idx, 0, istage_sf));
-              set_barrier_transaction_bytes(tma_sf_readable[istage_sf], kExpectedBytesSFA);
-            }
-          }
-
-          // A/B cooperative loads
-          copy(tma_b.with(tma_readable[istage_ab], 0, TMA::CacheHintSm100::EVICT_FIRST),
+          copy(tma_b.with(ab_readable[istage_ab], 0, TMA::CacheHintSm100::EVICT_FIRST),
                tBg(_, itile_n, itile_k, igroup), tBs(_, 0, 0, istage_ab));
-          copy(tma_a.with(td_a, tma_readable[istage_ab], 0, TMA::CacheHintSm100::EVICT_FIRST),
+          copy(tma_a.with(td_a, ab_readable[istage_ab], 0, TMA::CacheHintSm100::EVICT_FIRST),
                tAg(_, itile_m, itile_k), tAs(_, 0, 0, istage_ab));
           if (elected_cta) {
-            set_barrier_transaction_bytes(tma_readable[istage_ab], kExpectedBytesAB);
+            set_barrier_transaction_bytes(ab_readable[istage_ab], kExpectedBytesAB);
           } else {
-            arrive_cluster_barrier(tma_readable[istage_ab], 0);
+            arrive_cluster_barrier(ab_readable[istage_ab], 0);
+          }
+
+          // load SFA/SFB
+          int sfb_flat_n = igroup * (n / kTileN) + itile_n;
+          wait_barrier(sf_writable[istage_sf], phase_sf);
+          copy(tma_sfb.with(sf_readable[istage_sf], 0, TMA::CacheHintSm100::EVICT_FIRST),
+               tSFBg(_, 0, 0, sfb_flat_n, itile_k), tSFBs(_, 0, 0, istage_sf));
+          if (elected_cta) {
+            set_barrier_transaction_bytes(sf_readable[istage_sf], kExpectedBytesSFB);
+          } else {
+            arrive_cluster_barrier(sf_readable[istage_sf], 0);
+          }
+
+          int sfa_tile_global = shm_cu_tiles[igroup] + itile_m;
+          if constexpr (kSmallTM) {
+            if (elected_cta) {
+              copy(tma_sfa.with(sf_readable[istage_sf], mcast_mask),
+                   tSFAg(_, 0, 0, sfa_tile_global, itile_k), tSFAs(_, 0, 0, istage_sf));
+            }
+            set_barrier_transaction_bytes(sf_readable[istage_sf], kExpectedBytesSFA);
+          } else {
+            copy(tma_sfa.with(sf_readable[istage_sf], mcast_mask),
+                 tSFAg(_, sm_idx, 0, sfa_tile_global, itile_k), tSFAs(_, sm_idx, 0, istage_sf));
+            set_barrier_transaction_bytes(sf_readable[istage_sf], kExpectedBytesSFA);
           }
 
           istage_ab++;
+          istage_sf++;
           if (istage_ab == kStage) {
-            phase_ab ^= 1;
             istage_ab = 0;
-          }
-          if (iab_in_sf == kABPerSF - 1 || itile_k == ntile_k - 1) {
-            istage_sf++;
-            if (istage_sf == kStage) {
-              phase_sf ^= 1;
-              istage_sf = 0;
-            }
+            phase_ab ^= 1;
+            istage_sf = 0;
+            phase_sf ^= 1;
           }
         }
       }
@@ -996,12 +960,14 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
       }
     }
   } else if (iwarp == 1) {
-    // UTCCP warp: SF SMEM -> SF TMEM (CTA0 issues, CTA1 keeps task pipeline alive).
-    int phase_sf_r = 0;
-    int phase_sf_w = 1;
+    // UTCCP warp
+    int phase_sf_r = 0;  // sf_readable phase
+    int phase_sf_w = 1;  // sf_writable phase
     int istage_sf = 0;
+
     int phase_task = 0;
     int istage_task = 0;
+
     int igroup = 0;
     int sum_tile_m = 0;
     int itile_m, itile_n;
@@ -1013,10 +979,9 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
 
     while (true) {
       if (igroup >= 0 && elected_cta) {
-        int ntile_k_sf = (ntile_k + kABPerSF - 1) / kABPerSF;
-        for (int isf = 0; isf < ntile_k_sf; ++isf) {
+        for (int isf = 0; isf < ntile_k; ++isf) {
           wait_barrier(sf_writable[istage_sf], phase_sf_w);
-          wait_barrier(tma_sf_readable[istage_sf], phase_sf_r);
+          wait_barrier(sf_readable[istage_sf], phase_sf_r);
 
           uint32_t sf_slot = sf_base + istage_sf * kScaleColsPerTile;
 
@@ -1059,14 +1024,18 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
     }
   } else if (iwarp == 2) {
     // MMA warp
-    int phase_ab = 0;
-    int phase_utccp_done = 0;
+    int phase_ab = 0;          // ab_readable phase
+    int phase_utccp_done = 0;  // utccp_done phase (SF TMEM ready)
+
     int istage_ab = 0;
     int istage_sf = 0;
+
     int istage_tile = 0;
     int phase_tile = 1;
+
     int phase_task = 0;
     int istage_task = 0;
+
     int igroup = 0;
     int sum_tile_m = 0;
     int itile_m, itile_n;
@@ -1085,24 +1054,16 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
         wait_barrier(tmem_writable[istage_tile], phase_tile);
 
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
-          int iab_in_sf = itile_k % kABPerSF;
-
-          // Wait for SF TMEM (once per SF tile)
-          if (iab_in_sf == 0) {
-            wait_barrier(utccp_done[istage_sf], phase_utccp_done);
-          }
+          // Wait for SF TMEM
+          wait_barrier(utccp_done[istage_sf], phase_utccp_done);
           // Wait for AB SMEM
-          wait_barrier(tma_readable[istage_ab], phase_ab);
+          wait_barrier(ab_readable[istage_ab], phase_ab);
 
           uint32_t sf_slot = sf_base + istage_sf * kScaleColsPerTile;
-
 #pragma unroll
           for (uint32_t ik = 0; ik < size<2>(tBr); ik++) {
-            // SF sub-index: offset by iab_in_sf*(kTileK/32) so kTileK=64
-            // uses ik=0,1 on first AB, ik=2,3 on second.
-            uint32_t sf_ik = iab_in_sf * (kTileK / kSfVec) + ik;
-            uint32_t sfb_addr_ki = (sf_slot & 0x3FFFFFFFu) | (sf_ik << 30);
-            uint32_t sfa_addr_ki = ((sf_slot + 4) & 0x3FFFFFFFu) | (sf_ik << 30);
+            uint32_t sfb_addr_ki = (sf_slot & 0x3FFFFFFFu) | (ik << 30);
+            uint32_t sfa_addr_ki = ((sf_slot + 4) & 0x3FFFFFFFu) | (ik << 30);
             auto sfb_ki = make_tensor(make_tmem_ptr<cutlass::float_ue8m0_t>(sfb_addr_ki),
                                       make_layout(make_shape(1)));
             auto sfa_ki = make_tensor(make_tmem_ptr<cutlass::float_ue8m0_t>(sfa_addr_ki),
@@ -1114,23 +1075,16 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
 
           // Release AB SMEM
           cutlass::arch::umma_arrive_multicast_2x1SM(&ab_writable[istage_ab], mcast_mask);
-
-          // Release SF SMEM+TMEM after the last AB in this SF batch (or last k-tile)
-          if (iab_in_sf == kABPerSF - 1 || itile_k == ntile_k - 1) {
-            cutlass::arch::umma_arrive_multicast_2x1SM(&sf_writable[istage_sf], mcast_mask);
-          }
+          // Release SF SMEM+TMEM
+          cutlass::arch::umma_arrive_multicast_2x1SM(&sf_writable[istage_sf], mcast_mask);
 
           istage_ab++;
+          istage_sf++;
           if (istage_ab == kStage) {
-            phase_ab ^= 1;
             istage_ab = 0;
-          }
-          if (iab_in_sf == kABPerSF - 1 || itile_k == ntile_k - 1) {
-            istage_sf++;
-            if (istage_sf == kStage) {
-              phase_utccp_done ^= 1;
-              istage_sf = 0;
-            }
+            phase_ab ^= 1;
+            istage_sf = 0;
+            phase_utccp_done ^= 1;
           }
         }
 
@@ -1160,7 +1114,7 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
       }
     }
   } else if (iwarp == 3 && elected) {
-    // Find task (both CTAs; each maintains its own task_shm).
+    // Find task
     int phase_task_write = 1;
     int istage_task = 0;
     int igroup = 0;
@@ -1188,7 +1142,7 @@ __global__ __launch_bounds__(256, 1) void group_gemm_2sm_mxfp8_kernel(
       }
     }
   } else if (idx >= 128) {
-    // Epilogue warps W4-W7 (both CTAs; each stores its own kCtaTileN slab).
+    // Epilogue warps (both CTAs; each stores its own kCtaTileN slab).
     int epi_idx = idx - 128;
     int tmem_rd_phase = 0;
     int istage_tile = 0;

@@ -22,10 +22,16 @@ torch::Tensor fuse_moe_mxfp8_entry(const torch::Tensor &x, const torch::Tensor &
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   // shape / dtype validation
-  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn &&
-                  gate_up_weight.dtype() == torch::kFloat8_e4m3fn &&
-                  down_weight.dtype() == torch::kFloat8_e4m3fn,
-              "x, gate_up_weight, down_weight must be fp8_e4m3");
+  // x is always fp8_e4m3. Weights may be fp8_e4m3 (mxfp8) or uint8 (mxfp4 packed,
+  // 2 x e2m1 per byte → K dim halved). gate_up_weight and down_weight must share
+  // the same precision (single is_fp4 switch).
+  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn, "x must be fp8_e4m3");
+  TORCH_CHECK((gate_up_weight.dtype() == torch::kFloat8_e4m3fn &&
+               down_weight.dtype() == torch::kFloat8_e4m3fn) ||
+                  (gate_up_weight.dtype() == torch::kUInt8 && down_weight.dtype() == torch::kUInt8),
+              "gate_up_weight and down_weight must both be fp8_e4m3 (mxfp8) "
+              "or both be uint8 (mxfp4 packed)");
+  bool is_fp4 = (gate_up_weight.dtype() == torch::kUInt8);
   TORCH_CHECK(x_scale.dtype() == torch::kUInt8 &&
                   gate_up_weight_scale_packed.dtype() == torch::kUInt8 &&
                   down_weight_scale_packed.dtype() == torch::kUInt8,
@@ -46,16 +52,24 @@ torch::Tensor fuse_moe_mxfp8_entry(const torch::Tensor &x, const torch::Tensor &
   int num_expert_local = static_cast<int>(gate_up_weight.size(0));
   int intermediate = static_cast<int>(gate_up_weight.size(1)) / 2;
 
-  TORCH_CHECK(gate_up_weight.size(2) == hidden, "gate_up_weight last dim must equal hidden");
+  // Expected weight K (size(2)): fp8 → full K, fp4 → K/2 (2 x e2m1 per byte).
+  int gate_up_k_expected = is_fp4 ? hidden / 2 : hidden;
+  int down_k_expected = is_fp4 ? intermediate / 2 : intermediate;
+  TORCH_CHECK(gate_up_weight.size(2) == gate_up_k_expected,
+              "gate_up_weight last dim must equal hidden (mxfp8) or hidden/2 (mxfp4)");
   TORCH_CHECK(down_weight.size(0) == num_expert_local, "down_weight num_expert_local mismatch");
   TORCH_CHECK(down_weight.size(1) == hidden, "down_weight first dim must equal hidden");
-  TORCH_CHECK(down_weight.size(2) == intermediate,
-              "down_weight second dim must equal intermediate");
+  TORCH_CHECK(down_weight.size(2) == down_k_expected,
+              "down_weight second dim must equal intermediate (mxfp8) or intermediate/2 (mxfp4)");
   TORCH_CHECK(gate_up_weight.size(1) % 2 == 0, "gate_up_weight dim1 must be even");
-  // mxfp8 group_gemm now supports kTileK=128 (K%128==0) and kTileK=64 (K%64==0).
-  TORCH_CHECK(hidden % 64 == 0,
-              "hidden must be multiple of 64 (mxfp8 group_gemm kTileK=128 or 64)");
-  TORCH_CHECK(intermediate % 64 == 0, "intermediate must be multiple of 64");
+  // mxfp4 weight (sub-byte e2m1) needs K%128==0 for the TMA descriptor byte alignment.
+  if (is_fp4) {
+    TORCH_CHECK(hidden % 128 == 0, "mxfp4 requires hidden to be a multiple of 128");
+    TORCH_CHECK(intermediate % 128 == 0, "mxfp4 requires intermediate to be a multiple of 128");
+  } else {
+    TORCH_CHECK(hidden % 32 == 0, "hidden must be multiple of 32");
+    TORCH_CHECK(intermediate % 32 == 0, "intermediate must be multiple of 32");
+  }
   TORCH_CHECK(x_scale.size(0) == num_seq && x_scale.size(1) == hidden / 32,
               "x_scale shape must be (num_seq, hidden/32)");
   TORCH_CHECK(num_topk <= 128, "num_topk must be <= 128");
@@ -136,7 +150,8 @@ torch::Tensor fuse_moe_mxfp8_entry(const torch::Tensor &x, const torch::Tensor &
       gateup_x_row_map.mutable_data_ptr(), seqlens.mutable_data_ptr(),
       cu_seqlens.mutable_data_ptr(), tiles.mutable_data_ptr(), cu_tiles.mutable_data_ptr(),
       shared_output_ptr, num_seq, hidden, intermediate, num_topk,
-      static_cast<int>(num_expert_total), num_expert_local, static_cast<int>(rank_ep), stream);
+      static_cast<int>(num_expert_total), num_expert_local, static_cast<int>(rank_ep), is_fp4,
+      stream);
 
   return y;
 }

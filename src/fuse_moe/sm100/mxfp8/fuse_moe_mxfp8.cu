@@ -94,7 +94,7 @@ void fuse_moe_mxfp8_async(
     const void *topk_scale_ptr, void *topk_pos_ptr, void *gateup_x_row_map_ptr, void *seqlens_ptr,
     void *cu_seqlens_ptr, void *tiles_ptr, void *cu_tiles_ptr, const void *shared_output_ptr,
     int num_seq, int hidden_size, int intermediate_size, int num_topk, int num_expert_total,
-    int num_expert_local, int rank_ep, cudaStream_t stream) {
+    int num_expert_local, int rank_ep, bool is_fp4, cudaStream_t stream) {
   const int total_num_seq = num_seq * num_topk;
   const int num_seq_per_group_avg = total_num_seq / num_expert_total;
   // Gateup uses cp_async (1SM only), down uses TMA (may use 2SM).
@@ -131,7 +131,7 @@ void fuse_moe_mxfp8_async(
       gate_up_weight_scale_packed_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr,
       gateup_tiles_ptr, gateup_cu_tiles_ptr, num_expert_local, total_num_seq, intermediate_size * 2,
       hidden_size, num_seq_per_group_avg, /*update_tma=*/false, stream, gateup_x_row_map_ptr,
-      num_seq, /*use_pdl=*/use_pdl);
+      num_seq, /*use_pdl=*/use_pdl, /*is_fp4=*/is_fp4);
 
   // 4. Activation + mxfp8 quant + fused SFA prepack for down.
   //    Writes scale directly to packed layout, skipping the separate prepack kernel.
@@ -148,7 +148,8 @@ void fuse_moe_mxfp8_async(
       down_output_ptr, down_input_ptr, down_weight_ptr, down_input_scale_packed_ptr,
       down_weight_scale_packed_ptr, seqlens_ptr, cu_seqlens_ptr, down_tmas_ptr, down_tiles_ptr,
       down_cu_tiles_ptr, num_expert_local, total_num_seq, hidden_size, intermediate_size,
-      num_seq_per_group_avg, /*update_tma=*/false, stream, /*use_pdl=*/use_pdl);
+      num_seq_per_group_avg, /*update_tma=*/false, stream, /*use_pdl=*/use_pdl,
+      /*is_fp4=*/is_fp4);
 
   // 6. Reduce: scatter-add by topk_pos with topk_scale weights, optional shared_output add.
   reduce_async(output_ptr, down_output_ptr, topk_pos_ptr, topk_scale_ptr, shared_output_ptr,

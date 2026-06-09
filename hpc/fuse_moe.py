@@ -575,14 +575,18 @@ def fuse_moe_mxfp8(
     shared_output: Tensor = None,
     output: Tensor = None,
 ) -> Tensor:
-    """MXFP8 fused MoE forward.
+    """MXFP8 fused MoE forward (weights may be mxfp8 or mxfp4).
 
     Args:
         x: Input activation, fp8_e4m3, [num_seq, hidden]
         x_scale: Per-32K UE8M0 scale, uint8, [num_seq, hidden//32]
-        gate_up_weight: fp8_e4m3, [num_expert_local, intermediate, hidden]
+        gate_up_weight: weight B. Either fp8_e4m3 [num_expert_local, intermediate, hidden]
+            (mxfp8) or uint8 packed e2m1 [num_expert_local, intermediate, hidden//2]
+            (mxfp4, 2 values per byte). Precision auto-detected by dtype.
         gate_up_weight_scale_packed: uint8, prepacked SFW (1-D buffer)
-        down_weight: fp8_e4m3, [num_expert_local, hidden, intermediate//2]
+        down_weight: weight B. Either fp8_e4m3 [num_expert_local, hidden, intermediate//2]
+            (mxfp8) or uint8 packed e2m1 [num_expert_local, hidden, intermediate//4] (mxfp4).
+            Must share precision with gate_up_weight (single is_fp4 switch).
         down_weight_scale_packed: uint8, prepacked SFW (1-D buffer)
         topk_ids: int32, [num_seq, num_topk] (GLOBAL expert ids; out-of-rank ids
             are filtered)
@@ -594,6 +598,10 @@ def fuse_moe_mxfp8(
 
     Returns:
         bf16 tensor [num_seq, hidden]
+
+    Note:
+        mxfp4 weights require hidden % 128 == 0 and intermediate % 128 == 0
+        (sub-byte e2m1 TMA byte-alignment).
     """
     return torch.ops.hpc.fuse_moe_mxfp8(
         x,

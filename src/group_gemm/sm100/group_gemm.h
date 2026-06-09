@@ -65,7 +65,7 @@ void group_gemm_mxfp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                             const void *seqlens_ptr, const void *cu_seqlens_ptr, void *tmas_ptr,
                             void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m, int n, int k,
                             int num_seq_per_group_avg, bool update_tma, cudaStream_t stream,
-                            bool use_pdl = false);
+                            bool use_pdl = false, bool is_fp4 = false);
 
 void group_gemm_cp_async_mxfp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                                      const void *sfx_packed_ptr, const void *sfw_packed_ptr,
@@ -74,7 +74,7 @@ void group_gemm_cp_async_mxfp8_async(void *y_ptr, const void *x_ptr, const void 
                                      int num_group, int m, int n, int k, int num_seq_per_group_avg,
                                      bool update_tma, cudaStream_t stream,
                                      const void *x_row_map_ptr = nullptr, int x_num_rows = 0,
-                                     bool use_pdl = false);
+                                     bool use_pdl = false, bool is_fp4 = false);
 
 inline int mxfp8_dispatch_kTileM(int num_seq_per_group_avg, int n) {
   bool use_2sm = (n % 256 == 0) && (num_seq_per_group_avg > 32);

@@ -333,8 +333,9 @@ torch::Tensor group_gemm_mxfp8_entry(const torch::Tensor &x, const torch::Tensor
   TORCH_CHECK(cu_seqlens.device().is_cuda(), "cu_seqlens must be cuda");
   TORCH_CHECK(sfx_packed.device().is_cuda() && sfw_packed.device().is_cuda(),
               "sfx_packed/sfw_packed must be cuda");
-  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn && weight.dtype() == torch::kFloat8_e4m3fn,
-              "x and weight dtype must be fp8_e4m3");
+  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn, "x dtype must be fp8_e4m3");
+  TORCH_CHECK(weight.dtype() == torch::kFloat8_e4m3fn || weight.dtype() == torch::kUInt8,
+              "weight dtype must be fp8_e4m3 (mxfp8) or uint8 (mxfp4 packed)");
   TORCH_CHECK(sfx_packed.dtype() == torch::kUInt8 && sfw_packed.dtype() == torch::kUInt8,
               "prepacked sfx/sfw dtype must be uint8");
   TORCH_CHECK(seqlens.dtype() == torch::kInt32 && cu_seqlens.dtype() == torch::kInt32,
@@ -342,7 +343,16 @@ torch::Tensor group_gemm_mxfp8_entry(const torch::Tensor &x, const torch::Tensor
   TORCH_CHECK(x.is_contiguous() && weight.is_contiguous(), "x/weight must be contiguous");
   TORCH_CHECK(seqlens.size(0) == weight.size(0),
               "seqlens and weight must share the same num_group");
-  TORCH_CHECK(x.size(1) == weight.size(2), "x and weight must share the same k");
+
+  int k_x = static_cast<int>(x.size(1));
+  int w_k = static_cast<int>(weight.size(2));
+  bool is_fp4 = (w_k == k_x / 2);
+  TORCH_CHECK(w_k == k_x || is_fp4, "weight.size(2) must equal k (mxfp8) or k/2 (mxfp4 packed)");
+  TORCH_CHECK(k_x % 32 == 0, "k must be a multiple of 32 (SF_VEC)");
+  // fp4(B) is sub-byte (e2m1); its K-dim TMA descriptor byte-alignment is stricter
+  // than fp8, so k must be a multiple of 128 (otherwise cuTensorMapEncodeTiled
+  // fails). fp8(B) has no such restriction (k%32 suffices).
+  TORCH_CHECK(!is_fp4 || k_x % 128 == 0, "mxfp4 weight requires k to be a multiple of 128");
 
   int m = static_cast<int>(x.size(0));
   int k = static_cast<int>(x.size(1));
@@ -375,7 +385,8 @@ torch::Tensor group_gemm_mxfp8_entry(const torch::Tensor &x, const torch::Tensor
                          seqlens.const_data_ptr(), cu_seqlens.const_data_ptr(),
                          tmas.mutable_data_ptr(), tiles.mutable_data_ptr(),
                          cu_tiles.mutable_data_ptr(), num_group, m, n, k,
-                         static_cast<int>(num_seq_per_group_avg), update_tma, stream);
+                         static_cast<int>(num_seq_per_group_avg), update_tma, stream,
+                         /*use_pdl=*/false, is_fp4);
 
   return y;
 }
@@ -391,8 +402,9 @@ torch::Tensor group_gemm_cp_async_mxfp8_entry(
               "seqlens/cu_seqlens must be cuda");
   TORCH_CHECK(sfx_packed.device().is_cuda() && sfw_packed.device().is_cuda(),
               "sfx_packed/sfw_packed must be cuda");
-  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn && weight.dtype() == torch::kFloat8_e4m3fn,
-              "x and weight dtype must be fp8_e4m3");
+  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn, "x dtype must be fp8_e4m3");
+  TORCH_CHECK(weight.dtype() == torch::kFloat8_e4m3fn || weight.dtype() == torch::kUInt8,
+              "weight dtype must be fp8_e4m3 (mxfp8) or uint8 (mxfp4 packed)");
   TORCH_CHECK(sfx_packed.dtype() == torch::kUInt8 && sfw_packed.dtype() == torch::kUInt8,
               "prepacked sfx/sfw dtype must be uint8");
   TORCH_CHECK(seqlens.dtype() == torch::kInt32 && cu_seqlens.dtype() == torch::kInt32,
@@ -400,7 +412,16 @@ torch::Tensor group_gemm_cp_async_mxfp8_entry(
   TORCH_CHECK(x.is_contiguous() && weight.is_contiguous(), "x/weight must be contiguous");
   TORCH_CHECK(seqlens.size(0) == weight.size(0),
               "seqlens and weight must share the same num_group");
-  TORCH_CHECK(x.size(1) == weight.size(2), "x and weight must share the same k");
+  // Determine fp8(== k) / fp4(== k/2) by the weight's third dimension.
+  int k_x = static_cast<int>(x.size(1));
+  int w_k = static_cast<int>(weight.size(2));
+  bool is_fp4 = (w_k == k_x / 2);
+  TORCH_CHECK(w_k == k_x || is_fp4, "weight.size(2) must equal k (mxfp8) or k/2 (mxfp4 packed)");
+  TORCH_CHECK(k_x % 32 == 0, "k must be a multiple of 32 (SF_VEC)");
+  // fp4(B) is sub-byte (e2m1); its K-dim TMA descriptor byte-alignment is stricter
+  // than fp8, so k must be a multiple of 128 (otherwise cuTensorMapEncodeTiled
+  // fails). fp8(B) has no such restriction (k%32 suffices).
+  TORCH_CHECK(!is_fp4 || k_x % 128 == 0, "mxfp4 weight requires k to be a multiple of 128");
 
   int k = static_cast<int>(x.size(1));
   int n = static_cast<int>(weight.size(1));
@@ -450,7 +471,7 @@ torch::Tensor group_gemm_cp_async_mxfp8_entry(
       sfx_packed.const_data_ptr(), sfw_packed.const_data_ptr(), seqlens.const_data_ptr(),
       cu_seqlens.const_data_ptr(), tmas.mutable_data_ptr(), tiles.mutable_data_ptr(),
       cu_tiles.mutable_data_ptr(), num_group, m, n, k, static_cast<int>(num_seq_per_group_avg),
-      update_tma, stream, x_row_map_ptr, x_num_rows_int);
+      update_tma, stream, x_row_map_ptr, x_num_rows_int, /*use_pdl=*/false, is_fp4);
 
   return y;
 }

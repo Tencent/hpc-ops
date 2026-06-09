@@ -260,9 +260,6 @@ void count_and_route_row_mxfp8_async(
   // Down GEMM config dispatch: same logic as group_gemm_mxfp8_async
   bool use_2sm_down = (hidden_size % 256 == 0) && (num_seq_per_group_avg > 32);
   int kTileM_down = group_gemm::mxfp8_dispatch_kTileM(num_seq_per_group_avg, hidden_size);
-  // Down K = intermediate_size
-  int down_k = intermediate_size;
-  bool down_k_div128 = (down_k % 128 == 0);
 
   auto do_launch = [&](auto gateup_tag, auto down_tag) {
     using GateupCfg = typename decltype(gateup_tag)::type;
@@ -278,124 +275,66 @@ void count_and_route_row_mxfp8_async(
   // kTileM, kTileN, kTileK, kEpiTileM, kStage, kStageTM, kMmaSM, kStageTile
   auto dispatch_down = [&](auto gateup_tag) {
     if (use_2sm_down) {
-      if (down_k_div128) {
-        switch (kTileM_down) {
-          case 32:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, 256, 128, 32,
-                                                                  6, 4, 2, 4>>{});
-          case 64:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, 256, 128, 32,
-                                                                  6, 4, 2, 4>>{});
-          case 96:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 96, 256, 128, 32,
-                                                                  6, 4, 2, 4>>{});
-          case 128:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, 256, 128, 32,
-                                                                  6, 4, 2, 3>>{});
-          case 160:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 160, 256, 128, 32,
-                                                                  6, 4, 2, 2>>{});
-          case 192:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 192, 256, 128, 32,
-                                                                  6, 2, 2, 2>>{});
-          default:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, 256, 128, 64,
-                                                                  5, 2, 2, 1>>{});
-        }
-      } else {
-        switch (kTileM_down) {
-          case 32:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, 256, 64, 32,
-                                                                  10, 4, 2, 4>>{});
-          case 64:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, 256, 64, 32,
-                                                                  10, 4, 2, 4>>{});
-          case 96:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 96, 256, 64, 32,
-                                                                  10, 4, 2, 4>>{});
-          case 128:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, 256, 64, 32,
-                                                                  8, 4, 2, 3>>{});
-          case 160:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 160, 256, 64, 32,
-                                                                  8, 4, 2, 2>>{});
-          case 192:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 192, 256, 64, 32,
-                                                                  8, 2, 2, 2>>{});
-          default:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, 256, 64, 64,
-                                                                  8, 2, 2, 1>>{});
-        }
+      constexpr int kTileN = 256;
+      constexpr int kTileK = 128;
+      switch (kTileM_down) {
+        case 32:
+          return do_launch(gateup_tag,
+                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, kTileN, kTileK,
+                                                                32, 6, 4, 2, 4>>{});
+        case 64:
+          return do_launch(gateup_tag,
+                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, kTileN, kTileK,
+                                                                32, 6, 4, 2, 4>>{});
+        case 96:
+          return do_launch(gateup_tag,
+                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 96, kTileN, kTileK,
+                                                                32, 6, 4, 2, 4>>{});
+        case 128:
+          return do_launch(gateup_tag,
+                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, kTileN, kTileK,
+                                                                32, 6, 4, 2, 3>>{});
+        case 160:
+          return do_launch(gateup_tag,
+                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 160, kTileN, kTileK,
+                                                                32, 6, 4, 2, 2>>{});
+        case 192:
+          return do_launch(gateup_tag,
+                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 192, kTileN, kTileK,
+                                                                32, 6, 2, 2, 2>>{});
+        default:
+          return do_launch(gateup_tag,
+                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, kTileN, kTileK,
+                                                                64, 5, 2, 2, 1>>{});
       }
     } else {
-      if (down_k_div128) {
-        switch (kTileM_down) {
-          case 16:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 16, 128, 128, 16,
-                                                                  2, 4, 1, 4>>{});
-          case 32:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, 128, 128, 32,
-                                                                  2, 4, 1, 4>>{});
-          case 48:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 48, 128, 128, 16,
-                                                                  6, 4, 1, 4>>{});
-          case 64:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, 128, 128, 64,
-                                                                  6, 4, 1, 4>>{});
-          case 128:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, 128, 128, 64,
-                                                                  5, 3, 1, 3>>{});
-          default:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, 128, 128, 64,
-                                                                  3, 2, 1, 1>>{});
-        }
-      } else {
-        switch (kTileM_down) {
-          case 16:
-            return do_launch(
-                gateup_tag, _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 16, 128, 64, 16, 4,
-                                                                 4, 1, 4>>{});
-          case 32:
-            return do_launch(
-                gateup_tag, _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, 128, 64, 32, 4,
-                                                                 4, 1, 4>>{});
-          case 48:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 48, 128, 64, 16,
-                                                                  10, 4, 1, 4>>{});
-          case 64:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, 128, 64, 64,
-                                                                  10, 4, 1, 4>>{});
-          case 128:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, 128, 64, 64,
-                                                                  8, 3, 1, 3>>{});
-          default:
-            return do_launch(gateup_tag,
-                             _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, 128, 64, 64,
-                                                                  6, 2, 1, 1>>{});
-        }
+      constexpr int kTileN = 128;
+      constexpr int kTileK = 128;
+      switch (kTileM_down) {
+        case 16:
+          return do_launch(gateup_tag,
+                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 16, kTileN, kTileK,
+                                                                16, 2, 4, 1, 4>>{});
+        case 32:
+          return do_launch(gateup_tag,
+                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, kTileN, kTileK,
+                                                                32, 2, 4, 1, 4>>{});
+        case 48:
+          return do_launch(gateup_tag,
+                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 48, kTileN, kTileK,
+                                                                16, 6, 4, 1, 4>>{});
+        case 64:
+          return do_launch(gateup_tag,
+                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, kTileN, kTileK,
+                                                                64, 6, 4, 1, 4>>{});
+        case 128:
+          return do_launch(gateup_tag,
+                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, kTileN, kTileK,
+                                                                64, 5, 3, 1, 3>>{});
+        default:
+          return do_launch(gateup_tag,
+                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, kTileN, kTileK,
+                                                                64, 3, 2, 1, 1>>{});
       }
     }
   };
