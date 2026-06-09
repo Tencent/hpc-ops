@@ -105,6 +105,15 @@ def masked_act_mul_and_blockwise_quant(
     )
 
 
+def scaled_fp8_quant(
+    input: Tensor,
+    scale: Tensor,
+    output: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor]:
+    """Quantize a tensor to FP8 with one per-tensor scale."""
+    return torch.ops.hpc.scaled_fp8_quant(input, scale, output)
+
+
 @torch.library.register_fake("hpc::act_mul_and_quant")
 def act_mul_and_quant_fake(input, scale, use_bf16_mul, output):
     return torch.empty(
@@ -129,3 +138,18 @@ def masked_act_mul_and_blockwise_quant_fake(input, num_per_expert, output=None, 
             input.shape[0], input.shape[1] // 2 // 128, dtype=torch.float32, device=input.device
         ),
     )
+
+
+@torch.library.register_fake("hpc::scaled_fp8_quant")
+def scaled_fp8_quant_fake(input, scale=None, output=None):
+    output_tensor = (
+        output
+        if output is not None
+        else torch.empty_like(input, dtype=torch.float8_e4m3fn, device=input.device)
+    )
+    scale_tensor = (
+        scale
+        if scale is not None
+        else torch.empty((1,), dtype=torch.float32, device=input.device)
+    )
+    return output_tensor, scale_tensor
