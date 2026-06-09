@@ -59,11 +59,12 @@ void multi_stage_dim128_async(void *y_ptr, const void *q_ptr, const void *k_ptr,
         *tma_v.get_tma_descriptor(),
         *tma_y.get_tma_descriptor(),
     };
-    kernels::update_batched_tma<Tin, decltype(tma_q), decltype(tma_k), decltype(tma_v),
+    kernels::update_batched_tma<Tin, Tout, decltype(tma_q), decltype(tma_k), decltype(tma_v),
                                 decltype(tma_y)><<<num_batch, 32, 0, stream>>>(
         td_qkvy, tma_qkvy, (const Tin *)q_ptr, (const Tin *)k_ptr, (const Tin *)v_ptr,
-        (const Tout *)y_ptr, (const int *)seqlens_q_ptr, (const int *)cu_seqlens_q_ptr, num_batch,
-        max_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_kv, ldQ, ldK, ldV, ldY);
+        (const Tout *)y_ptr, (const int *)seqlens_q_ptr, (const int *)cu_seqlens_q_ptr,
+        (const int *)nullptr, num_batch, num_dim_qk, num_dim_v, num_head_q, num_head_kv, ldQ, ldK,
+        ldV, ldY);
   }
 
   // 1. compute attention
