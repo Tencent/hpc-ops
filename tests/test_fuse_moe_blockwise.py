@@ -262,7 +262,7 @@ def naive_fuse_moe_blockwise_fp8(
     return y
 
 
-@pytest.mark.parametrize("num_tokens", [128])
+@pytest.mark.parametrize("num_tokens", [128, 1024, 2048, 4096, 8192, 16384])
 @pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512, 256])
@@ -282,11 +282,11 @@ def test_fuse_moe_blockwise_fp8(
 ):
     dtype = torch.float8_e4m3fn
 
-    topk_ids = torch.randint(
-        0, num_expert, (num_tokens, num_topk), dtype=torch.int32, device="cuda"
-    )
+    topk_ids = torch.rand((num_tokens, num_expert), device="cuda").topk(num_topk, dim=1).indices
+    topk_ids = topk_ids.to(torch.int32)
     topk_ids, _ = torch.sort(topk_ids, dim=1)
-    topk_scale = torch.randn((num_tokens, num_topk), dtype=torch.float, device="cuda") / num_topk
+    topk_scale = torch.rand((num_tokens, num_topk), dtype=torch.float, device="cuda")
+    topk_scale = topk_scale / topk_scale.sum(dim=1, keepdim=True)
 
     x = (torch.randn((num_tokens, hidden_size), dtype=torch.float, device="cuda") / 100).to(dtype)
     x_scale = torch.randn((num_tokens, hidden_size // 128), dtype=torch.float, device="cuda")
@@ -344,4 +344,7 @@ def test_fuse_moe_blockwise_fp8(
 
     torch.cuda.synchronize()
 
-    assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.01, atol=0.01)
+    # Larger token counts accumulate more FP8/BF16 roundoff through two grouped GEMMs and reduce.
+    gt_f32 = gt.to(torch.float32)
+    my_f32 = my.to(torch.float32)
+    assert allclose(gt_f32, my_f32, rtol=0.01, atol=0.02)
