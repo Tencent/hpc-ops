@@ -32,6 +32,20 @@ stages:
         with:
           refName: "${BK_CI_HOOK_SOURCE_BRANCH}"
           enableGitLfs: false
+      - name: code.tar.gz
+        uses: linuxScript@1.*
+        with:
+          script: |-
+            set -xe
+            cd ${{ci.workspace}}
+            tar -cvf code.tar.gz ./
+      - name: upload-code.tar.gz
+        id: ""
+        uses: UploadArtifactory@8.*
+        with:
+          filePath: code.tar.gz
+          downloadFiles: "[{\"path\":\"\",\"param\":\"\"}]"
+          metadata: []
       - name: compile sm90
         uses: linuxScript@1.*
         with:
