@@ -273,7 +273,7 @@ void group_gemm_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                           kSwizzleW, kSwizzleY>(
         y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, y_scale, tmas_ptr, tiles_ptr,
         cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, update_tma, use_pdl, stream);
-  } else {
+  } else if (num_seq_per_group_avg <= 64) {
     constexpr int kTileM = 64;
     // use kTileK=64 + SW64 to reduce padding waste when k <= 192
     if (k <= 192) {
@@ -292,6 +292,34 @@ void group_gemm_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
           y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, y_scale, tmas_ptr, tiles_ptr,
           cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, update_tma, use_pdl, stream);
     }
+  } else if (num_seq_per_group_avg <= 96) {
+    constexpr int kTileM = 48;
+    constexpr int kStage = 8;
+    launch_group_gemm_fp8<kTileM, kTileN, kTileK, kStage, kWarpgroupM, kWarpgroupN, kSwizzleX,
+                          kSwizzleW, kSwizzleY>(
+        y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, y_scale, tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, update_tma, use_pdl, stream);
+  } else if (num_seq_per_group_avg <= 128) {
+    constexpr int kTileM = 32;
+    constexpr int kStage = 8;
+    launch_group_gemm_fp8<kTileM, kTileN, kTileK, kStage, kWarpgroupM, kWarpgroupN, kSwizzleX,
+                          kSwizzleW, kSwizzleY>(
+        y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, y_scale, tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, update_tma, use_pdl, stream);
+  } else if (num_seq_per_group_avg <= 144) {
+    constexpr int kTileM = 48;
+    constexpr int kStage = 8;
+    launch_group_gemm_fp8<kTileM, kTileN, kTileK, kStage, kWarpgroupM, kWarpgroupN, kSwizzleX,
+                          kSwizzleW, kSwizzleY>(
+        y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, y_scale, tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, update_tma, use_pdl, stream);
+  } else {
+    constexpr int kTileM = 64;
+    constexpr int kStage = 8;
+    launch_group_gemm_fp8<kTileM, kTileN, kTileK, kStage, kWarpgroupM, kWarpgroupN, kSwizzleX,
+                          kSwizzleW, kSwizzleY>(
+        y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, y_scale, tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, update_tma, use_pdl, stream);
   }
 }
 

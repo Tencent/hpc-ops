@@ -341,6 +341,14 @@ void group_gemm_fp8_multistage_async(void *y_ptr, const void *x_ptr, const void 
     dispatch_k_stage(Int<32>{});
   } else if (num_seq_per_group_avg <= 48) {
     dispatch_k_stage(Int<48>{});
+  } else if (num_seq_per_group_avg <= 64) {
+    dispatch_k_stage(Int<64>{});
+  } else if (num_seq_per_group_avg <= 96) {
+    dispatch_k_stage(Int<48>{});
+  } else if (num_seq_per_group_avg <= 128) {
+    dispatch_k_stage(Int<64>{});
+  } else if (num_seq_per_group_avg <= 144) {
+    dispatch_k_stage(Int<48>{});
   } else {
     dispatch_k_stage(Int<64>{});
   }

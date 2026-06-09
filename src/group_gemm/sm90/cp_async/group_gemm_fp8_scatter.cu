@@ -443,6 +443,14 @@ void group_gemm_fp8_scatter_async(void *y_ptr, const void *x_ptr, const void *w_
     launch_with_tile_m(cute::Int<32>{});
   } else if (num_seq_per_group_avg <= 48) {
     launch_with_tile_m(cute::Int<48>{});
+  } else if (num_seq_per_group_avg <= 64) {
+    launch_with_tile_m(cute::Int<64>{});
+  } else if (num_seq_per_group_avg <= 96) {
+    launch_with_tile_m(cute::Int<48>{});
+  } else if (num_seq_per_group_avg <= 128) {
+    launch_with_tile_m(cute::Int<64>{});
+  } else if (num_seq_per_group_avg <= 144) {
+    launch_with_tile_m(cute::Int<48>{});
   } else {
     launch_with_tile_m(cute::Int<64>{});
   }

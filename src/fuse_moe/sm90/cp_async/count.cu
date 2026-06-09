@@ -475,6 +475,34 @@ void count_and_build_indices_async(const void *topk_ids_ptr, void *row_indices_p
         (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, gate_up_tm, down_tm,
         gate_up_num_tile_n, down_num_tile_n, gateup_task_map_len, down_task_map_len, num_seq,
         num_topk, num_expert, start_expert, end_expert, stream);
+  } else if (num_seq_per_group_avg <= 64) {
+    constexpr int kTileM = 64;
+    launch_count_and_build<kTileM, kUsePDL>(
+        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
+        (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, gate_up_tm, down_tm,
+        gate_up_num_tile_n, down_num_tile_n, gateup_task_map_len, down_task_map_len, num_seq,
+        num_topk, num_expert, start_expert, end_expert, stream);
+  } else if (num_seq_per_group_avg <= 96) {
+    constexpr int kTileM = 48;
+    launch_count_and_build<kTileM, kUsePDL>(
+        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
+        (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, gate_up_tm, down_tm,
+        gate_up_num_tile_n, down_num_tile_n, gateup_task_map_len, down_task_map_len, num_seq,
+        num_topk, num_expert, start_expert, end_expert, stream);
+  } else if (num_seq_per_group_avg <= 128) {
+    constexpr int kTileM = 64;
+    launch_count_and_build<kTileM, kUsePDL>(
+        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
+        (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, gate_up_tm, down_tm,
+        gate_up_num_tile_n, down_num_tile_n, gateup_task_map_len, down_task_map_len, num_seq,
+        num_topk, num_expert, start_expert, end_expert, stream);
+  } else if (num_seq_per_group_avg <= 144) {
+    constexpr int kTileM = 48;
+    launch_count_and_build<kTileM, kUsePDL>(
+        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
+        (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, gate_up_tm, down_tm,
+        gate_up_num_tile_n, down_num_tile_n, gateup_task_map_len, down_task_map_len, num_seq,
+        num_topk, num_expert, start_expert, end_expert, stream);
   } else {
     constexpr int kTileM = 64;
     launch_count_and_build<kTileM, kUsePDL>(
