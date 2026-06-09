@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./hpc-ops-logo.png" width="780" alt="HPC-Ops" />
+  <img src="./assets/hpc-ops-logo.png" width="780" alt="HPC-Ops" />
   <h2 align="center">
     HPC-Ops
   </h2>
