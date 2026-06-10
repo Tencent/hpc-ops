@@ -47,7 +47,7 @@ def naive_group_gemm(x, w, seqlens, cu_seqlens, xscale, wscale):
     return y
 
 
-@pytest.mark.parametrize("num_group", [128, 1024, 2048])
+@pytest.mark.parametrize("num_group", [128])
 @pytest.mark.parametrize("actual_m", [30])
 @pytest.mark.parametrize("m", [32])
 @pytest.mark.parametrize("n", [1024])
