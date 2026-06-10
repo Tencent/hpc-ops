@@ -4,29 +4,32 @@
 
 #include <type_traits>
 
-#include "src/attention/mla/smallm_mla_dim576_persistent.h"
-#include "src/attention/mla/smallm_mla_dim576_persistent_launch.h"
+#include "src/attention/mla/smallm_sparse_mla_dim576_persistent.h"
+#include "src/attention/mla/smallm_sparse_mla_dim576_persistent_launch.h"
 
 namespace hpc {
 namespace attention {
 namespace mla {
 
-bool smallm_mla_dim576_persistent_async(void* y_ptr, const void* q_ptr, const void* kvcache_ptr,
-                                        float* y_partial_ptr, float* lse_ptr, int* task_tensor_ptr,
-                                        const int* block_ids_ptr, const int* cu_seqlens_q_ptr,
-                                        const int* num_seq_kv_ptr, const float* sink_weight_ptr,
-                                        int num_batch, int total_seq_q, int num_head_q, int qk_dim,
-                                        int v_dim, int num_kvcache_blocks, int num_seq_max_blocks,
-                                        int ldY, int ldQ, int ldKV, float softmax_scale,
-                                        cudaStream_t stream, bool task_tensor_prebuilt,
-                                        bool splitk) {
+bool smallm_sparse_mla_dim576_persistent_async(
+    void* y_ptr, const void* q_ptr, const void* kvcache_ptr, float* y_partial_ptr, float* lse_ptr,
+    int* task_tensor_ptr, const int* block_ids_ptr, const int* topk_ids_ptr,
+    const int* cu_seqlens_q_ptr, const float* sink_weight_ptr, int num_batch, int total_seq_q,
+    int num_head_q, int qk_dim, int v_dim, int num_kvcache_blocks, int num_seq_max_blocks,
+    int num_max_topk, int block_size, int ldY, int ldQ, int ldKV, float softmax_scale,
+    cudaStream_t stream, bool task_tensor_prebuilt, bool splitk, bool prefill) {
   constexpr int kTileNope = 512;
   constexpr int kTileRope = 64;
   constexpr int kTileV = 512;
+  constexpr int kBlockSize = 64;
 
-  // num_head_q ≤ 8 packs into kTileM=8 atom; 16 and 32 use native atoms;
-  // 64 routes to the dual-math-WG kernel (kTileM_per_WG=32).
   if (qk_dim != (kTileNope + kTileRope) || v_dim != kTileV) {
+    return false;
+  }
+  if (block_size != kBlockSize) {
+    return false;
+  }
+  if (num_max_topk > kSparseDim576MaxNumTopk) {
     return false;
   }
   if (num_head_q < 1 || num_head_q > 64) {
@@ -37,11 +40,11 @@ bool smallm_mla_dim576_persistent_async(void* y_ptr, const void* q_ptr, const vo
     constexpr int kTileM = decltype(kTileM_tag)::value;
     constexpr bool kUseSink = decltype(kUseSink_tag)::value;
     constexpr int kNumMathWG = decltype(kNumMathWG_tag)::value;
-    run_dim576_persistent<kTileM, kNumMathWG, kUseSink>(
+    run_sparse_dim576_persistent<kTileM, kNumMathWG, kUseSink>(
         y_ptr, q_ptr, kvcache_ptr, y_partial_ptr, lse_ptr, task_tensor_ptr, block_ids_ptr,
-        cu_seqlens_q_ptr, num_seq_kv_ptr, sink_weight_ptr, num_batch, total_seq_q, num_head_q,
-        qk_dim, v_dim, num_kvcache_blocks, num_seq_max_blocks, ldY, ldQ, ldKV, softmax_scale,
-        stream, task_tensor_prebuilt, splitk);
+        topk_ids_ptr, cu_seqlens_q_ptr, sink_weight_ptr, num_batch, total_seq_q, num_head_q, qk_dim,
+        v_dim, num_kvcache_blocks, num_seq_max_blocks, num_max_topk, ldY, ldQ, ldKV, softmax_scale,
+        stream, task_tensor_prebuilt, splitk, prefill);
   };
 
   auto dispatch_sink = [&](auto kTileM_tag, auto kNumMathWG_tag) {

@@ -95,6 +95,15 @@ GLOBAL_IMPACT_REGEX: List[Tuple[str, re.Pattern]] = [
     ]
 ]
 
+# Dirs traced at 2nd level: a change under `src/<top>/<sub>/...` maps to
+# `src/<top>/<sub>` instead of `src/<top>`. Requires each subdir to be
+# self-contained (its entry .cc only calls `*_async` declared in the same
+# subdir), else ops are silently dropped. Files directly under `src/<top>/`
+# keep 1st-level granularity.
+SECOND_LEVEL_SRC_DIRS: Set[str] = {
+    "src/attention",
+}
+
 # ---------------------------------------------------------------------------
 # Logging (stderr only so stdout stays capture-safe)
 # ---------------------------------------------------------------------------
@@ -226,7 +235,9 @@ def classify_changed_files(
 ) -> Tuple[Set[str], Set[str], Set[str], List[str]]:
     """
     Partition D into:
-      - top_src_dirs:        {'src/<A>', ...}    (1st-level dir under src/)
+      - top_src_dirs:        {'src/<A>', ...}    (trace units under src/;
+                             1st-level by default, 2nd-level for dirs in
+                             SECOND_LEVEL_SRC_DIRS, e.g. 'src/attention/mla')
       - direct_tests:        {'tests/test_*.py', ...}
       - touched_hpc_modules: {'<mod>', ...}       (hpc/<mod>.py, no __init__)
       - ignored:             list of paths recorded for INFO logging
@@ -241,11 +252,18 @@ def classify_changed_files(
     for p in D:
         if p.startswith("src/"):
             rest = p[len("src/"):]
-            top = rest.split("/", 1)[0]
-            if top:
-                top_src_dirs.add(f"src/{top}")
-            else:
+            parts = rest.split("/")
+            top = parts[0]
+            if not top:
                 ignored.append(p)
+                continue
+            top_dir = f"src/{top}"
+            # Whitelisted dirs: descend to 2nd level when the file is in a
+            # subdir; files directly under src/<top>/ keep 1st-level.
+            if top_dir in SECOND_LEVEL_SRC_DIRS and len(parts) >= 3 and parts[1]:
+                top_src_dirs.add(f"{top_dir}/{parts[1]}")
+            else:
+                top_src_dirs.add(top_dir)
             continue
 
         if p.startswith("tests/") and Path(p).name.startswith("test_") \

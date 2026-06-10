@@ -4,6 +4,7 @@
 #define SRC_ATTENTION_MLA_SMALLM_MLA_DIM576_PERSISTENT_KERNELS_CUH_
 
 #include <cuda.h>
+#include <cuda_bf16.h>
 #include <stdio.h>
 
 #include <algorithm>
@@ -19,6 +20,27 @@
 namespace hpc {
 namespace attention {
 namespace kernels {
+
+template <int kTileM>
+struct Dim576PersistentAtomSelector;
+
+template <>
+struct Dim576PersistentAtomSelector<32> {
+  template <cute::GMMA::Major A, cute::GMMA::Major B>
+  using Mma = cute::SM90_64x32x16_F32BF16BF16_SS<A, B>;
+};
+
+template <>
+struct Dim576PersistentAtomSelector<16> {
+  template <cute::GMMA::Major A, cute::GMMA::Major B>
+  using Mma = cute::SM90_64x16x16_F32BF16BF16_SS<A, B>;
+};
+
+template <>
+struct Dim576PersistentAtomSelector<8> {
+  template <cute::GMMA::Major A, cute::GMMA::Major B>
+  using Mma = cute::SM90_64x8x16_F32BF16BF16_SS<A, B>;
+};
 
 template <int kTileM>
 struct Dim576PersistentR2SCopyAtomSelector;
@@ -44,7 +66,7 @@ template <int kTileM, int kTileV, int kM, int kVN, typename TensorY, typename Te
 __device__ __forceinline__ void splitk_epilogue_dim576(
     TensorY &tYr_nm, TensorMax &gMax, TensorSum &gSum, TensorIY &tIY_nm, float *shm_sum,
     float *y_partial_ptr, float *lse_ptr, int row_base, int v_dim, int iwarp_in_warpgroup,
-    int ilane_in_warpgroup, int actual_num_heads) {
+    int ilane_in_warpgroup, int actual_num_heads, int iwarpgroup = 0) {
   using namespace cute;  // NOLINT
   constexpr int kWarpsPerWarpGroup = 4;
 
@@ -65,7 +87,7 @@ __device__ __forceinline__ void splitk_epilogue_dim576(
     }
   }
 
-  syncwarpgroup(0);
+  syncwarpgroup(iwarpgroup);
 
   if (ilane_in_warpgroup < 4) {
 #pragma unroll
@@ -97,7 +119,7 @@ __device__ __forceinline__ void splitk_epilogue_dim576(
   // normalise tYr_nm by warp_sum
 #pragma unroll
   for (int im = 0; im < kM; ++im) {
-    float one_over_gsum = rcpf_ftz(warp_sum[im]);
+    float one_over_gsum = (warp_sum[im] > 0.f) ? rcpf_ftz(warp_sum[im]) : 0.f;
 #pragma unroll
     for (int iv = 0; iv < kVN; ++iv) {
       tYr_nm(iv, im) = tYr_nm(iv, im) * one_over_gsum;
@@ -139,26 +161,121 @@ __device__ __forceinline__ void splitk_epilogue_dim576(
   }
 }
 
-template <typename Tin, int kTileM, int kTileN, int kTileNope, int kTileRope, int kTileV,
-          typename TiledMmaQK, typename TiledMmaSV, typename TmaQNope, typename TmaQRope,
-          typename TmaKNope, typename TmaKRope, typename SLayoutQNope, typename SLayoutQRope,
-          typename SLayoutKNope, typename SLayoutKRope, typename SLayoutP, typename SLayoutS,
-          typename SLayoutV, int kBlockSize, int kStage>
-__global__ void __launch_bounds__(256) attention_mla_dim576_persistent_kernel(
+template <int kTileM, int kTileV, int kM, int kVN, bool kUseSink, typename Tout, typename TensorY,
+          typename TensorMax, typename TensorSum, typename TensorIY>
+__device__ __forceinline__ void single_split_epilogue_dim576(
+    TensorY &tYr_nm, TensorMax &gMax, TensorSum &gSum, TensorIY &tIY_nm, float *shm_sum,
+    Tout *y_ptr, const float *sink_weight_ptr, int ibatch, int ldY, int v_dim,
+    int iwarp_in_warpgroup, int ilane_in_warpgroup, int actual_num_heads, int iwarpgroup = 0,
+    int head_offset = 0) {
+  using namespace cute;  // NOLINT
+  constexpr int kWarpsPerWarpGroup = 4;
+  constexpr float kLog2e = 1.4426950408889634f;
+
+  // warp-cross sum reduction (same as splitk_epilogue_dim576).
+  vec_t<float, kM> warp_sum;
+#pragma unroll
+  for (int im = 0; im < kM; ++im) {
+    warp_sum[im] = warp_8lane_stride4_reduce_sum_xor(gSum(im));
+  }
+
+  if (ilane_in_warpgroup < 4) {
+    if constexpr (kM == 8) {
+      auto &warp_sum_16B = reshape<kM / 4, 4>(warp_sum);
+      store(shm_sum + iwarp_in_warpgroup * kTileM + ilane_in_warpgroup * 4, warp_sum_16B[0]);
+      store(shm_sum + iwarp_in_warpgroup * kTileM + 16 + ilane_in_warpgroup * 4, warp_sum_16B[1]);
+    } else {
+      store(shm_sum + iwarp_in_warpgroup * kTileM + ilane_in_warpgroup * kM, warp_sum);
+    }
+  }
+
+  syncwarpgroup(iwarpgroup);
+
+  if (ilane_in_warpgroup < 4) {
+#pragma unroll
+    for (int im = 0; im < kM; ++im) {
+      warp_sum[im] = 0.f;
+    }
+#pragma unroll
+    for (int i = 0; i < kWarpsPerWarpGroup; i++) {
+      vec_t<float, kM> reduce_sum;
+      if constexpr (kM == 8) {
+        auto &reduce_sum_16B = reshape<kM / 4, 4>(reduce_sum);
+        reduce_sum_16B[0] = load<float, 4>(shm_sum + i * kTileM + ilane_in_warpgroup * 4);
+        reduce_sum_16B[1] = load<float, 4>(shm_sum + i * kTileM + 16 + ilane_in_warpgroup * 4);
+      } else {
+        reduce_sum = load<float, kM>(shm_sum + i * kTileM + ilane_in_warpgroup * kM);
+      }
+#pragma unroll
+      for (int im = 0; im < kM; ++im) {
+        warp_sum[im] += reduce_sum[im];
+      }
+    }
+  }
+
+#pragma unroll
+  for (int im = 0; im < kM; ++im) {
+    warp_sum[im] = __shfl_sync(0xFFFFFFFF, warp_sum[im], ilane_in_warpgroup % 4);
+  }
+
+  // Add sink contribution and compute 1/total_sum.
+#pragma unroll
+  for (int im = 0; im < kM; ++im) {
+    float total_sum = warp_sum[im];
+    if constexpr (kUseSink) {
+      int m_local = get<1>(tIY_nm(0, im));
+      if (m_local < actual_num_heads) {
+        float sink_log2 = sink_weight_ptr[m_local + head_offset] * kLog2e;
+        total_sum += exp2f_ftz(sink_log2 - gMax(im));
+      }
+    }
+    float inv_sum = (total_sum > 0.f) ? rcpf_ftz(total_sum) : 0.f;
+#pragma unroll
+    for (int iv = 0; iv < kVN; ++iv) {
+      tYr_nm(iv, im) = tYr_nm(iv, im) * inv_sum;
+    }
+  }
+
+  // Cast to Tout and write to y_ptr[ibatch, head, v].
+  Tout *y_row_base = y_ptr + static_cast<size_t>(ibatch) * ldY;
+#pragma unroll
+  for (int im = 0; im < kM; ++im) {
+    int m_local = get<1>(tIY_nm(0, im));
+    if (m_local >= actual_num_heads) {
+      continue;
+    }
+    int row_offset = (m_local + head_offset) * v_dim;
+#pragma unroll
+    for (int iv = 0; iv < kVN; ++iv) {
+      int v_local = get<0>(tIY_nm(iv, im));
+      y_row_base[row_offset + v_local] = static_cast<Tout>(tYr_nm(iv, im));
+    }
+  }
+}
+
+template <typename Tin, typename Tout, int kTileM, int kTileN, int kTileNope, int kTileRope,
+          int kTileV, typename TiledMmaQK, typename TiledMmaSV, typename TmaQNope,
+          typename TmaQRope, typename TmaKNope, typename TmaKRope, typename SLayoutQNope,
+          typename SLayoutQRope, typename SLayoutKNope, typename SLayoutKRope, typename SLayoutP,
+          typename SLayoutS, typename SLayoutV, int kBlockSize, int kStage, bool kUseSink = false,
+          int kNumMathWG = 1>
+__global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1) attention_mla_dim576_persistent_kernel(
     const __grid_constant__ TmaQNope tma_q_nope, const __grid_constant__ TmaQRope tma_q_rope,
     const __grid_constant__ TmaKNope tma_k_nope, const __grid_constant__ TmaKRope tma_k_rope,
-    float *y_partial_ptr, float *lse_ptr, const int *block_ids_ptr, const int *cu_seqlens_q_ptr,
-    const int *num_seq_kv_ptr, const int *cu_tasks, const int4 *task_list, const int *cu_splits,
+    float *y_partial_ptr, float *lse_ptr, Tout *y_ptr, const float *sink_weight_ptr,
+    const int *block_ids_ptr, const int *cu_tasks, const int4 *task_list, const int *cu_splits,
     int num_batch, int total_seq_q, int num_head_q, int qk_dim, int v_dim, int num_kvcache_blocks,
-    int num_seq_max_blocks, float one_over_dk_log2e) {
+    int num_seq_max_blocks, int ldY, float one_over_dk_log2e) {
   using namespace cute;  // NOLINT
 
   int isM = blockIdx.x;
   int idx = threadIdx.x;
 
-  constexpr int kMathThreads = size(TiledMmaQK{});
-  constexpr int kConsumers = kMathThreads / 128;
-  static_assert(kConsumers == 1, "persistent dim576 expects 1 math warpgroup");
+  constexpr int kMathThreads = size(TiledMmaQK{}) * kNumMathWG;
+  constexpr int kConsumers = kNumMathWG;
+  constexpr int kHeadsTotal = kTileM * kNumMathWG;
+  static_assert(size(TiledMmaQK{}) == 128, "expects 1 warpgroup per math WG");
+  static_assert(kNumMathWG == 1 || kNumMathWG == 2, "only 1 or 2 math WGs supported");
 
   int elected = cute::elect_one_sync();
   int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
@@ -178,7 +295,7 @@ __global__ void __launch_bounds__(256) attention_mla_dim576_persistent_kernel(
   auto *shm_k_nope = shm_q_rope + cosize(SLayoutQRope{});
   auto *shm_k_rope = shm_k_nope + cosize(SLayoutKNope{});
   auto *shm_p = shm_k_rope + cosize(SLayoutKRope{});
-  auto *shm_max = reinterpret_cast<float *>(shm_p + cosize(SLayoutP{}));
+  auto *shm_max = reinterpret_cast<float *>(shm_p + cosize(SLayoutP{}) * kNumMathWG);
 
   auto gQ_nope = tma_q_nope.get_tma_tensor(make_shape(num_head_q, Int<kTileNope>{}, total_seq_q));
   auto gQ_rope = tma_q_rope.get_tma_tensor(make_shape(num_head_q, Int<kTileRope>{}, total_seq_q));
@@ -198,8 +315,6 @@ __global__ void __launch_bounds__(256) attention_mla_dim576_persistent_kernel(
   auto sQ_rope = make_tensor(make_smem_ptr(shm_q_rope), SLayoutQRope{});
   auto sK_nope = make_tensor(make_smem_ptr(shm_k_nope), SLayoutKNope{});
   auto sK_rope = make_tensor(make_smem_ptr(shm_k_rope), SLayoutKRope{});
-  auto sP = make_tensor(make_smem_ptr(shm_p), SLayoutP{});
-  auto sS = make_tensor(make_smem_ptr(shm_p), SLayoutS{});
   auto sV = make_tensor(make_smem_ptr(shm_k_nope), SLayoutV{});
 
   auto btma_q_nope = tma_q_nope.get_slice(0);
@@ -221,7 +336,7 @@ __global__ void __launch_bounds__(256) attention_mla_dim576_persistent_kernel(
 
   if (is_leader_in_block) {
     initialize_barrier(q_readable, 1);
-    initialize_barrier(q_writable, 1);
+    initialize_barrier(q_writable, kNumMathWG);
 #pragma unroll
     for (int istage = 0; istage < kStage; ++istage) {
       initialize_barrier(kv_writable[istage], kConsumers);
@@ -258,18 +373,18 @@ __global__ void __launch_bounds__(256) attention_mla_dim576_persistent_kernel(
 
 #pragma unroll 1
       for (int task_offset = task_start; task_offset < task_end; ++task_offset) {
-        int4 t = task_list[task_offset];
-        int ibatch = t.x;
-        if (ibatch < 0) {
+        int4 t0 = task_list[task_offset * 2 + 0];
+        int itoken = t0.x;
+        if (itoken < 0) {
           break;  // sentinel
         }
-        int ikv_tile_start = t.z;
-        int ikv_tile_end = t.w;
+        int ibatch = t0.y;
+        int ikv_tile_start = t0.z;
+        int ikv_tile_end = t0.w;
+        int kv_len = task_list[task_offset * 2 + 1].x;
 
         wait_barrier(q_writable, q_phase_w);
         q_phase_w ^= 1;
-
-        int itoken = cu_seqlens_q_ptr[ibatch];  // decode: == ibatch.
 
         cute::copy(tma_q_nope.with(q_readable, 0, TMA::CacheHintSm90::EVICT_FIRST),
                    tQng(_, 0, _, itoken), tQns(_, 0, _));
@@ -279,8 +394,7 @@ __global__ void __launch_bounds__(256) attention_mla_dim576_persistent_kernel(
             q_readable, sizeof(Tin) * (cosize(SLayoutQNope{}) + cosize(SLayoutQRope{})));
 
         const int *batch_block_ids = block_ids_ptr + ibatch * num_seq_max_blocks;
-        int num_seq_kvc = num_seq_kv_ptr[ibatch];
-        int num_blocks_total = (num_seq_kvc + kBlockSize - 1) / kBlockSize;
+        int num_blocks_total = (kv_len + kBlockSize - 1) / kBlockSize;
 
 #pragma unroll 1
         for (int itile_seq_kv = ikv_tile_end - 1; itile_seq_kv >= ikv_tile_start; --itile_seq_kv) {
@@ -311,7 +425,6 @@ __global__ void __launch_bounds__(256) attention_mla_dim576_persistent_kernel(
       }
     }
   } else {
-    // Math warpgroup: idx < kMathThreads. 128 threads (kConsumers == 1).
     cutlass::arch::warpgroup_reg_alloc<240>();
 
     int idx_in_warpgroup = idx % 128;
@@ -320,16 +433,35 @@ __global__ void __launch_bounds__(256) attention_mla_dim576_persistent_kernel(
     int ilane_in_warpgroup = idx_in_warpgroup % 32;
     int elected_idx_in_warpgroup = ((iwarp_in_warpgroup == 0) && elected);
 
+    // Per-WG views into the shared smem regions. For kNumMathWG=1 the slice
+    // is the whole tensor / single allocation, identical to the original
+    // single-WG layout.
+    auto sQ_nope_wg =
+        local_tile(sQ_nope, make_shape(Int<kTileM>{}, Int<kTileNope>{}), make_coord(iwarpgroup, 0));
+    auto sQ_rope_wg =
+        local_tile(sQ_rope, make_shape(Int<kTileM>{}, Int<kTileRope>{}), make_coord(iwarpgroup, 0));
+    auto *shm_p_wg = shm_p + iwarpgroup * cosize(SLayoutP{});
+    auto sP = make_tensor(make_smem_ptr(shm_p_wg), SLayoutP{});
+    auto sS = make_tensor(make_smem_ptr(shm_p_wg), SLayoutS{});
+
+    // Each math WG owns a fixed kTileM-stride head slot; the last WG may have
+    // < kTileM real heads when num_head_q is not a multiple of kTileM (or is
+    // < kHeadsTotal). Epilogue masks m_local >= actual_num_heads_wg, and TMA
+    // OOB rows zero-fill so out-of-range head slots contribute nothing.
+    int head_offset = iwarpgroup * kTileM;
+    int rem_heads = num_head_q - head_offset;
+    int actual_num_heads_wg = rem_heads < 0 ? 0 : (rem_heads > kTileM ? kTileM : rem_heads);
+
     TiledMmaQK tiled_mma_qk;
     TiledMmaSV tiled_mma_sv;
 
-    auto thr_mma_qk = tiled_mma_qk.get_slice(idx);
-    auto thr_mma_sv = tiled_mma_sv.get_slice(idx);
+    auto thr_mma_qk = tiled_mma_qk.get_slice(idx_in_warpgroup);
+    auto thr_mma_sv = tiled_mma_sv.get_slice(idx_in_warpgroup);
 
     auto tKns4r = thr_mma_qk.partition_A(sK_nope);
     auto tKrs4r = thr_mma_qk.partition_A(sK_rope);
-    auto tQns4r = thr_mma_qk.partition_B(sQ_nope);
-    auto tQrs4r = thr_mma_qk.partition_B(sQ_rope);
+    auto tQns4r = thr_mma_qk.partition_B(sQ_nope_wg);
+    auto tQrs4r = thr_mma_qk.partition_B(sQ_rope_wg);
     auto tVs4r = thr_mma_sv.partition_A(sV);
     auto tSs4r = thr_mma_sv.partition_B(sS);
 
@@ -361,7 +493,7 @@ __global__ void __launch_bounds__(256) attention_mla_dim576_persistent_kernel(
 
     using R2SCopyAtomP = Copy_Atom<typename Dim576PersistentR2SCopyAtomSelector<kTileM>::type, Tin>;
     auto tiled_copy_P_r2s = make_tiled_copy_C(R2SCopyAtomP{}, tiled_mma_qk);
-    auto thr_copy_P_r2s = tiled_copy_P_r2s.get_slice(idx);
+    auto thr_copy_P_r2s = tiled_copy_P_r2s.get_slice(idx_in_warpgroup);
     auto tPs4r = thr_copy_P_r2s.partition_D(sP);
 
     int q_phase_r = 0;
@@ -370,14 +502,16 @@ __global__ void __launch_bounds__(256) attention_mla_dim576_persistent_kernel(
 
 #pragma unroll 1
     for (int task_offset = task_start; task_offset < task_end; ++task_offset) {
-      int4 t = task_list[task_offset];
-      int ibatch = t.x;
-      if (ibatch < 0) {
+      int4 t0 = task_list[task_offset * 2 + 0];
+      int itoken = t0.x;
+      if (itoken < 0) {
         break;
       }
-      int isplit_in_batch = t.y;
-      int ikv_tile_start = t.z;
-      int ikv_tile_end = t.w;
+      int ikv_tile_start = t0.z;
+      int ikv_tile_end = t0.w;
+      int4 t1 = task_list[task_offset * 2 + 1];
+      int kv_len = t1.x;
+      int isplit_in_token = t1.y;
 
       wait_barrier(q_readable, q_phase_r);
       q_phase_r ^= 1;
@@ -387,12 +521,10 @@ __global__ void __launch_bounds__(256) attention_mla_dim576_persistent_kernel(
       clear(tYr);
       tiled_mma_sv.accumulate_ = GMMA::ScaleOut::One;
 
-      int num_seq_kvc = num_seq_kv_ptr[ibatch];
-      int num_seq_q_local = cu_seqlens_q_ptr[ibatch + 1] - cu_seqlens_q_ptr[ibatch];
-      int num_seq_kvcache = num_seq_kvc - num_seq_q_local;
-      int itoken_in_batch = 0;
-      int num_tile_kv_total = (num_seq_kvcache + itoken_in_batch + 1 + kTileN - 1) / kTileN;
-      int iposq = num_seq_kvcache + itoken_in_batch;
+      // kv_len is the causal-visible KV length for this query token; iposq is the
+      // inclusive upper bound, num_tile_kv_total the number of KV tiles to scan.
+      int iposq = kv_len - 1;
+      int num_tile_kv_total = (kv_len + kTileN - 1) / kTileN;
 
 #pragma unroll 1
       for (int itile_seq_kv = ikv_tile_end - 1; itile_seq_kv >= ikv_tile_start; --itile_seq_kv) {
@@ -428,9 +560,9 @@ __global__ void __launch_bounds__(256) attention_mla_dim576_persistent_kernel(
           }
         }
 
-        online_softmax<true, kConsumers, kTileM, kM, kN>(tAttr_nm, gMax, gSum, tYr_nm,
-                                                         one_over_dk_log2e, shm_max, iwarpgroup,
-                                                         iwarp_in_warpgroup, ilane_in_warpgroup);
+        online_softmax<true, kNumMathWG, kHeadsTotal, kM, kN>(
+            tAttr_nm, gMax, gSum, tYr_nm, one_over_dk_log2e, shm_max, iwarpgroup,
+            iwarp_in_warpgroup, ilane_in_warpgroup);
 
         auto tAttAbf16 = make_tensor_like<cute::bfloat16_t>(tAttr);
 #pragma unroll
@@ -461,12 +593,24 @@ __global__ void __launch_bounds__(256) attention_mla_dim576_persistent_kernel(
         syncwarpgroup(iwarpgroup);
       }
 
-      // Epilogue
-      int isplit_global = cu_splits[ibatch] + isplit_in_batch;
-      splitk_epilogue_dim576<kTileM, kTileV, kM, kVN>(
-          tYr_nm, gMax, gSum, tIY_nm, shm_max, y_partial_ptr, lse_ptr,
-          /*row_base=*/isplit_global * num_head_q, v_dim, iwarp_in_warpgroup, ilane_in_warpgroup,
-          /*actual_num_heads=*/num_head_q);
+      float *shm_sum = shm_max + kHeadsTotal * 4;
+      float *shm_sum_wg = shm_sum + iwarpgroup * (kTileM * 4);
+      int isplit_global = cu_splits[itoken] + isplit_in_token;
+      int num_splits_for_batch = cu_splits[itoken + 1] - cu_splits[itoken];
+
+      if (num_splits_for_batch == 1) {
+        single_split_epilogue_dim576<kTileM, kTileV, kM, kVN, kUseSink, Tout>(
+            tYr_nm, gMax, gSum, tIY_nm, shm_sum_wg, y_ptr, sink_weight_ptr, itoken, ldY, v_dim,
+            iwarp_in_warpgroup, ilane_in_warpgroup,
+            /*actual_num_heads=*/actual_num_heads_wg, /*iwarpgroup=*/iwarpgroup,
+            /*head_offset=*/head_offset);
+      } else {
+        splitk_epilogue_dim576<kTileM, kTileV, kM, kVN>(
+            tYr_nm, gMax, gSum, tIY_nm, shm_sum_wg, y_partial_ptr, lse_ptr,
+            /*row_base=*/isplit_global * num_head_q + head_offset, v_dim, iwarp_in_warpgroup,
+            ilane_in_warpgroup,
+            /*actual_num_heads=*/actual_num_heads_wg, /*iwarpgroup=*/iwarpgroup);
+      }
 
       if (elected_idx_in_warpgroup) {
         arrive_barrier(q_writable);

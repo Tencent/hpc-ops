@@ -567,6 +567,7 @@ def mla_decode_with_kvcache_bf16(
     softmax_scale: float = 0.0,
     task_tensor: Tensor = None,
     output: Tensor = None,
+    splitk: bool = True,
 ) -> Tensor:
     """dim576 MLA decode — persistent kernel pipeline.
 
@@ -577,7 +578,8 @@ def mla_decode_with_kvcache_bf16(
     Constraints (raised via TORCH_CHECK if violated):
 
     - ``num_dim_qk == 576``  (kv_lora_rank=512 + qk_rope_head_dim=64).
-    - ``num_head_q ∈ {16, 32}`` (num_head_tile == 1).
+    - ``num_head_q ∈ {1, 2, 4, 8, 16, 32, 64}`` (64 uses a split-M
+      cooperative kernel; ≤32 uses the single-WG kernel).
     - Decode only: ``total_seq_q == num_batch`` (one q-token per batch).
     - ``num_batch ≤ 1024``.
     - ``kvcache.size(1) == 64``  (paged block size).
@@ -589,7 +591,7 @@ def mla_decode_with_kvcache_bf16(
         block_ids: [num_batch, num_seq_max_blocks] int32.
         cu_seqlens_q: [num_batch + 1] int32, ``cu_seqlens_q[b+1] - cu_seqlens_q[b] == 1``.
         num_seq_kv: [num_batch] int32, per-batch KV length.
-        sink_weight: optional fp32 [num_head_q]; bf16 inputs are auto-upcast.
+        sink_weight: optional fp32 [num_head_q]
         softmax_scale: 0.0 means use ``1 / sqrt(num_dim_qk)``.
         task_tensor: optional precomputed scheduler map from
             :func:`get_mla_scheduler_map`. When provided, skips the inline
@@ -598,12 +600,19 @@ def mla_decode_with_kvcache_bf16(
             attn call to amortise the launch cost.
         output: optional pre-allocated bf16 [num_batch, num_head_q, 512].
             Latent V dim is always 512 (dim576 attn writes V in latent space).
+        splitk: when True (default), split each batch's KV-tile range across
+            multiple SMs for higher utilization on long-KV / small-batch
+            shapes — current performance-optimal path. When False, every
+            non-empty batch is pinned to a single SM (no split-KV); the
+            combine step then reduces over a single partial, which makes
+            each batch's output bit-invariant w.r.t. its sibling batches in
+            the same call. Cost: long-KV batches no longer scale beyond one
+            SM. Use False only when bit-level batch-invariance is required
+            and the resulting throughput hit is acceptable.
 
     Returns:
         Tensor: [num_batch, num_head_q, 512] bf16.
     """
-    if sink_weight is not None and sink_weight.dtype == torch.bfloat16:
-        sink_weight = sink_weight.float()
     return torch.ops.hpc.mla_decode_with_kvcache_bf16(
         q,
         kvcache,
@@ -614,36 +623,155 @@ def mla_decode_with_kvcache_bf16(
         float(softmax_scale),
         task_tensor,
         output,
+        splitk,
+    )
+
+
+def sparse_mla_dsa_with_kvcache_bf16(
+    q: Tensor,
+    kvcache: Tensor,
+    block_ids: Tensor,
+    topk_ids: Tensor,
+    cu_seqlens_q: Tensor,
+    sink_weight: Tensor = None,
+    softmax_scale: float = 0.0,
+    task_tensor: Tensor = None,
+    output: Tensor = None,
+    splitk: bool = True,
+) -> Tensor:
+    """Sparse dim576 MLA (V3.2-DSA-style topk) with shared K/V latent.
+
+    Handles both decode and prefill / chunk-prefill in a single entry; the
+    mode is auto-detected from ``total_seq_q`` vs ``num_phys_batch``
+    (= ``cu_seqlens_q.numel() - 1``):
+
+    - **Decode**: ``total_seq_q == num_phys_batch``. ``topk_ids`` has one row
+      per physical batch, ``num_phys_batch <= 1024``.
+    - **Prefill / chunk-prefill**: ``total_seq_q > num_phys_batch``.
+      ``topk_ids`` has one row per query token (``[total_seq_q,
+      num_max_topk]``); no 1024-batch cap. The kernel resolves
+      ``iquery_token -> iphys_batch`` via ``cu_seqlens_q`` internally so the
+      caller does not need to expand ``block_ids``.
+
+    The producer warpgroup gathers KV via cp.async + ZFILL using
+    ``topk_ids`` (resolved through ``block_ids`` to the paged kvcache);
+    the math warpgroup masks invalid topk positions to ``-inf`` so they
+    contribute nothing to softmax.
+
+    Constraints:
+
+    - ``num_dim_qk == 576`` (kv_lora_rank=512 + qk_rope_head_dim=64).
+    - ``num_head_q ∈ {1, 2, 4, 8, 16, 32, 64}``.
+    - ``kvcache.size(1) == 64`` (paged block size).
+    - ``topk_ids`` int32, with ``-1`` marking invalid entries;
+      ``num_max_topk`` must be a multiple of 64 and ≤ 2048.
+
+    Args:
+        q: [total_seq_q, num_head_q, 576] bf16, packed [ql_nope(512) | q_pe(64)].
+        kvcache: [num_blocks, 64, 576] bf16, packed [kv_c_normed(512) | k_pe(64)].
+        block_ids: [num_phys_batch, num_seq_max_blocks] int32.
+        topk_ids: [num_topk_rows, num_max_topk] int32 — token-level KV indices
+            (e.g. via DeepSeek-V3.2 lightning indexer). ``num_topk_rows``
+            equals ``num_phys_batch`` (decode) or ``total_seq_q`` (prefill).
+            ``-1`` and out-of-range entries are masked.
+        cu_seqlens_q: [num_phys_batch + 1] int32.
+        sink_weight: optional fp32 [num_head_q].
+        softmax_scale: 0.0 → use 1/sqrt(num_dim_qk).
+        task_tensor: optional pre-allocated scheduler buffer (decode mode only;
+            see :func:`get_mla_scheduler_map`'s sparse mode for sizing).
+            Auto-allocated if None.
+        output: optional pre-allocated bf16 [total_seq_q, num_head_q, 512].
+        splitk: when True (default), split each batch's KV-tile range across
+            multiple SMs for higher utilization on long-KV / small-batch
+            shapes — current performance-optimal path. When False, every
+            non-empty batch is pinned to a single SM (no split-KV); the
+            combine step then reduces over a single partial, which makes
+            each batch's output bit-invariant w.r.t. its sibling batches in
+            the same call. Cost: long-KV batches no longer scale beyond one
+            SM. Use False only when bit-level batch-invariance is required
+            and the resulting throughput hit is acceptable.
+
+    Returns:
+        Tensor: [total_seq_q, num_head_q, 512] bf16.
+    """
+    return torch.ops.hpc.sparse_mla_dsa_with_kvcache_bf16(
+        q,
+        kvcache,
+        block_ids,
+        topk_ids,
+        cu_seqlens_q,
+        sink_weight,
+        float(softmax_scale),
+        task_tensor,
+        output,
+        splitk,
     )
 
 
 def get_mla_scheduler_map(
     num_seq_kv: Tensor,
+    cu_seqlens_q: Tensor,
+    num_actual_tokens: int,
+    index_topk: int = 0,
+    splitk: bool = True,
     task_tensor: Tensor = None,
 ) -> Tensor:
-    """Build the per-forward scheduler map for :func:`mla_decode_with_kvcache_bf16`.
+    """Build the per-forward scheduler map for the dim576 persistent MLA path.
 
-    For multi-layer transformer decode where ``num_seq_kv`` is constant
-    across attention layers, call this once per forward pass and pass the
-    returned tensor to every per-layer attn call via
-    ``mla_decode_with_kvcache_bf16(..., task_tensor=t)``. Amortises the
-    get_scheduler_map kernel's launch cost across the layer count.
+    Two modes, picked by ``index_topk``:
+
+    1. **Dense** (``index_topk == 0``, default) — read per-batch length
+       from ``num_seq_kv[i]``. Use this for
+       :func:`mla_decode_with_kvcache_bf16`.
+    2. **Sparse uniform** (``index_topk > 0``) — every batch contributes
+       exactly ``index_topk`` tokens; ``num_seq_kv`` is used only for its
+       size (= num_batch) and device. The tensor's values are ignored, so
+       any int32 size-B cuda tensor works (e.g. an uninitialised buffer).
+       Use this for :func:`sparse_mla_dsa_with_kvcache_bf16`.
+
+    **Prefill / chunk-prefill** is selected by ``num_actual_tokens``: when it
+    is > 0 and differs from ``num_seq_kv.numel()`` (= ``num_phys_batch``), the
+    map is built with one logical batch *per query token* (sized by
+    ``num_actual_tokens = total_seq_q``, uncapped by the dense 1024 limit).
+    ``index_topk`` must then be the uniform per-token ``num_max_topk``. The
+    returned map carries ``task_list / cu_tasks / cu_splits``, where each
+    task_list entry is 8 self-describing ints carrying the token->batch map.
+
+    ``cu_seqlens_q`` is **always required** (unified decode/prefill): the
+    scheduler resolves ``iquery_token -> iphys_batch`` by binary search in
+    both modes. For decode, pass the identity map
+    ``cu_seqlens_q = torch.arange(num_batch + 1, dtype=int32)`` (one q-token
+    per physical batch).
+
+    For multi-layer transformer decode, call this once per forward pass and
+    pass the returned tensor to every per-layer attn call via the
+    ``task_tensor=`` argument. Amortises the launch cost.
 
     Args:
-        num_seq_kv: Per-batch KV length tensor.
-            Shape: [num_batch] (num_batch ≤ 1024)
-            Dtype: int32
-        task_tensor: Optional pre-allocated int32 buffer to reuse across
-            forwards.  Must be CUDA, contiguous, int32, and at least
-            ``(num_batch + num_sm) * 4 + (num_sm + 1) + (num_batch + 1)``
-            ints (layout: task_list | cu_tasks | cu_splits).
-            If omitted, a fresh tensor is allocated.
+        num_seq_kv: int32 cuda Tensor of shape [num_batch] (num_batch ≤ 1024
+            in decode). Dense: per-batch KV length values.
+        cu_seqlens_q: int32 cuda Tensor of shape [num_phys_batch + 1].
+            Always required; for decode pass ``arange(num_batch + 1)``.
+        num_actual_tokens: > 0 and != ``num_seq_kv.numel()`` selects prefill
+            mode (= ``total_seq_q``). 0 (default) keeps decode-mode sizing.
+        index_topk: 0 for dense; > 0 for DSA, every query token contributes
+            ``index_topk`` selected KV tokens.
+        splitk: must match the splitk value passed to the consumer kernel.
+        task_tensor: optional pre-allocated int32 buffer to reuse across
+            forwards. Must be CUDA, contiguous, int32, and at least
+            ``(num_logical + num_sm) * 8 + (num_sm + 1) + (num_logical + 1)``
+            ints (layout: task_list | cu_tasks | cu_splits; each task_list
+            entry is 8 self-describing ints carrying the token->batch map, so
+            no separate iquery_to_ibatch_map segment is needed), where
+            ``num_logical`` is ``num_actual_tokens`` in prefill else
+            ``num_batch``. Auto-allocated if omitted.
 
     Returns:
-        Tensor: opaque scheduler map; pass it back to
-            ``mla_decode_with_kvcache_bf16``.
+        Tensor: opaque scheduler map; pass back via ``task_tensor=``.
     """
-    return torch.ops.hpc.get_mla_scheduler_map(num_seq_kv, task_tensor)
+    return torch.ops.hpc.get_mla_scheduler_map(
+        num_seq_kv, cu_seqlens_q, int(num_actual_tokens), int(index_topk), splitk, task_tensor
+    )
 
 
 def sparse_mla_with_kvcache_bf16(
@@ -1105,6 +1233,24 @@ def mla_decode_with_kvcache_bf16_fake(
     softmax_scale: float = 0.0,
     task_tensor: Tensor = None,
     output: Tensor = None,
+    splitk: bool = True,
+):
+    out_shape = (q.size(0), q.size(1), 512)
+    return q.new_empty(out_shape, dtype=torch.bfloat16)
+
+
+@torch.library.register_fake("hpc::sparse_mla_dsa_with_kvcache_bf16")
+def sparse_mla_dsa_with_kvcache_bf16_fake(
+    q: Tensor,
+    kvcache: Tensor,
+    block_ids: Tensor,
+    topk_ids: Tensor,
+    cu_seqlens_q: Tensor,
+    sink_weight: Tensor = None,
+    softmax_scale: float = 0.0,
+    task_tensor: Tensor = None,
+    output: Tensor = None,
+    splitk: bool = True,
 ):
     out_shape = (q.size(0), q.size(1), 512)
     return q.new_empty(out_shape, dtype=torch.bfloat16)
@@ -1113,13 +1259,14 @@ def mla_decode_with_kvcache_bf16_fake(
 @torch.library.register_fake("hpc::get_mla_scheduler_map")
 def get_mla_scheduler_map_fake(
     num_seq_kv: Tensor,
+    cu_seqlens_q: Tensor,
+    num_actual_tokens: int,
+    index_topk: int = 0,
+    splitk: bool = True,
     task_tensor: Tensor = None,
 ):
-    num_batch = num_seq_kv.size(0)
-    num_sm = 148  # maximum number of SMs
-    # Layout: [task_list (max_num_jobs * 4) | cu_tasks (num_sm + 1) |
-    #          cu_splits (num_batch + 1)].
-    n = (num_batch + num_sm) * 4 + (num_sm + 1) + (num_batch + 1)
+    num_sm = torch.cuda.get_device_properties(num_seq_kv.device).multi_processor_count
+    n = (num_actual_tokens + num_sm) * 4 + (num_sm + 1) + (num_actual_tokens + 1)
     return num_seq_kv.new_empty((n,), dtype=torch.int32)
 
 
