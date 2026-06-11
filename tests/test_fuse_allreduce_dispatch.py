@@ -48,6 +48,16 @@ def run_fuse_allreduce_dispatch_task(
     master_port = os.getenv("UCL_COMM_MASTER_PORT", "10086")
     master_addr = f"{master_ip}:{master_port}"
 
+    os.environ["NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME"] = os.environ.get(
+        "NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME", "bond1"
+    )
+    os.environ["NVSHMEM_HCA_LIST"] = os.environ.get(
+        "NVSHMEM_HCA_LIST",
+        "mlx5_bond_1:1,mlx5_bond_2:1,mlx5_bond_3:1,mlx5_bond_4:1,mlx5_bond_5:1,mlx5_bond_6:1,mlx5_bond_7:1,mlx5_bond_8:1",
+    )
+    os.environ["NVSHMEM_IB_TRAFFIC_CLASS"] = os.environ.get("NVSHMEM_IB_TRAFFIC_CLASS", "160")
+    os.environ["NVSHMEM_IB_TIMEOUT"] = os.environ.get("NVSHMEM_IB_TIMEOUT", "22")
+
     shmem_ibgda_num_rc_per_pe = int(os.getenv("NVSHMEM_IBGDA_NUM_RC_PER_PE", "40"))
     os.environ["NVSHMEM_IB_ENABLE_IBGDA"] = "1"
     os.environ["NVSHMEM_IBGDA_NUM_RC_PER_PE"] = f"{shmem_ibgda_num_rc_per_pe}"

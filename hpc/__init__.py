@@ -9,22 +9,8 @@ from typing import Dict
 
 _pkg_dir = Path(__file__).resolve().parent
 
-# Filenames to try, in order. Versioned SONAME first because that is what the
-# extension .so actually links against (NEEDED libnvshmem_host.so.3).
 _NVSHMEM_NAMES = ("libnvshmem_host.so.3", "libnvshmem_host.so")
-# Legacy in-source layout (master-branch style, kept for backward compatibility).
-_NVSHMEM_LEGACY_REL = Path("3rd", "ucl", "nvshmem", "lib")
-_PROJECT_ROOT_MARKERS = ("CMakeLists.txt", "setup.py")
-
-
-def _find_project_root() -> "Path | None":
-    """Walk up from the package directory to locate the project root."""
-    d = _pkg_dir.parent
-    for _ in range(5):
-        if any((d / m).is_file() for m in _PROJECT_ROOT_MARKERS):
-            return d
-        d = d.parent
-    return None
+_NVSHMEM_SYSTEM_PREFIX = "/usr/local/nvshmem"
 
 
 def _detect_sm_arch() -> "str | None":
@@ -38,142 +24,49 @@ def _detect_sm_arch() -> "str | None":
         return None
 
 
-def _nvshmem_search_dirs(arch: "str | None") -> "list[Path]":
-    """Build the ordered list of directories to search for libnvshmem_host.
-
-    NVSHMEM's ``libnvshmem_host.so`` statically embeds a per-arch device
-    fatbin (see comment in setup.py). Therefore the search order MUST
-    prefer per-arch subdirectories matching the current GPU architecture
-    over generic flat directories. Otherwise CUDA Runtime fails to
-    register the embedded module on a GPU of a different arch and the
-    test reports ``Unable to access device state. 500``.
-
-    The lookup priority is:
-      1. Wheel install per-arch layout: ``<pkg>/nvshmem/sm{ARCH}/``
-      2. Wheel install flat layout (legacy / single-arch wheels): ``<pkg>/``
-      3. Per-arch CMake build outputs: ``<root>/build/sm{ARCH}/hpc/nvshmem-install/lib``
-      4. Generic per-arch CMake build outputs (any arch).
-      5. Legacy in-source layout: ``<root>/3rd/ucl/nvshmem/lib``
-    """
-    dirs: list[Path] = []
-
-    # 1. Package per-arch subdirectory (current MULTI_ARCH wheel layout).
-    if arch is not None:
-        per_arch = _pkg_dir / "nvshmem" / f"sm{arch}"
-        if per_arch not in dirs:
-            dirs.append(per_arch)
-
-    # 2. Package flat directory (legacy single-arch wheel layout).
-    dirs.append(_pkg_dir)
-
-    # 3. Explicit override via env var.
-    env_root = os.environ.get("HPC_OPS_ROOT")
-    if env_root:
-        root = Path(env_root).resolve()
-        if arch is not None:
-            arch_build = root / "build" / f"sm{arch}" / "hpc" / "nvshmem-install" / "lib"
-            if arch_build not in dirs:
-                dirs.append(arch_build)
-        # Generic per-arch cmake layout (build/sm*/hpc/nvshmem-install/lib),
-        # used as a last-resort fallback when arch detection fails.
-        for d in (root / "build").glob("sm*/hpc/nvshmem-install/lib"):
-            if d not in dirs:
-                dirs.append(d)
-        legacy = root / _NVSHMEM_LEGACY_REL
-        if legacy not in dirs:
-            dirs.append(legacy)
-
-    # 4. Auto-detected project root (editable / local cmake build).
-    project_root = _find_project_root()
-    if project_root:
-        if arch is not None:
-            arch_build = project_root / "build" / f"sm{arch}" / "hpc" / "nvshmem-install" / "lib"
-            if arch_build not in dirs:
-                dirs.append(arch_build)
-        for d in (project_root / "build").glob("sm*/hpc/nvshmem-install/lib"):
-            if d not in dirs:
-                dirs.append(d)
-        legacy = project_root / _NVSHMEM_LEGACY_REL
-        if legacy not in dirs:
-            dirs.append(legacy)
-
-    return dirs
-
-
-def _setup_nvshmem_dlopen_path(lib_dir: Path) -> None:
-    """Make sure NVSHMEM's runtime ``dlopen("nvshmem_bootstrap_*.so.3")``
-    calls (issued from libnvshmem_host) can locate their plugins.
-
-    NVSHMEM loads bootstrap plugins by *bare filename* (no ``/``), so
-    ``ctypes.CDLL`` preload alone is not enough on every glibc/ld.so combo:
-    we also need to inject ``lib_dir`` into ``LD_LIBRARY_PATH`` so the
-    subsequent ``dlopen`` can resolve the plugin via the standard search
-    path. Doing both is intentional belt-and-braces, since glibc's runtime
-    ``dlopen`` re-reads ``LD_LIBRARY_PATH`` at call time.
-    """
-    # 1. Preload every plugin we shipped, so the dynamic linker has the
-    #    SONAME already in its loaded-list cache.
-    for so in sorted(lib_dir.glob("nvshmem_bootstrap_*.so*")):
-        if not so.is_file():
-            continue
-        try:
-            ctypes.CDLL(str(so), mode=ctypes.RTLD_GLOBAL)
-        except OSError as e:
-            # Non-fatal: LD_LIBRARY_PATH below is the real safety net.
-            print(f"WARNING: failed to preload {so}: {e}", file=sys.stderr)
-
-    # 2. Prepend lib_dir to LD_LIBRARY_PATH so plain-name dlopen() resolves.
-    lib_dir_s = str(lib_dir)
+def _ld_library_path_has_system_nvshmem() -> bool:
+    """Return True if any entry of ``LD_LIBRARY_PATH`` is under ``/usr/local/nvshmem``."""
     cur = os.environ.get("LD_LIBRARY_PATH", "")
-    parts = cur.split(":") if cur else []
-    if lib_dir_s not in parts:
-        os.environ["LD_LIBRARY_PATH"] = f"{lib_dir_s}:{cur}" if cur else lib_dir_s
+    if not cur:
+        return False
+    prefix = _NVSHMEM_SYSTEM_PREFIX.rstrip("/")
+    for entry in cur.split(":"):
+        if not entry:
+            continue
+        e = entry.rstrip("/")
+        if e == prefix or e.startswith(prefix + "/"):
+            return True
+    return False
 
 
 def _load_nvshmem_library():
-    """Preload ``libnvshmem_host.so[.3]`` via ``ctypes.CDLL`` so that the
-    subsequent ``torch.ops.load_library`` call on ``_C_sm*.abi3.so`` can
-    resolve its ``NEEDED libnvshmem_host.so.3`` dependency.
-
-    The host lib is per-arch (it statically links libnvshmem_device.a whose
-    fatbin is per-arch), so we MUST pick the copy that matches the current
-    GPU's compute capability. ``_nvshmem_search_dirs`` enforces this
-    ordering by placing ``<pkg>/nvshmem/sm{ARCH}/`` first.
-
-    On success, also configure ``LD_LIBRARY_PATH`` and preload bootstrap
-    plugins so that NVSHMEM's runtime ``dlopen`` calls succeed.
-
-    Failures are reported on stderr (instead of being silently swallowed) to
-    make CI diagnostics tractable.
+    """Ensure ``libnvshmem_host.so[.3]`` can be resolved when loading the
+    ``_C_sm*.abi3.so`` extension (which has ``NEEDED libnvshmem_host.so.3``).
     """
+    # -- Mode 1: trust the user-provided LD_LIBRARY_PATH --
+    if _ld_library_path_has_system_nvshmem():
+        return
+
+    # -- Mode 2: manual preload from per-arch cmake build output --
     arch = _detect_sm_arch()
+    if arch is None:
+        return
+
+    lib_dir = _pkg_dir.parent.parent / f"sm{arch}" / "hpc" / "nvshmem-install" / "lib"
     tried: list[str] = []
-    for d in _nvshmem_search_dirs(arch):
-        if not d.is_dir():
-            continue
+    if lib_dir.is_dir():
         for name in _NVSHMEM_NAMES:
-            so_path = d / name
+            so_path = lib_dir / name
             tried.append(str(so_path))
             if not so_path.exists():
                 continue
             try:
-                ctypes.CDLL(str(so_path), mode=ctypes.RTLD_GLOBAL)
-            except OSError as e:
-                print(
-                    f"WARNING: failed to preload {so_path}: {e}",
-                    file=sys.stderr,
-                )
+                ctypes.CDLL(str(so_path), mode=ctypes.RTLD_LOCAL)
+            except OSError:
                 continue
-            # Host lib loaded: also set up bootstrap plugin discovery.
-            _setup_nvshmem_dlopen_path(d)
             return
 
-    print(
-        "WARNING: libnvshmem_host.so[.3] not found; "
-        "_C extension load may fail with 'libnvshmem_host.so.3: cannot open "
-        "shared object file'. Tried:\n  " + "\n  ".join(tried),
-        file=sys.stderr,
-    )
+    print("WARNING: libnvshmem_host.so[.3] not found")
 
 
 def _load_extension_library():

@@ -29,6 +29,16 @@ def ref_allreduce_rmsnorm(input_list, residual, weight, rms_norm_eps):
 
 
 def run_task(rank, world_size, N, H, num_max_blocks):
+    os.environ["NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME"] = os.environ.get(
+        "NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME", "bond1"
+    )
+    os.environ["NVSHMEM_HCA_LIST"] = os.environ.get(
+        "NVSHMEM_HCA_LIST",
+        "mlx5_bond_1:1,mlx5_bond_2:1,mlx5_bond_3:1,mlx5_bond_4:1,mlx5_bond_5:1,mlx5_bond_6:1,mlx5_bond_7:1,mlx5_bond_8:1",
+    )
+    os.environ["NVSHMEM_IB_TRAFFIC_CLASS"] = os.environ.get("NVSHMEM_IB_TRAFFIC_CLASS", "160")
+    os.environ["NVSHMEM_IB_TIMEOUT"] = os.environ.get("NVSHMEM_IB_TIMEOUT", "22")
+
     device = torch.device("cuda", index=rank)
     torch.cuda.set_device(rank)
     torch.set_default_device(device)
