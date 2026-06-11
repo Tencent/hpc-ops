@@ -353,7 +353,8 @@ __global__ void gather_kernel(const vec_t<cute::TmaDescriptor, 4> td_xy,
 }  // namespace kernels
 
 template <typename Tin, typename Tout, int kTileM, int kTileN, int kTileK, int kStage,
-          bool kUsePDL = false, int kDownTileK = kTileK, bool kUseW4Mma = false>
+          bool kUsePDL = false, int kDownTileK = kTileK, bool kUseW4Mma = false,
+          bool kDownXForceSW128 = false>
 void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
                              void *down_input_ptr, void *down_output_ptr, const void *x_ptr,
                              const void *topk_ids_ptr, void *topk_pos_ptr, void *seqlens_ptr,
@@ -386,7 +387,12 @@ void launch_count_and_gather(void *gate_up_input_ptr, void *gate_up_output_ptr,
   auto gata_up_tma_x = make_tma_copy(SM90_TMA_LOAD{}, X_gate_up, slayout_x(_, _, 0));
   auto gata_up_tma_y = make_tma_copy(SM90_TMA_STORE{}, Y_gate_up, cpbox_yt);
 
-  constexpr bool kDownUseSW64 = (kDownTileK <= 64);
+  // The down-projection X TMA descriptor swizzle must match the consuming
+  // group GEMM. The fp8 down GEMM switches to SW64 when kTileK<=64, but the
+  // bf16 group GEMM always uses SW128 for X (kTileK=64). kDownXForceSW128 lets
+  // the bf16 path keep the down descriptor at SW128 to avoid a swizzle mismatch
+  // that otherwise stalls the GEMM's TMA pipeline.
+  constexpr bool kDownUseSW64 = (kDownTileK <= 64) && !kDownXForceSW128;
   auto down_slayout_x = [&]() {
     if constexpr (kDownUseSW64) {
       return tile_to_shape(GMMA::Layout_K_SW64_Atom<Tin>{},
@@ -660,7 +666,8 @@ void count_and_gather_bf16_async(void *gate_up_input_ptr, void *gate_up_output_p
   if (num_seq_per_group_avg <= 16) {
     constexpr int kTileM = 16;
     constexpr int kStage = 8;
-    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL>(
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, kTileK,
+                            /*kUseW4Mma=*/false, /*kDownXForceSW128=*/true>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
         cu_tiles_ptr, nullptr, nullptr, num_seq, hidden_size, intermediate_size, num_topk,
@@ -668,7 +675,8 @@ void count_and_gather_bf16_async(void *gate_up_input_ptr, void *gate_up_output_p
   } else if (num_seq_per_group_avg <= 32) {
     constexpr int kTileM = 32;
     constexpr int kStage = 8;
-    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL>(
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, kTileK,
+                            /*kUseW4Mma=*/false, /*kDownXForceSW128=*/true>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
         cu_tiles_ptr, nullptr, nullptr, num_seq, hidden_size, intermediate_size, num_topk,
@@ -676,7 +684,8 @@ void count_and_gather_bf16_async(void *gate_up_input_ptr, void *gate_up_output_p
   } else if (num_seq_per_group_avg <= 48) {
     constexpr int kTileM = 48;
     constexpr int kStage = 8;
-    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL>(
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, kTileK,
+                            /*kUseW4Mma=*/false, /*kDownXForceSW128=*/true>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
         cu_tiles_ptr, nullptr, nullptr, num_seq, hidden_size, intermediate_size, num_topk,
@@ -684,7 +693,8 @@ void count_and_gather_bf16_async(void *gate_up_input_ptr, void *gate_up_output_p
   } else {
     constexpr int kTileM = 64;
     constexpr int kStage = 8;
-    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL>(
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, kTileK,
+                            /*kUseW4Mma=*/false, /*kDownXForceSW128=*/true>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
         cu_tiles_ptr, nullptr, nullptr, num_seq, hidden_size, intermediate_size, num_topk,
