@@ -38,11 +38,11 @@ __device__ __forceinline__ dynamic::TaskScheduleInfo load_task(int* src_ptr) {
 }
 
 // Scheduling loop order: outer over ihead_kv, inner over ibatch.
-template <int kMaxNumBatch, int kMaxSplitK, int kTileN>
+template <int kMaxNumBatch, int kTileN>
 __global__ void assign_attention_decode_task_kernel(int* task_map_ptr, const int* num_seq_kvcache,
                                                     int num_batch, int num_head_kv, int num_seq_q,
                                                     bool new_kv_included, int min_process_len,
-                                                    int num_total_ctas) {
+                                                    int num_total_ctas, int max_splitk) {
   __shared__ int num_seqkvs[kMaxNumBatch];
   __shared__ int num_tiles[kMaxNumBatch];
   __shared__ int smem_total_tiles[1];
@@ -135,7 +135,7 @@ __global__ void assign_attention_decode_task_kernel(int* task_map_ptr, const int
       }
 
       int add_tiles = std::min(num_tile, bucket);
-      if (num_chunks == kMaxSplitK - 1) {
+      if (num_chunks == max_splitk - 1) {
         add_tiles = num_tile;
       }
 
@@ -201,7 +201,7 @@ __global__ void assign_attention_decode_task_kernel(int* task_map_ptr, const int
     int add_tiles = std::min(num_tile, bucket);
     int num_seqkv = num_seqkvs[ibatch];
 
-    if (num_chunks == kMaxSplitK - 1) {
+    if (num_chunks == max_splitk - 1) {
       add_tiles = num_tile;
     }
 
@@ -336,33 +336,19 @@ bool assign_attention_decode_task_async(int* task_map_ptr, const int* num_seq_kv
 
   constexpr int kMaxNumBatch = 2048;
 
-  auto launch = [&](auto tilen_tag, auto max_splitk_tag) {
+  auto launch = [&](auto tilen_tag) {
     constexpr int kTileN = decltype(tilen_tag)::value;
-    constexpr int kMaxSplitK = decltype(max_splitk_tag)::value;
+    int max_splitk = num_total_ctas;
 
-    kernels::assign_attention_decode_task_kernel<kMaxNumBatch, kMaxSplitK, kTileN>
-        <<<grid, block, 0, stream>>>(task_map_ptr, num_seq_kvcache, num_batch, num_head_kv,
-                                     num_seq_q, new_kv_included, min_process_len, num_total_ctas);
-  };
-
-  auto dispatch_splitk = [&](auto tilen_tag) {
-    if (num_total_ctas == 148) {
-      launch(tilen_tag, std::integral_constant<int, 148>{});
-    } else if (num_total_ctas == 78 * 4) {
-      launch(tilen_tag, std::integral_constant<int, 78 * 4>{});
-    } else if (num_total_ctas == 78 * 3) {
-      launch(tilen_tag, std::integral_constant<int, 78 * 3>{});
-    } else if (num_total_ctas == 78 * 2) {
-      launch(tilen_tag, std::integral_constant<int, 78 * 2>{});
-    } else {
-      launch(tilen_tag, std::integral_constant<int, 64>{});
-    }
+    kernels::assign_attention_decode_task_kernel<kMaxNumBatch, kTileN><<<grid, block, 0, stream>>>(
+        task_map_ptr, num_seq_kvcache, num_batch, num_head_kv, num_seq_q, new_kv_included,
+        min_process_len, num_total_ctas, max_splitk);
   };
 
   if (tilen == 64) {
-    dispatch_splitk(std::integral_constant<int, 64>{});
+    launch(std::integral_constant<int, 64>{});
   } else if (tilen == 128) {
-    dispatch_splitk(std::integral_constant<int, 128>{});
+    launch(std::integral_constant<int, 128>{});
   }
 
   return true;

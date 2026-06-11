@@ -25,7 +25,7 @@ template <typename Tin, typename Tout, int kTileM, int kTileN, int kTileK, int k
           int kHeadsPerGroup, typename TiledMmaQK, typename TiledMmaSV, typename TmaQ,
           typename TmaK, typename TmaV, typename TmaSplitY, typename SLayoutQ, typename SLayoutK,
           typename SLayoutP, typename SLayoutS, typename SLayoutVTma, typename SLayoutSplitY,
-          int kBlockSize, int kStage, int kMaxSplitK>
+          int kBlockSize, int kStage>
 __global__ void smallm_attention_decode_fp8_qpertoken_perhead_kvpertensor_dynamic_splitk_kernel(
     const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
     const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaSplitY tma_splity,
@@ -33,7 +33,7 @@ __global__ void smallm_attention_decode_fp8_qpertoken_perhead_kvpertensor_dynami
     const float* qscale_ptr, const float* kscale_ptr, const float* vscale_ptr, int num_batch,
     int num_seq_q, int num_dim_qk, int num_dim_v, int num_head_q, int num_head_k, int num_head_v,
     int heads_per_group, int lse_pad_heads_per_group, int num_kvcache_blocks,
-    int num_seq_max_blocks, int qscale_pad_stride, float one_over_dk_log2e) {
+    int num_seq_max_blocks, int qscale_pad_stride, float one_over_dk_log2e, int max_splitk) {
   using namespace cute;  // NOLINT
 
   constexpr int kWarpGroupN = 1;
@@ -72,7 +72,7 @@ __global__ void smallm_attention_decode_fp8_qpertoken_perhead_kvpertensor_dynami
       tma_k.get_tma_tensor(make_shape(kBlockSize, num_dim_qk, num_head_k, num_kvcache_blocks));
   auto gV = tma_v.get_tma_tensor(make_shape(num_dim_v, kBlockSize, num_head_v, num_kvcache_blocks));
   auto gSplitY = tma_splity.get_tma_tensor(
-      make_shape(num_dim_v, heads_per_group, num_head_k, num_seq_q, kMaxSplitK, num_batch));
+      make_shape(num_dim_v, heads_per_group, num_head_k, num_seq_q, max_splitk, num_batch));
 
   auto gAtt =
       make_tensor(make_gmem_ptr(static_cast<float*>(nullptr)),
@@ -273,7 +273,7 @@ __global__ void smallm_attention_decode_fp8_qpertoken_perhead_kvpertensor_dynami
       const int num_tile_causal = task.num_tile_causal;
 
       float* lse_batch = lse_ptr +
-                         ibatch * kMaxSplitK * num_head_k * lse_pad_heads_per_group * num_seq_q +
+                         ibatch * max_splitk * num_head_k * lse_pad_heads_per_group * num_seq_q +
                          ichunk * num_head_k * lse_pad_heads_per_group * num_seq_q +
                          ihead_kv * lse_pad_heads_per_group * num_seq_q;
 

@@ -18,11 +18,12 @@ namespace attention {
 namespace decode {
 namespace kernels {
 
-template <typename T, int kWarpCount, int kMaxSplitK>
+template <typename T, int kWarpCount>
 __global__ void attention_decode_dynamic_splitk_combine_kernel(
     T *y_ptr, const float *split_input_ptr, const float *lse_ptr, const int *task_map_ptr,
     int num_sm_count, int num_batch, int num_seq_q, int num_head_q, int num_head_k,
-    int pad_heads_per_group, int num_dim_v, cutlass::FastDivmod heads_per_group_divider) {
+    int pad_heads_per_group, int num_dim_v, int max_splitk,
+    cutlass::FastDivmod heads_per_group_divider) {
   constexpr int kItemsPerThread = 4;
   int iseq = blockIdx.y;
   int ibatch = blockIdx.z;
@@ -40,11 +41,11 @@ __global__ void attention_decode_dynamic_splitk_combine_kernel(
 
   const int lse_kv_head_stride = num_seq_q * pad_heads_per_group;
   const int lse_chunk_stride = num_head_k * lse_kv_head_stride;
-  const int lse_batch_stride = kMaxSplitK * lse_chunk_stride;
+  const int lse_batch_stride = max_splitk * lse_chunk_stride;
 
   const int input_seq_stride = num_head_q * num_dim_v;
   const int input_chunk_stride = num_seq_q * input_seq_stride;
-  const int input_batch_stride = kMaxSplitK * input_chunk_stride;
+  const int input_batch_stride = max_splitk * input_chunk_stride;
 
   const float *lse_batch = lse_ptr + ibatch * lse_batch_stride + ihead_kv * lse_kv_head_stride +
                            iseq * pad_heads_per_group + ihead;
@@ -53,8 +54,8 @@ __global__ void attention_decode_dynamic_splitk_combine_kernel(
   T *out_row = y_ptr + ibatch * num_seq_q * input_seq_stride + iseq * input_seq_stride +
                ihead_q * num_dim_v + icol;
 
-  // vec_t<float, 64> lse;
-  __shared__ float lse[kWarpCount][kMaxSplitK];
+  extern __shared__ float shm_lse[];
+  float *lse = shm_lse + iwarp * max_splitk;
   vec_t<float, kItemsPerThread> output;
 #pragma unroll
   for (int i = 0; i < kItemsPerThread; i++) {
@@ -67,15 +68,15 @@ __global__ void attention_decode_dynamic_splitk_combine_kernel(
 
 #pragma unroll 1
   for (int ichunk = ilane; ichunk < num_chunks; ichunk += 32) {
-    lse[iwarp][ichunk] = lse_batch[ichunk * lse_chunk_stride];
-    max_lse = max(max_lse, lse[iwarp][ichunk]);
+    lse[ichunk] = lse_batch[ichunk * lse_chunk_stride];
+    max_lse = max(max_lse, lse[ichunk]);
   }
 
   max_lse = warp_reduce_max_xor(max_lse);
 
 #pragma unroll 1
   for (int ichunk = ilane; ichunk < num_chunks; ichunk += 32) {
-    sum_lse += exp2f_ftz(lse[iwarp][ichunk] - max_lse);
+    sum_lse += exp2f_ftz(lse[ichunk] - max_lse);
   }
 
   sum_lse = warp_reduce_sum_xor(sum_lse);
@@ -86,7 +87,7 @@ __global__ void attention_decode_dynamic_splitk_combine_kernel(
 #pragma unroll 1
   for (int ichunk = 0; ichunk < num_chunks; ichunk++) {
     auto y = load<float, kItemsPerThread>(split_input + ichunk * input_chunk_stride);
-    float scale = exp2f_ftz(lse[iwarp][ichunk] - sum_lse);
+    float scale = exp2f_ftz(lse[ichunk] - sum_lse);
 
 #pragma unroll
     for (int i = 0; i < kItemsPerThread; i++) {

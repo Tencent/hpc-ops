@@ -16,7 +16,7 @@ namespace hpc {
 namespace attention {
 namespace decode {
 
-template <int kTileM, int kTileN, int kTileK, int kTileV, int kBlockSize, int kMaxSplitK>
+template <int kTileM, int kTileN, int kTileK, int kTileV, int kBlockSize>
 void launch_smallm_fp8_qpertoken_perhead_kvpertensor_dim128_dynamic_splitk_kernel(
     void *y_ptr, void *lse_ptr, void *splitk_out_ptr, const int *task_map_ptr, const void *q_ptr,
     void *kcache_ptr, void *vcache_ptr, const int *block_ids_ptr, const int *num_seq_kvcache_ptr,
@@ -26,7 +26,7 @@ void launch_smallm_fp8_qpertoken_perhead_kvpertensor_dim128_dynamic_splitk_kerne
     int block_size, int num_seq_max_blocks, int qscale_pad_stride, int ldY, int ldQ,
     int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
-    cudaStream_t stream) {
+    int max_splitk, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   constexpr int kStageQ = 4;
@@ -54,10 +54,10 @@ void launch_smallm_fp8_qpertoken_perhead_kvpertensor_dim128_dynamic_splitk_kerne
 
   auto Y = make_tensor(
       make_gmem_ptr(reinterpret_cast<const Tout *>(splitk_out_ptr)),
-      make_shape(num_dim_v, heads_per_group, num_head_k, num_seq_q, kMaxSplitK, num_batch),
+      make_shape(num_dim_v, heads_per_group, num_head_k, num_seq_q, max_splitk, num_batch),
       make_stride(Int<1>{}, num_dim_v, heads_per_group * num_dim_v, num_dim_v * num_head_q,
                   num_dim_v * num_head_q * num_seq_q,
-                  num_dim_v * num_head_q * num_seq_q * kMaxSplitK));
+                  num_dim_v * num_head_q * num_seq_q * max_splitk));
 
   auto slayout_q = tile_to_shape(GMMA::Layout_K_SW128_Atom<Tin>{},
                                  make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStageQ>{}));
@@ -132,7 +132,7 @@ void launch_smallm_fp8_qpertoken_perhead_kvpertensor_dim128_dynamic_splitk_kerne
           decltype(sv_tiled_mma), decltype(tma_q), decltype(tma_k), decltype(tma_v),
           decltype(tma_y), decltype(slayout_q), decltype(slayout_k), decltype(slayout_p),
           decltype(slayout_s), decltype(slayout_v), decltype(slayout_y), kClusterM, kClusterN,
-          kClusterK, kMmaSM, kBlockSize, kStageQ, kStageK, kStageP, kMaxSplitK>;
+          kClusterK, kMmaSM, kBlockSize, kStageQ, kStageK, kStageP>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
   cudaLaunchConfig_t config;
@@ -161,7 +161,7 @@ void launch_smallm_fp8_qpertoken_perhead_kvpertensor_dim128_dynamic_splitk_kerne
       block_ids_ptr, num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, new_kv_included,
       num_batch, num_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_k, num_head_v,
       heads_per_group, pad_heads_per_group, num_kvcache_blocks, num_seq_max_blocks,
-      qscale_pad_stride, one_over_dk_log2e, splitk_head_kv_divider);
+      qscale_pad_stride, one_over_dk_log2e, splitk_head_kv_divider, max_splitk);
 
   // combine kernel
   constexpr int kWarpCount = 4;
@@ -175,7 +175,7 @@ void launch_smallm_fp8_qpertoken_perhead_kvpertensor_dim128_dynamic_splitk_kerne
 
   combine_launch_config.gridDim = combine_grid;
   combine_launch_config.blockDim = combine_block;
-  combine_launch_config.dynamicSmemBytes = 0;
+  combine_launch_config.dynamicSmemBytes = sizeof(float) * kWarpCount * max_splitk;
 
   cudaLaunchAttribute attribute_combine[1];
   attribute_combine[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -187,14 +187,13 @@ void launch_smallm_fp8_qpertoken_perhead_kvpertensor_dim128_dynamic_splitk_kerne
   combine_launch_config.stream = stream;
 
   auto combine_kernel =
-      kernels::attention_decode_dynamic_splitk_combine_kernel<__nv_bfloat16, kWarpCount,
-                                                              kMaxSplitK>;
+      kernels::attention_decode_dynamic_splitk_combine_kernel<__nv_bfloat16, kWarpCount>;
 
   cudaLaunchKernelEx(
       &combine_launch_config, combine_kernel, reinterpret_cast<__nv_bfloat16 *>(y_ptr),
       reinterpret_cast<const float *>(splitk_out_ptr), reinterpret_cast<const float *>(lse_ptr),
       reinterpret_cast<const int *>(task_map_ptr), num_sm_count, num_batch, num_seq_q, num_head_q,
-      num_head_k, pad_heads_per_group, num_dim_v, heads_per_group_divider);
+      num_head_k, pad_heads_per_group, num_dim_v, max_splitk, heads_per_group_divider);
 }
 
 bool smallm_fp8_qpertoken_perhead_kvpertensor_dim128_dynamic_async(
@@ -228,35 +227,26 @@ bool smallm_fp8_qpertoken_perhead_kvpertensor_dim128_dynamic_async(
     return false;
   }
 
-  auto launch = [&](auto tilem_tag, auto splitk_tag) {
+  auto launch = [&](auto tilem_tag) {
     constexpr int kTileM = decltype(tilem_tag)::value;
-    constexpr int kMaxSplitK = decltype(splitk_tag)::value;
     constexpr int kBlockSize = 64;
 
     launch_smallm_fp8_qpertoken_perhead_kvpertensor_dim128_dynamic_splitk_kernel<
-        kTileM, kTileN, kTileK, kTileV, kBlockSize, kMaxSplitK>(
+        kTileM, kTileN, kTileK, kTileV, kBlockSize>(
         y_ptr, lse_ptr, splitk_out_ptr, task_map_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
         num_seq_kvcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, split_flag_ptr, new_kv_included,
         num_batch, num_seq_q, num_head_q, num_head_k, num_head_v, heads_per_group, num_dim_qk,
         num_dim_v, num_kvcache_blocks, block_size, num_seq_max_blocks, qscale_pad_stride, ldY, ldQ,
         kcache_block_stride, kcache_token_stride, kcache_head_stride, vcache_block_stride,
-        vcache_token_stride, vcache_head_stride, stream);
-  };
-
-  auto dispatch_splitk = [&](auto tilem_tag) {
-    if (splitk == 148) {
-      launch(tilem_tag, std::integral_constant<int, 148>{});
-    } else {
-      launch(tilem_tag, std::integral_constant<int, 64>{});
-    }
+        vcache_token_stride, vcache_head_stride, splitk, stream);
   };
 
   if (num_seq_q == 1) {
-    dispatch_splitk(std::integral_constant<int, 8>{});
+    launch(std::integral_constant<int, 8>{});
   } else if (num_seq_q == 2) {
-    dispatch_splitk(std::integral_constant<int, 16>{});
+    launch(std::integral_constant<int, 16>{});
   } else if (num_seq_q == 3 || num_seq_q == 4) {
-    dispatch_splitk(std::integral_constant<int, 32>{});
+    launch(std::integral_constant<int, 32>{});
   }
 
   return true;

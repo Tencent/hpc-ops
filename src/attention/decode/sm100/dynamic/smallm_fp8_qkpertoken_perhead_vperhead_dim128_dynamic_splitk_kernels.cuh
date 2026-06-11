@@ -26,7 +26,7 @@ template <typename Tout, typename Tin, int kTileM, int kTileN, int kTileK, int k
           typename TmaK, typename TmaV, typename TmaY, typename TmaKS, typename SLayoutQ,
           typename SLayoutK, typename SLayoutP, typename SLayoutS, typename SLayoutV,
           typename SLayoutY, typename SLayoutKS, int kClusterM, int kClusterN, int kClusterK,
-          int kMmaSM, int kBlockSize, int kStageQ, int kStageK, int kStageP, int kMaxSplitK>
+          int kMmaSM, int kBlockSize, int kStageQ, int kStageK, int kStageP>
 __global__ void __launch_bounds__(512, 1)
     smallm_attention_decode_fp8_qkpertoken_perhead_vperhead_dynamic_splitk_kernel(
         const __grid_constant__ TmaQ tma_q, const __grid_constant__ TmaK tma_k,
@@ -37,7 +37,7 @@ __global__ void __launch_bounds__(512, 1)
         int num_seq_q, int num_dim_qk, int num_dim_v, int num_head_q, int num_head_k,
         int num_head_v, int heads_per_group, int lse_pad_heads_per_group, int num_kvcache_blocks,
         int num_seq_max_blocks, int qscale_pad_stride, float one_over_dk_log2e,
-        cutlass::FastDivmod splitk_head_kv_divider) {
+        cutlass::FastDivmod splitk_head_kv_divider, int max_splitk) {
   using namespace cute;  // NOLINT
   constexpr float kDecodePScale = 256.0f;
   constexpr float kDecodePScaleInv = 1.0f / kDecodePScale;
@@ -888,7 +888,7 @@ __global__ void __launch_bounds__(512, 1)
 
     const int lse_kv_head_stride = num_seq_q * lse_pad_heads_per_group;
     const int lse_chunk_stride = num_head_k * lse_kv_head_stride;
-    const int lse_batch_stride = kMaxSplitK * lse_chunk_stride;
+    const int lse_batch_stride = max_splitk * lse_chunk_stride;
 
     while (true) {
       if (!task_info.valid) {
@@ -931,7 +931,7 @@ __global__ void __launch_bounds__(512, 1)
       // tma store
       if (leader_warp) {
         auto gYY = tma_y.get_tma_tensor(
-            make_shape(num_dim_v, heads_per_group, num_head_k, num_seq_q, kMaxSplitK, num_batch));
+            make_shape(num_dim_v, heads_per_group, num_head_k, num_seq_q, max_splitk, num_batch));
         auto btma_y = tma_y.get_slice(0);
 
         // (((_64,_8),_2),_1,_2):(((_1,_64),_512),_0,_1024)

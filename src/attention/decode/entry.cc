@@ -218,10 +218,6 @@ torch::Tensor attention_decode_fp8_entry(const torch::Tensor &q, torch::Tensor &
       // use dynamic splitk
       splitk = decode::dynamic::kCtaPerSmMap.at(sm_major_version)[num_seq_q - 1] * get_sm_count();
 
-      if (splitk != 78 * 2 && splitk != 78 * 3 && splitk != 78 * 4 && splitk != 148) {
-        splitk = 64;
-      }
-
       int pad_heads_per_group = ((heads_per_group + 7) / 8) * 8;
       lse = torch::empty({num_batch, splitk, num_head_k, num_seq_q, pad_heads_per_group},
                          q.options().dtype(torch::kFloat32));
