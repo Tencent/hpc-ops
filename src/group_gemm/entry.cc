@@ -221,7 +221,7 @@ torch::Tensor group_gemm_bf16_entry(const torch::Tensor &x, const torch::Tensor 
 
   group_gemm_bf16_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr,
                                  tmas_ptr, tiles_ptr, cu_tiles_ptr, num_group, m, n, k,
-                                 num_seq_per_group_avg, update_tma, stream);
+                                 num_seq_per_group_avg, update_tma, false, stream);
 
   return y;
 }

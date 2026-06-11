@@ -891,7 +891,8 @@ __global__ void __launch_bounds__(384, 1)
   }
 }
 
-template <typename Config, typename TmaA, typename TmaB, typename TmaD, bool IsLoopH>
+template <typename Config, typename TmaA, typename TmaB, typename TmaD, bool IsLoopH,
+          bool kUsePDL = false>
 __global__ void __launch_bounds__(384, 1)
     group_gemm_bf16_kernel(const __grid_constant__ TmaB tma_b, cute::TmaDescriptor *td_xy,
                                     int *seqlens_ptr, int *tiles_ptr,
@@ -929,6 +930,10 @@ __global__ void __launch_bounds__(384, 1)
 
   TmaA tma_a;
   TmaD tma_d;
+
+  if constexpr (kUsePDL) {
+    cudaGridDependencySynchronize();
+  }
 
   int num_total_warps = blockDim.x / 32;
   for (int i = iwarp; i < num_group * 2; i += num_total_warps) {
@@ -1179,6 +1184,10 @@ __global__ void __launch_bounds__(384, 1)
         tma_store_arrive();
       }
     }
+  }
+
+  if constexpr (kUsePDL) {
+    cudaTriggerProgrammaticLaunchCompletion();
   }
 }
 

@@ -32,7 +32,7 @@ void group_gemm_bf16_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
         const void *seqlens_ptr, const void *cu_seqlens_ptr,
         void *tmas_ptr, void *tiles_ptr,
         void *cu_tiles_ptr, int num_group, int m, int n, int k,
-        int num_seq_per_group_avg, bool update_tma,
+        int num_seq_per_group_avg, bool update_tma, bool use_pdl,
         cudaStream_t stream);
 }  // namespace group_gemm
 }  // namespace hpc

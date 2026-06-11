@@ -127,6 +127,8 @@ void fuse_moe_bf16_async(
   int num_seq_per_group_avg = total_num_seq / num_expert_total;
   using T1 = __nv_bfloat16;
 
+  bool use_pdl = true;
+
   // 0. call count_and_gather_bf16_async (fills TMA descriptors for bf16 group gemm)
   count_and_gather_bf16_async(gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr,
                               input_ptr, topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr,
@@ -138,23 +140,24 @@ void fuse_moe_bf16_async(
   group_gemm::group_gemm_bf16_async(
       gate_up_output_ptr, gate_up_input_ptr, gate_up_weight_ptr, seqlens_ptr, cu_seqlens_ptr,
       gate_up_tmas_ptr, tiles_ptr, cu_tiles_ptr, num_expert_local, total_num_seq,
-      intermediate_size, hidden_size, num_seq_per_group_avg, false, stream);
+      intermediate_size, hidden_size, num_seq_per_group_avg, false, use_pdl, stream);
 
   // 2. call act and mul (bf16 activation)
   const int *valid_row_range_ptr =
       (int *)cu_seqlens_ptr + num_expert_local;  // get last number as valid row
   activation::act_mul_bf16_async((T1 *)down_input_ptr, (const T1 *)gate_up_output_ptr,
-                                 valid_row_range_ptr, total_num_seq, intermediate_size / 2, stream);
+                                 valid_row_range_ptr, total_num_seq, intermediate_size / 2, use_pdl,
+                                 stream);
 
   // 3. call down linear (bf16), TMA descriptors pre-filled by count_and_gather_bf16_async
   group_gemm::group_gemm_bf16_async(
       down_output_ptr, down_input_ptr, down_weight_ptr, seqlens_ptr, cu_seqlens_ptr,
       down_tmas_ptr, tiles_ptr, cu_tiles_ptr, num_expert_local, total_num_seq, hidden_size,
-      intermediate_size / 2, num_seq_per_group_avg, false, stream);
+      intermediate_size / 2, num_seq_per_group_avg, false, use_pdl, stream);
 
   // 4. call reduce
   reduce_async(output_ptr, down_output_ptr, topk_pos_ptr, topk_scale_ptr, shared_output_ptr,
-               total_num_seq, num_seq, hidden_size, num_topk, false, stream);
+               total_num_seq, num_seq, hidden_size, num_topk, use_pdl, stream);
 }
 
 
