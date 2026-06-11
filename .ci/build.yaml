@@ -33,7 +33,7 @@ variables:
           description: "false"
       description: "true = full, false = incremental, default false"
   TAIJI_API_TOKEN:
-    value: vgsb1k2nXk6ZuFYP-V68sQ
+    value: VLkUmhaOkLQFiF2bJT-bWw
     const: true
     props:
       type: vuex-input
@@ -81,6 +81,7 @@ stages:
       name: Pack and check source code
       runs-on:
         pool-name: docker
+        hw-spec: Standard-M
         container:
           image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.0
       steps:
@@ -116,6 +117,7 @@ stages:
             set -xe
             cd ${{ci.workspace}}
             tar -cvf code.tar.gz ./
+            cat /sys/fs/cgroup/memory/memory.limit_in_bytes
       - name: upload-code.tar.gz
         id: ""
         uses: UploadArtifactory@8.*
@@ -131,6 +133,7 @@ stages:
       name: torch290+cu129+sm90
       runs-on:
         pool-name: docker
+        hw-spec: Standard-M
         container:
           image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.0
       steps:
@@ -173,6 +176,7 @@ stages:
       name: torch2100+cu129+sm90
       runs-on:
         pool-name: docker
+        hw-spec: Standard-M
         container:
           image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.2
       steps:
@@ -215,6 +219,7 @@ stages:
       name: torch2100+cu130+sm90
       runs-on:
         pool-name: docker
+        hw-spec: Standard-M
         container:
           image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.3
       steps:
@@ -257,6 +262,7 @@ stages:
       name: torch2100+cu130+sm100
       runs-on:
         pool-name: docker
+        hw-spec: Standard-M
         container:
           image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.3
       steps:
@@ -299,6 +305,7 @@ stages:
       name: torch2100+cu130+multi-arch
       runs-on:
         pool-name: docker
+        hw-spec: Standard-M
         container:
           image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.3
       steps:
