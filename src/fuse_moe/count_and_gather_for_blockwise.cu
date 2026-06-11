@@ -708,6 +708,46 @@ void blockwise_count_and_gather_async(
         gateup_task_map_ptr, down_task_map_ptr, num_tokens, num_padded_tokens, hidden_size,
         intermediate_size, num_topk, num_experts_local, eprank, num_tokens_per_group_avg, use_pdl,
         stream);
+  } else if (num_tokens_per_group_avg <= 64) {
+    constexpr int kTileM = 64;
+    constexpr int kStage = 8;
+    launch_blockwise_count_and_gather<kTileM, kTileN, kTileK, kStage>(
+        input_ptr, input_scale_ptr, gate_up_input_ptr, gate_up_output_ptr, gate_up_input_scale_ptr,
+        down_input_ptr, down_output_ptr, topk_ids_ptr, topk_pos_ptr, num_tokens_per_group_ptr,
+        cu_num_tokens_per_group_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr, cu_tiles_ptr,
+        gateup_task_map_ptr, down_task_map_ptr, num_tokens, num_padded_tokens, hidden_size,
+        intermediate_size, num_topk, num_experts_local, eprank, num_tokens_per_group_avg, use_pdl,
+        stream);
+  } else if (num_tokens_per_group_avg <= 96) {
+    constexpr int kTileM = 48;
+    constexpr int kStage = 8;
+    launch_blockwise_count_and_gather<kTileM, kTileN, kTileK, kStage>(
+        input_ptr, input_scale_ptr, gate_up_input_ptr, gate_up_output_ptr, gate_up_input_scale_ptr,
+        down_input_ptr, down_output_ptr, topk_ids_ptr, topk_pos_ptr, num_tokens_per_group_ptr,
+        cu_num_tokens_per_group_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr, cu_tiles_ptr,
+        gateup_task_map_ptr, down_task_map_ptr, num_tokens, num_padded_tokens, hidden_size,
+        intermediate_size, num_topk, num_experts_local, eprank, num_tokens_per_group_avg, use_pdl,
+        stream);
+  } else if (num_tokens_per_group_avg <= 128) {
+    constexpr int kTileM = 32;
+    constexpr int kStage = 8;
+    launch_blockwise_count_and_gather<kTileM, kTileN, kTileK, kStage>(
+        input_ptr, input_scale_ptr, gate_up_input_ptr, gate_up_output_ptr, gate_up_input_scale_ptr,
+        down_input_ptr, down_output_ptr, topk_ids_ptr, topk_pos_ptr, num_tokens_per_group_ptr,
+        cu_num_tokens_per_group_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr, cu_tiles_ptr,
+        gateup_task_map_ptr, down_task_map_ptr, num_tokens, num_padded_tokens, hidden_size,
+        intermediate_size, num_topk, num_experts_local, eprank, num_tokens_per_group_avg, use_pdl,
+        stream);
+  } else if (num_tokens_per_group_avg <= 144) {
+    constexpr int kTileM = 48;
+    constexpr int kStage = 8;
+    launch_blockwise_count_and_gather<kTileM, kTileN, kTileK, kStage>(
+        input_ptr, input_scale_ptr, gate_up_input_ptr, gate_up_output_ptr, gate_up_input_scale_ptr,
+        down_input_ptr, down_output_ptr, topk_ids_ptr, topk_pos_ptr, num_tokens_per_group_ptr,
+        cu_num_tokens_per_group_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr, cu_tiles_ptr,
+        gateup_task_map_ptr, down_task_map_ptr, num_tokens, num_padded_tokens, hidden_size,
+        intermediate_size, num_topk, num_experts_local, eprank, num_tokens_per_group_avg, use_pdl,
+        stream);
   } else {
     constexpr int kTileM = 64;
     constexpr int kStage = 8;

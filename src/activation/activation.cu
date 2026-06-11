@@ -711,6 +711,14 @@ void act_mul_and_blockwise_quant_async(void *output_ptr, void *output_scale_ptr,
     ktile_m = 32;
   } else if (num_tokens_per_group_avg <= 48) {
     ktile_m = 48;
+  } else if (num_tokens_per_group_avg <= 64) {
+    ktile_m = 64;
+  } else if (num_tokens_per_group_avg <= 96) {
+    ktile_m = 48;
+  } else if (num_tokens_per_group_avg <= 128) {
+    ktile_m = 32;
+  } else if (num_tokens_per_group_avg <= 144) {
+    ktile_m = 48;
   } else {
     ktile_m = 64;
   }
