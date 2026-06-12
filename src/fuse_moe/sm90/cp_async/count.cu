@@ -15,22 +15,39 @@ namespace fuse_moe_cp_async {
 
 namespace kernels {
 
-// Kernel 1 (large num_seq path): count tokens per expert and initialize topk_pos to -1.
-// One thread per topk element.
+// Kernel 1 (large num_seq path): count tokens per expert with a block-local histogram.
 template <bool kUsePDL = false>
 __global__ void count_seq_kernel(const int *topk_ids_ptr, int *topk_pos_ptr, int *seqlens_ptr,
-                                 int total_num_topk, int start_expert, int end_expert) {
-  int idx = threadIdx.x + blockDim.x * blockIdx.x;
+                                 int total_num_topk, int num_expert, int start_expert,
+                                 int end_expert) {
+  extern __shared__ int seqlens_shm[];
+  for (int i = threadIdx.x; i < num_expert; i += blockDim.x) {
+    seqlens_shm[i] = 0;
+  }
+  __syncthreads();
+
   if constexpr (kUsePDL) {
     cudaGridDependencySynchronize();
   }
+
+  int idx = threadIdx.x + blockDim.x * blockIdx.x;
   if (idx < total_num_topk) {
     int iexpert = topk_ids_ptr[idx];
     if ((iexpert >= start_expert) && (iexpert < end_expert)) {
-      atomicAdd(&seqlens_ptr[iexpert - start_expert], 1);
+      atomicAdd(&seqlens_shm[iexpert - start_expert], 1);
     }
     topk_pos_ptr[idx] = -1;
   }
+  __syncthreads();
+
+  // Aggregate block-local counts into the global counters.
+  for (int i = threadIdx.x; i < num_expert; i += blockDim.x) {
+    int cnt = seqlens_shm[i];
+    if (cnt > 0) {
+      atomicAdd(&seqlens_ptr[i], cnt);
+    }
+  }
+
   if constexpr (kUsePDL) {
     cudaTriggerProgrammaticLaunchCompletion();
   }
@@ -125,19 +142,42 @@ __global__ void build_indices_kernel(const int *topk_ids_ptr, int *row_indices_p
     cudaGridDependencySynchronize();
   }
   if (blockIdx.x < num_topk_blocks) {
+    extern __shared__ int counter_shm[];
+    for (int i = threadIdx.x; i < num_expert; i += blockDim.x) {
+      counter_shm[i] = 0;
+    }
+    __syncthreads();
+
+    int my_local_expert = -1;
+    int my_local_pos = 0;
+    int my_token_idx = 0;
+    int my_topk_j = 0;
     if (idx < total_num_topk) {
       int iexpert = topk_ids_ptr[idx];
       if ((iexpert >= start_expert) && (iexpert < end_expert)) {
-        int local_expert = iexpert - start_expert;
-        int slot = atomicAdd(&seqlens_ptr[local_expert], 1);
-        int pos = cu_seqlens_ptr[local_expert] + slot;
-        // token index and topk sub-index
-        int token_idx = idx / num_topk;
-        int topk_j = idx % num_topk;
-        row_indices_ptr[pos] = token_idx;
-        topk_pos_ptr[token_idx * num_topk + topk_j] = pos;
+        my_local_expert = iexpert - start_expert;
+        my_local_pos = atomicAdd(&counter_shm[my_local_expert], 1);
+        my_token_idx = idx / num_topk;
+        my_topk_j = idx % num_topk;
       }
       // topk_pos was already set to -1 in count_seq_kernel for tokens outside this EP rank
+    }
+    __syncthreads();
+
+    // Reserve one global base per expert touched by this block.
+    for (int e = threadIdx.x; e < num_expert; e += blockDim.x) {
+      int cnt = counter_shm[e];
+      if (cnt > 0) {
+        int base = atomicAdd(&seqlens_ptr[e], cnt);
+        counter_shm[e] = base;
+      }
+    }
+    __syncthreads();
+
+    if (my_local_expert >= 0) {
+      int pos = cu_seqlens_ptr[my_local_expert] + counter_shm[my_local_expert] + my_local_pos;
+      row_indices_ptr[pos] = my_token_idx;
+      topk_pos_ptr[my_token_idx * num_topk + my_topk_j] = pos;
     }
   } else {
     int task_idx = blockIdx.x - num_topk_blocks;
@@ -374,14 +414,14 @@ void launch_count_and_build(const int *topk_ids_ptr, int *row_indices_ptr, int *
           /*use_pdl=*/kUsePDL, stream);
     }
   } else {
-    // Step 0.1: count tokens per expert
+    // Step 0.1: count tokens per expert.
     {
       dim3 block(kThreadPerBlock);
       dim3 grid((total_num_topk + kThreadPerBlock - 1) / kThreadPerBlock);
-      auto cfg = make_pdl_config(grid, block, 0, stream, attr);
+      auto cfg = make_pdl_config(grid, block, num_expert * sizeof(int), stream, attr);
       auto kernel = kernels::count_seq_kernel<kUsePDL>;
       cudaLaunchKernelEx(&cfg, kernel, topk_ids_ptr, topk_pos_ptr, seqlens_ptr, total_num_topk,
-                         start_expert, end_expert);
+                         num_expert, start_expert, end_expert);
     }
 
     // Step 0.2: prefix sum → cu_seqlens, cu_tiles; also resets seqlens to 0
@@ -417,7 +457,7 @@ void launch_count_and_build(const int *topk_ids_ptr, int *row_indices_ptr, int *
       int task_map_blocks = need_tm ? (num_expert + tail_blocks) : 0;
       dim3 block(kThreadPerBlock);
       dim3 grid(num_topk_blocks + task_map_blocks);
-      auto cfg = make_pdl_config(grid, block, 0, stream, attr);
+      auto cfg = make_pdl_config(grid, block, num_expert * sizeof(int), stream, attr);
       auto kernel = kernels::build_indices_kernel<kUsePDL>;
       cudaLaunchKernelEx(&cfg, kernel, topk_ids_ptr, row_indices_ptr, topk_pos_ptr, seqlens_ptr,
                          (const int *)cu_seqlens_ptr, (const int *)cu_tiles_ptr,
