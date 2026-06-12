@@ -13,9 +13,11 @@ Pipeline (per Makefile `sanitizer-incremental`):
      Deletions are excluded (cannot symbol-trace a gone file). On any git
      failure -> full fallback.
   2. If D hits the (narrow) GLOBAL_IMPACT list -> full fallback.
-     GLOBAL_IMPACT still covers: build system (setup.py, CMakeLists.txt),
+     GLOBAL_IMPACT covers: build system (CMakeLists.txt),
      test infra (tests/utils.py), shared C/C++
      (src/C|utils|communicator), and vendored deps (3rd/**).
+     setup.py is handled with fine-grained diff analysis: only
+     substantive changes (not parallelism/comments) trigger fallback.
      Makefile / .ci/** / tools/** are still considered no-impact.
   3. Classify D into (top_src_dirs, direct_tests, touched_hpc_modules).
   4. For each A in top_src_dirs, run a 4-layer C++ symbol trace:
@@ -84,15 +86,39 @@ CXX_SRC_EXTS_FOR_CLOSURE: Tuple[str, ...] = (
 # Patterns whose modification forces a full-sanitizer fallback. Kept verbatim
 # against the previous implementation. `.*` = fnmatch `**`, `[^/]*` = fnmatch
 # `*`, literal dots escaped.
+# NOTE: setup.py is handled separately with fine-grained diff analysis
+#       (see _setup_py_has_real_impact) to avoid false full-fallback when
+#       only build parallelism or other non-product settings are changed.
 GLOBAL_IMPACT_REGEX: List[Tuple[str, re.Pattern]] = [
     (label, re.compile(pat)) for label, pat in [
-        ("setup.py",             r"^setup\.py$"),
         ("CMakeLists.txt",       r"^CMakeLists\.txt$"),
         ("tests/utils.py",       r"^tests/utils\.py$"),
         ("src/C/**",             r"^src/C/.*$"),
         ("src/utils/**",         r"^src/utils/.*$"),
         ("3rd/**",               r"^3rd/.*$"),
     ]
+]
+
+# Files that require fine-grained diff analysis before triggering full
+# fallback. Each entry maps to a checker function that returns True if the
+# diff has real (product-affecting) impact.
+CONDITIONAL_IMPACT_FILES: Set[str] = {"setup.py"}
+
+# Regex patterns matching setup.py diff lines that are considered harmless
+# (do not affect the build product). A changed line (after stripping the
+# leading +/- and whitespace) matching ANY of these is safe to ignore.
+# If ALL changed lines match, setup.py is deemed non-impactful.
+_SETUP_PY_SAFE_PATTERNS: List[re.Pattern] = [
+    # Parallelism-related: CMAKE_BUILD_PARALLEL_LEVEL / parallel / -j
+    re.compile(r'.*CMAKE_BUILD_PARALLEL_LEVEL.*'),
+    re.compile(r'.*parallel.*=.*os\.environ\.get\(.*CMAKE_BUILD_PARALLEL_LEVEL.*'),
+    re.compile(r'.*f"-j\{parallel\}".*'),
+    re.compile(r'.*-j\d+.*'),
+    re.compile(r'^\s*parallel\s*='),
+    # Pure comment lines
+    re.compile(r'^\s*#'),
+    # Blank lines
+    re.compile(r'^\s*$'),
 ]
 
 # Dirs traced at 2nd level: a change under `src/<top>/<sub>/...` maps to
@@ -223,6 +249,83 @@ def is_global_impact(path: str) -> Optional[str]:
     for label, regex in GLOBAL_IMPACT_REGEX:
         if regex.match(path):
             return label
+    return None
+
+
+def _setup_py_has_real_impact() -> bool:
+    """Check whether setup.py changes affect the build product.
+
+    Runs `git diff` (combined staged + unstaged + committed) on setup.py and
+    inspects the changed lines. If every added/removed line matches one of
+    the safe patterns (parallelism settings, comments, blank lines), the
+    change is deemed non-impactful and returns False.
+
+    Returns True (impactful) on any git failure (fail-open / conservative).
+    """
+    # Get the full diff of setup.py relative to merge-base
+    remote_master = (os.environ.get("HPC_DIFF_BASE_REF", "").strip()
+                     or REMOTE_MASTER_DEFAULT)
+    base, _ = _resolve_base(remote_master)
+
+    # Collect changed lines from all diff sources
+    diff_sources_args = []
+    if base:
+        diff_sources_args.append(["diff", f"{base}..HEAD", "--", "setup.py"])
+    diff_sources_args.append(["diff", "--cached", "--", "setup.py"])
+    diff_sources_args.append(["diff", "--", "setup.py"])
+
+    changed_lines: List[str] = []
+    for args in diff_sources_args:
+        rc, out, _ = run_git(args)
+        if rc != 0:
+            log.warning("git diff for setup.py fine-grained check failed "
+                        "-> conservatively treating as impactful")
+            return True
+        for line in out.splitlines():
+            # Only consider actual changed lines (starting with + or -, excluding diff headers)
+            if line.startswith(("+++", "---")):
+                continue
+            if line.startswith(("+", "-")):
+                # Strip the leading +/- character
+                content = line[1:]
+                changed_lines.append(content)
+
+    if not changed_lines:
+        # No actual content lines changed (e.g. permission-only change) -> non-impactful
+        log.info("setup.py: no content lines changed -> non-impactful")
+        return False
+
+    # Check whether every changed line matches a safe pattern
+    for line in changed_lines:
+        stripped = line.strip()
+        # Blank lines are always safe
+        if not stripped:
+            continue
+        safe = any(pat.match(stripped) for pat in _SETUP_PY_SAFE_PATTERNS)
+        if not safe:
+            log.info("setup.py: impactful line detected: %r", line)
+            return True
+
+    log.info("setup.py: all %d changed lines are non-impactful "
+             "(parallelism/comments only)", len(changed_lines))
+    return False
+
+
+def check_conditional_impact_files(D: List[str]) -> Optional[str]:
+    """Check files in D that need fine-grained analysis.
+
+    Returns the label/path of the first file with real impact, or None if
+    all conditional-impact files pass the fine-grained check.
+    """
+    for p in D:
+        if p in CONDITIONAL_IMPACT_FILES:
+            if p == "setup.py":
+                if _setup_py_has_real_impact():
+                    return "setup.py (substantive change)"
+                else:
+                    log.info("setup.py changed but only non-impactful "
+                             "modifications (e.g. parallelism) -> skipping "
+                             "full fallback")
     return None
 
 
@@ -941,6 +1044,13 @@ def main() -> int:
         for p, label in hit_global:
             log.warning("  * %s (pattern: %s)", p, label)
         return _emit_full("global-impact hit")
+
+    # Step 2b: conditional-impact check (fine-grained diff analysis)
+    conditional_hit = check_conditional_impact_files(D)
+    if conditional_hit:
+        log.warning("CONDITIONAL IMPACT file has real changes: %s",
+                    conditional_hit)
+        return _emit_full(f"conditional-impact: {conditional_hit}")
 
     # Step 3: classify D
     top_src_dirs, direct_tests, touched_hpc_modules, ignored = \

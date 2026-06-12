@@ -85,7 +85,7 @@ class CMakeBuild(build_ext):
         subprocess.check_call(
             ["cmake", ext.sourcedir] + cmake_args, cwd=build_temp_dir, env=cmake_env
         )
-        parallel = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL", "8")
+        parallel = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL", "16")
         subprocess.check_call(
             ["cmake", "--build", ".", "--config", "Release", f"-j{parallel}"], cwd=build_temp_dir
         )
