@@ -22,15 +22,67 @@ def _act_mul_and_quant(gate_up, scale):
     return outfp8
 
 
-def gt_masked_act_mul_and_quant(gate_up, scale, num_per_expert):
+def gt_masked_act_mul_and_quant(gate_up, scale, num_per_expert, use_bf16_mul=True):
 
     def silu(x):
         return x / (1 + (-x).exp())
 
     gate, up = torch.chunk(gate_up.float(), 2, dim=1)
-    out = silu(gate) * up * scale
+    if use_bf16_mul:
+        out = (silu(gate).to(torch.bfloat16) * up.to(torch.bfloat16)).to(torch.float32) * scale
+    else:
+        out = silu(gate) * up * scale
     outfp8 = out.to(torch.float8_e4m3fn)
     return outfp8
+
+
+def _check_masked(
+    num_expert,
+    num_max_tokens_per_expert,
+    num_intermediate_size,
+    num_per_expert,
+    use_bf16_mul=True,
+    seed=0,
+):
+    """Run the kernel and compare against the reference on the valid (non-pad) rows.
+
+    avg/max hints are derived from num_per_expert, mirroring what the router
+    feeds in alongside the gate_up GEMM.
+    """
+    num_tokens = num_expert * num_max_tokens_per_expert
+    torch.manual_seed(seed)
+    gate_up = torch.randn(
+        (num_tokens, num_intermediate_size * 2), dtype=torch.bfloat16, device="cuda"
+    )
+    scale = torch.randn((1,), dtype=torch.float32, device="cuda")
+    output = torch.empty(
+        (num_tokens, num_intermediate_size), dtype=torch.float8_e4m3fn, device="cuda"
+    )
+
+    avg_hint = max(1, int(num_per_expert.float().mean().item()))
+    max_hint = int(num_per_expert.max().item())
+    my = hpc.masked_act_mul_and_quant(
+        gate_up,
+        scale,
+        num_per_expert,
+        avg_hint,
+        output=output,
+        use_bf16_mul=use_bf16_mul,
+        num_seq_per_group_max=max_hint,
+    )
+    gt = gt_masked_act_mul_and_quant(gate_up, scale, num_per_expert, use_bf16_mul=use_bf16_mul)
+
+    assert my.device == gt.device and my.dtype == gt.dtype and my.shape == gt.shape
+
+    idx = torch.arange(num_tokens, device="cuda")
+    keep = (idx % num_max_tokens_per_expert) < num_per_expert[idx // num_max_tokens_per_expert]
+    gt = gt.to(torch.float)
+    my = my.to(torch.float)
+    gt[~keep] = 0.0
+    my[~keep] = 0.0
+
+    atol = 0.15 if use_bf16_mul else 0.05
+    assert allclose(gt.to(torch.float32), my.to(torch.float32), atol=atol, rtol=0.0125)
 
 
 @pytest.mark.parametrize("num_batch", [128 * 1024])
@@ -57,15 +109,6 @@ def test_act_mul_and_quant(num_batch, intermediate_size, use_output):
 @pytest.mark.parametrize("num_max_tokens_per_expert", [336])
 @pytest.mark.parametrize("num_intermediate_size", [2048])
 def test_masked_act_mul_and_quant(num_expert, num_max_tokens_per_expert, num_intermediate_size):
-
-    num_tokens = num_expert * num_max_tokens_per_expert
-
-    gate_up_out = torch.randn(
-        (num_tokens, num_intermediate_size * 2), dtype=torch.bfloat16, device="cuda"
-    )
-
-    scale = torch.randn((1,), dtype=torch.float32, device="cuda")
-
     num_per_expert = torch.tensor(
         [
             4,
@@ -104,34 +147,83 @@ def test_masked_act_mul_and_quant(num_expert, num_max_tokens_per_expert, num_int
         dtype=torch.int32,
         device="cuda",
     )
+    _check_masked(num_expert, num_max_tokens_per_expert, num_intermediate_size, num_per_expert)
 
-    output = torch.empty((num_tokens, num_intermediate_size), device="cuda").to(
-        dtype=torch.float8_e4m3fn
+
+# Sweep shapes and fill levels with a uniform num_per_expert, exercising both
+# the bf16 and fp32 multiply specialisations.
+@pytest.mark.parametrize("num_expert", [32, 128])
+@pytest.mark.parametrize("num_max_tokens_per_expert", [16, 256, 1024])
+@pytest.mark.parametrize("num_intermediate_size", [192, 256, 512, 1024, 2048])
+@pytest.mark.parametrize("fill", [0.5, 1.0])
+@pytest.mark.parametrize("use_bf16_mul", [True, False])
+def test_masked_act_mul_and_quant_uniform(
+    num_expert,
+    num_max_tokens_per_expert,
+    num_intermediate_size,
+    fill,
+    use_bf16_mul,
+):
+    n = max(1, int(num_max_tokens_per_expert * fill))
+    num_per_expert = torch.full((num_expert,), n, dtype=torch.int32, device="cuda")
+    _check_masked(
+        num_expert,
+        num_max_tokens_per_expert,
+        num_intermediate_size,
+        num_per_expert,
+        use_bf16_mul=use_bf16_mul,
+        seed=7,
     )
-    my = hpc.masked_act_mul_and_quant(gate_up_out, scale, num_per_expert, output=output)
-    gt = gt_masked_act_mul_and_quant(gate_up_out, scale, num_per_expert)
 
-    assert gt.device == my.device
-    assert gt.dtype == my.dtype
-    assert gt.shape == my.shape
 
-    # zero out the unmasked data
-    idx = torch.arange(num_tokens, device="cuda")
-    iexpert = idx // num_max_tokens_per_expert
-    itoken = idx % num_max_tokens_per_expert
+# Decode-time MoE has num_per_expert << num_max_tokens_per_expert, so most rows
+# are padding.  Covers uniform-low, irregular, and half-experts-empty patterns.
+@pytest.mark.parametrize("num_expert", [32, 128])
+@pytest.mark.parametrize("num_max_tokens_per_expert", [256, 1024])
+@pytest.mark.parametrize("num_intermediate_size", [192, 256, 512])
+@pytest.mark.parametrize("fill_strategy", ["uniform_low", "irregular", "zero_some"])
+def test_masked_act_mul_and_quant_sparse_fill(
+    num_expert,
+    num_max_tokens_per_expert,
+    num_intermediate_size,
+    fill_strategy,
+):
+    torch.manual_seed(13)
+    if fill_strategy == "uniform_low":
+        n = max(1, num_max_tokens_per_expert // 20)
+        num_per_expert = torch.full((num_expert,), n, dtype=torch.int32, device="cuda")
+    elif fill_strategy == "irregular":
+        torch.manual_seed(42)
+        num_per_expert = torch.randint(
+            1,
+            max(2, num_max_tokens_per_expert // 8 + 1),
+            (num_expert,),
+            dtype=torch.int32,
+            device="cuda",
+        )
+    else:  # zero_some: half the experts skipped by the router
+        n = max(1, num_max_tokens_per_expert // 10)
+        num_per_expert = torch.zeros((num_expert,), dtype=torch.int32, device="cuda")
+        num_per_expert[::2] = n
+    _check_masked(
+        num_expert, num_max_tokens_per_expert, num_intermediate_size, num_per_expert, seed=13
+    )
 
-    keep = itoken < num_per_expert[iexpert]
 
-    gt = gt.to(torch.float)
-    my = my.to(torch.float)
+# Production decode shape (E=12, C=1536, padded to 192*16), balanced low fill.
+@pytest.mark.parametrize("t_real", [8, 40, 48])
+@pytest.mark.parametrize("use_bf16_mul", [True, False])
+def test_masked_act_mul_and_quant_sparse_hint_true_case(t_real, use_bf16_mul):
+    num_per_expert = torch.full((12,), t_real, dtype=torch.int32, device="cuda")
+    _check_masked(12, 192 * 16, 1536, num_per_expert, use_bf16_mul=use_bf16_mul, seed=31 + t_real)
 
-    gt[~keep] = 0.0
-    my[~keep] = 0.0
 
-    print(gt)
-    print(my)
-
-    assert allclose(gt.to(torch.float32), my.to(torch.float32), atol=0.15, rtol=0.0125)
+# Skewed routing: one heavy expert, the rest empty.  The max hint must not break
+# correctness -- num_per_expert stays the source of truth for valid rows.
+def test_masked_act_mul_and_quant_sparse_hint_skew_max_guard():
+    num_per_expert = torch.zeros((128,), dtype=torch.int32, device="cuda")
+    num_per_expert[0] = 512
+    _check_masked(128, 1024, 512, num_per_expert, seed=43)
 
 
 def gt_masked_act_mul_and_blockwise_quant(gate_up, num_per_expert):

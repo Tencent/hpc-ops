@@ -50,7 +50,9 @@ torch::Tensor act_mul_and_quant_entry(const torch::Tensor &input, const torch::T
 
 torch::Tensor masked_act_mul_and_quant_entry(const torch::Tensor &input, torch::Tensor &scale,
                                              const torch::Tensor &num_per_expert,
-                                             std::optional<torch::Tensor> output) {
+                                             int64_t num_seq_per_group_avg,
+                                             std::optional<torch::Tensor> output, bool use_bf16_mul,
+                                             int64_t num_seq_per_group_max) {
   auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
   TORCH_CHECK(input.is_contiguous(), "input tensor must be contiguous");
@@ -87,13 +89,21 @@ torch::Tensor masked_act_mul_and_quant_entry(const torch::Tensor &input, torch::
 
   int num_experts = num_per_expert.size(0);
   int num_total_tokens = input.size(0);
+
+  // Empty-input guard: avoid integer divide-by-zero below and
+  // avoid a `dim3 grid(0)` launch in the kernel dispatcher.
+  if (num_experts <= 0 || num_total_tokens <= 0) {
+    return output_tensor;
+  }
+
   int num_tokens_per_expert = num_total_tokens / num_experts;
 
   int num_intermediate_size = input.size(1) / 2;
 
   masked_act_mul_and_quant_async(output_ptr, input_ptr, scale_ptr, num_per_expert_ptr,
                                  num_total_tokens, num_intermediate_size, num_tokens_per_expert,
-                                 stream);
+                                 use_bf16_mul, static_cast<int>(num_seq_per_group_avg),
+                                 static_cast<int>(num_seq_per_group_max), stream);
 
   return output_tensor;
 }
@@ -199,8 +209,9 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "(Tensor)");
   m.impl("act_mul_and_quant", torch::kCUDA, &hpc::activation::act_mul_and_quant_entry);
   m.def(
-      "masked_act_mul_and_quant(Tensor input, Tensor scale, Tensor num_per_expert, Tensor? output) "
-      "-> (Tensor)");
+      "masked_act_mul_and_quant(Tensor input, Tensor scale, Tensor num_per_expert, "
+      "int num_seq_per_group_avg, Tensor? output=None, bool use_bf16_mul=True, "
+      "int num_seq_per_group_max=-1) -> (Tensor)");
   m.impl("masked_act_mul_and_quant", torch::kCUDA,
          &hpc::activation::masked_act_mul_and_quant_entry);
   m.def(

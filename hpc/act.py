@@ -34,7 +34,13 @@ def act_mul_and_quant(
 
 
 def masked_act_mul_and_quant(
-    gate_up: Tensor, scale: Tensor, num_per_expert: Tensor, output: Optional[Tensor] = None
+    gate_up: Tensor,
+    scale: Tensor,
+    num_per_expert: Tensor,
+    num_seq_per_group_avg: int,
+    output: Optional[Tensor] = None,
+    use_bf16_mul: bool = True,
+    num_seq_per_group_max: int = -1,
 ) -> Tensor:
     """Applies activation, multiplication, and quantization to the gate_up projection.
 
@@ -57,13 +63,32 @@ def masked_act_mul_and_quant(
       num_per_expert: Real num tokens of per expert
           Shape: [num_expert, ]
           Dtype: int32
+      num_seq_per_group_avg: Average number of real tokens per expert, produced
+          alongside the gate_up GEMM by the router. Sizes the persistent grid to
+          the real work instead of the padded shape; must be positive.
+      output: Optional pre-allocated output tensor.
+      use_bf16_mul: when True (default), the silu(gate)*up multiply runs at
+          bf16 precision (faster, slight accuracy loss); when False, the
+          multiply runs at fp32. Mirrors the same flag on `act_mul_and_quant`.
+      num_seq_per_group_max: Optional routing hint: maximum number of real
+          tokens in any expert. When greater than the average it signals a
+          skewed distribution and widens the persistent layout for heavy
+          experts. Defaults to -1 (assume balanced).
 
     Returns:
       Quantized output tensor.
           Shape: [N, C]
           Dtype: fp8_e4m3
     """
-    return torch.ops.hpc.masked_act_mul_and_quant(gate_up, scale, num_per_expert, output)
+    return torch.ops.hpc.masked_act_mul_and_quant(
+        gate_up,
+        scale,
+        num_per_expert,
+        num_seq_per_group_avg,
+        output,
+        use_bf16_mul,
+        num_seq_per_group_max,
+    )
 
 
 def masked_act_mul_and_blockwise_quant(
@@ -141,7 +166,15 @@ def act_mul_and_quant_fake(input, scale, use_bf16_mul, output):
 
 
 @torch.library.register_fake("hpc::masked_act_mul_and_quant")
-def masked_act_mul_and_quant_fake(input, scale, num_per_expert, output=None):
+def masked_act_mul_and_quant_fake(
+    input,
+    scale,
+    num_per_expert,
+    num_seq_per_group_avg,
+    output=None,
+    use_bf16_mul=True,
+    num_seq_per_group_max=-1,
+):
     return torch.empty(
         input.shape[0], input.shape[1] // 2, dtype=torch.float8_e4m3fn, device=input.device
     )
