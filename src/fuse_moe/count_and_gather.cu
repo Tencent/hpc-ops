@@ -663,7 +663,16 @@ void count_and_gather_bf16_async(void *gate_up_input_ptr, void *gate_up_output_p
   using Tin = cute::bfloat16_t;
   using Tout = cute::bfloat16_t;
   constexpr bool kUsePDL = true;
-  if (num_seq_per_group_avg <= 16) {
+  if (num_seq_per_group_avg <= 8) {
+    constexpr int kTileM = 8;
+    constexpr int kStage = 8;
+    launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, kTileK,
+                            /*kUseW4Mma=*/false, /*kDownXForceSW128=*/true>(
+        gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
+        topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
+        cu_tiles_ptr, nullptr, nullptr, num_seq, hidden_size, intermediate_size, num_topk,
+        num_expert, eprank, num_seq_per_group_avg, stream);
+  } else if (num_seq_per_group_avg <= 16) {
     constexpr int kTileM = 16;
     constexpr int kStage = 8;
     launch_count_and_gather<Tin, Tout, kTileM, kTileN, kTileK, kStage, kUsePDL, kTileK,

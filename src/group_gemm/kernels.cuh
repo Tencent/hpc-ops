@@ -1156,8 +1156,9 @@ __global__ void __launch_bounds__(384, 1)
       // Epilogue
       auto sCT =
           make_tensor(make_smem_ptr(reinterpret_cast<Tout *>(shm_c)), SLayoutCT{});  // (M, N)
-      using R2SCopyAtomC = Copy_Atom<cute::SM90_U16x8_STSM_T, Tout>;
-      // using R2SCopyAtomC = Copy_Atom<cute::SM90_U16x4_STSM_T, Tout>;
+      using STSM_ATOM =
+          std::conditional_t<kTileM == 8, cute::SM90_U16x4_STSM_T, cute::SM90_U16x8_STSM_T>;
+      using R2SCopyAtomC = Copy_Atom<STSM_ATOM, Tout>;
       auto tiled_copy_c = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);
       auto thr_copy_c = tiled_copy_c.get_slice(idx);
 

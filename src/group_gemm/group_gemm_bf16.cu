@@ -165,7 +165,14 @@ void group_gemm_bf16_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
   constexpr int kSwizzleX = 128;
   constexpr int kSwizzleW = 128;
   constexpr int kSwizzleY = 64;
-  if (num_seq_per_group_avg <= 16) {
+    if (num_seq_per_group_avg <= 8) {
+    constexpr int kTileM = 8;
+    constexpr int kStage = 8;
+    launch_group_gemm_bf16<kTileM, kTileN, kTileK, kStage, kWarpgroupM, kWarpgroupN, kSwizzleX,
+                          kSwizzleW, kSwizzleY>(y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr,
+                                                tmas_ptr, tiles_ptr, cu_tiles_ptr,
+                                                num_group, m, n, k, update_tma, use_pdl, stream);
+  } else if (num_seq_per_group_avg <= 16) {
     constexpr int kTileM = 16;
     constexpr int kStage = 8;
     launch_group_gemm_bf16<kTileM, kTileN, kTileK, kStage, kWarpgroupM, kWarpgroupN, kSwizzleX,
