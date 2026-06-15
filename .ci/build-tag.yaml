@@ -23,6 +23,7 @@ stages:
       name: torch290+cu129+sm90
       runs-on:
         pool-name: docker
+        hw-spec: Standard-M
         container:
           image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.0
       steps:
@@ -39,6 +40,7 @@ stages:
             set -xe
             cd ${{ci.workspace}}
             tar -cvf code.tar.gz ./
+            cat /sys/fs/cgroup/memory/memory.limit_in_bytes
       - name: upload-code.tar.gz
         id: ""
         uses: UploadArtifactory@8.*
@@ -79,6 +81,7 @@ stages:
       name: torch2100+cu129+sm90
       runs-on:
         pool-name: docker
+        hw-spec: Standard-M
         container:
           image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.2
       steps:
@@ -121,6 +124,7 @@ stages:
       name: torch2100+cu130+sm90
       runs-on:
         pool-name: docker
+        hw-spec: Standard-M
         container:
           image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.3
       steps:
@@ -163,6 +167,7 @@ stages:
       name: torch2100+cu130+sm100
       runs-on:
         pool-name: docker
+        hw-spec: Standard-M
         container:
           image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.3
       steps:
@@ -205,6 +210,7 @@ stages:
       name: Compile torch2100 cuda13.0 multi-arch
       runs-on:
         pool-name: docker
+        hw-spec: Standard-M
         container:
           image: mirrors.tencent.com/hunyuan_infer/text2text_base:H-1.7.3
       steps:
