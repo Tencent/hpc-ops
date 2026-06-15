@@ -121,6 +121,7 @@ void fuse_moe_bf16_async(
     void *down_output_ptr, const void *down_weight_ptr, void *down_tmas_ptr,
     const void *topk_ids_ptr, const void *topk_scale_ptr, void *topk_pos_ptr, void *seqlens_ptr,
     void *cu_seqlens_ptr, void *tiles_ptr, void *cu_tiles_ptr, const void *shared_output_ptr,
+    void *gateup_task_map_ptr, void *down_task_map_ptr, int num_gateup_waves, int num_down_waves,
     int num_seq, int hidden_size, int intermediate_size, int num_topk, int num_expert_total,
     int num_expert_local, int rank_ep, cudaStream_t stream) {
   int total_num_seq = num_seq * num_topk;
@@ -129,17 +130,19 @@ void fuse_moe_bf16_async(
 
   bool use_pdl = true;
 
-  // 0. call count_and_gather_bf16_async (fills TMA descriptors for bf16 group gemm)
+  // 0. call count_and_gather_bf16_async (fills TMA descriptors + task maps for bf16 group gemm)
   count_and_gather_bf16_async(gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr,
                               input_ptr, topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr,
-                              gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr, cu_tiles_ptr, num_seq,
-                              hidden_size, intermediate_size, num_topk, num_expert_local, rank_ep,
+                              gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr, cu_tiles_ptr,
+                              gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+                              intermediate_size, num_topk, num_expert_local, rank_ep,
                               num_seq_per_group_avg, stream);
 
   // 1. call gate_up linear (bf16), TMA descriptors pre-filled by count_and_gather_bf16_async
   group_gemm::group_gemm_bf16_async(
       gate_up_output_ptr, gate_up_input_ptr, gate_up_weight_ptr, seqlens_ptr, cu_seqlens_ptr,
-      gate_up_tmas_ptr, tiles_ptr, cu_tiles_ptr, num_expert_local, total_num_seq,
+      gate_up_tmas_ptr, tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr, num_gateup_waves,
+      num_expert_local, total_num_seq,
       intermediate_size, hidden_size, num_seq_per_group_avg, false, use_pdl, stream);
 
   // 2. call act and mul (bf16 activation)
@@ -152,7 +155,8 @@ void fuse_moe_bf16_async(
   // 3. call down linear (bf16), TMA descriptors pre-filled by count_and_gather_bf16_async
   group_gemm::group_gemm_bf16_async(
       down_output_ptr, down_input_ptr, down_weight_ptr, seqlens_ptr, cu_seqlens_ptr,
-      down_tmas_ptr, tiles_ptr, cu_tiles_ptr, num_expert_local, total_num_seq, hidden_size,
+      down_tmas_ptr, tiles_ptr, cu_tiles_ptr, down_task_map_ptr, num_down_waves, num_expert_local,
+      total_num_seq, hidden_size,
       intermediate_size / 2, num_seq_per_group_avg, false, use_pdl, stream);
 
   // 4. call reduce

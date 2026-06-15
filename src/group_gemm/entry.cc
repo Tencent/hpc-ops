@@ -172,7 +172,8 @@ torch::Tensor group_gemm_bf16_entry(const torch::Tensor &x, const torch::Tensor 
                                              const torch::Tensor &cu_seqlens,
                                              const int64_t num_seq_per_group_avg,
                                              std::optional<torch::Tensor> output,
-                                             std::optional<torch::Tensor> tma_desc) {
+                                             std::optional<torch::Tensor> tma_desc,
+                                             std::optional<torch::Tensor> task_map_workspace) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
   TORCH_CHECK(weight.device().is_cuda(), "weight tensor must be cuda");
@@ -206,6 +207,13 @@ torch::Tensor group_gemm_bf16_entry(const torch::Tensor &x, const torch::Tensor 
     tmas = torch::empty({num_group * 2, 128}, options);
   }
 
+  int num_waves = 0;
+  void *task_map_ptr = nullptr;
+  if (num_seq_per_group_avg <= 8 && update_tma && task_map_workspace.has_value()) {
+    num_waves = task_map_workspace.value().size(0);
+    task_map_ptr = task_map_workspace.value().mutable_data_ptr();
+  }
+
   torch::Tensor tiles = torch::empty({num_group}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({num_group + 1}, options.dtype(torch::kInt32));
 
@@ -220,7 +228,8 @@ torch::Tensor group_gemm_bf16_entry(const torch::Tensor &x, const torch::Tensor 
   auto *cu_tiles_ptr = cu_tiles.mutable_data_ptr();
 
   group_gemm_bf16_async(y_ptr, x_ptr, weight_ptr, seqlens_ptr, cu_seqlens_ptr,
-                                 tmas_ptr, tiles_ptr, cu_tiles_ptr, num_group, m, n, k,
+                                 tmas_ptr, tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves,
+                                 num_group, m, n, k,
                                  num_seq_per_group_avg, update_tma, false, stream);
 
   return y;
@@ -297,7 +306,8 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 
   m.def(
       "group_gemm_bf16(Tensor x, Tensor weight, Tensor seqlens, Tensor cu_seqlens, "
-      "int num_seq_per_group_avg, Tensor? output, Tensor? tma_desc) -> (Tensor)");
+      "int num_seq_per_group_avg, Tensor? output, Tensor? tma_desc, Tensor? task_map_workspace) -> "
+      "(Tensor)");
   m.impl("group_gemm_bf16", torch::kCUDA,
          &hpc::group_gemm::group_gemm_bf16_entry);
 

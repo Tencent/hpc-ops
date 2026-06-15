@@ -707,6 +707,43 @@ torch::Tensor fuse_moe_bf16_entry(
   torch::Tensor tiles = torch::empty({num_expert}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
 
+  // For very small m-per-group the bf16 group GEMM uses kTileM=8 + the persistent
+  // task map (policy 0). Size the per-expert tile padding the same way the GEMM
+  // buckets pick kTileM, so the task map workspace is large enough.
+  int num_tokens_per_group_avg = num_seq * num_topk / num_expert_total;
+  int aligned_size = 0;
+  if (num_tokens_per_group_avg <= 8) {
+    aligned_size = 8;
+  } else if (num_tokens_per_group_avg <= 16) {
+    aligned_size = 16;
+  } else if (num_tokens_per_group_avg <= 32) {
+    aligned_size = 32;
+  } else if (num_tokens_per_group_avg <= 48) {
+    aligned_size = 48;
+  } else {
+    aligned_size = 64;
+  }
+
+  int num_sm = get_sm_count();
+  constexpr int kTileN = 128;
+  int num_gateup_tiles = ((num_seq + aligned_size - 1) / aligned_size) *
+                         ((intermediate_size + kTileN - 1) / kTileN) * num_expert;
+  int num_down_tiles = ((num_seq + aligned_size - 1) / aligned_size) *
+                       ((hidden_size + kTileN - 1) / kTileN) * num_expert;
+  int num_gateup_waves = (num_gateup_tiles + num_sm - 1) / num_sm + 1;
+  int num_down_waves = (num_down_tiles + num_sm - 1) / num_sm + 1;
+  torch::Tensor gateup_task_map;
+  torch::Tensor down_task_map;
+  void *gateup_task_map_ptr = nullptr;
+  void *down_task_map_ptr = nullptr;
+
+  if (num_tokens_per_group_avg <= 8) {
+    gateup_task_map = torch::empty({num_gateup_waves, num_sm, 4}, options.dtype(torch::kInt32));
+    gateup_task_map_ptr = gateup_task_map.mutable_data_ptr();
+    down_task_map = torch::empty({num_down_waves, num_sm, 4}, options.dtype(torch::kInt32));
+    down_task_map_ptr = down_task_map.mutable_data_ptr();
+  }
+
   const auto *x_ptr = x.const_data_ptr();
   const auto *topk_ids_ptr = topk_ids.const_data_ptr();
   const auto *topk_scale_ptr = topk_scale.const_data_ptr();
@@ -730,7 +767,8 @@ torch::Tensor fuse_moe_bf16_entry(
       y_ptr, x_ptr, gate_up_input_ptr, gate_up_output_ptr, gate_up_weight_ptr, gate_up_tmas_ptr,
       down_input_ptr, down_output_ptr, down_weight_ptr, down_tmas_ptr,
       topk_ids_ptr, topk_scale_ptr, topk_pos_ptr, seqlens_ptr,
-      cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr, shared_output_ptr, num_seq, hidden_size,
+      cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr, shared_output_ptr, gateup_task_map_ptr,
+      down_task_map_ptr, num_gateup_waves, num_down_waves, num_seq, hidden_size,
       intermediate_size, num_topk, num_expert_total, num_expert, rank_ep, stream);
 
   return y;

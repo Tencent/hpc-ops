@@ -655,7 +655,8 @@ void count_and_gather_bf16_async(void *gate_up_input_ptr, void *gate_up_output_p
                                  void *down_input_ptr, void *down_output_ptr, const void *x_ptr,
                                  const void *topk_ids_ptr, void *topk_pos_ptr, void *seqlens_ptr,
                                  void *cu_seqlens_ptr, void *gate_up_tmas_ptr, void *down_tmas_ptr,
-                                 void *tiles_ptr, void *cu_tiles_ptr, int num_seq, int hidden_size,
+                                 void *tiles_ptr, void *cu_tiles_ptr, void *gateup_task_map_ptr,
+                                 void *down_task_map_ptr, int num_seq, int hidden_size,
                                  int intermediate_size, int num_topk, int num_expert, int eprank,
                                  int num_seq_per_group_avg, cudaStream_t stream) {
   constexpr int kTileN = 128;
@@ -670,8 +671,8 @@ void count_and_gather_bf16_async(void *gate_up_input_ptr, void *gate_up_output_p
                             /*kUseW4Mma=*/false, /*kDownXForceSW128=*/true>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
-        cu_tiles_ptr, nullptr, nullptr, num_seq, hidden_size, intermediate_size, num_topk,
-        num_expert, eprank, num_seq_per_group_avg, stream);
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
   } else if (num_seq_per_group_avg <= 16) {
     constexpr int kTileM = 16;
     constexpr int kStage = 8;
@@ -679,8 +680,8 @@ void count_and_gather_bf16_async(void *gate_up_input_ptr, void *gate_up_output_p
                             /*kUseW4Mma=*/false, /*kDownXForceSW128=*/true>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
-        cu_tiles_ptr, nullptr, nullptr, num_seq, hidden_size, intermediate_size, num_topk,
-        num_expert, eprank, num_seq_per_group_avg, stream);
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
   } else if (num_seq_per_group_avg <= 32) {
     constexpr int kTileM = 32;
     constexpr int kStage = 8;
@@ -688,8 +689,8 @@ void count_and_gather_bf16_async(void *gate_up_input_ptr, void *gate_up_output_p
                             /*kUseW4Mma=*/false, /*kDownXForceSW128=*/true>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
-        cu_tiles_ptr, nullptr, nullptr, num_seq, hidden_size, intermediate_size, num_topk,
-        num_expert, eprank, num_seq_per_group_avg, stream);
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
   } else if (num_seq_per_group_avg <= 48) {
     constexpr int kTileM = 48;
     constexpr int kStage = 8;
@@ -697,8 +698,8 @@ void count_and_gather_bf16_async(void *gate_up_input_ptr, void *gate_up_output_p
                             /*kUseW4Mma=*/false, /*kDownXForceSW128=*/true>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
-        cu_tiles_ptr, nullptr, nullptr, num_seq, hidden_size, intermediate_size, num_topk,
-        num_expert, eprank, num_seq_per_group_avg, stream);
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
   } else {
     constexpr int kTileM = 64;
     constexpr int kStage = 8;
@@ -706,8 +707,8 @@ void count_and_gather_bf16_async(void *gate_up_input_ptr, void *gate_up_output_p
                             /*kUseW4Mma=*/false, /*kDownXForceSW128=*/true>(
         gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, x_ptr, topk_ids_ptr,
         topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr, gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr,
-        cu_tiles_ptr, nullptr, nullptr, num_seq, hidden_size, intermediate_size, num_topk,
-        num_expert, eprank, num_seq_per_group_avg, stream);
+        cu_tiles_ptr, gateup_task_map_ptr, down_task_map_ptr, num_seq, hidden_size,
+        intermediate_size, num_topk, num_expert, eprank, num_seq_per_group_avg, stream);
   }
 }
 

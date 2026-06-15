@@ -891,13 +891,13 @@ __global__ void __launch_bounds__(384, 1)
   }
 }
 
-template <typename Config, typename TmaA, typename TmaB, typename TmaD, bool IsLoopH,
+template <typename Config, typename TmaA, typename TmaB, typename TmaD, int kTaskLoopPolicy,
           bool kUsePDL = false>
 __global__ void __launch_bounds__(384, 1)
     group_gemm_bf16_kernel(const __grid_constant__ TmaB tma_b, cute::TmaDescriptor *td_xy,
                                     int *seqlens_ptr, int *tiles_ptr,
-                                    int *cu_tiles_ptr, int num_group, int m, int n, int k,
-                                    cutlass::FastDivmod flat_divider) {
+                                    int *cu_tiles_ptr, int4 *task_map_ptr, int num_group, int m,
+                                    int n, int k, cutlass::FastDivmod flat_divider) {
   using namespace cute;  // NOLINT
 
   using Tin = typename Config::Tin;
@@ -915,6 +915,7 @@ __global__ void __launch_bounds__(384, 1)
   int idx = threadIdx.x;
 
   int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
+  int ilane = idx % 32;
   int elected = cute::elect_one_sync();
   bool is_leader_in_block = (iwarp == 0) && elected;
   bool is_leader_in_warpgroup = ((iwarp % 4) == 0) && elected;
@@ -926,7 +927,9 @@ __global__ void __launch_bounds__(384, 1)
   auto *shm_a = reinterpret_cast<Tin *>(shm_data);
   auto *shm_b = shm_a + cosize(SLayoutA{});
   auto *shm_c = reinterpret_cast<Tout *>(shm_b + cosize(SLayoutB{}));
-  int *shm_tiles = reinterpret_cast<int *>(shm_c + cosize(SLayoutCT{}));
+
+  using Ttask = std::conditional_t<kTaskLoopPolicy == 0, int4, int>;
+  Ttask *shm_tiles = reinterpret_cast<Ttask *>(shm_c + cosize(SLayoutCT{}));
 
   TmaA tma_a;
   TmaD tma_d;
@@ -981,7 +984,25 @@ __global__ void __launch_bounds__(384, 1)
     return;
   }
 
-  if constexpr (IsLoopH) {
+  if constexpr (kTaskLoopPolicy == 0) {
+    // Persistent task map: each block walks the flat tile array with a stride
+    // of gridDim.x and stages its tasks into shm_tiles (one int4 per wave).
+    int warp_count = blockDim.x / 32;
+    int iwarp_block = blockIdx.x + gridDim.x * iwarp;
+    int actual_tiles = total_m * num_tile_n + gridDim.x;
+    int iwave = 0;
+    while (iwarp_block < actual_tiles) {
+      int4 task = task_map_ptr[iwarp_block];
+      if (ilane == 0) {
+        shm_tiles[iwave * warp_count + iwarp] = task;
+      }
+      if (task.z < 0) {
+        break;
+      }
+      iwarp_block += gridDim.x * warp_count;
+      iwave++;
+    }
+  } else if constexpr (kTaskLoopPolicy == 1) {
     for (int i = idx; i < num_group; i += blockDim.x) {
       shm_tiles[i] = tiles_ptr[i];
     }
@@ -1014,8 +1035,18 @@ __global__ void __launch_bounds__(384, 1)
       int igroup = 0;
       int sum_tile_m = 0;
       int itile_m, itile_n;
+      int iwave = 0;
       while (true) {
-        if constexpr (IsLoopH) {
+        if constexpr (kTaskLoopPolicy == 0) {
+          int4 task = shm_tiles[iwave];
+          itile_m = task.x;
+          itile_n = task.y;
+          igroup = task.z;
+          if (igroup < 0) {
+            break;
+          }
+          iwave++;
+        } else if constexpr (kTaskLoopPolicy == 1) {
           get_next_tile_horizon(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, sum_tile_m,
                                 flat_divider);
           if (igroup < 0) {
@@ -1081,8 +1112,18 @@ __global__ void __launch_bounds__(384, 1)
     int igroup = 0;
     int sum_tile_m = 0;
     int itile_m, itile_n;
+    int iwave = 0;
     while (true) {
-      if constexpr (IsLoopH) {
+      if constexpr (kTaskLoopPolicy == 0) {
+        int4 task = shm_tiles[iwave];
+        itile_m = task.x;
+        itile_n = task.y;
+        igroup = task.z;
+        if (igroup < 0) {
+          break;
+        }
+        iwave++;
+      } else if constexpr (kTaskLoopPolicy == 1) {
         get_next_tile_horizon(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, sum_tile_m,
                               flat_divider);
         if (igroup < 0) {
