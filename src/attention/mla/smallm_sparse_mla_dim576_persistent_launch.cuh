@@ -163,11 +163,14 @@ void launch_sparse_dim576_persistent(void* y_ptr, const void* q_ptr, const void*
     constexpr int kVChunk = decltype(v_chunk_tag)::value;
     constexpr int kMaxSplits = kDim576PersistentMaxNumSm;
     static_assert(kTileV % kVChunk == 0, "kTileV must be a multiple of kVChunk");
-    dim3 combine_grid(total_seq_q, num_head_q, v_dim / kVChunk);
-    dim3 combine_block(32);
-    auto combine_kernel =
-        kernels::attention_mla_dim576_persistent_combine_kernel<__nv_bfloat16, kVChunk, kMaxSplits,
-                                                                kUseSink, /*kUsePDL=*/true>;
+
+    constexpr int kNumVChunks = kTileV / kVChunk;
+    constexpr int kWarpsPerBlock = (kNumVChunks % 4 == 0) ? 4 : (kNumVChunks % 2 == 0) ? 2 : 1;
+    int v_chunks = v_dim / kVChunk;
+    dim3 combine_grid(total_seq_q, num_head_q, v_chunks / kWarpsPerBlock);
+    dim3 combine_block(32 * kWarpsPerBlock);
+    auto combine_kernel = kernels::attention_mla_dim576_persistent_combine_kernel<
+        __nv_bfloat16, kVChunk, kMaxSplits, kUseSink, /*kUsePDL=*/true, kWarpsPerBlock>;
     cudaLaunchConfig_t combine_cfg{};
     combine_cfg.gridDim = combine_grid;
     combine_cfg.blockDim = combine_block;

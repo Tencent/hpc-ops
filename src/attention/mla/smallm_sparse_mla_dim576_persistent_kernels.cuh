@@ -57,6 +57,8 @@ __global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1)
   __shared__ uint64_t q_writable;
   __shared__ uint64_t kv_writable[kStage];
   __shared__ uint64_t kv_readable[kStage];
+  // Ping-pong turn tokens for the two math WGs (kNumMathWG==2)
+  __shared__ uint64_t pp_turn[2];
   __shared__ int shm_task_start;
   __shared__ int shm_task_end;
   __shared__ int shm_kv_offset[kStage][kTileN];
@@ -104,6 +106,10 @@ __global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1)
       initialize_barrier(kv_writable[istage], kConsumers);
       // 128 producer threads each call cpasync_barrier_arrive_noinc once per stage.
       initialize_barrier(kv_readable[istage], 128);
+    }
+    if (kNumMathWG == 2) {
+      initialize_barrier(pp_turn[0], 1);
+      initialize_barrier(pp_turn[1], 1);
     }
   }
 
@@ -328,6 +334,24 @@ __global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1)
     int kv_phase = 0;
     int kv_istage = 0;
 
+    int pp_phase = (iwarpgroup == 0) ? 1 : 0;
+
+    // order_wait: block until this WG owns the tensor-core turn.
+    // order_arrive: release the partner WG into its tensor-core region.
+    auto order_wait = [&]() {
+      if constexpr (kNumMathWG == 2) {
+        wait_barrier(pp_turn[iwarpgroup], pp_phase);
+        pp_phase ^= 1;
+      }
+    };
+    auto order_arrive = [&]() {
+      if constexpr (kNumMathWG == 2) {
+        if (elected_idx_in_warpgroup) {
+          arrive_barrier(pp_turn[1 - iwarpgroup]);
+        }
+      }
+    };
+
 #pragma unroll 1
     for (int task_offset = task_start; task_offset < task_end; ++task_offset) {
       int4 t0 = task_list[task_offset * 2 + 0];
@@ -351,6 +375,7 @@ __global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1)
       for (int itile_seq_kv = ikv_tile_end - 1; itile_seq_kv >= ikv_tile_start; --itile_seq_kv) {
         wait_barrier(kv_readable[kv_istage], kv_phase);
 
+        order_wait();
         tiled_mma_qk.accumulate_ = GMMA::ScaleOut::Zero;
         warpgroup_fence_operand(tAttr);
         warpgroup_arrive();
@@ -366,6 +391,8 @@ __global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1)
         warpgroup_commit_batch();
         warpgroup_wait<0>();
         warpgroup_fence_operand(tAttr);
+        // QK done
+        order_arrive();
 
         // Sparse validity mask: invalid topk rows (-1 / out-of-range) get -inf
         // so they contribute nothing to softmax. ZFILL on cp.async already
@@ -373,12 +400,12 @@ __global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1)
         const int *batch_topk_ids = topk_ids_ptr + itoken * num_max_topk;
 #pragma unroll
         for (int in = 0; in < kN; ++in) {
+          int row_in_tile = get<0>(tI_nm(in, 0));
+          int itopk = itile_seq_kv * kTileN + row_in_tile;
+          int t_id = (itopk < num_max_topk) ? batch_topk_ids[itopk] : -1;
+          if (t_id < 0) {
 #pragma unroll
-          for (int im = 0; im < kM; ++im) {
-            int row_in_tile = get<0>(tI_nm(in, im));
-            int itopk = itile_seq_kv * kTileN + row_in_tile;
-            int t_id = (itopk < num_max_topk) ? batch_topk_ids[itopk] : -1;
-            if (t_id < 0) {
+            for (int im = 0; im < kM; ++im) {
               tAttr_nm(in, im) = -std::numeric_limits<float>::infinity();
             }
           }
@@ -399,12 +426,15 @@ __global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1)
         cutlass::arch::fence_view_async_shared();
         syncwarpgroup(iwarpgroup);
 
+        order_wait();
         warpgroup_fence_operand(tYr);
         warpgroup_arrive();
         cute::gemm(tiled_mma_sv, tVr(_, _, _, kv_istage), tSr, tYr);
         warpgroup_commit_batch();
         warpgroup_wait<0>();
         warpgroup_fence_operand(tYr);
+        // SV done
+        order_arrive();
 
         if (elected_idx_in_warpgroup) {
           arrive_barrier(kv_writable[kv_istage]);

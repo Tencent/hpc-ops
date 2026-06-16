@@ -285,6 +285,8 @@ __global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1) attention_mla_dim57
   __shared__ uint64_t q_writable;
   __shared__ uint64_t kv_writable[kStage];
   __shared__ uint64_t kv_readable[kStage];
+  // Ping-pong turn tokens for the two math WGs (kNumMathWG==2)
+  __shared__ uint64_t pp_turn[2];
   __shared__ int shm_task_start;
   __shared__ int shm_task_end;
   extern __shared__ uint8_t shm_data[] alignas(128);
@@ -341,6 +343,10 @@ __global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1) attention_mla_dim57
     for (int istage = 0; istage < kStage; ++istage) {
       initialize_barrier(kv_writable[istage], kConsumers);
       initialize_barrier(kv_readable[istage], 1);
+    }
+    if (kNumMathWG == 2) {
+      initialize_barrier(pp_turn[0], 1);
+      initialize_barrier(pp_turn[1], 1);
     }
   }
 
@@ -500,6 +506,24 @@ __global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1) attention_mla_dim57
     int kv_phase = 0;
     int kv_istage = 0;
 
+    int pp_phase = (iwarpgroup == 0) ? 1 : 0;
+
+    // order_wait: block until this WG owns the tensor-core turn.
+    // order_arrive: release the partner WG into its tensor-core region.
+    auto order_wait = [&]() {
+      if constexpr (kNumMathWG == 2) {
+        wait_barrier(pp_turn[iwarpgroup], pp_phase);
+        pp_phase ^= 1;
+      }
+    };
+    auto order_arrive = [&]() {
+      if constexpr (kNumMathWG == 2) {
+        if (elected_idx_in_warpgroup) {
+          arrive_barrier(pp_turn[1 - iwarpgroup]);
+        }
+      }
+    };
+
 #pragma unroll 1
     for (int task_offset = task_start; task_offset < task_end; ++task_offset) {
       int4 t0 = task_list[task_offset * 2 + 0];
@@ -530,6 +554,7 @@ __global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1) attention_mla_dim57
       for (int itile_seq_kv = ikv_tile_end - 1; itile_seq_kv >= ikv_tile_start; --itile_seq_kv) {
         wait_barrier(kv_readable[kv_istage], kv_phase);
 
+        order_wait();
         tiled_mma_qk.accumulate_ = GMMA::ScaleOut::Zero;
         warpgroup_fence_operand(tAttr);
         warpgroup_arrive();
@@ -545,6 +570,8 @@ __global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1) attention_mla_dim57
         warpgroup_commit_batch();
         warpgroup_wait<0>();
         warpgroup_fence_operand(tAttr);
+        // QK done
+        order_arrive();
 
         // Causal mask only on the global last KV tile.
         if (itile_seq_kv == num_tile_kv_total - 1) {
@@ -575,12 +602,15 @@ __global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1) attention_mla_dim57
         cutlass::arch::fence_view_async_shared();
         syncwarpgroup(iwarpgroup);
 
+        order_wait();
         warpgroup_fence_operand(tYr);
         warpgroup_arrive();
         cute::gemm(tiled_mma_sv, tVr(_, _, _, kv_istage), tSr, tYr);
         warpgroup_commit_batch();
         warpgroup_wait<0>();
         warpgroup_fence_operand(tYr);
+        // SV done
+        order_arrive();
 
         if (elected_idx_in_warpgroup) {
           arrive_barrier(kv_writable[kv_istage]);

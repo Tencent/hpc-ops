@@ -19,8 +19,11 @@ namespace kernels {
 //   lse       : fp32 [total_splits, num_head_q]
 //   y         : Tout [total_seq_q, num_head_q, v_dim]   strided by ldY on axis-0
 //   sink_weight: fp32[num_head_q] (optional)
-template <typename Tout, int kVChunk, int kMaxSplits, bool kUseSink, bool kUsePDL = false>
-__global__ void __launch_bounds__(32)
+//
+// Each WARP reduces one kVChunk-wide V slice
+template <typename Tout, int kVChunk, int kMaxSplits, bool kUseSink, bool kUsePDL = false,
+          int kWarpsPerBlock = 1>
+__global__ void __launch_bounds__(32 * kWarpsPerBlock)
     attention_mla_dim576_persistent_combine_kernel(Tout* y_ptr, const float* y_partial_ptr,
                                                    const float* lse_ptr,
                                                    const float* sink_weight_ptr,
@@ -28,7 +31,8 @@ __global__ void __launch_bounds__(32)
                                                    int v_dim, int total_seq_q, int ldY) {
   int ibatch = blockIdx.x;
   int ihead = blockIdx.y;
-  int iv_chunk = blockIdx.z;
+  int iwarp_in_block = threadIdx.x / 32;
+  int iv_chunk = blockIdx.z * kWarpsPerBlock + iwarp_in_block;
 
   if constexpr (kUsePDL) {
     cudaGridDependencySynchronize();
@@ -39,6 +43,7 @@ __global__ void __launch_bounds__(32)
   constexpr int kVecsPerChunk = kVChunk / kItemsPerThread;
   constexpr int kSplitsPerThread = (kMaxSplits + kThreadsPerWarp - 1) / kThreadsPerWarp;
   static_assert(kVChunk % kItemsPerThread == 0, "kVChunk must be a multiple of kItemsPerThread");
+  static_assert(kVecsPerChunk <= kThreadsPerWarp, "kVChunk must fit one warp (<= 32*items)");
   static_assert(kMaxSplits <= kThreadsPerWarp * kSplitsPerThread,
                 "kSplitsPerThread * 32 must cover kMaxSplits");
 
@@ -46,8 +51,7 @@ __global__ void __launch_bounds__(32)
   int s_end = cu_splits_ptr[ibatch + 1];
   int num_splits_local = s_end - s_begin;
 
-  int tid = threadIdx.x;  // 0..31
-  int lane = tid;
+  int lane = threadIdx.x % 32;
 
   using YPVec = vec_t<float, kItemsPerThread>;
   using YVec = vec_t<Tout, kItemsPerThread>;
