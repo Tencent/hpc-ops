@@ -355,7 +355,6 @@ stages:
       steps:
       - name: 启动单测任务
         id: start
-        continue-on-error: true
         run: |
           #!/bin/bash
           # Start a Taiji CI task that runs make + test + sanitizer in one GPU container.
@@ -453,7 +452,6 @@ stages:
         shell: bash
       - name: 查询任务
         id: status
-        continue-on-error: true
         run: |
           #!/bin/bash
           # Poll Taiji CI task status. Fail fast on first failure (no retry).
@@ -498,136 +496,6 @@ stages:
             sleep "${_CI_POLL_INTERVAL}"
           done
         shell: bash
-    job_old_test:
-      name: Test
-      mutex:
-        label: singleton
-        queue-length: 5
-      runs-on:
-        pool-name: agentless
-      steps:
-      - name: download-code.tar.gz
-        id: ""
-        uses: JobScriptExecutionA@1.*
-        with:
-          envId:
-          - dpzbvgzp
-          account: reedlauliu
-          shellScriptContent: |-
-            #!/bin/bash
-            set -xe
-            echo ${{BK_CI_PROJECT_NAME}}
-            echo ${{BK_CI_PIPELINE_ID}}
-            echo ${{BK_CI_BUILD_ID}}
-            echo ${{BK_CI_BUILD_NUM}}
-            echo ${{BK_CI_BUILD_TASK_ID}}
-
-            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-            sudo mkdir -p ${workpath}
-            cd ${workpath}
-
-            sudo curl -L -O --user reedlauliu:063d7d21ae494ce73636f0f767a15ec5 "https://bkrepo.woa.com/generic/ds-opt/pipeline/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}/code.tar.gz"
-          operatorType: PIPELINE_AUTHORIZER
-      - name: untar-code
-        uses: JobScriptExecutionA@1.*
-        with:
-          envId:
-          - dpzbvgzp
-          account: reedlauliu
-          shellScriptContent: |-
-            #!/bin/bash
-            set -xe
-
-            echo ${{BK_CI_PROJECT_NAME}}
-            echo ${{BK_CI_PIPELINE_ID}}
-            echo ${{BK_CI_BUILD_ID}}
-            echo ${{BK_CI_BUILD_NUM}}
-            echo ${{BK_CI_BUILD_TASK_ID}}
-
-            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && tar -xvf ./code.tar.gz"
-      - name: make
-        uses: JobScriptExecutionA@1.*
-        with:
-          envId:
-          - dpzbvgzp
-          account: reedlauliu
-          shellScriptContent: |-
-            #!/bin/bash
-
-            set -xe
-
-            echo ${{BK_CI_PROJECT_NAME}}
-            echo ${{BK_CI_PIPELINE_ID}}
-            echo ${{BK_CI_BUILD_ID}}
-            echo ${{BK_CI_BUILD_NUM}}
-            echo ${{BK_CI_BUILD_TASK_ID}}
-
-            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && export CMAKE_BUILD_PARALLEL_LEVEL=32 && make"
-      - name: pytest
-        id: yST
-        uses: JobScriptExecutionA@1.*
-        with:
-          envId:
-          - dpzbvgzp
-          account: reedlauliu
-          shellScriptContent: |-
-            #!/bin/bash
-
-            set -xe
-
-            echo ${{BK_CI_PROJECT_NAME}}
-            echo ${{BK_CI_PIPELINE_ID}}
-            echo ${{BK_CI_BUILD_ID}}
-            echo ${{BK_CI_BUILD_NUM}}
-            echo ${{BK_CI_BUILD_TASK_ID}}
-
-            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-            sudo docker exec -t hpc-ops-cicd bash -c "pkill -9 python3 || true"
-            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && export SKIP_MULTI_GPU=0 && make test"
-      - name: compute-sanitizer (incremental)
-        if: variables.RUN_FULL_SANITIZER == 'false'
-        uses: JobScriptExecutionA@1.*
-        with:
-          envId:
-          - dpzbvgzp
-          scriptTimeout: "43200"
-          account: reedlauliu
-          shellScriptContent: |-
-            #!/bin/bash
-            set -xe
-
-            echo ${{BK_CI_PROJECT_NAME}}
-            echo ${{BK_CI_PIPELINE_ID}}
-            echo ${{BK_CI_BUILD_ID}}
-            echo ${{BK_CI_BUILD_NUM}}
-            echo ${{BK_CI_BUILD_TASK_ID}}
-
-            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-            sudo docker exec -t hpc-ops-cicd bash -c "pkill -9 python3 || true"
-            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && (git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git fetch origin master --depth=200 || true) && make sanitizer"
-      - name: compute-sanitizer (full)
-        if: variables.RUN_FULL_SANITIZER == 'true'
-        uses: JobScriptExecutionA@1.*
-        with:
-          envId:
-          - dpzbvgzp
-          scriptTimeout: "43200"
-          account: reedlauliu
-          shellScriptContent: |-
-            #!/bin/bash
-            set -xe
-
-            echo ${{BK_CI_PROJECT_NAME}}
-            echo ${{BK_CI_PIPELINE_ID}}
-            echo ${{BK_CI_BUILD_ID}}
-            echo ${{BK_CI_BUILD_NUM}}
-            echo ${{BK_CI_BUILD_TASK_ID}}
-
-            workpath=/data/landun/workspace/${{BK_CI_PROJECT_NAME}}/${{BK_CI_PIPELINE_ID}}/${{BK_CI_BUILD_ID}}
-            sudo docker exec -t hpc-ops-cicd bash -c "pkill -9 python3 || true"
-            sudo docker exec -t hpc-ops-cicd bash -c "cd ${workpath}/ && make sanitizer-all"
 
 finally:
   job_StopTaiji:
