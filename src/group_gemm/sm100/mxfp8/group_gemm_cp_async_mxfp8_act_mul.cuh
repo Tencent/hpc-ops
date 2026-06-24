@@ -1,38 +1,22 @@
 // Copyright 2026 hpc-ops authors
+//
+// Fused GateUp GEMM + SiLU(gate)*up + MXFP8 quantization kernel.
+//
+// Weight layout (offline interleaved): N-dim every 16 elements:
+//   [gate_0..15, up_0..15, gate_16..31, up_16..31, ...]
+// SFB (weight scale) interleaved identically.
+//
+// Output: fp8_e4m3 activations (via STSM + TMA store) + UE8M0 scale (global store).
 
-#ifndef SRC_GROUP_GEMM_SM100_MXFP8_GROUP_GEMM_CP_ASYNC_MXFP8_CUH_
-#define SRC_GROUP_GEMM_SM100_MXFP8_GROUP_GEMM_CP_ASYNC_MXFP8_CUH_
+#ifndef SRC_GROUP_GEMM_SM100_MXFP8_GROUP_GEMM_CP_ASYNC_MXFP8_ACT_MUL_CUH_
+#define SRC_GROUP_GEMM_SM100_MXFP8_GROUP_GEMM_CP_ASYNC_MXFP8_ACT_MUL_CUH_
 
 #include <cuda.h>
-#include <stdio.h>
+#include <cuda_fp8.h>
 
 #include <algorithm>
 
-#include "cute/algorithm/gemm.hpp"
-#include "cute/arch/cluster_sm90.hpp"
-#include "cute/arch/copy_sm100.hpp"
-#include "cute/arch/copy_sm90.hpp"
-#include "cute/arch/copy_sm90_tma.hpp"
-#include "cute/arch/tmem_allocator_sm100.hpp"
-#include "cute/atom/copy_atom.hpp"
-#include "cute/atom/copy_traits_sm100.hpp"
-#include "cute/atom/copy_traits_sm90.hpp"
-#include "cute/atom/mma_atom.hpp"
-#include "cute/atom/mma_traits_sm100.hpp"
-#include "cute/tensor.hpp"
-#include "cutlass/arch/barrier.h"
-#include "cutlass/arch/reg_reconfig.h"
-#include "cutlass/cutlass.h"
-#include "cutlass/detail/sm100_blockscaled_layout.hpp"
-#include "cutlass/detail/sm100_tmem_helper.hpp"
-#include "cutlass/fast_math.h"
-#include "cutlass/float8.h"
-#include "cutlass/numeric_types.h"
-#include "src/group_gemm/sm100/mxfp8/config.h"
-#include "src/group_gemm/sm100/mxfp8/group_gemm_mxfp8.cuh"  // for get_next_tile_horizon_mxfp8
-#include "src/group_gemm/sm100/mxfp8/utils.cuh"
-#include "src/utils/tma.cuh"
-#include "src/utils/utils.cuh"
+#include "src/group_gemm/sm100/mxfp8/group_gemm_cp_async_mxfp8.cuh"
 
 namespace hpc {
 namespace group_gemm {
@@ -41,21 +25,31 @@ using namespace cute;  // NOLINT
 
 namespace kernels {
 
-// cp.async 4B with zero-fill: copies src_size bytes, zero-fills (4 - src_size) bytes.
-// When src_size=0, fills 4 zeros without accessing gmem_src.
-__device__ __forceinline__ void cp_async_4b(void *smem_dst, const void *gmem_src, int src_size) {
-  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_dst);
-  asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(smem_addr), "l"(gmem_src),
-               "r"(src_size));
+__device__ __forceinline__ uint8_t fp32_absmax_to_ue8m0_act(float absmax) {
+  if (absmax == 0.f) {
+    return 0;
+  }
+  uint32_t bits = __float_as_uint(absmax);
+  int exp_biased = (bits >> 23) & 0xFF;
+  uint32_t mant = bits & 0x7FFFFF;
+  int sf_bits = exp_biased - 8 + (mant > 0x600000u ? 1 : 0);
+  if (sf_bits < 0) {
+    sf_bits = 0;
+  }
+  if (sf_bits > 255) {
+    sf_bits = 255;
+  }
+  return static_cast<uint8_t>(sf_bits);
 }
 
-template <typename GemmConfig, typename TmaB, typename TmaY, typename TmaSFB, bool kUsePDL = false>
-__global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
+template <typename GemmConfig, typename TmaB, typename TmaSFB, bool kUsePDL = false>
+__global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_act_mul_kernel(
     const __grid_constant__ TmaB tma_b, const __grid_constant__ TmaSFB tma_sfb,
-    cute::TmaDescriptor *td_ay, const typename GemmConfig::Tin *__restrict__ x_ptr,
-    const uint8_t *__restrict__ sfx_ptr, const int *__restrict__ x_row_map_ptr, int x_num_rows,
-    int *seqlens_ptr, int *cu_seqlens_ptr, int *tiles_ptr, int *cu_tiles_ptr, int num_group, int m,
-    int n, int k, cutlass::FastDivmod flat_divider) {
+    const typename GemmConfig::Tin *__restrict__ x_ptr, const uint8_t *__restrict__ sfx_ptr,
+    const int *__restrict__ x_row_map_ptr, int x_num_rows,
+    typename GemmConfig::Tout *__restrict__ y_ptr, __nv_fp8_e4m3 *y_fp8_ptr,
+    uint8_t *__restrict__ out_scale_ptr, int *seqlens_ptr, int *cu_seqlens_ptr, int *tiles_ptr,
+    int *cu_tiles_ptr, int num_group, int m, int n, int k, cutlass::FastDivmod flat_divider) {
   if constexpr (kUsePDL) {
     cudaGridDependencySynchronize();
   }
@@ -68,17 +62,14 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
   using SLayoutB = typename GemmConfig::SLayoutB;
   using SLayoutSFA = typename GemmConfig::SLayoutSFA;
   using SLayoutSFB = typename GemmConfig::SLayoutSFB;
-  using SLayoutY = typename GemmConfig::SLayoutY;
-  using SLayoutYT = typename GemmConfig::SLayoutYT;
   using TiledMma = typename GemmConfig::TiledMma;
   using G2SCopy = typename GemmConfig::G2SCopy;
 
   constexpr int kTileM = GemmConfig::kTileM;
-  constexpr int kTileN = GemmConfig::kTileN;
+  constexpr int kTileN = GemmConfig::kTileN;  // 128 (interleaved gate+up)
   constexpr int kTileK = GemmConfig::kTileK;
   constexpr int kEpiTileM = GemmConfig::kEpiTileM;
   constexpr int kStage = GemmConfig::kStage;
-  constexpr int kStageTMA = GemmConfig::kStageTMA;
   constexpr int kStageTile = GemmConfig::kStageTile;
   constexpr int kStageTask = 5;
   constexpr int kSfVec = GemmConfig::kSfVec;
@@ -87,49 +78,57 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
   constexpr int kMmaSM = GemmConfig::kMmaSM;
   constexpr int kScaleColsPerTile = GemmConfig::kScaleColsPerTile;
 
-  static_assert(kMmaSM == 1, "cp_async mxfp8 kernel is 1SM only");
+  static_assert(kMmaSM == 1, "act_mul mxfp8 kernel is 1SM only");
+
+  // SMEM layout for bf16 intermediate (TMEM → STSM landing): (kTileN=128, kEpiTileM, kStageTMA)
+  // Uses SLayoutYT (SW128 swizzle) — same as non-fused kernel's STSM target.
+  constexpr int kOutTileN = kTileN / 2;
+  (void)kOutTileN;
+  constexpr int kStageTMA = GemmConfig::kStageTMA;
+  using SLayoutYT = typename GemmConfig::SLayoutYT;
+
+  const int n_half = n / 2;
+  (void)n_half;
 
   int idx = threadIdx.x;
   int iwarp = idx / 32;
   int elected = cute::elect_one_sync();
 
-  // Smem
+  // SMEM layout:
+  //   [A (activation)] [B (weight)] [SFA] [SFB] [YT (bf16 intermediate)] [tiles/cu_tiles]
   extern __shared__ uint8_t shm_data[] alignas(128);
   auto *shm_a = reinterpret_cast<Tin *>(shm_data);
   auto *shm_b = shm_a + cosize(SLayoutA{});
   auto *shm_sfa = reinterpret_cast<Tsf *>(shm_b + cosize(SLayoutB{}));
   auto *shm_sfb = shm_sfa + cosize(SLayoutSFA{});
-  auto *shm_yt = reinterpret_cast<Tout *>(shm_sfb + cosize(SLayoutSFB{}));
-  int *shm_tiles = reinterpret_cast<int *>(shm_yt + cosize(SLayoutYT{}));
+  auto *shm_y = reinterpret_cast<Tout *>(shm_sfb + cosize(SLayoutSFB{}));
+  int *shm_tiles = reinterpret_cast<int *>(shm_y + cosize(SLayoutYT{}));
   int *shm_cu_tiles = shm_tiles + (num_group + 1);
 
   Tensor sA = make_tensor(make_smem_ptr(shm_a), SLayoutA{});
   Tensor sB = make_tensor(make_smem_ptr(shm_b), SLayoutB{});
   Tensor sSFA = make_tensor(make_smem_ptr(shm_sfa), SLayoutSFA{});
   Tensor sSFB = make_tensor(make_smem_ptr(shm_sfb), SLayoutSFB{});
-  Tensor sY = make_tensor(make_smem_ptr(shm_yt), SLayoutY{});
-  Tensor sYT = make_tensor(make_smem_ptr(shm_yt), SLayoutYT{});
 
   // Global tensors
-  TmaY tma_y;
   auto gB = tma_b.get_tma_tensor(make_shape(n, k, num_group));
   int Ksf_tiles_runtime = (k / kSfVec + 3) / 4;
   auto gSFB = tma_sfb.get_tma_tensor(
       make_shape(Int<32>{}, Int<16>{}, num_group * (n / 128), Ksf_tiles_runtime));
+
+  // TMEM output: (kTileN=128, kTileM) with gate/up interleaved
   auto gY =
       make_tensor(make_gmem_ptr(static_cast<float *>(nullptr)),
                   make_shape(Int<kTileN>{}, Int<kTileM>{}), make_stride(Int<kTileM>{}, Int<1>{}));
 
-  // SFA row-major params (K_sf = number of scale values per row)
   const int K_sf = k / kSfVec;
 
   auto gA_full = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x_ptr)), make_shape(m, k),
                              make_stride(k, Int<1>{}));
   auto gA_tiled = local_tile(gA_full, make_tile(Int<kTileM>{}, Int<kTileK>{}), make_coord(0, _));
-  // Identity tensor for recovering the in-tile (row, k) coord per cp.async element.
   auto IA = make_identity_tensor(make_shape(Int<kTileM>{}, Int<kTileK>{}));
 
-  // TMA partition (B, SFB only — SFA is loaded via inline prepack)
+  // TMA partition
   auto btma_b = tma_b.get_slice(0);
   auto btma_sfb = tma_sfb.get_slice(0);
   auto tBg = btma_b.partition_S(gB);
@@ -139,41 +138,40 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
 
   int ntile_k = size<2>(tBg);
 
-  // TiledMma partition
+  // TiledMma
   TiledMma tiled_mma;
   auto cta_mma = tiled_mma.get_slice(0);
   auto tBr = cta_mma.make_fragment_A(cta_mma.partition_A(sB));
   auto tAr = cta_mma.make_fragment_B(cta_mma.partition_B(sA));
   auto tCt = cta_mma.make_fragment_C(cta_mma.partition_C(gY));
 
-  // SF UTCCP descriptors (pre-built for all SMEM SF stages).
+  // SF UTCCP descriptors
   __shared__ uint64_t sfb_desc[kStage];
   __shared__ uint64_t sfa_low_desc[kStage];
-  __shared__ uint64_t sfa_high_desc[kStage];  // only used when !kSmallTM
+  __shared__ uint64_t sfa_high_desc[kStage];
 #pragma unroll
   for (int s = 0; s < kStage; s++) {
-    auto *sfb_ptr = shm_sfb + s * 32 * 16;
-    auto *sfa_ptr = shm_sfa + s * kSfxRows * 16;
+    auto *sfb_ptr_s = shm_sfb + s * 32 * 16;
+    auto *sfa_ptr_s = shm_sfa + s * kSfxRows * 16;
     Tensor t_sfb = make_tensor(
-        make_smem_ptr(sfb_ptr),
+        make_smem_ptr(sfb_ptr_s),
         make_layout(make_shape(Int<32>{}, Int<16>{}), make_stride(Int<16>{}, Int<1>{})));
     Tensor t_sfa_lo = make_tensor(
-        make_smem_ptr(sfa_ptr),
+        make_smem_ptr(sfa_ptr_s),
         make_layout(make_shape(Int<32>{}, Int<16>{}), make_stride(Int<16>{}, Int<1>{})));
     sfb_desc[s] = static_cast<uint64_t>(UMMA::make_umma_desc<UMMA::Major::K>(t_sfb));
     sfa_low_desc[s] = static_cast<uint64_t>(UMMA::make_umma_desc<UMMA::Major::K>(t_sfa_lo));
     if constexpr (!kSmallTM) {
       Tensor t_sfa_hi = make_tensor(
-          make_smem_ptr(sfa_ptr + 32 * 16),
+          make_smem_ptr(sfa_ptr_s + 32 * 16),
           make_layout(make_shape(Int<32>{}, Int<16>{}), make_stride(Int<16>{}, Int<1>{})));
       sfa_high_desc[s] = static_cast<uint64_t>(UMMA::make_umma_desc<UMMA::Major::K>(t_sfa_hi));
     }
   }
 
-  // TMEM allocation
+  // TMEM
   using TmemAllocator = TMEM::Allocator1Sm;
   TmemAllocator tmem_allocator{};
-
   auto next_power2 = [&](auto tmem_cols) {
     constexpr int x = decltype(tmem_cols)::value;
     if constexpr (x <= 32) {
@@ -188,31 +186,26 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
       return 512;
     }
   };
-  // SF TMEM needs only ONE slot: UTCCP (tcgen05.cp) and MMA (tcgen05.mma) run on
-  // the same tensor-core unit in the same warp, so they are strictly serialized
-  // -> the next k-step's cp cannot overwrite the slot before this step's mma has
-  // consumed it. No kStage replication, no fence needed.
   constexpr int kTmemCols =
       next_power2(std::integral_constant<int, kStageTile * kTileM + kScaleColsPerTile>{});
 
   __shared__ uint32_t s_tmem_base;
-  __shared__ uint64_t ab_readable[kStage];  // A+SFA(cp.async) + B+SFB(TMA) SMEM data ready
-  __shared__ uint64_t ab_writable[kStage];  // A+B+SF SMEM reusable (shared barrier)
+  __shared__ uint64_t ab_readable[kStage];
+  __shared__ uint64_t ab_writable[kStage];
   __shared__ uint64_t tmem_readable[kStageTile];
   __shared__ uint64_t tmem_writable[kStageTile];
-
   __shared__ uint64_t task_readable[kStageTask];
   __shared__ uint64_t task_writable[kStageTask];
   __shared__ int task_shm[kStageTask][4];
 
-  constexpr int kCpAsyncThreads = 128;  // W8-W11 (cp.async A + SFA load)
+  constexpr int kCpAsyncThreads = 128;
+  constexpr uint32_t kExpectedBytesB = sizeof(typename GemmConfig::TinB) * kTileN * kTileK;
+  constexpr uint32_t kExpectedBytesSFB = 32 * 16;
 
   if (iwarp == 0 && elected) {
 #pragma unroll
     for (int i = 0; i < kStage; i++) {
-      // ab_readable: 128 cp.async noinc arrives (A+SFA) + 1 TMA expect_tx arrive (B+SFB) = 129.
       initialize_barrier(ab_readable[i], kCpAsyncThreads + 1);
-      // ab_writable: single MMA umma_arrive releases the stage for both producers.
       initialize_barrier(ab_writable[i], 1);
     }
 #pragma unroll
@@ -220,17 +213,10 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
       initialize_barrier(tmem_readable[i], 1);
       initialize_barrier(tmem_writable[i], 1);
     }
-
-    constexpr int kTmaThreads = 1;    // W0 (elected)
-    constexpr int kMmaThreads = 32;   // W1
-    constexpr int kEpiThreads = 128;  // W4-W7
-    // W2 = FindTask (waits task_writable, does not arrive). W8-W11 = cp.async.
-
 #pragma unroll
     for (int i = 0; i < kStageTask; i++) {
       initialize_barrier(task_readable[i], 1);
-      initialize_barrier(task_writable[i],
-                         kMmaThreads + kTmaThreads + kEpiThreads + kCpAsyncThreads);
+      initialize_barrier(task_writable[i], 32 + 1 + 128 + kCpAsyncThreads);
     }
     cutlass::arch::fence_barrier_init();
   } else if (iwarp == 1) {
@@ -238,15 +224,12 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
     tmem_allocator.release_allocation_lock();
   }
 
-  // Load shm_tiles
   for (int i = idx; i < num_group; i += blockDim.x) {
     shm_tiles[i] = tiles_ptr[i];
   }
   for (int i = idx; i <= num_group; i += blockDim.x) {
     shm_cu_tiles[i] = cu_tiles_ptr[i];
   }
-
-  // fp4 weight: TMA scatter-unpack does not fill every byte of SMEM B, so pre-zero it.
   if constexpr (GemmConfig::kNeedPreZeroB) {
     for (int i = idx; i < static_cast<int>(cosize(SLayoutB{})); i += blockDim.x) {
       reinterpret_cast<uint8_t *>(shm_b)[i] = 0;
@@ -255,9 +238,6 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
   __syncthreads();
 
   tCt.data() = make_tmem_ptr<float>(s_tmem_base);
-
-  constexpr uint32_t kExpectedBytesB = GemmConfig::kExpectedBytesB;
-  constexpr uint32_t kExpectedBytesSFB = 32 * 16;  // SFB only (SFA via inline prepack)
 
   if (idx >= 256) {
     // W8-W11 (128 threads): cp.async load A + SFA inline prepack
@@ -286,7 +266,6 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
 
     constexpr int kCopyM = size<1>(tAg);
     int a_row_offsets[kCopyM];
-
     const bool kUseRowMap = (x_row_map_ptr != nullptr);
 
     while (true) {
@@ -294,8 +273,7 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
         // Precompute per-row A fix-up offsets for this (igroup, itile_m) tile.
         int cu_seq = cu_seqlens_ptr[igroup];
         int tile_base_row = cu_seq + itile_m * kTileM;
-        int rows_in_group = seqlens_ptr[igroup];
-        int remaining_m = rows_in_group - itile_m * kTileM;
+        int remaining_m = seqlens_ptr[igroup] - itile_m * kTileM;
 #pragma unroll
         for (int ir = 0; ir < kCopyM; ir++) {
           int ir_in_tile = get<0>(tIA(0, ir, 0));
@@ -337,7 +315,6 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
             sfa_valid_size[i] = valid ? 4 : 0;
           }
         }
-
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
           // cp.async load A — wait stage reusable, then issue per-row copies.
           wait_barrier(ab_writable[istage_a], phase_a);
@@ -347,8 +324,6 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
                                        tAg(_, ir, _, itile_k).layout());
             cute::copy(g2s_tiled_copy, tAg_src, tAs(_, ir, _, istage_a));
           }
-
-          // cp.async load SFA — only threads with local_idx < kTileM issue loads.
           if (local_idx < kTileM) {
             auto *sfa_stage = reinterpret_cast<uint8_t *>(shm_sfa) + istage_a * kSfxRows * 16;
 #pragma unroll
@@ -375,11 +350,9 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
       itile_m = task_shm[istage_task][1];
       itile_n = task_shm[istage_task][2];
       arrive_barrier(task_writable[istage_task]);
-
       if (igroup < 0) {
         break;
       }
-
       istage_task++;
       if (istage_task == kStageTask) {
         istage_task = 0;
@@ -401,7 +374,6 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
 
     get_next_tile_horizon_mxfp8<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_n, itile_m,
                                         sum_tile_m, flat_divider);
-
     while (true) {
       if (igroup >= 0) {
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
@@ -421,17 +393,14 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
           }
         }
       }
-
       wait_barrier(task_readable[istage_task], phase_task);
       igroup = task_shm[istage_task][0];
       itile_m = task_shm[istage_task][1];
       itile_n = task_shm[istage_task][2];
       arrive_barrier(task_writable[istage_task]);
-
       if (igroup < 0) {
         break;
       }
-
       istage_task++;
       if (istage_task == kStageTask) {
         istage_task = 0;
@@ -456,7 +425,6 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
 
     get_next_tile_horizon_mxfp8<kMmaSM>(shm_tiles, iblock, num_group, igroup, itile_n, itile_m,
                                         sum_tile_m, flat_divider);
-
     while (true) {
       if (igroup >= 0) {
         uint32_t c_base = s_tmem_base + istage_tile * kTileM;
@@ -467,17 +435,7 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
 
         wait_barrier(tmem_writable[istage_tile], phase_tile);
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
-          // Single readable barrier now gates A(cp.async) + B(TMA) + SFB(TMA) + SFA(prepack).
           wait_barrier(ab_readable[istage_k], phase);
-
-          // SF: MMA warp does the SMEM->TMEM UTCCP itself (no separate UTCCP warp,
-          // no utccp_done barrier). tcgen05.cp and the following tcgen05.mma are
-          // issued by the same warp, so they execute in program order on tensor
-          // memory -> the copy lands before the MMA reads it. SF SMEM is already
-          // resident because ab_readable covers it.
-          // Single TMEM SF slot (no per-stage offset): cp writes it, the very
-          // next mma reads it, all on the same serialized tensor-core unit.
-          // uint32_t sf_slot = sf_base;
 
           if (elected) {
             SM100::TMEM::UTCCP::SM100_UTCCP_4x32dp128bit_1cta::copy(sfb_desc[istage_k], sf_base);
@@ -488,14 +446,13 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
                                                                       sf_base + 4 + 4);
             }
           }
-
 #pragma unroll
           for (uint32_t ik = 0; ik < size<2>(tBr); ik++) {
-            uint32_t sfb_addr_ki = (sf_base & 0x3FFFFFFFu) | (ik << 30);
-            uint32_t sfa_addr_ki = ((sf_base + 4) & 0x3FFFFFFFu) | (ik << 30);
-            auto sfb_ki = make_tensor(make_tmem_ptr<cutlass::float_ue8m0_t>(sfb_addr_ki),
+            uint32_t sfb_addr = (sf_base & 0x3FFFFFFFu) | (ik << 30);
+            uint32_t sfa_addr = ((sf_base + 4) & 0x3FFFFFFFu) | (ik << 30);
+            auto sfb_ki = make_tensor(make_tmem_ptr<cutlass::float_ue8m0_t>(sfb_addr),
                                       make_layout(make_shape(1)));
-            auto sfa_ki = make_tensor(make_tmem_ptr<cutlass::float_ue8m0_t>(sfa_addr_ki),
+            auto sfa_ki = make_tensor(make_tmem_ptr<cutlass::float_ue8m0_t>(sfa_addr),
                                       make_layout(make_shape(1)));
             cute::gemm(tiled_mma.with(tiled_mma.accumulate_, sfb_ki, sfa_ki),
                        tBr(_, _, ik, istage_k), tAr(_, _, ik, istage_k), tCt);
@@ -520,17 +477,14 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
           istage_tile = 0;
         }
       }
-
       wait_barrier(task_readable[istage_task], phase_task);
       igroup = task_shm[istage_task][0];
       itile_m = task_shm[istage_task][1];
       itile_n = task_shm[istage_task][2];
       arrive_barrier(task_writable[istage_task]);
-
       if (igroup < 0) {
         break;
       }
-
       istage_task++;
       if (istage_task == kStageTask) {
         istage_task = 0;
@@ -568,9 +522,17 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
       }
     }
   } else if (idx >= 128 && idx < 256) {
-    // W4-W7: Epilogue (TMEM → STSM → TMA store)
+    // W4-W7: Epilogue
+    //   Phase A: TMEM → reg (fp32) → bf16 → STSM → SMEM  (identical to non-fused)
+    //   Phase B: SMEM read → act_mul (SiLU(gate)*up) + mxfp8 quant → global store
     int epi_idx = idx - 128;
     bool is_leader = elected && (iwarp == 4);
+
+    // ---- Phase A setup: TMEM → STSM (same as group_gemm_1sm_cp_async_mxfp8_kernel) ----
+    using SLayoutY = typename GemmConfig::SLayoutY;
+    using SLayoutYT = typename GemmConfig::SLayoutYT;
+    Tensor sY = make_tensor(make_smem_ptr(reinterpret_cast<Tout *>(shm_y)), SLayoutY{});
+    Tensor sYT = make_tensor(make_smem_ptr(reinterpret_cast<Tout *>(shm_y)), SLayoutYT{});
 
     auto epi_tiler = make_tile(Int<kTileN>{}, Int<kEpiTileM>{});
     auto tCt_epi = zipped_divide(tCt, make_tile(epi_tiler));
@@ -610,11 +572,10 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
     while (true) {
       if (igroup >= 0) {
         tCt4r.data() = tCt4r_base_ptr + istage_tile * kTileM;
-        auto *td_y_g = td_ay + igroup * 2 + 1;
-        prefetch_tma_descriptor(td_y_g);
         wait_barrier(tmem_readable[istage_tile], phase_tile);
 #pragma unroll
         for (int iepi = 0; iepi < nepi_tile; iepi++) {
+          // ===== Phase A: TMEM → reg → bf16 → STSM → SMEM =====
           copy(tiled_copy_t2r, tCt4r(_, _, iepi), tCr4t);
           cutlass::arch::fence_view_async_tmem_load();
 
@@ -624,6 +585,7 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
             }
           }
 
+          // fp32 → bf16 conversion in registers
           auto tCr_fp2 = recast<float2>(tCr4t);
           auto tCr_bf162 = recast<__nv_bfloat162>(tCr4s);
 #pragma unroll
@@ -631,24 +593,82 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
             tCr_bf162(i) = __float22bfloat162_rn(tCr_fp2(i));
           }
 
-          tma_store_wait<kStageTMA - 1>();
+          // STSM: reg → SMEM (all 128 threads participate)
           cutlass::arch::NamedBarrier::sync(128, 0);
-
           copy(tiled_copy_r2s, tCr4s, tCs4r(_, _, istage_tma));
-
-          tma_store_fence();
           cutlass::arch::NamedBarrier::sync(128, 0);
 
-          if (is_leader) {
-            auto gYT_tma = tma_y.get_tma_tensor(make_shape(n, m));
-            auto btma_y = tma_y.get_slice(0);
-            auto tDs = btma_y.partition_S(sYT);
-            auto tDg = btma_y.partition_D(gYT_tma);
+          // act_mul and quant
+          {
+            constexpr int kActMulVec = 16;
+            constexpr int kThreadsPerCol = kTileN / (2 * kActMulVec);
+            constexpr int kTotalWork = kThreadsPerCol * kEpiTileM;
+            constexpr int kItersPerThread = (kTotalWork + 127) / 128;
+            constexpr int kSfVecOut = 32;
 
-            cute::copy(tma_y.with(td_y_g), tDs(_, 0, 0, istage_tma),
-                       tDg(_, itile_n, itile_m * nepi_tile + iepi));
-            tma_store_arrive();
-          }
+            int cu_seq = cu_seqlens_ptr[igroup];
+            int global_m_base = cu_seq + itile_m * kTileM + iepi * kEpiTileM;
+            int global_n_base = itile_n * kOutTileN;
+
+#pragma unroll
+            for (int iter = 0; iter < kItersPerThread; iter++) {
+              int work_id = epi_idx + iter * 128;
+              if (work_id >= kTotalWork) {
+                break;
+              }
+
+              int n_row = work_id % kThreadsPerCol;
+              int m_col = work_id / kThreadsPerCol;
+              int n_base = n_row * (2 * kActMulVec);
+
+              vec_t<float, kActMulVec> v;
+              float local_max = 0.f;
+              {
+#pragma unroll
+                for (int i = 0; i < 2; i++) {
+                  auto g =
+                      to<float>(load<__nv_bfloat16, 8>(&sYT(n_base + i * 8, m_col, istage_tma)));
+                  auto u = to<float>(
+                      load<__nv_bfloat16, 8>(&sYT(n_base + kActMulVec + i * 8, m_col, istage_tma)));
+#pragma unroll
+                  for (int j = 0; j < 8; j++) {
+                    v[i * 8 + j] = silu(g[j]) * u[j];
+                    local_max = fmaxf(local_max, fabsf(v[i * 8 + j]));
+                  }
+                }
+              }
+
+              float partner_max = __shfl_xor_sync(0xFFFFFFFF, local_max, 1);
+              float absmax = fmaxf(local_max, partner_max);
+
+              uint8_t sf_bits = fp32_absmax_to_ue8m0_act(absmax);
+              float inv_sf;
+              if (sf_bits == 0) {
+                inv_sf = 0.f;
+              } else {
+                inv_sf = 1.f / exp2f(static_cast<float>(sf_bits) - 127.f);
+              }
+
+              int out_n_base = global_n_base + n_row * kActMulVec;
+              int global_m = global_m_base + m_col;
+              if (global_m < m) {
+                vec_t<__nv_fp8_e4m3, kActMulVec> v_fp8;
+#pragma unroll
+                for (int i = 0; i < kActMulVec; i++) {
+                  v_fp8[i] = static_cast<__nv_fp8_e4m3>(v[i] * inv_sf);
+                }
+                store<__nv_fp8_e4m3, kActMulVec>(
+                    &y_fp8_ptr[static_cast<int64_t>(global_m) * n_half + out_n_base], v_fp8);
+
+                if ((n_row & 1) == 0) {
+                  int K_sf_out = n_half / kSfVecOut;
+                  int sf_n_idx = (global_n_base / kSfVecOut) + (n_row / 2);
+                  out_scale_ptr[static_cast<int64_t>(global_m) * K_sf_out + sf_n_idx] = sf_bits;
+                }
+              }
+            }
+          }  //  act_mul and quant end
+          cutlass::arch::NamedBarrier::sync(128, 0);
 
           istage_tma = (istage_tma + 1) % kStageTMA;
         }
@@ -665,11 +685,9 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
       itile_m = task_shm[istage_task][1];
       itile_n = task_shm[istage_task][2];
       arrive_barrier(task_writable[istage_task]);
-
       if (igroup < 0) {
         break;
       }
-
       istage_task++;
       if (istage_task == kStageTask) {
         istage_task = 0;
@@ -691,4 +709,4 @@ __global__ __launch_bounds__(384, 1) void group_gemm_1sm_cp_async_mxfp8_kernel(
 }  // namespace group_gemm
 }  // namespace hpc
 
-#endif  // SRC_GROUP_GEMM_SM100_MXFP8_GROUP_GEMM_CP_ASYNC_MXFP8_CUH_
+#endif  // SRC_GROUP_GEMM_SM100_MXFP8_GROUP_GEMM_CP_ASYNC_MXFP8_ACT_MUL_CUH_

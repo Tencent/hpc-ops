@@ -18,8 +18,13 @@ import torch.cuda.nvtx as nvtx
 
 import hpc
 import flashinfer.fused_moe as fused_moe
-from flashinfer import mxfp8_quantize, fp4_quantize
-from flashinfer.fused_moe import trtllm_fp4_block_scale_moe, trtllm_fp8_per_tensor_scale_moe
+from flashinfer import ActivationType, mxfp8_quantize, fp4_quantize
+from flashinfer.fused_moe import (
+    RoutingMethodType,
+    trtllm_fp4_block_scale_routed_moe,
+    trtllm_fp8_per_tensor_scale_moe,
+)
+from flashinfer.utils import device_support_pdl
 
 
 # ---------------------------- config ----------------------------
@@ -28,21 +33,21 @@ NUM_EXPERT_TOTAL = 256
 NUM_TOPK = 8
 
 # Total token counts (m = num_seq) to sweep.
-M_CASES = [256, 512, 1024, 2048, 4096, 8192]
-
+M_CASES = [256, 320, 384, 448, 512, 1024, 16384, 32768]
+# M_CASES = [512]
 # (label, hidden, intermediate_size, num_expert_local, rank_ep)
 SHAPES = [
-    ("h6144_tp8", 6144, 256, 256, 0),
-    ("h6144_tp4", 6144, 512, 256, 0),
+    # ("h6144_tp8", 6144, 256, 256, 0),
+    # ("h6144_tp4", 6144, 512, 256, 0),
     ("h6144_ep8", 6144, 2048, 32, 0),
-    ("h4096_tp8", 4096, 192, 192, 0),
-    ("h4096_tp4", 4096, 384, 192, 0),
-    ("h4096_ep8", 4096, 1536, 24, 0),
+    # ("h4096_tp8", 4096, 192, 192, 0),
+    # ("h4096_tp4", 4096, 384, 192, 0),
+    # ("h4096_ep8", 4096, 1536, 24, 0),
 ]
 
 SF_VEC = 32
-WARMUP = 5
-ITER = 100
+WARMUP = 1
+ITER = 10
 
 
 # ---------------------------- helpers ----------------------------
@@ -55,19 +60,20 @@ def _prepack_weight_scale(sfw, avg):
 
 
 def _build_routing(num_seq, num_expert_local, rank_ep, device):
-    """Build routing tensors (topk_ids uniformly over ALL experts).
+    """Build strictly uniform routing across ALL experts (simulates real EP).
 
-    Real EP: tokens are uniformly routed across all NUM_EXPERT_TOTAL experts.
-    Only ids in [rank_ep*E_local, (rank_ep+1)*E_local) are processed locally.
+    Returns topk_ids and topk_scale shared by both HPC and FlashInfer backends.
+    Tokens are uniformly distributed over all NUM_EXPERT_TOTAL experts via modulo.
+    Only ids in [rank_ep*num_expert_local, (rank_ep+1)*num_expert_local) are
+    processed locally — matching the original EP semantics where each rank only
+    handles its local shard (1/EP of total work).
     """
-    topk_ids = torch.randint(
-        0,
-        NUM_EXPERT_TOTAL,
-        (num_seq, NUM_TOPK),
-        device=device,
-        dtype=torch.int32,
-    )
+    total_slots = num_seq * NUM_TOPK
+    flat = torch.arange(total_slots, device=device, dtype=torch.int32) % NUM_EXPERT_TOTAL
+    topk_ids = flat.reshape(num_seq, NUM_TOPK).contiguous()
+
     topk_scale = torch.rand((num_seq, NUM_TOPK), device=device, dtype=torch.float32) * 0.5 + 0.5
+
     return topk_ids, topk_scale
 
 
@@ -103,9 +109,9 @@ def _build_hpc_mxfp8_mxfp4(hidden, inter, num_expert_local, rank_ep, num_seq, av
     gate_up_w_scale_packed = _prepack_weight_scale(gate_up_w_scale, avg)
     down_w_scale_packed = _prepack_weight_scale(down_w_scale, avg)
 
-    topk_ids, topk_scale = _build_routing(num_seq, num_expert_local, rank_ep, device)
+    shared_output = torch.randn((num_seq, hidden), dtype=torch.bfloat16, device=device)
 
-    def run():
+    def run(topk_ids, topk_scale):
         return hpc.fuse_moe_mxfp8(
             x,
             x_scale,
@@ -117,6 +123,7 @@ def _build_hpc_mxfp8_mxfp4(hidden, inter, num_expert_local, rank_ep, num_seq, av
             topk_scale,
             rank_ep=rank_ep,
             num_expert_total=NUM_EXPERT_TOTAL,
+            shared_output=shared_output,
         )
 
     return run
@@ -140,9 +147,9 @@ def _build_hpc_fp8(hidden, inter, num_expert_local, rank_ep, num_seq, device):
     down_scale = torch.full((num_expert_local,), 0.25, dtype=torch.float32, device=device)
     act_and_mul_scale = torch.full((1,), 1.0, dtype=torch.float32, device=device)
 
-    topk_ids, topk_scale = _build_routing(num_seq, num_expert_local, rank_ep, device)
+    shared_output = torch.randn((num_seq, hidden), dtype=torch.bfloat16, device=device)
 
-    def run():
+    def run(topk_ids, topk_scale):
         return hpc.fuse_moe(
             x,
             gate_up_w,
@@ -154,6 +161,7 @@ def _build_hpc_fp8(hidden, inter, num_expert_local, rank_ep, num_seq, device):
             topk_scale,
             rank_ep,
             NUM_EXPERT_TOTAL,
+            shared_output=shared_output,
         )
 
     return run
@@ -165,14 +173,18 @@ def _build_hpc_fp8(hidden, inter, num_expert_local, rank_ep, num_seq, device):
 # ---------------------------- flashinfer trtllm builder ----------------------------
 
 
-def _build_flashinfer_trtllm_mxfp4(hidden, inter, num_expert_local, rank_ep, num_seq, device):
-    """flashinfer.trtllm_fp4_block_scale_moe with mxfp8 activation + mxfp4 weight.
+def _build_flashinfer_trtllm_mxfp4(
+    hidden, inter, num_expert_local, rank_ep, num_seq, topk_ids, topk_scale, device
+):
+    """flashinfer.trtllm_fp4_block_scale_routed_moe with mxfp8 activation + mxfp4 weight.
 
-    This API includes routing internally (takes routing_logits as input).
+    Uses the routed API that directly accepts topk_ids (no internal routing).
     """
     if hidden % 128 != 0 or inter % 128 != 0:
         return None
     gate_up_n = inter * 2
+    local_expert_offset = rank_ep * num_expert_local
+    enable_pdl = device_support_pdl(device)
 
     # Generate bf16 source tensors then quantize.
     x_bf16 = torch.randn((num_seq, hidden), dtype=torch.bfloat16, device=device) / 100
@@ -199,39 +211,47 @@ def _build_flashinfer_trtllm_mxfp4(hidden, inter, num_expert_local, rank_ep, num
     w2_sf = w2_sf.view(torch.float8_e4m3fn).reshape(num_expert_local, hidden, -1)
 
     # Output scale scalars (all 1.0 since global_scale=1.0)
-    output1_scale = torch.ones(num_expert_local, device=device)
-    output1_gate_scale = torch.ones(num_expert_local, device=device)
-    output2_scale = torch.ones(num_expert_local, device=device)
+    output_scale = torch.ones(num_expert_local, device=device, dtype=torch.float32)
 
-    # Routing logits: uniform across all experts (real EP scenario).
-    routing_logits = torch.randn(num_seq, NUM_EXPERT_TOTAL, dtype=torch.float32, device=device)
+    # topk_weights in bf16 for routed API
+    topk_weights = topk_scale.to(torch.bfloat16)
+
+    # Pre-allocate output buffer
+    output = torch.empty(num_seq, hidden, device=device, dtype=torch.bfloat16)
 
     def run():
-        return trtllm_fp4_block_scale_moe(
-            routing_logits,
-            None,  # routing_bias
-            mxfp8_x,
-            mxfp8_x_sf,
-            w1_fp4,
-            w1_sf,
-            None,  # gemm1_bias
-            None,  # gemm1_alpha
-            None,  # gemm1_beta
-            None,  # gemm1_clamp_limit
-            w2_fp4,
-            w2_sf,
-            None,  # gemm2_bias
-            output1_scale,
-            output1_gate_scale,
-            output2_scale,
-            NUM_EXPERT_TOTAL,
-            NUM_TOPK,
-            None,  # n_group
-            None,  # topk_group
-            inter,
-            rank_ep * num_expert_local,  # local_expert_offset
-            num_expert_local,
-            None,  # routed_scaling_factor
+        return trtllm_fp4_block_scale_routed_moe(
+            topk_ids=(topk_ids, topk_weights),
+            routing_bias=None,
+            hidden_states=mxfp8_x,
+            hidden_states_scale=mxfp8_x_sf,
+            gemm1_weights=w1_fp4,
+            gemm1_weights_scale=w1_sf,
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=w2_fp4,
+            gemm2_weights_scale=w2_sf,
+            gemm2_bias=None,
+            output1_scale_scalar=output_scale,
+            output1_scale_gate_scalar=output_scale,
+            output2_scale_scalar=output_scale,
+            num_experts=NUM_EXPERT_TOTAL,
+            top_k=NUM_TOPK,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=inter,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=num_expert_local,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.Renormalize.value,
+            do_finalize=True,
+            enable_pdl=enable_pdl,
+            activation_type=ActivationType.Swiglu.value,
+            per_token_scale=None,
+            output=output,
+            tune_max_num_tokens=num_seq,
         )
 
     # Trigger JIT/cubin load eagerly so failures are caught here rather than in _bench.
@@ -244,11 +264,19 @@ def _build_flashinfer_trtllm_mxfp4(hidden, inter, num_expert_local, rank_ep, num
     return run
 
 
-def _build_flashinfer_trtllm_fp8(hidden, inter, num_expert_local, rank_ep, num_seq, device):
-    """flashinfer.trtllm_fp8_per_tensor_scale_moe (fp8 per-tensor, includes routing)."""
-    gate_up_n = inter * 2
+def _build_flashinfer_trtllm_fp8(
+    hidden, inter, num_expert_local, rank_ep, num_seq, topk_ids, topk_scale, device
+):
+    """flashinfer.trtllm_fp8_per_tensor_scale_moe (fp8 per-tensor, includes routing).
 
-    # FP8 per-tensor: quantize hidden_states and weights to fp8
+    Since there is no routed variant for fp8 per-tensor, we construct routing_logits
+    from topk_ids such that torch.topk reproduces the same routing.
+    Note: this API includes routing overhead in the timing.
+    """
+    gate_up_n = inter * 2
+    local_expert_offset = rank_ep * num_expert_local
+
+    # FP8 per-tensor: cast hidden_states and weights to fp8
     x_bf16 = torch.randn((num_seq, hidden), dtype=torch.bfloat16, device=device) / 100
     x_fp8 = x_bf16.to(torch.float8_e4m3fn)
 
@@ -266,8 +294,18 @@ def _build_flashinfer_trtllm_fp8(hidden, inter, num_expert_local, rank_ep, num_s
     output1_gate_scale = torch.full((num_expert_local,), 0.25, dtype=torch.float32, device=device)
     output2_scale = torch.full((num_expert_local,), 0.25, dtype=torch.float32, device=device)
 
-    # Routing logits
-    routing_logits = torch.randn(num_seq, NUM_EXPERT_TOTAL, dtype=torch.float32, device=device)
+    # Construct routing_logits from topk_ids so that topk(logits) == topk_ids.
+    # Use large spread: selected experts get high values, unselected get -1e4.
+    routing_logits = torch.full(
+        (num_seq, NUM_EXPERT_TOTAL), -1e4, device=device, dtype=torch.float32
+    )
+    # Assign decreasing values K, K-1, ..., 1 to ensure ordering matches topk_ids
+    values = (
+        torch.arange(NUM_TOPK, 0, -1, device=device, dtype=torch.float32)
+        .unsqueeze(0)
+        .expand(num_seq, -1)
+    )
+    routing_logits.scatter_(1, topk_ids.long(), values)
 
     def run():
         return trtllm_fp8_per_tensor_scale_moe(
@@ -284,7 +322,7 @@ def _build_flashinfer_trtllm_fp8(hidden, inter, num_expert_local, rank_ep, num_s
             None,  # n_group
             None,  # topk_group
             inter,
-            rank_ep * num_expert_local,  # local_expert_offset
+            local_expert_offset,  # local_expert_offset
             num_expert_local,
             None,  # routed_scaling_factor
             False,  # use_routing_scales_on_input
@@ -369,6 +407,9 @@ def main():
             # num_seq_per_group = avg tokens per expert (for prepack kTileM).
             num_seq_per_group = num_seq * NUM_TOPK // NUM_EXPERT_TOTAL
 
+            # Build shared routing (uniform distribution, same topk_ids for all backends)
+            topk_ids, topk_scale = _build_routing(num_seq, num_expert_local, rank_ep, device)
+
             # hpc mxfp8_mxfp4
             run_hpc = _build_hpc_mxfp8_mxfp4(
                 hidden, inter, num_expert_local, rank_ep, num_seq, num_seq_per_group, device
@@ -376,15 +417,21 @@ def main():
             if run_hpc is None:
                 t_hpc = None
             else:
-                t_hpc = _bench(f"hpc_mxfp8_mxfp4/{shape_label}/n{num_seq}", run_hpc)
+                t_hpc = _bench(
+                    f"hpc_mxfp8_mxfp4/{shape_label}/n{num_seq}",
+                    lambda: run_hpc(topk_ids, topk_scale),
+                )
 
             # hpc fp8 per-tensor
             run_fp8 = _build_hpc_fp8(hidden, inter, num_expert_local, rank_ep, num_seq, device)
-            t_fp8 = _bench(f"hpc_fp8/{shape_label}/n{num_seq}", run_fp8)
+            t_fp8 = _bench(
+                f"hpc_fp8/{shape_label}/n{num_seq}",
+                lambda: run_fp8(topk_ids, topk_scale),
+            )
 
-            # flashinfer trtllm mxfp8_mxfp4 (includes routing)
+            # flashinfer trtllm mxfp4 (pre-routed, same topk_ids)
             run_trtllm_mxfp4 = _build_flashinfer_trtllm_mxfp4(
-                hidden, inter, num_expert_local, rank_ep, num_seq, device
+                hidden, inter, num_expert_local, rank_ep, num_seq, topk_ids, topk_scale, device
             )
             if run_trtllm_mxfp4 is None:
                 t_trtllm_mxfp4 = None
@@ -393,9 +440,9 @@ def main():
                     f"fi_trtllm_mxfp4/{shape_label}/n{num_seq}", run_trtllm_mxfp4
                 )
 
-            # flashinfer trtllm fp8 per-tensor (includes routing)
+            # flashinfer trtllm fp8 block-scale (pre-routed, same topk_ids)
             run_trtllm_fp8 = _build_flashinfer_trtllm_fp8(
-                hidden, inter, num_expert_local, rank_ep, num_seq, device
+                hidden, inter, num_expert_local, rank_ep, num_seq, topk_ids, topk_scale, device
             )
             if run_trtllm_fp8 is None:
                 t_trtllm_fp8 = None

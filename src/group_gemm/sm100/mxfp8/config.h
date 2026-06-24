@@ -174,6 +174,29 @@ struct GroupGEMMMxFp8Config {
     }
   }
 
+  // get_tma variant that skips SFA TMA construction (for cp_async kernels where
+  // SFA is loaded via cp.async inline prepack, not TMA).
+  template <typename TX, typename TW, typename TY, typename TSFW>
+  auto get_tma_without_sfa(TX x, TW w, TY y, TSFW sfw) {
+    if constexpr (kMmaSM == 2) {
+      auto copybox_a = tile_to_shape(SLayoutABAtom{}, make_shape(Int<kTileM>{}, Int<kTileK>{}));
+      auto copybox_b = tile_to_shape(SLayoutABAtom{}, make_shape(Int<kTileN>{}, Int<kTileK>{}));
+      auto copybox_sfb =
+          make_layout(make_shape(Int<64>{}, Int<16>{}), make_stride(Int<16>{}, Int<1>{}));
+      auto tma_a = make_tma_copy(SM100_TMA_2SM_LOAD{}, x, copybox_a, Int<kMmaSM>{});
+      auto tma_b = make_tma_copy(SM100_TMA_2SM_LOAD{}, w, copybox_b, Int<kMmaSM>{});
+      auto tma_sfb = make_tma_copy(SM100_TMA_2SM_LOAD{}, sfw, copybox_sfb, Int<kMmaSM>{});
+      auto tma_y = make_tma_copy(SM90_TMA_STORE{}, y, SLayoutYT{}(_, _, 0));  // NOLINT
+      return std::make_tuple(tma_a, tma_b, tma_y, tma_sfb);
+    } else {
+      auto tma_a = make_tma_copy(SM90_TMA_LOAD{}, x, SLayoutA{}(_, _, 0));        // NOLINT
+      auto tma_b = make_tma_copy(SM90_TMA_LOAD{}, w, SLayoutB{}(_, _, 0));        // NOLINT
+      auto tma_y = make_tma_copy(SM90_TMA_STORE{}, y, SLayoutYT{}(_, _, 0));      // NOLINT
+      auto tma_sfb = make_tma_copy(SM90_TMA_LOAD{}, sfw, SLayoutSFB{}(_, _, 0));  // NOLINT
+      return std::make_tuple(tma_a, tma_b, tma_y, tma_sfb);
+    }
+  }
+
   static constexpr int shm_ab = (cosize(SLayoutA{}) + cosize(SLayoutB{})) * sizeof(Tin);
   static constexpr int shm_sf = (cosize(SLayoutSFA{}) + cosize(SLayoutSFB{})) * sizeof(Tsf);
   static constexpr int shm_y = cosize(SLayoutYT{}) * sizeof(Tout);

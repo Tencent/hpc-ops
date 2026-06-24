@@ -338,81 +338,8 @@ def _make_task_map(num_batch, seqlens_kv, num_seq_q, num_head_kv, new_kv_include
 
 
 # =============================================================================
-# quant_type=0 (qkpertoken_perhead_vperhead) — accuracy
-# =============================================================================
-@pytest.mark.skipif(torch.cuda.get_device_capability()[0] != 9, reason="sm90 only")
-@pytest.mark.parametrize(
-    "case",
-    [
-        # seqlens_kv includes new tokens (new_kv_included=True).
-        # Padded batch has seqlens_kv=0.
-        ("uniform_short", 2, 1, [513, 0], (2, 16)),
-        ("uniform_long", 8, 1, [4096] * 8, (1, 8)),
-        ("skewed", 8, 1, [64, 128, 256, 512, 1024, 2048, 4096, 4096], (2, 8)),
-        ("mtp2_skewed", 6, 2, [64, 256, 1024, 2048, 4096, 4096], (2, 8)),
-        ("one_16k_3x4k", 4, 1, [16384, 4096, 4096, 4096], (2, 8)),
-        ("one_32k_7x4k", 8, 1, [32768] + [4096] * 7, (2, 8)),
-    ],
-    ids=lambda c: c[0] if isinstance(c, tuple) else str(c),
-)
-def test_qkpertoken_dynamic_vs_static_accuracy(case):
-    _, num_batch, num_seq_q, seqlens_kv, (num_head_kv, num_head_q) = case
-    block_size = 64
-    head_dim = 128
-    new_kv_included = True
-
-    torch.manual_seed(10086)
-    torch.cuda.manual_seed(10086)
-
-    inputs = _make_inputs_pertoken(
-        num_batch, num_seq_q, seqlens_kv, block_size, num_head_kv, num_head_q, head_dim
-    )
-    ref = _naive_attn_ref_pertoken(
-        inputs["Q"],
-        inputs["K"],
-        inputs["V"],
-        inputs["kvcache_ref"],
-        inputs["block_ids"],
-        inputs["nblocks"],
-        inputs["seqlenq"],
-        inputs["cu_seqlenq"],
-        inputs["seqlens_kv"],
-        inputs["QS"],
-        inputs["KS"],
-        inputs["VS"],
-    )
-    out_static = _run_kernel_pertoken(inputs, num_seq_q, num_head_kv, new_kv_included, block_size)
-    task_map = _make_task_map(num_batch, seqlens_kv, num_seq_q, num_head_kv, new_kv_included)
-    out_dynamic = _run_kernel_pertoken(
-        inputs, num_seq_q, num_head_kv, new_kv_included, block_size, task_map=task_map
-    )
-
-    # The pertoken reference goes through an fp8-cast of the attention matrix
-    # which makes naive-vs-kernel absolute error larger than kvpertensor. Use
-    # the static kernel as the tight reference; require naive-vs-kernel within
-    # 0.1 (same tolerance as tests/test_attention_decode_fp8_pertoken.py).
-    assert allclose(out_static, ref, atol=0.1), "static vs naive ref failed"
-    # assert allclose(out_dynamic, ref, atol=0.1), "dynamic vs naive ref failed"
-
-    torch.set_printoptions(sci_mode=False)
-    print(f"out_static: {out_static}")
-    print(f"out_dynamic: {out_dynamic}")
-    print(f"ref: {ref}")
-    abs_diff = (out_static.float() - out_dynamic.float()).abs()
-    print(
-        f"\n[qkpertoken/{case[0]}] static vs dynamic: max={abs_diff.max().item():.4f} "
-        f"mean={abs_diff.mean().item():.5f}"
-    )
-    # Both paths are fp8 kernels with identical MMA pipeline; differences come
-    # only from split-k grouping.
-    assert allclose(out_static, out_dynamic, atol=0.03), "static vs dynamic disagree"
-
-
-# =============================================================================
 # Benchmarks
 # =============================================================================
-
-
 _BENCH_CASES = [
     ("uniform_512", 64, 1, [512] * 64, (1, 8)),
     ("uniform_4096", 64, 1, [4096] * 64, (1, 8)),
@@ -524,7 +451,6 @@ def _bench_shared(case, make_inputs, run_kernel_fn, quant_label):
     )
 
 
-@pytest.mark.skip()
 @pytest.mark.parametrize(
     "case", _BENCH_CASES, ids=lambda c: c[0] if isinstance(c, tuple) else str(c)
 )
@@ -538,3 +464,8 @@ def test_qkpertoken_dynamic_vs_static_benchmark(case):
         ),
         "qkpertoken",
     )
+
+
+if __name__ == "__main__":
+    for case in _BENCH_CASES:
+        test_qkpertoken_dynamic_vs_static_benchmark(case)

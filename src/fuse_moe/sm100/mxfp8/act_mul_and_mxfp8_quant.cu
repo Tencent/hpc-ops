@@ -32,14 +32,12 @@ __device__ __forceinline__ uint8_t fp32_absmax_to_ue8m0(float absmax) {
   return static_cast<uint8_t>(sf_bits);
 }
 
-template <int kThreadPerBlock, int kTileM, int kSfLanes, bool kUsePDL = false>
+template <int kThreadPerBlock, bool kUsePDL = false>
 __global__ void act_mul_mxfp8_kernel(const __nv_bfloat16 *__restrict__ gate_up_ptr,
                                      __nv_fp8_e4m3 *__restrict__ out_ptr,
                                      uint8_t *__restrict__ out_scale_packed_ptr,
                                      const int *__restrict__ valid_row_range_ptr,
-                                     const int *__restrict__ cu_seqlens_ptr,
-                                     const int *__restrict__ cu_tiles_ptr, int num_expert_local,
-                                     int intermediate_size, int k_sf_tiles) {
+                                     int intermediate_size) {
   if constexpr (kUsePDL) {
     cudaGridDependencySynchronize();
   }
@@ -51,16 +49,6 @@ __global__ void act_mul_mxfp8_kernel(const __nv_bfloat16 *__restrict__ gate_up_p
 
   int irow = blockIdx.y;
   int ikblock = blockIdx.x * kThreadPerBlock + threadIdx.x;
-
-  // Load cu_seqlens and cu_tiles
-  extern __shared__ int smem[];
-  int *cu_seqlens_shm = smem;
-  int *cu_tiles_shm = smem + num_expert_local + 1;
-  for (int i = threadIdx.x; i <= num_expert_local; i += kThreadPerBlock) {
-    cu_seqlens_shm[i] = cu_seqlens_ptr[i];
-    cu_tiles_shm[i] = cu_tiles_ptr[i];
-  }
-  __syncthreads();
 
   if (ikblock >= K_sf) {
     return;
@@ -119,52 +107,9 @@ __global__ void act_mul_mxfp8_kernel(const __nv_bfloat16 *__restrict__ gate_up_p
   store<__nv_fp8_e4m3, 16>(out_row, out_fp8_lo);
   store<__nv_fp8_e4m3, 16>(out_row + 16, out_fp8_hi);
 
-  // Store scale directly to packed SFA layout (fused prepack)
-  // Find which expert group this row belongs to (binary search in cu_seqlens)
-  int lo = 0, hi = num_expert_local;
-  while (lo < hi) {
-    int mid = (lo + hi + 1) >> 1;
-    if (cu_seqlens_shm[mid] <= irow) {
-      lo = mid;
-    } else {
-      hi = mid - 1;
-    }
-  }
-  int group = lo;
-
-  int local_row = irow - cu_seqlens_shm[group];
-  int tile_in_group = local_row / kTileM;
-  int row_in_tile = local_row - tile_in_group * kTileM;
-  int global_tile = cu_tiles_shm[group] + tile_in_group;
-
-  // Packed layout addressing:
-  //   For kSfLanes=32: row_in_tile maps to (lane, q) as:
-  //     lane = row_in_tile % 32,  q = row_in_tile / 32
-  //   For kSfLanes=64: the mapping is interleaved:
-  //     row_in_tile < 128: lane = row_in_tile % 32,      q = row_in_tile / 32
-  //     row_in_tile >= 128: lane = row_in_tile % 32 + 32, q = (row_in_tile - 128) / 32
-  //   dst_v index = global_tile * kSfLanes * k_sf_tiles + kt * kSfLanes + lane
-  //   byte in vec = q * 4 + k_within
-  int lane, q;
-  if constexpr (kSfLanes == 32) {
-    lane = row_in_tile & 31;
-    q = row_in_tile >> 5;
-  } else {
-    // kSfLanes == 64
-    if (row_in_tile < 128) {
-      lane = row_in_tile & 31;
-      q = row_in_tile >> 5;
-    } else {
-      lane = (row_in_tile & 31) + 32;
-      q = (row_in_tile - 128) >> 5;
-    }
-  }
-  int kt = ikblock >> 2;       // ikblock / 4
-  int k_within = ikblock & 3;  // ikblock % 4
-
-  int byte_offset = global_tile * (kSfLanes * k_sf_tiles * 16) + kt * (kSfLanes * 16) + lane * 16 +
-                    q * 4 + k_within;
-  out_scale_packed_ptr[byte_offset] = sf_bits;
+  // Store scale in row-major layout: sfx_ptr[irow * K_sf + ikblock]
+  // The downstream GEMM kernel does inline prepack via cp.async.
+  out_scale_packed_ptr[static_cast<uint64_t>(irow) * K_sf + ikblock] = sf_bits;
 
   if constexpr (kUsePDL) {
     cudaTriggerProgrammaticLaunchCompletion();
@@ -173,11 +118,9 @@ __global__ void act_mul_mxfp8_kernel(const __nv_bfloat16 *__restrict__ gate_up_p
 
 }  // namespace kernels_mxfp8
 
-void act_mul_and_mxfp8_quant_async(void *out_ptr, void *out_scale_packed_ptr,
-                                   const void *gate_up_ptr, const void *valid_row_range_ptr,
-                                   const void *cu_seqlens_ptr, const void *cu_tiles_ptr,
-                                   int num_expert_local, int total_num_seq, int intermediate_size,
-                                   int kTileM, int k_sf_tiles, cudaStream_t stream, bool use_pdl) {
+void act_mul_and_mxfp8_quant_async(void *out_ptr, void *out_scale_ptr, const void *gate_up_ptr,
+                                   const void *valid_row_range_ptr, int total_num_seq,
+                                   int intermediate_size, cudaStream_t stream, bool use_pdl) {
   constexpr int kSfVec = 32;
   constexpr int kThreadPerBlock = 128;
 
@@ -186,72 +129,29 @@ void act_mul_and_mxfp8_quant_async(void *out_ptr, void *out_scale_packed_ptr,
 
   dim3 grid(gridx, total_num_seq);
   dim3 block(kThreadPerBlock);
-  int smem_size = 2 * (num_expert_local + 1) * sizeof(int);
 
-  bool is_smallm = (kTileM <= 128);
-
-  auto launch = [&](auto tilem_tag, auto sflanes_tag) {
-    constexpr int KTM = decltype(tilem_tag)::value;
-    constexpr int SFLANES = decltype(sflanes_tag)::value;
-    if (use_pdl) {
-      auto kernel = kernels_mxfp8::act_mul_mxfp8_kernel<kThreadPerBlock, KTM, SFLANES, true>;
-      cudaLaunchAttribute attr[1];
-      attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attr[0].val.programmaticStreamSerializationAllowed = 1;
-      cudaLaunchConfig_t cfg{};
-      cfg.gridDim = grid;
-      cfg.blockDim = block;
-      cfg.dynamicSmemBytes = smem_size;
-      cfg.stream = stream;
-      cfg.attrs = attr;
-      cfg.numAttrs = 1;
-      cudaLaunchKernelEx(&cfg, kernel, reinterpret_cast<const __nv_bfloat16 *>(gate_up_ptr),
-                         reinterpret_cast<__nv_fp8_e4m3 *>(out_ptr),
-                         reinterpret_cast<uint8_t *>(out_scale_packed_ptr),
-                         reinterpret_cast<const int *>(valid_row_range_ptr),
-                         reinterpret_cast<const int *>(cu_seqlens_ptr),
-                         reinterpret_cast<const int *>(cu_tiles_ptr), num_expert_local,
-                         intermediate_size, k_sf_tiles);
-    } else {
-      auto kernel = kernels_mxfp8::act_mul_mxfp8_kernel<kThreadPerBlock, KTM, SFLANES, false>;
-      kernel<<<grid, block, smem_size, stream>>>(
-          reinterpret_cast<const __nv_bfloat16 *>(gate_up_ptr),
-          reinterpret_cast<__nv_fp8_e4m3 *>(out_ptr),
-          reinterpret_cast<uint8_t *>(out_scale_packed_ptr),
-          reinterpret_cast<const int *>(valid_row_range_ptr),
-          reinterpret_cast<const int *>(cu_seqlens_ptr),
-          reinterpret_cast<const int *>(cu_tiles_ptr), num_expert_local, intermediate_size,
-          k_sf_tiles);
-    }
-  };
-
-  using SF32 = std::integral_constant<int, 32>;
-  using SF64 = std::integral_constant<int, 64>;
-
-  if (is_smallm) {
-    switch (kTileM) {
-      case 16:
-        return launch(std::integral_constant<int, 16>{}, SF32{});
-      case 32:
-        return launch(std::integral_constant<int, 32>{}, SF32{});
-      case 48:
-        return launch(std::integral_constant<int, 48>{}, SF32{});
-      case 64:
-        return launch(std::integral_constant<int, 64>{}, SF32{});
-      case 96:
-        return launch(std::integral_constant<int, 96>{}, SF32{});
-      default:
-        return launch(std::integral_constant<int, 128>{}, SF32{});
-    }
+  if (use_pdl) {
+    auto kernel = kernels_mxfp8::act_mul_mxfp8_kernel<kThreadPerBlock, true>;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, kernel, reinterpret_cast<const __nv_bfloat16 *>(gate_up_ptr),
+                       reinterpret_cast<__nv_fp8_e4m3 *>(out_ptr),
+                       reinterpret_cast<uint8_t *>(out_scale_ptr),
+                       reinterpret_cast<const int *>(valid_row_range_ptr), intermediate_size);
   } else {
-    switch (kTileM) {
-      case 160:
-        return launch(std::integral_constant<int, 160>{}, SF64{});
-      case 192:
-        return launch(std::integral_constant<int, 192>{}, SF64{});
-      default:
-        return launch(std::integral_constant<int, 256>{}, SF64{});
-    }
+    auto kernel = kernels_mxfp8::act_mul_mxfp8_kernel<kThreadPerBlock, false>;
+    kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16 *>(gate_up_ptr),
+        reinterpret_cast<__nv_fp8_e4m3 *>(out_ptr), reinterpret_cast<uint8_t *>(out_scale_ptr),
+        reinterpret_cast<const int *>(valid_row_range_ptr), intermediate_size);
   }
 }
 

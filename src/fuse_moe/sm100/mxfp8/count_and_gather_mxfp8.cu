@@ -5,12 +5,14 @@
 
 #include <algorithm>
 #include <cub/cub.cuh>  // NOLINT(build/include_order)
+#include <type_traits>
 
 #include "cute/tensor.hpp"
 #include "cutlass/fast_math.h"
 #include "src/fuse_moe/sm100/count_kernels.cuh"
 #include "src/fuse_moe/sm100/mxfp8/fuse_moe_mxfp8.h"
 #include "src/group_gemm/sm100/group_gemm.h"
+#include "src/group_gemm/sm100/mxfp8/dispatch.cuh"
 #include "src/group_gemm/sm100/mxfp8/group_gemm_mxfp8.cuh"
 #include "src/utils/tma.cuh"
 #include "src/utils/utils.cuh"
@@ -19,7 +21,7 @@
 namespace hpc {
 namespace fuse_moe {
 
-template <typename GateupCfg, typename DownCfg>
+template <typename GateUpConfig, typename DownConfig>
 void launch_count_and_route_row_mxfp8(
     void *gate_up_input_ptr, void *gate_up_output_ptr, void *down_input_ptr, void *down_output_ptr,
     const void *topk_ids_ptr, void *topk_pos_ptr, const void *topk_scale_ptr,
@@ -32,18 +34,10 @@ void launch_count_and_route_row_mxfp8(
   using Tout = cute::bfloat16_t;
   using Tsf = uint8_t;
 
-  // Gateup config (cp_async 1SM path)
-  constexpr int kTileM = GateupCfg::kTileM;
-  constexpr int kTileN = GateupCfg::kTileN;
-  constexpr int kTileK = GateupCfg::kTileK;
-  constexpr int kStage = GateupCfg::kStage;
-  constexpr int kEpiTileM = GateupCfg::kEpiTileM;
-  constexpr int kStageTMA = GateupCfg::kStageTMA;
-
-  // Down config (may be 1SM or 2SM)
-  constexpr int kTileM_Down = DownCfg::kTileM;
-  constexpr int kTileN_Down = DownCfg::kTileN;
-  constexpr int kMmaSM_Down = DownCfg::kMmaSM;
+  // Tile-M for the tile-counting kernels — taken from each GEMM's config so the
+  // tile partition matches what the downstream GEMMs consume.
+  constexpr int kTileM = GateUpConfig::kTileM;
+  constexpr int kTileM_Down = DownConfig::kTileM;
 
   int total_num_topk = num_seq * num_topk;
   int start_expert = rank_ep * num_expert_local;
@@ -65,43 +59,33 @@ void launch_count_and_route_row_mxfp8(
   auto Y_down = make_tensor(make_gmem_ptr(reinterpret_cast<Tout *>(down_output_ptr)),
                             make_shape(hidden_size, M_total), make_stride(Int<1>{}, hidden_size));
 
-  // Gateup TMA (always 1SM cp_async path)
-  auto slayout_gateup_x = tile_to_shape(UMMA::Layout_K_SW128_Atom<Tin>{},
-                                        make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{}));
-  auto slayout_gateup_yt =
-      tile_to_shape(UMMA::Layout_MN_SW128_Atom<Tout>{},
-                    make_shape(Int<kTileN>{}, Int<kEpiTileM>{}, Int<kStageTMA>{}));
-  auto tma_gateup_x = make_tma_copy(SM90_TMA_LOAD{}, X_gateup, slayout_gateup_x(_, _, 0));
-  auto tma_gateup_y = make_tma_copy(SM90_TMA_STORE{}, Y_gateup, slayout_gateup_yt(_, _, 0));
+  // Descriptors are derived from the GEMM configs (both 1SM, kMmaSM=1) so they
+  // are byte-identical to what each kernel builds. A box/op mismatch between the
+  // descriptor stage-1 publishes and the one a kernel consumes deadlocks the
+  // TMA mbarrier (e.g. the down GEMM consumes down_X via 1SM SM90_TMA_LOAD).
+  //
+  //   * gateup_X : unused by the GateUp GEMM (loads X via cp.async) but built
+  //                from GateUpConfig for a consistent descriptor type.
+  //   * gateup_Y : consumed by the GateUp epilogue TMA store.
+  //   * down_X   : consumed by the Down GEMM A-TMA load — the box must match
+  //                DownConfig::SLayoutA exactly.
+  //   * down_Y   : unused by the Down GEMM (atomic scatter-add reduce) but built
+  //                from DownConfig for a consistent descriptor type.
+  static_assert(GateUpConfig::kMmaSM == 1 && DownConfig::kMmaSM == 1,
+                "fuse_moe stage-1 descriptors assume 1SM GateUp/Down GEMM configs");
 
-  // Down TMA — use DownCfg's get_tma() for correct tile shapes (handles 1SM/2SM/kTileK)
-  // We create dummy B/SFA/SFB tensors since get_tma() needs them but we only use tma_a/tma_y.
-  int down_k = intermediate_size;
-  int down_n = hidden_size;
-  constexpr int kSfVec_Down = DownCfg::kSfVec;
-  constexpr int kSfxRows_Down = DownCfg::kSfxRows;
-  int down_k_sf_tiles = (down_k / kSfVec_Down + 3) / 4;
-  int down_n_padded = ((down_n + kTileN_Down - 1) / kTileN_Down) * kTileN_Down;
-  int down_sfx_max_tiles = M_total / kTileM_Down + num_expert_local;
-
-  auto B_down_dummy = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(down_input_ptr)),
-                                  make_shape(down_n, down_k, num_expert_local),
-                                  make_stride(down_k, Int<1>{}, down_n * down_k));
-  auto SFA_down_dummy = make_tensor(
-      make_gmem_ptr(reinterpret_cast<const Tsf *>(down_input_ptr)),
-      make_shape(Int<kSfxRows_Down>{}, Int<16>{}, down_sfx_max_tiles, down_k_sf_tiles),
-      make_stride(Int<16>{}, Int<1>{}, down_k_sf_tiles * kSfxRows_Down * 16, kSfxRows_Down * 16));
-
-  constexpr int kSfbRows_Down = (kMmaSM_Down == 1) ? 32 : 64;
-  auto SFB_down_dummy = make_tensor(
-      make_gmem_ptr(reinterpret_cast<const Tsf *>(down_input_ptr)),
-      make_shape(Int<kSfbRows_Down>{}, Int<16>{}, num_expert_local * (down_n_padded / kTileN_Down),
-                 down_k_sf_tiles),
-      make_stride(Int<16>{}, Int<1>{}, down_k_sf_tiles * kSfbRows_Down * 16, kSfbRows_Down * 16));
-
-  DownCfg down_config;
-  auto [tma_down_x, tma_down_b_unused, tma_down_y, tma_down_sfa_unused, tma_down_sfb_unused] =
-      down_config.get_tma(X_down, B_down_dummy, Y_down, SFA_down_dummy, SFB_down_dummy);
+  typename GateUpConfig::SLayoutA gateup_a_layout{};
+  typename GateUpConfig::SLayoutYT gateup_yt_layout{};
+  typename DownConfig::SLayoutA down_a_layout{};
+  typename DownConfig::SLayoutYT down_yt_layout{};
+  auto gateup_x_layout = gateup_a_layout(_, _, 0);
+  auto gateup_y_layout = gateup_yt_layout(_, _, 0);
+  auto down_x_layout = down_a_layout(_, _, 0);
+  auto down_y_layout = down_yt_layout(_, _, 0);
+  auto tma_gateup_x = make_tma_copy(SM90_TMA_LOAD{}, X_gateup, gateup_x_layout);
+  auto tma_gateup_y = make_tma_copy(SM90_TMA_STORE{}, Y_gateup, gateup_y_layout);
+  auto tma_down_x = make_tma_copy(SM90_TMA_LOAD{}, X_down, down_x_layout);
+  auto tma_down_y = make_tma_copy(SM90_TMA_STORE{}, Y_down, down_y_layout);
 
   vec_t<cute::TmaDescriptor, 4> td_xy{
       *tma_gateup_x.get_tma_descriptor(),
@@ -238,13 +222,6 @@ void launch_count_and_route_row_mxfp8(
   }
 }
 
-namespace {
-template <typename T>
-struct _ti {
-  using type = T;
-};
-}  // namespace
-
 void count_and_route_row_mxfp8_async(
     void *gate_up_input_ptr, void *gate_up_output_ptr, void *down_input_ptr, void *down_output_ptr,
     const void *topk_ids_ptr, void *topk_pos_ptr, const void *topk_scale_ptr,
@@ -253,116 +230,26 @@ void count_and_route_row_mxfp8_async(
     void *gate_up_tmas_ptr, void *down_tmas_ptr, int num_seq, int num_topk, int hidden_size,
     int intermediate_size, int num_expert_local, int rank_ep, int num_seq_per_group_avg,
     cudaStream_t stream) {
-  using Tin = cute::float_e4m3_t;
-  using Tout = cute::bfloat16_t;
-  using Tsf = cutlass::float_ue8m0_t;
+  using GemmTin = cute::float_e4m3_t;
+  using GemmTout = cute::bfloat16_t;
+  using GemmTsf = cutlass::float_ue8m0_t;
 
-  // Down GEMM config dispatch: same logic as group_gemm_mxfp8_async
-  bool use_2sm_down = (hidden_size % 256 == 0) && (num_seq_per_group_avg > 32);
-  int kTileM_down = group_gemm::mxfp8_dispatch_kTileM(num_seq_per_group_avg, hidden_size);
+  // GateUp and Down GEMMs share the same kTileM ladder (same avg, both 1SM), so a
+  // single selector instance yields both configs. We derive the stage-1 TMA
+  // descriptors from these exact config types so they match the descriptors the
+  // GateUp (cp_async) and Down (with_reduce) kernels consume.
+  int kTileM = group_gemm::mxfp8_dispatch_kTileM(num_seq_per_group_avg);
 
-  auto do_launch = [&](auto gateup_tag, auto down_tag) {
-    using GateupCfg = typename decltype(gateup_tag)::type;
-    using DownCfg = typename decltype(down_tag)::type;
-    launch_count_and_route_row_mxfp8<GateupCfg, DownCfg>(
-        gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, topk_ids_ptr,
-        topk_pos_ptr, topk_scale_ptr, gateup_x_row_map_ptr, seqlens_ptr, cu_seqlens_ptr,
-        gateup_tiles_ptr, gateup_cu_tiles_ptr, down_tiles_ptr, down_cu_tiles_ptr, gate_up_tmas_ptr,
-        down_tmas_ptr, num_seq, num_topk, hidden_size, intermediate_size, num_expert_local, rank_ep,
-        stream);
-  };
-
-  // kTileM, kTileN, kTileK, kEpiTileM, kStage, kStageTM, kMmaSM, kStageTile
-  auto dispatch_down = [&](auto gateup_tag) {
-    if (use_2sm_down) {
-      constexpr int kTileN = 256;
-      constexpr int kTileK = 128;
-      switch (kTileM_down) {
-        case 32:
-          return do_launch(gateup_tag,
-                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, kTileN, kTileK,
-                                                                32, 6, 4, 2, 4>>{});
-        case 64:
-          return do_launch(gateup_tag,
-                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, kTileN, kTileK,
-                                                                32, 6, 4, 2, 4>>{});
-        case 96:
-          return do_launch(gateup_tag,
-                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 96, kTileN, kTileK,
-                                                                32, 6, 4, 2, 4>>{});
-        case 128:
-          return do_launch(gateup_tag,
-                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, kTileN, kTileK,
-                                                                32, 6, 4, 2, 3>>{});
-        case 160:
-          return do_launch(gateup_tag,
-                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 160, kTileN, kTileK,
-                                                                32, 6, 4, 2, 2>>{});
-        case 192:
-          return do_launch(gateup_tag,
-                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 192, kTileN, kTileK,
-                                                                32, 6, 2, 2, 2>>{});
-        default:
-          return do_launch(gateup_tag,
-                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, kTileN, kTileK,
-                                                                64, 5, 2, 2, 1>>{});
-      }
-    } else {
-      constexpr int kTileN = 128;
-      constexpr int kTileK = 128;
-      switch (kTileM_down) {
-        case 16:
-          return do_launch(gateup_tag,
-                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 16, kTileN, kTileK,
-                                                                16, 2, 4, 1, 4>>{});
-        case 32:
-          return do_launch(gateup_tag,
-                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, kTileN, kTileK,
-                                                                32, 2, 4, 1, 4>>{});
-        case 48:
-          return do_launch(gateup_tag,
-                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 48, kTileN, kTileK,
-                                                                16, 6, 4, 1, 4>>{});
-        case 64:
-          return do_launch(gateup_tag,
-                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, kTileN, kTileK,
-                                                                64, 6, 4, 1, 4>>{});
-        case 128:
-          return do_launch(gateup_tag,
-                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, kTileN, kTileK,
-                                                                64, 5, 3, 1, 3>>{});
-        default:
-          return do_launch(gateup_tag,
-                           _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, kTileN, kTileK,
-                                                                64, 3, 2, 1, 1>>{});
-      }
-    }
-  };
-
-  // Dispatch GateupCfg (always 1SM cp_async, kTileN=128, kTileK=128, kStageTile=1)
-  // kTileM, kTileN, kTileK, kEpiTileM, kStage, kStageTM, kMmaSM, kStageTile
-  if (num_seq_per_group_avg <= 16) {
-    return dispatch_down(
-        _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 16, 128, 128, 16, 8, 4, 1, 1>>{});
-  }
-  if (num_seq_per_group_avg <= 32) {
-    return dispatch_down(
-        _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, 128, 128, 32, 6, 4, 1, 1>>{});
-  }
-  if (num_seq_per_group_avg <= 48) {
-    return dispatch_down(
-        _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 48, 128, 128, 16, 6, 4, 1, 1>>{});
-  }
-  if (num_seq_per_group_avg <= 64) {
-    return dispatch_down(
-        _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, 128, 128, 64, 6, 4, 1, 1>>{});
-  }
-  if (num_seq_per_group_avg <= 128) {
-    return dispatch_down(
-        _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, 128, 128, 64, 5, 3, 1, 1>>{});
-  }
-  return dispatch_down(
-      _ti<group_gemm::GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, 128, 128, 64, 3, 2, 1, 1>>{});
+  group_gemm::group_gemm_1sm_mxfp8_dispatch_selector<GemmTin, GemmTout, GemmTsf, GemmTin>(
+      kTileM, [&](auto cfg_tag) {
+        using Cfg = typename decltype(cfg_tag)::type;
+        launch_count_and_route_row_mxfp8<Cfg, Cfg>(
+            gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr, topk_ids_ptr,
+            topk_pos_ptr, topk_scale_ptr, gateup_x_row_map_ptr, seqlens_ptr, cu_seqlens_ptr,
+            gateup_tiles_ptr, gateup_cu_tiles_ptr, down_tiles_ptr, down_cu_tiles_ptr,
+            gate_up_tmas_ptr, down_tmas_ptr, num_seq, num_topk, hidden_size, intermediate_size,
+            num_expert_local, rank_ep, stream);
+      });
 }
 
 }  // namespace fuse_moe

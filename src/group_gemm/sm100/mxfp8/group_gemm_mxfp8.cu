@@ -9,6 +9,7 @@
 #include "cute/tensor.hpp"
 #include "src/group_gemm/sm100/gemm_config.h"
 #include "src/group_gemm/sm100/group_gemm.h"
+#include "src/group_gemm/sm100/mxfp8/dispatch.cuh"
 #include "src/group_gemm/sm100/mxfp8/group_gemm_mxfp8.cuh"
 
 namespace hpc {
@@ -66,7 +67,7 @@ void prepack_mxfp8_x_scale_async(void *sfx_packed_ptr, const void *sfx_ptr,
   }
 }
 
-template <typename GemmConfig, int kCtaPerSm = 1, bool kUsePDL = false>
+template <typename GemmConfig, int kCtaPerSm = 1>
 void launch_group_gemm_1sm_mxfp8(void *y_ptr, const void *x_ptr, const void *w_ptr,
                                  const void *sfx_packed_ptr, const void *sfw_packed_ptr,
                                  const void *seqlens_ptr, const void *cu_seqlens_ptr,
@@ -142,10 +143,9 @@ void launch_group_gemm_1sm_mxfp8(void *y_ptr, const void *x_ptr, const void *w_p
     dim3 block(256);
     dim3 grid(num_sm * kCtaPerSm);
 
-    auto kernel =
-        kernels::group_gemm_1sm_mxfp8_kernel<decltype(config), decltype(tma_a), decltype(tma_b),
-                                             decltype(tma_y), decltype(tma_sfa), decltype(tma_sfb),
-                                             kUsePDL>;
+    auto kernel = kernels::group_gemm_1sm_mxfp8_kernel<decltype(config), decltype(tma_a),
+                                                       decltype(tma_b), decltype(tma_y),
+                                                       decltype(tma_sfa), decltype(tma_sfb), true>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
     cudaLaunchConfig_t launch_config;
@@ -157,13 +157,9 @@ void launch_group_gemm_1sm_mxfp8(void *y_ptr, const void *x_ptr, const void *w_p
     cudaLaunchAttribute attr[2];
     attr[0].id = cudaLaunchAttributeClusterDimension;
     attr[0].val.clusterDim = {1, 1, 1};
-    int num_attrs = 1;
-    if constexpr (kUsePDL) {
-      attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attr[1].val.programmaticStreamSerializationAllowed = 1;
-      num_attrs = 2;
-    }
-    launch_config.numAttrs = num_attrs;
+    attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[1].val.programmaticStreamSerializationAllowed = 1;
+    launch_config.numAttrs = 2;
     launch_config.attrs = attr;
 
     cudaLaunchKernelEx(&launch_config, kernel, tma_b, tma_sfb, tma_sfa, tma_ay, (int *)seqlens_ptr,
@@ -171,7 +167,7 @@ void launch_group_gemm_1sm_mxfp8(void *y_ptr, const void *x_ptr, const void *w_p
   }
 }
 
-template <typename GemmConfig, int kCtaPerSm = 1, bool kUsePDL = false>
+template <typename GemmConfig, int kCtaPerSm = 1>
 void launch_group_gemm_2sm_mxfp8(void *y_ptr, const void *x_ptr, const void *w_ptr,
                                  const void *sfx_packed_ptr, const void *sfw_packed_ptr,
                                  const void *seqlens_ptr, const void *cu_seqlens_ptr,
@@ -245,10 +241,9 @@ void launch_group_gemm_2sm_mxfp8(void *y_ptr, const void *x_ptr, const void *w_p
     dim3 block(256);
     dim3 grid(num_sm * kCtaPerSm);
 
-    auto kernel =
-        kernels::group_gemm_2sm_mxfp8_kernel<decltype(config), decltype(tma_a), decltype(tma_b),
-                                             decltype(tma_y), decltype(tma_sfa), decltype(tma_sfb),
-                                             kUsePDL>;
+    auto kernel = kernels::group_gemm_2sm_mxfp8_kernel<decltype(config), decltype(tma_a),
+                                                       decltype(tma_b), decltype(tma_y),
+                                                       decltype(tma_sfa), decltype(tma_sfb), true>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
     cudaLaunchConfig_t launch_config;
@@ -260,13 +255,9 @@ void launch_group_gemm_2sm_mxfp8(void *y_ptr, const void *x_ptr, const void *w_p
     cudaLaunchAttribute attr[2];
     attr[0].id = cudaLaunchAttributeClusterDimension;
     attr[0].val.clusterDim = {static_cast<unsigned>(kMmaSM), 1, 1};
-    int num_attrs = 1;
-    if constexpr (kUsePDL) {
-      attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attr[1].val.programmaticStreamSerializationAllowed = 1;
-      num_attrs = 2;
-    }
-    launch_config.numAttrs = num_attrs;
+    attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[1].val.programmaticStreamSerializationAllowed = 1;
+    launch_config.numAttrs = 2;
     launch_config.attrs = attr;
 
     cudaLaunchKernelEx(&launch_config, kernel, tma_b, tma_sfb, tma_sfa, tma_ay, (int *)seqlens_ptr,
@@ -274,140 +265,68 @@ void launch_group_gemm_2sm_mxfp8(void *y_ptr, const void *x_ptr, const void *w_p
   }
 }
 
-namespace {
-template <typename T>
-struct type_id {
-  using type = T;
-};
-}  // namespace
-
 void group_gemm_mxfp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
                             const void *sfx_packed_ptr, const void *sfw_packed_ptr,
                             const void *seqlens_ptr, const void *cu_seqlens_ptr, void *tmas_ptr,
                             void *tiles_ptr, void *cu_tiles_ptr, int num_group, int m, int n, int k,
                             int num_seq_per_group_avg, bool update_tma, cudaStream_t stream,
-                            bool use_pdl, bool is_fp4) {
-  int kTileM_dispatch = mxfp8_dispatch_kTileM(num_seq_per_group_avg, n);
-  bool use_2sm = (n % 256 == 0) && (num_seq_per_group_avg > 32);
+                            bool is_fp4) {
+  int kTileM_dispatch = mxfp8_dispatch_kTileM(num_seq_per_group_avg);
 
   using Tin = cute::float_e4m3_t;
   using TinB_fp4 = cutlass::detail::float_e2m1_unpacksmem_t;
   using Tout = cute::bfloat16_t;
   using Tsf = cutlass::float_ue8m0_t;
 
-  auto launch_1sm = [&](auto cfg_tag, auto cta_tag) {
-    using Cfg = typename decltype(cfg_tag)::type;
-    constexpr int kCtaPerSm = decltype(cta_tag)::value;
-    if (use_pdl) {
-      launch_group_gemm_1sm_mxfp8<Cfg, kCtaPerSm, true>(
-          y_ptr, x_ptr, w_ptr, sfx_packed_ptr, sfw_packed_ptr, seqlens_ptr, cu_seqlens_ptr,
-          tmas_ptr, tiles_ptr, cu_tiles_ptr, num_group, m, n, k, update_tma, stream);
-    } else {
-      launch_group_gemm_1sm_mxfp8<Cfg, kCtaPerSm, false>(
-          y_ptr, x_ptr, w_ptr, sfx_packed_ptr, sfw_packed_ptr, seqlens_ptr, cu_seqlens_ptr,
-          tmas_ptr, tiles_ptr, cu_tiles_ptr, num_group, m, n, k, update_tma, stream);
-    }
-  };
-
   auto launch_2sm = [&](auto cfg_tag) {
     using Cfg = typename decltype(cfg_tag)::type;
-    if (use_pdl) {
-      launch_group_gemm_2sm_mxfp8<Cfg, 1, true>(
-          y_ptr, x_ptr, w_ptr, sfx_packed_ptr, sfw_packed_ptr, seqlens_ptr, cu_seqlens_ptr,
-          tmas_ptr, tiles_ptr, cu_tiles_ptr, num_group, m, n, k, update_tma, stream);
-    } else {
-      launch_group_gemm_2sm_mxfp8<Cfg, 1, false>(
-          y_ptr, x_ptr, w_ptr, sfx_packed_ptr, sfw_packed_ptr, seqlens_ptr, cu_seqlens_ptr,
-          tmas_ptr, tiles_ptr, cu_tiles_ptr, num_group, m, n, k, update_tma, stream);
-    }
+    launch_group_gemm_2sm_mxfp8<Cfg, 1>(y_ptr, x_ptr, w_ptr, sfx_packed_ptr, sfw_packed_ptr,
+                                        seqlens_ptr, cu_seqlens_ptr, tmas_ptr, tiles_ptr,
+                                        cu_tiles_ptr, num_group, m, n, k, update_tma, stream);
   };
-
-  using IC1 = std::integral_constant<int, 1>;
-  using IC3 = std::integral_constant<int, 3>;
 
   assert(k % 32 == 0 && "group_gemm_mxfp8: k must be a multiple of 32 (SF_VEC)");
 
   constexpr int kTileK = 128;
 
-  // 1SM dispatch table, parameterized by TinB (TinB=Tin for fp8, TinB=float_e2m1_unpacksmem_t
-  //   for fp4). The Config's 12th template parameter = TinB.
-  auto dispatch_1sm = [&](auto tinb_tag) {
+  // 2SM dispatch: kTileN=256, kMmaSM=2
+  auto dispatch_2sm = [&](auto tinb_tag) {
     using TinB = typename decltype(tinb_tag)::type;
-    constexpr int kMmaSM = 1;
-    constexpr int kTileN = 128;
+    constexpr int kMmaSM = 2;
+    constexpr int kTileN = 256;
     switch (kTileM_dispatch) {
       // Tin, Tout, Tsf, KTM, kTileN, kTileK, EPI, STAGE, STAGE_TMA, kMmaSM, STAGE_TILE, TinB
       case 16:
-        return launch_1sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 16, kTileN, kTileK, 16, 2, 4,
-                                                       kMmaSM, 4, TinB>>{},
-                          IC3{});
+        return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 16, kTileN, kTileK, 16, 8, 4,
+                                                       kMmaSM, 4, TinB>>{});
       case 32:
-        return launch_1sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, kTileN, kTileK, 32, 2, 4,
-                                                       kMmaSM, 4, TinB>>{},
-                          IC3{});
-      case 48:
-        return launch_1sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 48, kTileN, kTileK, 16, 6, 4,
-                                                       kMmaSM, 4, TinB>>{},
-                          IC1{});
+        return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, kTileN, kTileK, 32, 8, 4,
+                                                       kMmaSM, 4, TinB>>{});
       case 64:
-        return launch_1sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, kTileN, kTileK, 64, 6, 4,
-                                                       kMmaSM, 4, TinB>>{},
-                          IC1{});
+        return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, kTileN, kTileK, 32, 6, 4,
+                                                       kMmaSM, 4, TinB>>{});
+      case 96:
+        return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 96, kTileN, kTileK, 32, 6, 4,
+                                                       kMmaSM, 4, TinB>>{});
       case 128:
-        return launch_1sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, kTileN, kTileK, 64, 5,
-                                                       3, kMmaSM, 3, TinB>>{},
-                          IC1{});
+        return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, kTileN, kTileK, 32, 6,
+                                                       4, kMmaSM, 3, TinB>>{});
+      case 160:
+        return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 160, kTileN, kTileK, 32, 6,
+                                                       4, kMmaSM, 2, TinB>>{});
+      case 192:
+        return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 192, kTileN, kTileK, 32, 6,
+                                                       2, kMmaSM, 2, TinB>>{});
       default:
-        return launch_1sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, kTileN, kTileK, 64, 3,
-                                                       2, kMmaSM, 1, TinB>>{},
-                          IC1{});
+        return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, kTileN, kTileK, 64, 5,
+                                                       2, kMmaSM, 1, TinB>>{});
     }
   };
 
-  if (use_2sm) {
-    // 2SM, kTileK=128 (TinB=Tin for fp8, TinB=float_e2m1_unpacksmem_t for fp4).
-    //   The Config's 12th template parameter = TinB.
-    auto dispatch_2sm = [&](auto tinb_tag) {
-      using TinB = typename decltype(tinb_tag)::type;
-      constexpr int kMmaSM = 2;
-      constexpr int kTileN = 256;
-      switch (kTileM_dispatch) {
-        // Tin, Tout, Tsf, KTM, kTileN, kTileK, EPI, STAGE, STAGE_TMA, kMmaSM, STAGE_TILE, TinB
-        case 32:
-          return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 32, kTileN, kTileK, 32, 6,
-                                                         4, kMmaSM, 4, TinB>>{});
-        case 64:
-          return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 64, kTileN, kTileK, 32, 6,
-                                                         4, kMmaSM, 4, TinB>>{});
-        case 96:
-          return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 96, kTileN, kTileK, 32, 6,
-                                                         4, kMmaSM, 4, TinB>>{});
-        case 128:
-          return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 128, kTileN, kTileK, 32, 6,
-                                                         4, kMmaSM, 3, TinB>>{});
-        case 160:
-          return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 160, kTileN, kTileK, 32, 6,
-                                                         4, kMmaSM, 2, TinB>>{});
-        case 192:
-          return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 192, kTileN, kTileK, 32, 6,
-                                                         2, kMmaSM, 2, TinB>>{});
-        default:
-          return launch_2sm(type_id<GroupGEMMMxFp8Config<Tin, Tout, Tsf, 256, kTileN, kTileK, 64, 5,
-                                                         2, kMmaSM, 1, TinB>>{});
-      }
-    };
-
-    if (is_fp4) {
-      return dispatch_2sm(type_id<TinB_fp4>{});
-    } else {
-      return dispatch_2sm(type_id<Tin>{});
-    }
+  if (is_fp4) {
+    return dispatch_2sm(type_id<TinB_fp4>{});
   } else {
-    if (is_fp4) {
-      return dispatch_1sm(type_id<TinB_fp4>{});
-    } else {
-      return dispatch_1sm(type_id<Tin>{});
-    }
+    return dispatch_2sm(type_id<Tin>{});
   }
 }
 

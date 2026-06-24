@@ -18,32 +18,22 @@ void count_and_route_row_mxfp8_async(
     int intermediate_size, int num_expert_local, int rank_ep, int num_seq_per_group_avg,
     cudaStream_t stream);
 
-// Prepack SFA with gather: reads x_scale[gateup_x_row_map[irow], :] and writes
-// directly to packed layout, combining the gather and prepack steps.
-void prepack_mxfp8_sfa_with_gather_async(void *sfa_packed_ptr, const void *x_scale_ptr,
-                                         const void *gateup_x_row_map_ptr,
-                                         const void *cu_seqlens_ptr, int num_group, int m_total,
-                                         int k, int kTileM, cudaStream_t stream,
-                                         bool use_pdl = false);
-
-void act_mul_and_mxfp8_quant_async(void *out_ptr, void *out_scale_packed_ptr,
-                                   const void *gate_up_ptr, const void *valid_row_range_ptr,
-                                   const void *cu_seqlens_ptr, const void *cu_tiles_ptr,
-                                   int num_expert_local, int total_num_seq, int intermediate_size,
-                                   int kTileM, int k_sf_tiles, cudaStream_t stream,
+void act_mul_and_mxfp8_quant_async(void *out_ptr, void *out_scale_ptr, const void *gate_up_ptr,
+                                   const void *valid_row_range_ptr, int total_num_seq,
+                                   int intermediate_size, cudaStream_t stream,
                                    bool use_pdl = false);
 
 void fuse_moe_mxfp8_async(void *output_ptr,
                           // input
                           const void *x_ptr, const void *x_scale_ptr,
                           // gateup
-                          void *gate_up_input_ptr, void *gate_up_input_scale_packed_ptr,
-                          void *gate_up_output_ptr, const void *gate_up_weight_ptr,
+                          void *gate_up_input_ptr, void *gate_up_output_ptr,
+                          const void *gate_up_weight_ptr,
                           const void *gate_up_weight_scale_packed_ptr, void *gate_up_tmas_ptr,
                           // down
-                          void *down_input_ptr, void *down_input_scale_packed_ptr,
-                          void *down_output_ptr, const void *down_weight_ptr,
-                          const void *down_weight_scale_packed_ptr, void *down_tmas_ptr,
+                          void *down_input_ptr, void *down_input_scale_ptr, void *down_output_ptr,
+                          const void *down_weight_ptr, const void *down_weight_scale_packed_ptr,
+                          void *down_tmas_ptr,
                           // routing / scratch
                           const void *topk_ids_ptr, const void *topk_scale_ptr, void *topk_pos_ptr,
                           void *gateup_x_row_map_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,

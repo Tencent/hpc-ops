@@ -5,6 +5,8 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <tuple>
+
 #include "src/fuse_moe/sm100/mxfp8/fuse_moe_mxfp8.h"
 #include "src/group_gemm/sm100/group_gemm.h"
 
@@ -21,10 +23,6 @@ torch::Tensor fuse_moe_mxfp8_entry(const torch::Tensor &x, const torch::Tensor &
                                    int64_t num_expert_total, std::optional<torch::Tensor> output) {
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
-  // shape / dtype validation
-  // x is always fp8_e4m3. Weights may be fp8_e4m3 (mxfp8) or uint8 (mxfp4 packed,
-  // 2 x e2m1 per byte → K dim halved). gate_up_weight and down_weight must share
-  // the same precision (single is_fp4 switch).
   TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn, "x must be fp8_e4m3");
   TORCH_CHECK((gate_up_weight.dtype() == torch::kFloat8_e4m3fn &&
                down_weight.dtype() == torch::kFloat8_e4m3fn) ||
@@ -75,15 +73,6 @@ torch::Tensor fuse_moe_mxfp8_entry(const torch::Tensor &x, const torch::Tensor &
   TORCH_CHECK(num_topk <= 128, "num_topk must be <= 128");
 
   int total_num_seq = num_seq * num_topk;
-  int num_seq_per_group_avg = total_num_seq / num_expert_total;
-
-  // Gateup uses cp_async (1SM only), down uses TMA (may use 2SM) — different kTileM.
-  int kTileM_gateup = group_gemm::mxfp8_dispatch_kTileM_cp_async(num_seq_per_group_avg);
-  int kTileM_down = group_gemm::mxfp8_dispatch_kTileM(num_seq_per_group_avg, hidden);
-  int kSFAlignM_gateup = (kTileM_gateup <= 128) ? 128 : 256;
-  int kSFAlignM_down = (kTileM_down <= 128) ? 128 : 256;
-  int sfa_max_tiles_gateup = total_num_seq / kTileM_gateup + num_expert_local;
-  int sfa_max_tiles_down = total_num_seq / kTileM_down + num_expert_local;
 
   // shared_output validation
   const void *shared_output_ptr = nullptr;
@@ -96,16 +85,18 @@ torch::Tensor fuse_moe_mxfp8_entry(const torch::Tensor &x, const torch::Tensor &
     shared_output_ptr = t.const_data_ptr();
   }
 
-  // output
+  // output: when shared_output is provided, accumulate directly into it (same as fp8 path).
   auto opt = x.options();
   torch::Tensor y;
-  if (output.has_value()) {
+  if (shared_output.has_value()) {
+    y = shared_output.value();
+  } else if (output.has_value()) {
     y = output.value();
     TORCH_CHECK(y.size(0) == num_seq && y.size(1) == hidden,
                 "output shape must equal (num_seq, hidden)");
     TORCH_CHECK(y.dtype() == torch::kBFloat16, "output dtype must be bf16");
   } else {
-    y = torch::empty({num_seq, hidden}, opt.dtype(torch::kBFloat16));
+    y = torch::zeros({num_seq, hidden}, opt.dtype(torch::kBFloat16));
   }
 
   // workspace buffers
@@ -114,18 +105,15 @@ torch::Tensor fuse_moe_mxfp8_entry(const torch::Tensor &x, const torch::Tensor &
   auto bf16 = opt.dtype(torch::kBFloat16);
 
   // gate_up input/output
-  int hidden_k_sf_padded = ((hidden / 32 + 3) / 4) * 4;
-  int inter_k_sf_padded = ((intermediate / 32 + 3) / 4) * 4;
   torch::Tensor gate_up_input = torch::empty({total_num_seq, hidden}, opt);
-  torch::Tensor gate_up_input_scale_packed = torch::empty(
-      {static_cast<int64_t>(sfa_max_tiles_gateup) * kSFAlignM_gateup * hidden_k_sf_padded}, u8);
   torch::Tensor gate_up_output = torch::empty({total_num_seq, intermediate * 2}, bf16);
   torch::Tensor gate_up_tmas = torch::empty({num_expert_local * 2, 128}, opt.dtype(torch::kInt8));
 
   // down input/output
-  torch::Tensor down_input = torch::empty({total_num_seq, intermediate}, opt);
-  torch::Tensor down_input_scale_packed = torch::empty(
-      {static_cast<int64_t>(sfa_max_tiles_down) * kSFAlignM_down * inter_k_sf_padded}, u8);
+  torch::Tensor down_input = torch::zeros({total_num_seq, intermediate}, opt);
+  // down_input_scale: row-major (total_num_seq, K_sf), inline prepacked by down GEMM kernel.
+  int inter_k_sf = intermediate / 32;
+  torch::Tensor down_input_scale = torch::zeros({total_num_seq, inter_k_sf}, u8);
   torch::Tensor down_output = torch::empty({total_num_seq, hidden}, bf16);
   torch::Tensor down_tmas = torch::empty({num_expert_local * 2, 128}, opt.dtype(torch::kInt8));
 
@@ -140,20 +128,46 @@ torch::Tensor fuse_moe_mxfp8_entry(const torch::Tensor &x, const torch::Tensor &
 
   fuse_moe_mxfp8_async(
       y.mutable_data_ptr(), x.const_data_ptr(), x_scale.const_data_ptr(),
-      gate_up_input.mutable_data_ptr(), gate_up_input_scale_packed.mutable_data_ptr(),
-      gate_up_output.mutable_data_ptr(), gate_up_weight.const_data_ptr(),
-      gate_up_weight_scale_packed.const_data_ptr(), gate_up_tmas.mutable_data_ptr(),
-      down_input.mutable_data_ptr(), down_input_scale_packed.mutable_data_ptr(),
-      down_output.mutable_data_ptr(), down_weight.const_data_ptr(),
-      down_weight_scale_packed.const_data_ptr(), down_tmas.mutable_data_ptr(),
-      topk_ids.const_data_ptr(), topk_scale.const_data_ptr(), topk_pos.mutable_data_ptr(),
-      gateup_x_row_map.mutable_data_ptr(), seqlens.mutable_data_ptr(),
+      gate_up_input.mutable_data_ptr(), gate_up_output.mutable_data_ptr(),
+      gate_up_weight.const_data_ptr(), gate_up_weight_scale_packed.const_data_ptr(),
+      gate_up_tmas.mutable_data_ptr(), down_input.mutable_data_ptr(),
+      down_input_scale.mutable_data_ptr(), down_output.mutable_data_ptr(),
+      down_weight.const_data_ptr(), down_weight_scale_packed.const_data_ptr(),
+      down_tmas.mutable_data_ptr(), topk_ids.const_data_ptr(), topk_scale.const_data_ptr(),
+      topk_pos.mutable_data_ptr(), gateup_x_row_map.mutable_data_ptr(), seqlens.mutable_data_ptr(),
       cu_seqlens.mutable_data_ptr(), tiles.mutable_data_ptr(), cu_tiles.mutable_data_ptr(),
       shared_output_ptr, num_seq, hidden, intermediate, num_topk,
       static_cast<int>(num_expert_total), num_expert_local, static_cast<int>(rank_ep), is_fp4,
       stream);
 
   return y;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> act_mul_and_mxfp8_quant_entry(const torch::Tensor &gate_up,
+                                                                       int64_t num_valid_rows) {
+  auto stream = at::cuda::getCurrentCUDAStream(gate_up.get_device());
+  TORCH_CHECK(gate_up.is_cuda() && gate_up.is_contiguous(), "gate_up must be cuda+contiguous");
+  TORCH_CHECK(gate_up.dtype() == torch::kBFloat16, "gate_up must be bf16");
+  TORCH_CHECK(gate_up.dim() == 2, "gate_up must be 2D (total_rows, 2*intermediate)");
+
+  int total_rows = static_cast<int>(gate_up.size(0));
+  int intermediate_size = static_cast<int>(gate_up.size(1)) / 2;
+
+  auto options = gate_up.options();
+  torch::Tensor out_fp8 =
+      torch::empty({total_rows, intermediate_size}, options.dtype(torch::kFloat8_e4m3fn));
+  torch::Tensor out_scale =
+      torch::empty({total_rows, intermediate_size / 32}, options.dtype(torch::kUInt8));
+
+  // Use cu_seqlens last element as valid_row_range (single int on device)
+  torch::Tensor valid_row_range =
+      torch::tensor({static_cast<int>(num_valid_rows)}, options.dtype(torch::kInt32));
+
+  act_mul_and_mxfp8_quant_async(out_fp8.mutable_data_ptr(), out_scale.mutable_data_ptr(),
+                                gate_up.const_data_ptr(), valid_row_range.const_data_ptr(),
+                                total_rows, intermediate_size, stream, false);
+
+  return std::make_tuple(out_fp8, out_scale);
 }
 
 }  // namespace fuse_moe
@@ -167,4 +181,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "Tensor? shared_output, int rank_ep, int num_expert_total, "
       "Tensor? output) -> (Tensor)");
   m.impl("fuse_moe_mxfp8", torch::kCUDA, &hpc::fuse_moe::fuse_moe_mxfp8_entry);
+
+  m.def("act_mul_and_mxfp8_quant(Tensor gate_up, int num_valid_rows) -> (Tensor, Tensor)");
+  m.impl("act_mul_and_mxfp8_quant", torch::kCUDA, &hpc::fuse_moe::act_mul_and_mxfp8_quant_entry);
 }

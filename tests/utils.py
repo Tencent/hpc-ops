@@ -187,3 +187,16 @@ def allclose(ref_tensor, real_tensor, atol=1e-8, rtol=1e-5):
             )
         )
     return is_true
+
+
+def mxfp8_dispatch_kTileM(num_seq_per_group_avg: int) -> int:
+    """Mirror C++ `mxfp8_dispatch_kTileM(avg)` in src/group_gemm/sm100/group_gemm.h.
+
+    Returns kTileM. The C++ helper now exposes a single unified ladder; whether a
+    given op runs 1SM or 2SM is a property of the op (cp_async / with_reduce are
+    1SM; the standalone group_gemm_mxfp8 is 2SM), not of this dispatch.
+    """
+    for ktm in (16, 32, 64, 96, 128, 160, 192):
+        if num_seq_per_group_avg <= ktm:
+            return ktm
+    return 256

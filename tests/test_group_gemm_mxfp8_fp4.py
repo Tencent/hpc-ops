@@ -12,7 +12,7 @@ sys.path.insert(
 import hpc
 import torch
 import pytest
-from utils import allclose
+from utils import allclose, mxfp8_dispatch_kTileM
 
 SF_VEC = 32
 
@@ -22,20 +22,6 @@ _E2M1_LUT = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
     dtype=torch.float32,
 )
-
-
-def _mxfp8_kTileM(num_seq_per_group_avg: int, n: int) -> int:
-    """Mirror C++ mxfp8_dispatch_kTileM(avg, n)."""
-    use_2sm = (n % 256 == 0) and (num_seq_per_group_avg > 32)
-    if use_2sm:
-        for ktm in (64, 96, 128, 160, 192):
-            if num_seq_per_group_avg <= ktm:
-                return ktm
-        return 256
-    for ktm in (16, 32, 48, 64, 128):
-        if num_seq_per_group_avg <= ktm:
-            return ktm
-    return 256
 
 
 def dequant_mxfp8(x_fp8: torch.Tensor, sf_u8: torch.Tensor) -> torch.Tensor:
@@ -122,7 +108,7 @@ def _run_one(num_group: int, seq_per_group: int, n: int, k: int):
     sfx = torch.randint(124, 131, (m_total, k // SF_VEC), dtype=torch.uint8, device=device)
     sfw = torch.randint(124, 131, (num_group, n, k // SF_VEC), dtype=torch.uint8, device=device)
 
-    kTileM = _mxfp8_kTileM(seq_per_group, n)
+    kTileM = mxfp8_dispatch_kTileM(seq_per_group)
 
     sfx_packed, sfw_packed = hpc.prepack_mxfp8_scale(
         sfx, sfw, cu_seqlens, num_seq_per_group_avg=seq_per_group
@@ -139,7 +125,8 @@ def _run_one(num_group: int, seq_per_group: int, n: int, k: int):
     )
 
     gt = naive_group_gemm_mxfp8_mxfp4(x_fp8, w_fp4_packed, sfx, sfw, seqlens, cu_seqlens, k)
-
+    print(gt)
+    print(y)
     abs_diff = (gt.to(torch.float32) - y.to(torch.float32)).abs()
     print(
         f"[g={num_group} seq={seq_per_group} kTileM={kTileM} n={n} k={k}] "
@@ -152,8 +139,22 @@ def _run_one(num_group: int, seq_per_group: int, n: int, k: int):
 @pytest.mark.parametrize(
     "num_group, seq_per_group, n, k",
     [
-        (192, 128, 384, 4096),
-        (192, 128, 4096, 4096),
+        # tp8: gate_up
+        (192, 4, 512, 6144),
+        (192, 8, 512, 6144),
+        (192, 16, 512, 6144),
+        (192, 32, 512, 6144),
+        (192, 64, 512, 6144),
+        (192, 128, 512, 6144),
+        (192, 256, 512, 6144),
+        # tp8: down
+        (192, 4, 6144, 256),
+        (192, 8, 6144, 256),
+        (192, 16, 6144, 256),
+        (192, 32, 6144, 256),
+        (192, 64, 6144, 256),
+        (192, 128, 6144, 256),
+        (192, 256, 6144, 256),
     ],
 )
 def test_group_gemm_mxfp8_mxfp4_(num_group, seq_per_group, n, k):

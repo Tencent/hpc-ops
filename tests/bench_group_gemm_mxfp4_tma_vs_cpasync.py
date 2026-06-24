@@ -27,7 +27,7 @@ NUM_TOPK = 8
 
 # Total token counts (m = num_seq) to sweep.
 M_CASES = [256, 512, 1024, 2048, 4096, 8192]
-
+# M_CASES = [256]
 # hy4.0  (label, n, k, num_group)
 #   tp8/tp4: all 256 experts local (num_group=256)
 #   ep8: 256/8=32 experts per card (num_group=32)
@@ -135,14 +135,14 @@ def _bench(label: str, fn) -> float:
 
     # Try CUDA graph capture; fall back to eager if capture fails.
     graph = None
-    try:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            fn()
-        torch.cuda.synchronize()
-    except Exception:
-        graph = None
-        torch.cuda.synchronize()
+    # try:
+    #     graph = torch.cuda.CUDAGraph()
+    #     with torch.cuda.graph(graph):
+    #         fn()
+    #     torch.cuda.synchronize()
+    # except Exception:
+    #     graph = None
+    #     torch.cuda.synchronize()
 
     nvtx.range_push(label)
     start = torch.cuda.Event(enable_timing=True)

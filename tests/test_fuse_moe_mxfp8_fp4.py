@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/li
 import hpc
 import torch
 import pytest
-from utils import allclose
+from utils import allclose, mxfp8_dispatch_kTileM
 
 SF_VEC = 32
 
@@ -19,19 +19,6 @@ _E2M1_LUT = torch.tensor(
 )
 # Reverse: map fp32 values to the nearest e2m1 nibble (only used to pack integer weights to fp4)
 _E2M1_VALUES = _E2M1_LUT.tolist()
-
-
-def _mxfp8_kTileM(avg: int, n: int) -> int:
-    use_2sm = (n % 256 == 0) and (avg > 32)
-    if use_2sm:
-        for ktm in (64, 96, 128, 160, 192):
-            if avg <= ktm:
-                return ktm
-        return 256
-    for ktm in (16, 32, 48, 64, 128):
-        if avg <= ktm:
-            return ktm
-    return 256
 
 
 def quantize_mxfp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -154,8 +141,8 @@ def naive_fuse_moe(
     return out.to(torch.bfloat16)
 
 
-def _prepack_weight_scale(sfw, avg):
-    _, sfw_packed = hpc.prepack_mxfp8_scale(None, sfw, None, num_seq_per_group_avg=avg)
+def _prepack_weight_scale(sfw):
+    _, sfw_packed = hpc.prepack_mxfp8_scale(None, sfw, None)
     return sfw_packed
 
 
@@ -168,8 +155,10 @@ def _run_one(
     device = torch.device("cuda:0")
     half = intermediate // 2
 
+    avg = (num_seq * num_topk) // num_expert_total
+
     # X: fp8
-    x_f32 = torch.randint(-2, 3, (num_seq, hidden), device=device, dtype=torch.float32)
+    x_f32 = torch.randint(-2, 3, (num_seq, hidden), device=device, dtype=torch.float32) / 100
     x_fp8 = x_f32.to(torch.float8_e4m3fn).contiguous()
     x_scale = torch.full((num_seq, hidden // SF_VEC), 127, dtype=torch.uint8, device=device)
 
@@ -196,9 +185,8 @@ def _run_one(
     )
     topk_scale = torch.rand((num_seq, num_topk), device=device, dtype=torch.float32) * 0.5 + 0.5
 
-    avg = (num_seq * num_topk) // num_expert_total
-    gate_up_w_scale_packed = _prepack_weight_scale(gate_up_w_scale, avg)
-    down_w_scale_packed = _prepack_weight_scale(down_w_scale, avg)
+    gate_up_w_scale_packed = _prepack_weight_scale(gate_up_w_scale)
+    down_w_scale_packed = _prepack_weight_scale(down_w_scale)
 
     y = hpc.fuse_moe_mxfp8(
         x_fp8,
@@ -236,7 +224,7 @@ def _run_one(
     print(
         f"[N={num_seq} topk={num_topk} El={num_expert_local} "
         f"H={hidden} I={intermediate} ep={rank_ep}/{num_expert_total} "
-        f"avg={avg} kTileM={_mxfp8_kTileM(avg, intermediate)}] "
+        f"avg={avg} kTileM={mxfp8_dispatch_kTileM(avg)}] "
         f"peak={peak:.1f} max_err={max_err:.2f} rel_err(peak)={rel_err:.4f}"
     )
     assert allclose(
@@ -248,9 +236,13 @@ def _run_one(
 @pytest.mark.parametrize(
     "num_seq,num_topk,num_expert,hidden,intermediate",
     [
-        (16, 4, 8, 512, 1024),
-        (32, 4, 8, 1024, 2048),
-        (64, 8, 16, 1024, 2048),
+        (16, 8, 24, 6144, 2048),
+        (32, 8, 24, 6144, 2048),
+        (64, 8, 24, 6144, 2048),
+        (128, 8, 24, 6144, 2048),
+        (256, 8, 24, 6144, 2048),
+        (512, 8, 24, 6144, 2048),
+        (1024, 8, 24, 6144, 2048),
     ],
 )
 def test_fuse_moe_mxfp8_fp4_basic(num_seq, num_topk, num_expert, hidden, intermediate):
@@ -265,8 +257,8 @@ def test_fuse_moe_mxfp8_fp4_ep(rank_ep, num_expert_total):
         num_seq=32,
         num_topk=4,
         num_expert_local=num_expert_local,
-        hidden=512,
-        intermediate=1024,
+        hidden=6144,
+        intermediate=2048,
         rank_ep=rank_ep,
         num_expert_total=num_expert_total,
     )

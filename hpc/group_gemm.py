@@ -348,7 +348,7 @@ def prepack_mxfp8_scale(
     sfx: Optional[Tensor],
     sfw: Optional[Tensor],
     cu_seqlens: Optional[Tensor],
-    num_seq_per_group_avg: int,
+    num_seq_per_group_avg: int = 128,
 ) -> Tuple[Tensor, Tensor]:
     """Prepack raw MXFP8 block scales (UE8M0) into the UTCCP-friendly layout
     consumed by ``group_gemm_mxfp8``.

@@ -16,6 +16,7 @@ NUM_TOPK = 8
 
 # Total token counts (m = num_seq) to sweep.
 M_CASES = [256, 512, 1024, 2048, 4096, 8192]
+# M_CASES = [1024]
 
 # hy4.0
 # (label, n, k, num_group)
