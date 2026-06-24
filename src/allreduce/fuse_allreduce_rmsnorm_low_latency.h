@@ -9,6 +9,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <array>
 #include <iostream>
 #include <type_traits>
 #include <atomic>
