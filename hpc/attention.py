@@ -28,6 +28,10 @@ class QuantType(Enum):
     QPERTENSOR_KPERTENSOR_VPERTENSOR = 2
     QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD_QKHADAMARD = 3
 
+    # FP8-storage / BF16-compute attention (Q kept in bf16).
+    QBF16_KPERTOKEN_PERHEAD_VPERHEAD = 10
+    QBF16_KPERTENSOR_VPERTENSOR = 11
+
 
 def attention_prefill_bf16(
     q: Tensor,

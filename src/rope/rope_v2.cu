@@ -359,16 +359,16 @@ __global__ void rope_norm_store_kv_kernel(
   cudaTriggerProgrammaticLaunchCompletion();
 }
 
-template <int kQuantPolicy, bool kIsPrefill, int kWarpsPerBlock, int kNumQHeads, int kNumKVHeads,
-          int kQKHeadDim, int kVHeadDim, int kNormPolicy>
+template <int kQuantPolicy, bool kIsPrefill, bool kHadamard, int kWarpsPerBlock, int kNumQHeads,
+          int kNumKVHeads, int kQKHeadDim, int kVHeadDim, int kNormPolicy>
 __global__ void rope_norm_store_kv_fp8_kernel(
-    __nv_fp8_e4m3 *out_q_ptr, __nv_fp8_e4m3 *kcache_ptr, __nv_fp8_e4m3 *vcache_ptr,
-    __nv_fp8_e4m3 *out_k_ptr, __nv_fp8_e4m3 *out_v_ptr, int32_t *split_k_flag_ptr,
-    float *q_scale_ptr, const __nv_bfloat16 *in_qkv_ptr, const float *cos_sin_ptr,
-    const int *num_seqlen_per_req_ptr, const int *q_index_ptr, const int *kvcache_indices_ptr,
-    const float *q_norm_weight_ptr, const float *k_norm_weight_ptr, float *k_scale_ptr,
-    const float *v_scale_ptr, const float *q_scale_inv_ptr, float upper_max, int max_seqlen_aligned,
-    Strides4D kc, Strides4D ks, Strides4D vc, Strides2D ki, int num_batch,
+    void *out_q_ptr, __nv_fp8_e4m3 *kcache_ptr, __nv_fp8_e4m3 *vcache_ptr, __nv_fp8_e4m3 *out_k_ptr,
+    __nv_fp8_e4m3 *out_v_ptr, int32_t *split_k_flag_ptr, float *q_scale_ptr,
+    const __nv_bfloat16 *in_qkv_ptr, const float *cos_sin_ptr, const int *num_seqlen_per_req_ptr,
+    const int *q_index_ptr, const int *kvcache_indices_ptr, const float *q_norm_weight_ptr,
+    const float *k_norm_weight_ptr, float *k_scale_ptr, const float *v_scale_ptr,
+    const float *q_scale_inv_ptr, float upper_max, int max_seqlen_aligned, Strides4D kc,
+    Strides4D ks, Strides4D vc, Strides2D ki, int num_batch,
     cutlass::FastDivmod kv_block_size_divider, int num_rows, int num_compute_blocks) {
   using DType = __nv_bfloat16;
   using QType = __nv_fp8_e4m3;
@@ -576,7 +576,6 @@ __global__ void rope_norm_store_kv_fp8_kernel(
       int q_head = bidy * kQPerKV + dq;
       // Q heads are stored compactly in smem starting at offset 0 (only this group's Q heads)
       const DType *q_src = qkv_row + dq * kQKHeadDim;
-      QType *q_dst = out_q_ptr + irow * kNumQHeads * kQKHeadDim + q_head * kQKHeadDim;
 
       vec_t<float, kNumItemPerThread> data = {0};
 
@@ -606,41 +605,58 @@ __global__ void rope_norm_store_kv_fp8_kernel(
         rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_q_norm_w, ilane);
       }
 
-      if constexpr (kQuantPolicy == 3) {
-        static_assert(kQKHeadDim == 128, "kQuantPolicy=3 (hadamard) requires kQKHeadDim == 128");
+      if constexpr (kHadamard) {
+        static_assert(kQKHeadDim == 128, "Hadamard requires kQKHeadDim == 128");
         hadamard_128(data, ilane);
       }
 
-      // Q quantization
-      float q_mult;
-      if constexpr (kQuantPolicy == 0 || kQuantPolicy == 1 || kQuantPolicy == 3) {
-        // dqskv (and dqksv+hadamard): dynamic per-token per-head
-        float max_abs = warp_abs_max<kNumItemPerThread>(data);
-        float q_scale_val = max_abs / upper_max;
-        if (ilane == 0) {
-          if constexpr (kIsPrefill) {
-            // Prefill layout: [batch_id, q_head, tok_in_chunk]
-            int tok_in_chunk = irow - q_index_ptr[batch_id];
-            q_scale_ptr[batch_id * kNumQHeads * max_seqlen_aligned + q_head * max_seqlen_aligned +
-                        tok_in_chunk] = q_scale_val;
-          } else {
-            // Decode layout: [irow, q_head]
-            q_scale_ptr[irow * kNumQHeads + q_head] = q_scale_val;
+      if constexpr (kQuantPolicy == 10 || kQuantPolicy == 11) {
+        // Q remains in bf16: no quantization, no q_scale.
+        __nv_bfloat16 *q_dst = reinterpret_cast<__nv_bfloat16 *>(out_q_ptr) +
+                               irow * kNumQHeads * kQKHeadDim + q_head * kQKHeadDim;
+#pragma unroll
+        for (int r = 0; r < kNumRoundsHalf; ++r) {
+          int i = r * kWarpSize + ilane;
+          if (i < kQKHeadDim / 2) {
+            q_dst[i] = __float2bfloat16(data[r * 2]);
+            q_dst[i + kQKHeadDim / 2] = __float2bfloat16(data[r * 2 + 1]);
           }
         }
-        q_mult = __frcp_rn(q_scale_val);
-      } else if constexpr (kQuantPolicy == 2) {
-        // sqskv: static per-tensor
-        q_mult = q_scale_inv_ptr[0];
-      }
+      } else {
+        QType *q_dst = reinterpret_cast<QType *>(out_q_ptr) + irow * kNumQHeads * kQKHeadDim +
+                       q_head * kQKHeadDim;
 
-      // Store FP8 Q
+        // Q quantization
+        float q_mult;
+        if constexpr (kQuantPolicy == 0 || kQuantPolicy == 1) {
+          // dqskv: dynamic per-token per-head
+          float max_abs = warp_abs_max<kNumItemPerThread>(data);
+          float q_scale_val = max_abs / upper_max;
+          if (ilane == 0) {
+            if constexpr (kIsPrefill) {
+              // Prefill layout: [batch_id, q_head, tok_in_chunk]
+              int tok_in_chunk = irow - q_index_ptr[batch_id];
+              q_scale_ptr[batch_id * kNumQHeads * max_seqlen_aligned + q_head * max_seqlen_aligned +
+                          tok_in_chunk] = q_scale_val;
+            } else {
+              // Decode layout: [irow, q_head]
+              q_scale_ptr[irow * kNumQHeads + q_head] = q_scale_val;
+            }
+          }
+          q_mult = __frcp_rn(q_scale_val);
+        } else if constexpr (kQuantPolicy == 2) {
+          // sqskv: static per-tensor
+          q_mult = q_scale_inv_ptr[0];
+        }
+
+        // Store FP8 Q
 #pragma unroll
-      for (int r = 0; r < kNumRoundsHalf; ++r) {
-        int i = r * kWarpSize + ilane;
-        if (i < kQKHeadDim / 2) {
-          q_dst[i] = QType(data[r * 2] * q_mult);
-          q_dst[i + kQKHeadDim / 2] = QType(data[r * 2 + 1] * q_mult);
+        for (int r = 0; r < kNumRoundsHalf; ++r) {
+          int i = r * kWarpSize + ilane;
+          if (i < kQKHeadDim / 2) {
+            q_dst[i] = QType(data[r * 2] * q_mult);
+            q_dst[i + kQKHeadDim / 2] = QType(data[r * 2 + 1] * q_mult);
+          }
         }
       }
     }
@@ -683,8 +699,8 @@ __global__ void rope_norm_store_kv_fp8_kernel(
         rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_k_norm_w, ilane);
       }
 
-      if constexpr (kQuantPolicy == 3) {
-        static_assert(kQKHeadDim == 128, "kQuantPolicy=3 (hadamard) requires kQKHeadDim == 128");
+      if constexpr (kHadamard) {
+        static_assert(kQKHeadDim == 128, "Hadamard requires kQKHeadDim == 128");
         hadamard_128(data, ilane);
       }
 
@@ -694,8 +710,8 @@ __global__ void rope_norm_store_kv_fp8_kernel(
 
       // K quantization
       float k_mult;
-      if constexpr (kQuantPolicy == 0 || kQuantPolicy == 3) {
-        // Dynamic per-token per-head quantization (with optional hadamard)
+      if constexpr (kQuantPolicy == 0 || kQuantPolicy == 10) {
+        // Dynamic per-token per-head quantization
         float max_abs = warp_abs_max<kNumItemPerThread>(data);
         float k_scale_val = max_abs / upper_max;
         if (ilane == 0) {
@@ -707,7 +723,7 @@ __global__ void rope_norm_store_kv_fp8_kernel(
           k_scale_ptr[phys_block_id * ks.s0 + r * ks.s1 + bidy * ks.s2 + l] = k_scale_val;
         }
         k_mult = __frcp_rn(k_scale_val);
-      } else if constexpr (kQuantPolicy == 1 || kQuantPolicy == 2) {
+      } else if constexpr (kQuantPolicy == 1 || kQuantPolicy == 2 || kQuantPolicy == 11) {
         // Static per-tensor quantization
         k_mult = __frcp_rn(k_scale_ptr[0]);
       }
@@ -734,14 +750,13 @@ __global__ void rope_norm_store_kv_fp8_kernel(
       constexpr int kNumLoadRound = ceil_div<kNumPackPerHead, kWarpSize>();
 
       // V is not staged: read directly from global to register
-      // (no RoPE, no reuse, linear vectorized access)
       const DType *v_src_head = in_qkv_ptr + irow * kNumElemPerRow +
                                 (kNumQHeads + kNumKVHeads) * kQKHeadDim + bidy * kVHeadDim;
       QType *v_dst_head = (out_v_ptr != nullptr)
                               ? out_v_ptr + irow * kNumKVHeads * kVHeadDim + bidy * kVHeadDim
                               : vcache_ptr + vc_tok_offset + bidy * vc.s2;
 
-      if constexpr (kQuantPolicy == 0 || kQuantPolicy == 3) {
+      if constexpr (kQuantPolicy == 0 || kQuantPolicy == 10) {
         v_mult = __frcp_rn(v_scale_ptr[bidy]);
       } else {
         v_mult = __frcp_rn(v_scale_ptr[0]);
@@ -871,15 +886,15 @@ void rope_norm_store_kv_async(__nv_bfloat16 *out_q_ptr, __nv_bfloat16 *kcache_pt
 // Launch helper – dispatches kQuantPolicy + kNormPolicy + kIsPrefill at compile time
 template <int kNumQHeads, int kNumKVHeads, int kQKHeadDim, int kVHeadDim>
 void launch_rope_norm_store_kv_fp8(
-    __nv_fp8_e4m3 *out_q_ptr, __nv_fp8_e4m3 *kcache_ptr, __nv_fp8_e4m3 *vcache_ptr,
-    __nv_fp8_e4m3 *out_k_ptr, __nv_fp8_e4m3 *out_v_ptr, int32_t *split_k_flag_ptr,
-    float *q_scale_ptr, const __nv_bfloat16 *in_qkv_ptr, const float *cos_sin_ptr,
-    const int *num_seqlen_per_req_ptr, const int *q_index_ptr, const int *kvcache_indices_ptr,
-    const float *q_norm_weight_ptr, const float *k_norm_weight_ptr, float *k_scale_ptr,
-    const float *v_scale_ptr, const float *q_scale_inv_ptr, float upper_max, int max_seqlen_aligned,
-    Strides4D kc, Strides4D ks, Strides4D vc, Strides2D ki, int num_batch,
+    void *out_q_ptr, __nv_fp8_e4m3 *kcache_ptr, __nv_fp8_e4m3 *vcache_ptr, __nv_fp8_e4m3 *out_k_ptr,
+    __nv_fp8_e4m3 *out_v_ptr, int32_t *split_k_flag_ptr, float *q_scale_ptr,
+    const __nv_bfloat16 *in_qkv_ptr, const float *cos_sin_ptr, const int *num_seqlen_per_req_ptr,
+    const int *q_index_ptr, const int *kvcache_indices_ptr, const float *q_norm_weight_ptr,
+    const float *k_norm_weight_ptr, float *k_scale_ptr, const float *v_scale_ptr,
+    const float *q_scale_inv_ptr, float upper_max, int max_seqlen_aligned, Strides4D kc,
+    Strides4D ks, Strides4D vc, Strides2D ki, int num_batch,
     cutlass::FastDivmod kv_block_size_divider, int num_rows, int qk_norm_policy, int quant_policy,
-    bool is_prefill, cudaStream_t stream) {
+    bool is_prefill, bool apply_hadamard, cudaStream_t stream) {
   constexpr int kWarpsPerBlock = 4;
   constexpr int kWarpSize = 32;
 
@@ -888,15 +903,16 @@ void launch_rope_norm_store_kv_fp8(
   dim3 block(kWarpsPerBlock * kWarpSize);
   dim3 grid(num_compute_blocks + num_clear_blocks, kNumKVHeads);
 
-  auto launch = [&](auto quant_tag, auto norm_tag, auto prefill_tag) {
+  auto launch = [&](auto quant_tag, auto norm_tag, auto prefill_tag, auto hadamard_tag) {
     constexpr int kQP = decltype(quant_tag)::value;
     constexpr int kNP = decltype(norm_tag)::value;
     constexpr bool kIP = decltype(prefill_tag)::value;
+    constexpr bool kHD = decltype(hadamard_tag)::value;
     // Matches kernel-side staging: only (kQPerKV Q heads + 1 K head) per warp
     constexpr int kQPerKV = kNumQHeads / kNumKVHeads;
     constexpr int kSmemElemPerRow = (kQPerKV + 1) * kQKHeadDim;
     constexpr int kShmQkv = kWarpsPerBlock * kSmemElemPerRow * sizeof(__nv_bfloat16);
-    auto *kernel = kernels::rope_norm_store_kv_fp8_kernel<kQP, kIP, kWarpsPerBlock, kNumQHeads,
+    auto *kernel = kernels::rope_norm_store_kv_fp8_kernel<kQP, kIP, kHD, kWarpsPerBlock, kNumQHeads,
                                                           kNumKVHeads, kQKHeadDim, kVHeadDim, kNP>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kShmQkv);
 
@@ -921,45 +937,55 @@ void launch_rope_norm_store_kv_fp8(
                        num_rows, num_compute_blocks);
   };
 
-  auto dispatch_prefill = [&](auto quant_tag, auto norm_tag) {
+  auto dispatch_prefill = [&](auto quant_tag, auto norm_tag, auto hadamard_tag) {
     if (is_prefill) {
-      launch(quant_tag, norm_tag, std::true_type{});
+      launch(quant_tag, norm_tag, std::true_type{}, hadamard_tag);
     } else {
-      launch(quant_tag, norm_tag, std::false_type{});
+      launch(quant_tag, norm_tag, std::false_type{}, hadamard_tag);
     }
   };
 
-  auto dispatch_norm = [&](auto quant_tag) {
+  auto dispatch_norm = [&](auto quant_tag, auto hadamard_tag) {
     if (qk_norm_policy == 1) {
-      dispatch_prefill(quant_tag, std::integral_constant<int, 1>{});
+      dispatch_prefill(quant_tag, std::integral_constant<int, 1>{}, hadamard_tag);
     } else if (qk_norm_policy == 2) {
-      dispatch_prefill(quant_tag, std::integral_constant<int, 2>{});
+      dispatch_prefill(quant_tag, std::integral_constant<int, 2>{}, hadamard_tag);
     } else {
-      dispatch_prefill(quant_tag, std::integral_constant<int, 0>{});
+      dispatch_prefill(quant_tag, std::integral_constant<int, 0>{}, hadamard_tag);
+    }
+  };
+
+  auto dispatch_hadamard = [&](auto quant_tag) {
+    if (apply_hadamard) {
+      dispatch_norm(quant_tag, std::true_type{});
+    } else {
+      dispatch_norm(quant_tag, std::false_type{});
     }
   };
 
   if (quant_policy == 0) {
-    dispatch_norm(std::integral_constant<int, 0>{});
+    dispatch_hadamard(std::integral_constant<int, 0>{});
   } else if (quant_policy == 1) {
-    dispatch_norm(std::integral_constant<int, 1>{});
+    dispatch_hadamard(std::integral_constant<int, 1>{});
   } else if (quant_policy == 2) {
-    dispatch_norm(std::integral_constant<int, 2>{});
-  } else {
-    dispatch_norm(std::integral_constant<int, 3>{});
+    dispatch_hadamard(std::integral_constant<int, 2>{});
+  } else if (quant_policy == 10) {
+    dispatch_hadamard(std::integral_constant<int, 10>{});
+  } else if (quant_policy == 11) {
+    dispatch_hadamard(std::integral_constant<int, 11>{});
   }
 }
 
 void rope_norm_store_kv_fp8_async(
-    __nv_fp8_e4m3 *out_q_ptr, __nv_fp8_e4m3 *kcache_ptr, __nv_fp8_e4m3 *vcache_ptr,
-    __nv_fp8_e4m3 *out_k_ptr, __nv_fp8_e4m3 *out_v_ptr, int32_t *split_k_flag_ptr,
-    float *q_scale_ptr, const __nv_bfloat16 *in_qkv_ptr, const float *cos_sin_ptr,
-    const int *num_seqlen_per_req_ptr, const int *q_index_ptr, const int *kvcache_indices_ptr,
-    const float *q_norm_weight_ptr, const float *k_norm_weight_ptr, float *k_scale_ptr,
-    const float *v_scale_ptr, const float *q_scale_inv_ptr, float upper_max, int max_seqlens,
-    Strides4D kc_strides, Strides4D ks_strides, Strides4D vc_strides, Strides2D ki_strides,
-    int num_batch, int kv_block_size, int num_rows, int num_q_heads, int num_kv_heads,
-    int qk_head_dim, int v_head_dim, bool is_prefill, int qk_norm_policy, int quant_policy,
+    void *out_q_ptr, __nv_fp8_e4m3 *kcache_ptr, __nv_fp8_e4m3 *vcache_ptr, __nv_fp8_e4m3 *out_k_ptr,
+    __nv_fp8_e4m3 *out_v_ptr, int32_t *split_k_flag_ptr, float *q_scale_ptr,
+    const __nv_bfloat16 *in_qkv_ptr, const float *cos_sin_ptr, const int *num_seqlen_per_req_ptr,
+    const int *q_index_ptr, const int *kvcache_indices_ptr, const float *q_norm_weight_ptr,
+    const float *k_norm_weight_ptr, float *k_scale_ptr, const float *v_scale_ptr,
+    const float *q_scale_inv_ptr, float upper_max, int max_seqlens, Strides4D kc_strides,
+    Strides4D ks_strides, Strides4D vc_strides, Strides2D ki_strides, int num_batch,
+    int kv_block_size, int num_rows, int num_q_heads, int num_kv_heads, int qk_head_dim,
+    int v_head_dim, bool is_prefill, int qk_norm_policy, int quant_policy, bool apply_hadamard,
     cudaStream_t stream) {
   cutlass::FastDivmod kv_block_size_divider(kv_block_size);
   int max_seqlen_aligned = ((max_seqlens + 127) / 128) * 128;
@@ -975,7 +1001,8 @@ void rope_norm_store_kv_fp8_async(
           in_qkv_ptr, cos_sin_ptr, num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr,
           q_norm_weight_ptr, k_norm_weight_ptr, k_scale_ptr, v_scale_ptr, q_scale_inv_ptr,
           upper_max, max_seqlen_aligned, kc_strides, ks_strides, vc_strides, ki_strides, num_batch,
-          kv_block_size_divider, num_rows, qk_norm_policy, quant_policy, is_prefill, stream);
+          kv_block_size_divider, num_rows, qk_norm_policy, quant_policy, is_prefill, apply_hadamard,
+          stream);
     };
     if (num_q_heads == 8 && num_kv_heads == 1) {
       dispatch_heads(std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});

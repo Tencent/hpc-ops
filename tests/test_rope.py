@@ -1190,7 +1190,8 @@ def test_rope_norm_store_kv(
 @pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer")
 @pytest.mark.parametrize("num_q_heads,num_kv_heads,qk_head_dim", [(8, 1, 128), (64, 8, 128)])
 @pytest.mark.parametrize("qk_norm_policy", [0, 1, 2])
-@pytest.mark.parametrize("quant_policy", [0, 1, 2, 3])  # 0=dqksv 1=dqskv 2=sqskv 3=sqskv+hadamard
+# 0=dqksv 1=dqskv 2=sqskv 3=dqksv+hadamard 10=qbf16+dynKV 11=qbf16+staticKV
+@pytest.mark.parametrize("quant_policy", [0, 1, 2, 3, 10, 11])
 @pytest.mark.parametrize("num_req", [7, 16])
 @pytest.mark.parametrize("is_prefill,mtp", [(True, None), (False, 0), (False, 1)])
 def test_rope_norm_store_kv_fp8(
@@ -1215,7 +1216,7 @@ def test_rope_norm_store_kv_fp8(
     num_blocks = kcache.shape[0]
     device = qkv.device
 
-    if quant_policy == 0 or quant_policy == 3:
+    if quant_policy == 0 or quant_policy == 3 or quant_policy == 10:
         # Dynamic per-head per-token: k_scale is [num_blocks, R, num_kv_heads, L] (output)
         L = qk_head_dim * 1 // 4  # sizeof(fp8) / sizeof(float)
         R = kv_block_size // L
@@ -1238,6 +1239,7 @@ def test_rope_norm_store_kv_fp8(
         max_seqlens = mtp + 1  # tokens per request in decode
 
     needs_q_scale_inv = quant_policy == 2
+    apply_hadamard = quant_policy in (3, 10, 11)
 
     q_fp8, q_scale_out, split_k_flag = hpc.rope_norm_store_kv_fp8(
         key_cache=kcache_fp8,
@@ -1256,6 +1258,7 @@ def test_rope_norm_store_kv_fp8(
         q_norm_weight=q_norm_w if qk_norm_policy > 0 else None,
         k_norm_weight=k_norm_w if qk_norm_policy > 0 else None,
         qk_norm_policy=qk_norm_policy,
+        apply_hadamard=apply_hadamard,
     )
 
     assert split_k_flag.shape == (num_seqlen.shape[0], num_kv_heads)
@@ -1281,6 +1284,11 @@ def test_rope_norm_store_kv_fp8(
             q_bf16 = (q_fp8[:rows].to(torch.bfloat16) * q_scale_out[:rows, :, None]).to(
                 torch.bfloat16
             )
+    elif quant_policy == 10 or quant_policy == 11:  # Q kept in bf16, no quantization, no q_scale
+        assert q_scale_out is None
+        assert q_fp8.dtype == torch.bfloat16
+        rows = real_rows if real_rows is not None else q_fp8.shape[0]
+        q_bf16 = q_fp8[:rows]
     else:  # sqskv (with or without hadamard): static scale supplied by caller
         assert q_scale_out is None
         rows = real_rows if real_rows is not None else q_fp8.shape[0]
@@ -1303,13 +1311,13 @@ def test_rope_norm_store_kv_fp8(
         q_norm_w,
         k_norm_w,
         qk_norm_policy,
-        apply_hadamard=(quant_policy == 3),
+        apply_hadamard=apply_hadamard,
     )
     assert allclose(ref_q, q_bf16, atol=0.8)
 
     # ========= Verify KV cache for all quant policies =========
     q_lens_r = (qi_r[1:] - qi_r[:-1]).tolist()
-    if quant_policy == 0 or quant_policy == 3:
+    if quant_policy == 0 or quant_policy == 3 or quant_policy == 10:
         L = qk_head_dim * 1 // 4
     tok = 0
     for ri in range(num_req):
@@ -1322,7 +1330,7 @@ def test_rope_norm_store_kv_fp8(
             for h in range(num_kv_heads):
                 v_fp8_vals = vcache_fp8[cb, pb, h, :].to(torch.float32)
                 v_ref_vals = vcache_ref[cb, pb, h, :].to(torch.float32)
-                if quant_policy == 0 or quant_policy == 3:
+                if quant_policy == 0 or quant_policy == 3 or quant_policy == 10:
                     v_dequant = v_fp8_vals * v_scale[h]
                 else:
                     v_dequant = v_fp8_vals * v_scale[0]
@@ -1333,7 +1341,7 @@ def test_rope_norm_store_kv_fp8(
             for h in range(num_kv_heads):
                 k_fp8_vals = kcache_fp8[cb, pb, h, :].to(torch.float32)
                 k_ref_vals = kcache_ref[cb, pb, h, :].to(torch.float32)
-                if quant_policy == 0 or quant_policy == 3:
+                if quant_policy == 0 or quant_policy == 3 or quant_policy == 10:
                     r_idx = pb // L
                     l_idx = pb % L
                     k_s = k_scale[cb, r_idx, h, l_idx].item()

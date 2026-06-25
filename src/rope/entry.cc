@@ -560,7 +560,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
     std::optional<double> upper_max_double, std::optional<torch::Tensor> q_scale_inv_opt,
     std::optional<torch::Tensor> q_norm_weight_opt, std::optional<torch::Tensor> k_norm_weight_opt,
     std::optional<torch::Tensor> out_q_opt, std::optional<torch::Tensor> out_k_opt,
-    std::optional<torch::Tensor> out_v_opt, int64_t qk_norm_policy) {
+    std::optional<torch::Tensor> out_v_opt, int64_t qk_norm_policy, bool apply_hadamard) {
   auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
   TORCH_CHECK(qkv.is_contiguous(), "qkv tensor must be contiguous");
   TORCH_CHECK(cos_sin.is_contiguous(), "cos_sin tensor must be contiguous");
@@ -569,8 +569,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
   TORCH_CHECK(qkv.scalar_type() == torch::kBFloat16, "qkv must be bfloat16");
   TORCH_CHECK(kcache.dtype().itemsize() == 1, "kcache must be 1-byte dtype");
   TORCH_CHECK(vcache.dtype().itemsize() == 1, "vcache must be 1-byte dtype");
-  TORCH_CHECK(quant_policy >= 0 && quant_policy <= 3, "quant_policy must be 0, 1, 2 or 3");
+  TORCH_CHECK((quant_policy >= 0 && quant_policy <= 3) || quant_policy == 10 || quant_policy == 11,
+              "quant_policy must be 0, 1, 2, 3, 10 or 11");
   TORCH_CHECK(qk_norm_policy >= 0 && qk_norm_policy <= 2, "qk_norm_policy must be 0, 1 or 2");
+
+  // Legacy alias: quant_policy=3 (QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD_QKHADAMARD) is
+  // equivalent to quant_policy=0 with apply_hadamard=true. Collapse it here so the kernel only
+  // needs to handle the orthogonal (quant_policy, apply_hadamard) axes.
+  if (quant_policy == 3) {
+    apply_hadamard = true;
+    quant_policy = 0;
+  }
 
   using DType = __nv_bfloat16;
   using QType = __nv_fp8_e4m3;
@@ -589,13 +598,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
   Strides4D vc_strides{vcache.stride(0), vcache.stride(1), vcache.stride(2)};
   Strides2D ki_strides{kvcache_indices.stride(0)};
 
+  // Q kept in bf16 (no quantization) for policies 10/11.
+  bool q_is_bf16 = (quant_policy == 10 || quant_policy == 11);
+  // K/V use dynamic per-head per-token (K) + per-head (V) scaling for policies 0/10
+  // (policy 3 has already been folded into 0 above).
+  bool kv_dynamic = (quant_policy == 0 || quant_policy == 10);
+
   // Validate scale tensor shapes based on quant_policy
   Strides4D ks_strides{0, 0, 0};
-  if (quant_policy == 0 || quant_policy == 3) {
+  if (kv_dynamic) {
     // Dynamic per-head per-token: k_scale is [num_block, R, num_kv_heads, L] (output)
     int L = qk_head_dim * static_cast<int>(sizeof(QType)) / static_cast<int>(sizeof(float));
     int R = kv_block_size / L;
-    TORCH_CHECK(k_scale.dim() == 4, "k_scale must be 4D for quant_policy=0 or quant_policy=3");
+    TORCH_CHECK(k_scale.dim() == 4, "k_scale must be 4D for quant_policy=0 or 10");
     TORCH_CHECK(k_scale.size(1) == R, "k_scale dim 1 must equal block_size/L=", R, ", got ",
                 k_scale.size(1));
     TORCH_CHECK(k_scale.size(2) == num_kv_heads,
@@ -603,7 +618,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
     TORCH_CHECK(k_scale.size(3) == L, "k_scale dim 3 must equal L=", L, ", got ", k_scale.size(3));
     // V scale: per-head [num_kv_heads]
     TORCH_CHECK(v_scale.dim() == 1 && v_scale.size(0) == num_kv_heads,
-                "v_scale must be [num_kv_heads] for quant_policy=0 or quant_policy=3");
+                "v_scale must be [num_kv_heads] for quant_policy=0 or 10");
     ks_strides = Strides4D{k_scale.stride(0), k_scale.stride(1), k_scale.stride(2)};
   } else {
     // Static per-tensor: k_scale and v_scale are [1]
@@ -618,21 +633,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
     upper_max = in_upper_max;
   }
 
-  // out_q
+  // out_q: bf16 for policies 10/11 (Q not quantized), fp8 otherwise.
+  auto out_q_dtype = q_is_bf16 ? torch::kBFloat16 : torch::kFloat8_e4m3fn;
   torch::Tensor out_q;
   if (out_q_opt.has_value()) {
     out_q = out_q_opt.value();
-    TORCH_CHECK(out_q.is_contiguous() && out_q.scalar_type() == torch::kFloat8_e4m3fn);
+    TORCH_CHECK(out_q.is_contiguous() && out_q.scalar_type() == out_q_dtype);
   } else {
     out_q = torch::empty({num_rows, num_q_heads, qk_head_dim},
-                         torch::dtype(torch::kFloat8_e4m3fn).device(qkv.device()));
+                         torch::dtype(out_q_dtype).device(qkv.device()));
   }
 
-  // q_scale: dqskv allocates real storage, sqskv gets an empty tensor
+  // q_scale: dynamic-Q policies allocate real storage; bf16-Q (10/11) and sqskv get an empty tensor
   torch::Tensor q_scale;
   float *q_scale_ptr = nullptr;
   int max_seqlens_pad128 = 0;
-  if (quant_policy == 0 || quant_policy == 1 || quant_policy == 3) {
+  if (quant_policy == 0 || quant_policy == 1) {
     if (is_prefill) {
       max_seqlens_pad128 = ((max_seqlens + 127) / 128) * 128;
       q_scale = torch::empty({num_req, num_q_heads, max_seqlens_pad128},
@@ -679,13 +695,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
     TORCH_CHECK(q_scale_inv_opt.value().scalar_type() == torch::kFloat);
     q_scale_inv_ptr = q_scale_inv_opt.value().const_data_ptr<float>();
   }
-  if (quant_policy == 3) {
-    TORCH_CHECK(qk_head_dim == 128, "quant_policy=3 (dqksv+hadamard) requires qk_head_dim == 128");
+  if (apply_hadamard) {
+    TORCH_CHECK(qk_head_dim == 128, "apply_hadamard=true requires qk_head_dim == 128");
   }
 
   rope_norm_store_kv_fp8_async(
-      reinterpret_cast<QType *>(out_q.mutable_data_ptr()),
-      reinterpret_cast<QType *>(kcache.mutable_data_ptr()),
+      out_q.mutable_data_ptr(), reinterpret_cast<QType *>(kcache.mutable_data_ptr()),
       reinterpret_cast<QType *>(vcache.mutable_data_ptr()), out_k_ptr, out_v_ptr,
       split_k_flag.mutable_data_ptr<int32_t>(), q_scale_ptr,
       reinterpret_cast<const DType *>(qkv.const_data_ptr()), cos_sin.const_data_ptr<float>(),
@@ -694,7 +709,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
       k_scale.mutable_data_ptr<float>(), v_scale.const_data_ptr<float>(), q_scale_inv_ptr,
       upper_max, max_seqlens, kc_strides, ks_strides, vc_strides, ki_strides, num_req,
       kv_block_size, num_rows, num_q_heads, num_kv_heads, qk_head_dim, v_head_dim, is_prefill,
-      qk_norm_policy, quant_policy, stream);
+      qk_norm_policy, quant_policy, apply_hadamard, stream);
 
   return std::make_tuple(out_q, q_scale, split_k_flag);
 }
@@ -751,7 +766,8 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "bool is_prefill, Tensor! k_scale, Tensor v_scale, "
       "int quant_policy, int max_seqlens, float? upper_max, Tensor? q_scale_inv, "
       "Tensor? q_norm_weight, Tensor? k_norm_weight, "
-      "Tensor? out_q=None, Tensor? out_k=None, Tensor? out_v=None, int qk_norm_policy=0) -> "
+      "Tensor? out_q=None, Tensor? out_k=None, Tensor? out_v=None, int qk_norm_policy=0, "
+      "bool apply_hadamard=False) -> "
       "(Tensor, Tensor, Tensor)");
   m.impl("rope_norm_store_kv_fp8", torch::kCUDA, &hpc::rope_v2::rope_norm_store_kv_fp8_entry);
 }

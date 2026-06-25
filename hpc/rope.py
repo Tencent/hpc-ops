@@ -431,6 +431,7 @@ def rope_norm_store_kv_fp8(
     out_k: Optional[Tensor] = None,
     out_v: Optional[Tensor] = None,
     qk_norm_policy: int = 0,
+    apply_hadamard: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Applies RoPE to Q/K with FP8 quantization, optionally applies QK RMSNorm, and writes K/V into a paged FP8 KV cache.
 
@@ -484,9 +485,10 @@ def rope_norm_store_kv_fp8(
             - 1: dqskv — dynamic per-token per-head Q quantization; K/V use static scaling.
                  Q scale computed by the kernel and written to the returned q_scale tensor.
             - 2: sqskv — static quantization; uses the caller-supplied q_scale_inv.
-            - 3: Q,K per-head-per-token, V per head, additionally applies a per-head (head_dim=128)
-                 Hadamard rotation to Q and K after norm and before quantization.
-                 Only supports qk_head_dim == 128 for now.
+            - 3: Legacy alias for policy 0 with ``apply_hadamard=True``. Kept for
+                 backward compatibility. Requires qk_head_dim == 128.
+            - 10: QBF16_KPERTOKEN_PERHEAD_VPERHEAD — Q in bf16 (no q_scale); K/V same as policy 0.
+            - 11: QBF16_KPERTENSOR_VPERTENSOR — Q in bf16 (no q_scale); K/V same as policy 1.
         max_seqlens: Maximum sequence length in the batch. Used to size the q_scale allocation
             in prefill mode (padded to a multiple of 128).
             Shape: scalar
@@ -505,7 +507,7 @@ def rope_norm_store_kv_fp8(
             Dtype: float32
         out_q: Optional pre-allocated output buffer for Q.
             Shape: [num_rows, num_q_heads, qk_head_dim]
-            Dtype: float8_e4m3fn
+            Dtype: float8_e4m3fn (bfloat16 for policies 10/11)
         out_k: Optional output buffer for K. If provided, K is written here instead of key_cache.
             Shape: [num_rows, num_kv_heads, qk_head_dim]
             Dtype: float8_e4m3fn
@@ -518,15 +520,20 @@ def rope_norm_store_kv_fp8(
             - 0: No RMSNorm.
             - 1: RoPE then RMSNorm.
             - 2: RMSNorm then RoPE.
+        apply_hadamard: Apply per-head Hadamard rotation to Q and K after norm.
+            Requires ``qk_head_dim == 128``. Defaults to False.
+            Shape: scalar
+            Dtype: bool
 
     Returns:
         Tuple of:
-        - out_q_fp8 (Tensor): Rotated (and optionally normalized) Q tensor quantized to FP8.
+        - out_q (Tensor): Rotated (and optionally normalized) Q tensor.
+            FP8 for most quant policies; bf16 for policies 10/11 (Q not quantized).
             Shape: [num_rows, num_q_heads, qk_head_dim]
-            Dtype: float8_e4m3fn
+            Dtype: float8_e4m3fn (bfloat16 for policies 10/11)
         - q_scale (Tensor): Dynamic per-token per-head Q scale (dqskv only).
             Prefill shape: [num_req, num_q_heads, max_seqlens_pad128]; Decode shape: [num_rows, num_q_heads].
-            Empty tensor when quant_policy=2.
+            Empty tensor when quant_policy=2, 10 or 11.
             Dtype: float32
         - split_k_flag (Tensor): Per-request per-KV-head flag zeroed by the kernel, used by downstream attention.
             Shape: [num_req, num_kv_heads]
@@ -556,6 +563,7 @@ def rope_norm_store_kv_fp8(
         out_k,
         out_v,
         qk_norm_policy,
+        apply_hadamard,
     )
 
 
@@ -716,6 +724,8 @@ def rope_norm_store_kv_fake(
     v_head_dim = value_cache.shape[-1]
     q_heads = (hidden_size - kv_heads * qk_head_dim - kv_heads * v_head_dim) // qk_head_dim
     num_rows = qkv.shape[0]
+    if out_q is not None:
+        return out_q
     return torch.empty(num_rows, q_heads, qk_head_dim, dtype=qkv.dtype, device=qkv.device)
 
 
@@ -741,6 +751,7 @@ def rope_norm_store_kv_fp8_fake(
     out_k,
     out_v,
     qk_norm_policy,
+    apply_hadamard,
 ):
     num_rows = qkv.shape[0]
     qk_dim = key_cache.shape[-1]
@@ -749,15 +760,20 @@ def rope_norm_store_kv_fp8_fake(
     num_req = num_seqlen_per_req.shape[0]
     q_heads = (qkv.shape[-1] - kv_heads * qk_dim - kv_heads * v_dim) // qk_dim
 
-    out_q_fp8 = torch.empty(
-        num_rows,
-        q_heads,
-        qk_dim,
-        dtype=torch.float8_e4m3fn,
-        device=qkv.device,
-    )
+    # Policies 10/11 keep Q in bf16 (no quantization); others emit fp8 Q.
+    q_is_bf16 = quant_policy == 10 or quant_policy == 11
+    out_q_dtype = torch.bfloat16 if q_is_bf16 else torch.float8_e4m3fn
 
-    if quant_policy.value == 0 or quant_policy.value == 1 or quant_policy.value == 3:  # dq Q
+    if out_q is None:
+        out_q = torch.empty(
+            num_rows,
+            q_heads,
+            qk_dim,
+            dtype=out_q_dtype,
+            device=qkv.device,
+        )
+
+    if quant_policy == 0 or quant_policy == 1 or quant_policy == 3:  # dq Q
         if is_prefill:
             aligned = ((max_seqlens + 127) // 128) * 128
             q_scale = torch.empty(
@@ -783,4 +799,4 @@ def rope_norm_store_kv_fp8_fake(
         dtype=torch.int32,
         device=qkv.device,
     )
-    return (out_q_fp8, q_scale, split_k_flag)
+    return (out_q, q_scale, split_k_flag)
