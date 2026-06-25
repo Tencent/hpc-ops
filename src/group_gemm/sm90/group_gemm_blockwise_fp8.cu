@@ -436,38 +436,6 @@ void group_gemm_blockwise_fp8_async(void *y_ptr, const void *x_ptr, const void *
         y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
         tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
         num_block_k_pad4, update_tma, use_pdl, stream);
-  } else if (num_seq_per_group_avg <= 64) {
-    constexpr int kTileM = 64;
-    constexpr int kStage = 8;
-    launch_group_gemm_blockwise_fp8<kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
-                                    kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
-        y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
-        tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
-        num_block_k_pad4, update_tma, use_pdl, stream);
-  } else if (num_seq_per_group_avg <= 96) {
-    constexpr int kTileM = 48;
-    constexpr int kStage = 8;
-    launch_group_gemm_blockwise_fp8<kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
-                                    kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
-        y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
-        tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
-        num_block_k_pad4, update_tma, use_pdl, stream);
-  } else if (num_seq_per_group_avg <= 128) {
-    constexpr int kTileM = 32;
-    constexpr int kStage = 8;
-    launch_group_gemm_blockwise_fp8<kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
-                                    kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
-        y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
-        tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
-        num_block_k_pad4, update_tma, use_pdl, stream);
-  } else if (num_seq_per_group_avg <= 144) {
-    constexpr int kTileM = 48;
-    constexpr int kStage = 8;
-    launch_group_gemm_blockwise_fp8<kTileM, kTileN, kTileK, kTileS, kStage, kWarpgroupM,
-                                    kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
-        y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
-        tiles_ptr, cu_tiles_ptr, task_map_ptr, num_waves, num_group, m, n, k, m_pad,
-        num_block_k_pad4, update_tma, use_pdl, stream);
   } else {
     constexpr int kTileM = 64;
     constexpr int kStage = 8;
