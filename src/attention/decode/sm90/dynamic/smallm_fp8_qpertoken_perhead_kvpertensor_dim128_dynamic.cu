@@ -215,7 +215,7 @@ bool smallm_fp8_qpertoken_perhead_kvpertensor_dim128_dynamic_async(
   }
 
   int heads_per_group = num_head_q / num_head_k;
-  if (heads_per_group != 8 && heads_per_group != 4) {
+  if (heads_per_group < 1 || heads_per_group > 8) {
     std::cout << "launch launch_attention_decode_bf16_dim128_smallm_fp8 failed with "
               << " heads_per_group:" << heads_per_group << ", num_head_q:" << num_head_q
               << ", num_head_k:" << num_head_k << std::endl;
