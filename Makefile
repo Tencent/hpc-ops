@@ -1,5 +1,5 @@
 PY_FILES=$(shell find hpc -name "*.py") $(shell find tests -name "*.py") $(shell find ./ -maxdepth 1 -name "*.py")
-PY_TEST=$(shell find tests -name "test_*.py")
+PY_TEST=$(shell find tests -name "test_*.py" ! -name "*cutedsl*")
 CC_FILES=$(shell find src -name "*.cc")
 CU_FILES=$(shell find src -name "*.cu")
 H_FILES=$(shell find src -name "*.h")

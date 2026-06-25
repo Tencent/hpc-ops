@@ -1,8 +1,25 @@
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from torch import Tensor
+
+
+def _to_scalar_float(x: Union[float, torch.Tensor], name: str) -> float:
+    """Coerce a Python float / 0-d / 1-element tensor to a Python float.
+
+    Used by per-tensor-scale ABIs that accept either form. Raises on
+    multi-element tensors so callers don't accidentally pass a per-token /
+    per-head scale to a per-tensor entry point.
+    """
+    if isinstance(x, torch.Tensor):
+        if x.numel() != 1:
+            raise ValueError(
+                f"{name} must be a Python float or 1-element tensor, got "
+                f"shape={tuple(x.shape)} numel={x.numel()}"
+            )
+        return float(x.item())
+    return float(x)
 
 
 class QuantType(Enum):
@@ -247,6 +264,281 @@ def attention_with_kvcache_prefill_fp8(
         max_seqlens_q,
         quant_type.value,
         output,
+    )
+
+
+def attention_with_kvcache_prefill_fp8_packed_cutedsl(
+    q: Tensor,
+    kcache: Tensor,
+    vcache: Tensor,
+    qscale: Tensor,
+    kscale: Union[Tensor, float],
+    vscale: Union[Tensor, float],
+    cu_seqlens_q: Tensor,
+    block_ids: Tensor,
+    seqlens_kvcache: Tensor,
+    max_seqlens_q: int,
+    quant_type: QuantType = QuantType.QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD,
+    *,
+    output: Optional[Tensor] = None,
+    config=None,
+) -> Tensor:
+    """SM100 FP8 paged-prefill FMHA via CuTeDSL JIT backend.
+
+    Pure-Python backend built on ``cutlass.cute``; requires the
+    ``nvidia-cutlass-dsl`` pip package at runtime. This entry mirrors the
+    dispatch pattern of the SM90 hand-coded
+    :func:`attention_with_kvcache_prefill_fp8`: a single Python entry takes a
+    ``quant_type`` parameter and routes to the appropriate backend kernel.
+
+    Fixed kernel constraints: head_dim=128, block_size=64, causal mask,
+    SM100 (Blackwell) only.
+
+    Supported ``quant_type`` values:
+
+    - :attr:`QuantType.QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD` (default):
+      base op. ``kscale`` is a 4D fp8 byte-view of fp32 scales, ``vscale`` is a
+      ``[num_head_kv]`` fp32 tensor. K-scale is loaded via the sage K-scale
+      pipeline; V-scale is applied per-head in the epilogue.
+    - :attr:`QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR`: KV-pertensor
+      variant (forked kernel). ``kscale`` and ``vscale`` are scalars (Python
+      ``float`` / 0-d / 1-element fp32 tensor). Kernel skips the sage K-scale
+      pipeline entirely; ``v_scale`` is broadcast to ``[num_head_kv]`` per-head
+      tensor inside the wrapper before the kernel runs.
+
+    Other ``quant_type`` values raise :class:`NotImplementedError`.
+
+    Args:
+        q: Query tensor, FP8 E4M3.
+            Shape: [total_seq_q, num_head_q, 128]
+            Dtype: float8_e4m3fn
+        kcache: Paged K cache, FP8 E4M3.
+            Shape: [num_blocks, block_size=64, num_head_kv, 128]
+            Dtype: float8_e4m3fn
+            Notes: For ``QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR`` the kernel
+            does not read past the first ``block_size`` rows; you may still
+            allocate a wider ``[num_blocks, 2, block_size+scale_rows, Hkv, 128]``
+            buffer if the cache is shared with the base op.
+        vcache: Paged V cache, FP8 E4M3.
+            Shape: [num_blocks, block_size=64, num_head_kv, 128]
+            Dtype: float8_e4m3fn
+        qscale: Per-token-per-head Q dequant scale.
+            Shape: [num_batch, num_head_q, max_seqlens_q_pad]
+            Dtype: float32
+            Same for both quant_types.
+        kscale: K dequant scale. Shape and dtype depend on ``quant_type``:
+
+            * ``QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD`` (default):
+              4D fp8 byte-view of fp32 scales, shape
+              ``[num_blocks, scale_rows, num_head_kv, 128]``,
+              dtype ``float8_e4m3fn``. Stored in the trailing rows of the
+              same allocation backing the K cache.
+            * ``QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR``: scalar fp32
+              (Python ``float``, 0-d, or 1-element tensor). Folded with the
+              softmax temperature inside the kernel.
+        vscale: V dequant scale. Shape and dtype depend on ``quant_type``:
+
+            * ``QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD`` (default):
+              ``[num_head_kv]`` fp32 tensor.
+            * ``QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR``: scalar fp32
+              (broadcast to ``[num_head_kv]`` inside the wrapper).
+        cu_seqlens_q: Cumulative Q lengths.
+            Shape: [num_batch + 1]
+            Dtype: int32
+        block_ids: Page table (KV block indices per request).
+            Shape: [num_batch, max_blocks]
+            Dtype: int32
+        seqlens_kvcache: KV cache lengths per request.
+            Shape: [num_batch]
+            Dtype: int32
+        max_seqlens_q: Max Q sequence length (scalar). Must be a multiple of 128.
+        quant_type: Quantization scheme. Default
+            ``QuantType.QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD`` matches
+            the historical default of this entry (base op). For the SM90-family
+            default ``QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR``, pass
+            ``quant_type=QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR``
+            explicitly.
+        The CutDSL backend always uses a fixed internal ``p_scale = 256`` for
+            the FP8 softmax-P payload. The former external ``p_scale`` /
+            ``p_scale_inv`` ABI was removed to keep the SM100 path's numerical
+            contract fixed.
+        output: Optional pre-allocated bfloat16 output tensor with shape
+            ``[total_seq_q, num_head_q, 128]``.
+        config: Optional config from ``dsl.attention``:
+
+            * ``Fp8PagedPrefillConfig`` for the default quant_type
+            * ``Fp8PagedPrefillKvPertensorConfig`` for KV-pertensor
+
+            If a config of the wrong concrete type is passed for the chosen
+            ``quant_type`` it will be rejected with a ``TypeError``.
+
+    Returns:
+        Output tensor, shape ``[total_seq_q, num_head_q, 128]``, dtype bfloat16.
+
+    Raises:
+        RuntimeError: If the current CUDA device is not SM100 (Blackwell).
+        NotImplementedError: If ``quant_type`` is not one of the two supported
+            values.
+        ImportError: If ``nvidia-cutlass-dsl`` / ``cuda-python`` are not
+            installed.
+
+    Example:
+        >>> # Base op (default): per-token-per-head K + per-head V
+        >>> out = hpc.attention_with_kvcache_prefill_fp8_packed_cutedsl(
+        ...     q, kcache, vcache, qscale, kscale_4d, vscale_perhead,
+        ...     cu_seqlens_q, block_ids, seqlens_kvcache, max_seqlens_q,
+        ... )
+        >>> # KV-pertensor variant: scalar K + scalar V
+        >>> out = hpc.attention_with_kvcache_prefill_fp8_packed_cutedsl(
+        ...     q, kcache, vcache, qscale, k_scale_float, v_scale_float,
+        ...     cu_seqlens_q, block_ids, seqlens_kvcache, max_seqlens_q,
+        ...     quant_type=hpc.QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
+        ... )
+    """
+    # Early arch check — fail fast with a readable message instead of a
+    # cryptic cute JIT/PTX error many seconds later.
+    if q.is_cuda:
+        cap = torch.cuda.get_device_capability(q.device)
+        if cap[0] < 10:
+            raise RuntimeError(
+                "attention_with_kvcache_prefill_fp8_packed_cutedsl requires "
+                f"SM100 (Blackwell), but GPU at {q.device} has capability "
+                f"sm_{cap[0]}{cap[1]}."
+            )
+
+    # Lazy import: users that never touch this backend do not pay the
+    # cutlass.cute / cuda.bindings import cost, and `import hpc` keeps
+    # working even without nvidia-cutlass-dsl installed.
+    if quant_type == QuantType.QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD:
+        from dsl.attention import (
+            Fp8PagedPrefillConfig,
+            attention_prefill_fp8_cutedsl,
+        )
+
+        if config is None:
+            config = Fp8PagedPrefillConfig()
+        elif not isinstance(config, Fp8PagedPrefillConfig):
+            raise TypeError(
+                "quant_type=QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD requires "
+                f"config=None or Fp8PagedPrefillConfig, got {type(config).__name__}."
+            )
+
+        return attention_prefill_fp8_cutedsl(
+            q,
+            kcache,
+            vcache,
+            qscale,
+            kscale,
+            vscale,
+            cu_seqlens_q,
+            block_ids,
+            seqlens_kvcache,
+            max_seqlens_q,
+            output=output,
+            config=config,
+        )
+
+    if quant_type == QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR:
+        from dsl.attention import (
+            Fp8PagedPrefillKvPertensorConfig,
+            attention_prefill_fp8_cutedsl_q_pertoken_kv_pertensor,
+        )
+
+        if config is None:
+            config = Fp8PagedPrefillKvPertensorConfig()
+        elif not isinstance(config, Fp8PagedPrefillKvPertensorConfig):
+            raise TypeError(
+                "quant_type=QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR requires "
+                f"config=None or Fp8PagedPrefillKvPertensorConfig, got "
+                f"{type(config).__name__}."
+            )
+
+        # ABI: kscale / vscale are scalars (Python float / 0-d / 1-elem tensor).
+        # Reject multi-element tensors so callers don't accidentally pass a
+        # base-op K-scale tail through this dispatch path.
+        k_scale_f = _to_scalar_float(kscale, "kscale")
+        v_scale_f = _to_scalar_float(vscale, "vscale")
+
+        # V-scale still goes through the existing per-head [Hkv] tensor that
+        # the kernel reads once per head_kv in the epilogue; we broadcast the
+        # scalar v_scale into that tensor (zero kernel-side cost).
+        num_head_kv = kcache.shape[-2]
+        vscale_per_head = torch.full(
+            (num_head_kv,),
+            v_scale_f,
+            dtype=torch.float32,
+            device=q.device,
+        )
+
+        return attention_prefill_fp8_cutedsl_q_pertoken_kv_pertensor(
+            q,
+            kcache,
+            vcache,
+            qscale,
+            k_scale_f,
+            vscale_per_head,
+            cu_seqlens_q,
+            block_ids,
+            seqlens_kvcache,
+            max_seqlens_q,
+            output=output,
+            config=config,
+        )
+
+    raise NotImplementedError(
+        f"attention_with_kvcache_prefill_fp8_packed_cutedsl: quant_type={quant_type} "
+        f"is not supported by the cutedsl backend. Supported: "
+        f"QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD (default), "
+        f"QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR."
+    )
+
+
+def attention_with_kvcache_prefill_fp8_packed_cutedsl_q_pertoken_kv_pertensor(
+    q: Tensor,
+    kcache: Tensor,
+    vcache: Tensor,
+    qscale_pth: Tensor,
+    k_scale,
+    v_scale,
+    cu_seqlens_q: Tensor,
+    block_ids: Tensor,
+    seqlens_kvcache: Tensor,
+    max_seqlens_q: int,
+    *,
+    output: Optional[Tensor] = None,
+    config=None,
+) -> Tensor:
+    """**Deprecated thin wrapper** — call
+    :func:`attention_with_kvcache_prefill_fp8_packed_cutedsl` with
+    ``quant_type=QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR`` instead.
+
+    Kept for backward compatibility with callers written against the
+    pre-unified ABI (5/17). New code should prefer the unified entry — it
+    aligns with the SM90 family
+    :func:`attention_with_kvcache_prefill_fp8` (which dispatches the same
+    way via a ``quant_type`` parameter).
+
+    The math / kernel binary / numerical result are identical between this
+    wrapper and the unified entry with ``quant_type=KPERTENSOR_VPERTENSOR``.
+
+    See
+    :func:`attention_with_kvcache_prefill_fp8_packed_cutedsl` for the
+    parameter contract.
+    """
+    return attention_with_kvcache_prefill_fp8_packed_cutedsl(
+        q,
+        kcache,
+        vcache,
+        qscale_pth,
+        k_scale,
+        v_scale,
+        cu_seqlens_q,
+        block_ids,
+        seqlens_kvcache,
+        max_seqlens_q,
+        QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
+        output=output,
+        config=config,
     )
 
 

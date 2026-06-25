@@ -994,9 +994,11 @@ def select_affected_tests(
 # ---------------------------------------------------------------------------
 
 def _all_tests() -> List[str]:
+    # Exclude cutedsl tests (need nvidia-cutlass-dsl, absent on CI runner).
     return sorted(
         p.relative_to(REPO_ROOT).as_posix()
         for p in TESTS_DIR.glob("test_*.py")
+        if "cutedsl" not in p.name
     )
 
 
@@ -1123,6 +1125,12 @@ def main() -> int:
     T, reasons = select_affected_tests(
         direct_tests, P, U, incomplete_tests,
     )
+    # Exclude cutedsl tests (need nvidia-cutlass-dsl, absent on CI runner).
+    dropped = sorted(t for t in T if "cutedsl" in os.path.basename(t))
+    if dropped:
+        T = {t for t in T if "cutedsl" not in os.path.basename(t)}
+        for t in dropped:
+            log.info("  - %s   [excluded: cutedsl not in CI]", t)
     log.info("|T| = %d", len(T))
     if not T:
         log.info("no affected tests; emitting empty list")

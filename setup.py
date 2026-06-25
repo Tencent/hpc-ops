@@ -5,7 +5,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
-from setuptools import Extension, setup
+from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
 
@@ -192,7 +192,7 @@ setup(
     author_email="authors@hpc-ops",
     url="https://mirrors.tencent.com/#/private/pypi/detail?repo_id=155&project_name=hpc-ops",
     license="Copyright 2025",
-    packages=["hpc"],
+    packages=find_packages(include=["hpc", "hpc.*", "dsl", "dsl.*"]),
     ext_modules=ext_modules,
     cmdclass={"build_ext": CMakeBuild},
     # Include the _C_sm*.abi3.so in the wheel.
@@ -200,8 +200,12 @@ setup(
         "hpc": [
             "*.so",
             "*.so.*",
-        ]
+        ],
+        "dsl": ["**/*.txt"],
     },
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
-    install_requires=["torch"],
+    install_requires=[
+        "torch",
+        "nvidia-cutlass-dsl>=4.4",
+    ],
 )
