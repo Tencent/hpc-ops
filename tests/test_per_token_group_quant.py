@@ -101,9 +101,10 @@ def test_fused_layer_norm_with_scale_quant(
     )
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 128])
+@pytest.mark.parametrize("batch_size", [1, 2, 128, 2048, 4096])
 @pytest.mark.parametrize(
-    "hidden_states", [384, 512, 768, 1024, 1536, 2048, 3072, 4096, 5120, 6144, 7168, 13824]
+    "hidden_states",
+    [384, 512, 768, 1024, 1536, 2048, 3072, 3200, 3456, 4096, 5120, 6144, 6912, 7168, 8192, 13824],
 )
 def test_per_token_group_fp8_quant(
     batch_size,

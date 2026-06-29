@@ -368,7 +368,7 @@ template <typename Tin_, typename Tout_, typename TiledMmaQKAtom, typename Tiled
           int kTileM_, int kTileN_, int kTileK_, int kTileV_, int kBlockSize_, int kStage_,
           int kWarpgroupM_ = 2, int kWarpgroupN_ = 1, int kSwizzleQ = 128, int kSwizzleK = 128,
           int kSwizzleV = 128, int kSwizzleY = 128>
-struct AttentionKVCachePrefillQTokenKVTenorFp8Config {
+struct AttentionKVCachePrefillQTokenKVTensorFp8Config {
   using Tin = Tin_;
   using Tout = Tout_;
 
@@ -463,7 +463,7 @@ template <typename Tin_, typename Tout_, typename TiledMmaQKAtom, typename Tiled
           int kTileM_, int kTileN_, int kTileK_, int kTileV_, int kTileS_, int kBlockSize_,
           int kScaleBlockSize_, int kStage_, int kWarpgroupM_ = 2, int kWarpgroupN_ = 1,
           int kSwizzleQ = 128, int kSwizzleK = 128, int kSwizzleV = 128, int kSwizzleY = 128>
-struct AttentionKVCachePrefillQKTokenVTenorFp8Config {
+struct AttentionKVCachePrefillQKTokenVTensorFp8Config {
   using Tin = Tin_;
   using Tout = Tout_;
 

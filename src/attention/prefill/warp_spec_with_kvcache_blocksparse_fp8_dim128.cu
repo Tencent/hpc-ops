@@ -52,9 +52,9 @@ void launch_warp_spec_with_kvcache_blocksparse_qpertoken_perhead_kvpertensor_fp8
 
   using TiledMmaQK = SM90_64x64x32_F32E4M3E4M3_SS_TN<>;
   using TiledMmaPV = SM90_64x128x32_F32E4M3E4M3_RS_TN<>;
-  using Config = AttentionKVCachePrefillQTokenKVTenorFp8Config<Tin, Tout, TiledMmaQK, TiledMmaPV,
-                                                               128, 128, 128, 128, kBlockSize, 2, 2,
-                                                               1, 128, 128, 128, 128>;
+  using Config = AttentionKVCachePrefillQTokenKVTensorFp8Config<Tin, Tout, TiledMmaQK, TiledMmaPV,
+                                                                128, 128, 128, 128, kBlockSize, 2,
+                                                                2, 1, 128, 128, 128, 128>;
 
   Config config;
   auto [tma_q, tma_k, tma_v, tma_y, tma_qs] = config.get_tma(Q, K, V, Y, QS);
@@ -152,9 +152,9 @@ void launch_warp_spec_with_kvcache_blocksparse_qkpertoken_perhead_vperhead_fp8_d
   using TiledMmaQK = SM90_64x64x32_F32E4M3E4M3_SS_TN<>;
   using TiledMmaPV = SM90_64x128x32_F32E4M3E4M3_RS_TN<>;
   using Config =
-      AttentionKVCachePrefillQKTokenVTenorFp8Config<Tin, Tout, TiledMmaQK, TiledMmaPV, kTileM,
-                                                    kTileN, kTileK, kTileV, kTileS, kBlockSize,
-                                                    kScaleBlockSize, 2, 2, 1, 128, 128, 128, 128>;
+      AttentionKVCachePrefillQKTokenVTensorFp8Config<Tin, Tout, TiledMmaQK, TiledMmaPV, kTileM,
+                                                     kTileN, kTileK, kTileV, kTileS, kBlockSize,
+                                                     kScaleBlockSize, 2, 2, 1, 128, 128, 128, 128>;
 
   Config config;
   auto [tma_q, tma_k, tma_v, tma_y, tma_qs, tma_ks] = config.get_tma(Q, K, V, Y, QS, KS);

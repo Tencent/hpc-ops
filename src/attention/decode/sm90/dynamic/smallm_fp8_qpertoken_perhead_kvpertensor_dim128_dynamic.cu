@@ -157,10 +157,10 @@ static void launch_smallm_fp8_qpertoken_perhead_kvpertensor_dim128_dynamic_split
 
   cudaLaunchKernelEx(&attn_config, kernel, tma_q, tma_k, tma_v, tma_splity,
                      reinterpret_cast<float *>(splitk_out_ptr), reinterpret_cast<float *>(lse_ptr),
-                     task_map_ptr, block_ids_ptr, qscale_ptr, kscale_ptr, vscale_ptr, num_batch,
-                     num_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_k, num_head_v,
-                     heads_per_group, pad_heads_per_group, num_kvcache_blocks, num_seq_max_blocks,
-                     qscale_pad_stride, one_over_dk_log2e, max_splitk);
+                     task_map_ptr, block_ids_ptr, qscale_ptr, kscale_ptr, nullptr, vscale_ptr,
+                     num_batch, num_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_k,
+                     num_head_v, heads_per_group, pad_heads_per_group, num_kvcache_blocks,
+                     num_seq_max_blocks, qscale_pad_stride, one_over_dk_log2e, max_splitk);
 
   // ---- combine kernel: LSE-weighted reduction across chunks ----
   constexpr int kCombineWarps = 4;

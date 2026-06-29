@@ -9,7 +9,7 @@
 #include "cute/tensor.hpp"
 #include "src/attention/decode/sm90/dynamic/smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_splitk_kernels.cuh"
 #include "src/attention/decode/smallm_dim128.h"
-#include "src/attention/decode/splitk_combine_kernels.cuh"
+#include "src/attention/decode/splitk_combine_kernels_dimtiled.cuh"
 
 namespace hpc {
 namespace attention {
@@ -27,6 +27,8 @@ static constexpr auto mma_selector_fp8() {
       return SM90_64x24x32_F32E4M3E4M3_RS_TN<>{};
     } else if constexpr (kTileM == 32) {
       return SM90_64x32x32_F32E4M3E4M3_RS_TN<>{};
+    } else if constexpr (kTileM == 40) {
+      return SM90_64x40x32_F32E4M3E4M3_RS_TN<>{};
     }
   } else {
     if constexpr (kTileM == 8) {
@@ -37,23 +39,25 @@ static constexpr auto mma_selector_fp8() {
       return SM90_64x24x32_F32E4M3E4M3_SS_TN<>{};
     } else if constexpr (kTileM == 32) {
       return SM90_64x32x32_F32E4M3E4M3_SS_TN<>{};
+    } else if constexpr (kTileM == 40) {
+      return SM90_64x40x32_F32E4M3E4M3_SS_TN<>{};
     }
   }
 }
 
-template <int kTileM, int kTileN, int kTileK, int kTileV, int kBlockSize>
-static void launch_smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_splitk_kernel(
+template <int kTileM, int kTileN, int kTileK, int kTileV, int kBlockSize, int kMaxSplitK,
+          int kStage = 2>
+static void launch_smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_adaptive_splitk_kernel(
     void *y_ptr, void *splitk_out_ptr, void *lse_ptr, const int *task_map_ptr, const void *q_ptr,
     void *kcache_ptr, void *vcache_ptr, const int *block_ids_ptr, const float *qscale_ptr,
-    const float *kscale_ptr, const float *vscale_ptr, int num_batch, int num_seq_q, int num_head_q,
-    int num_head_k, int num_head_v, int heads_per_group, int num_dim_qk, int num_dim_v,
-    int num_kvcache_blocks, int num_seq_max_blocks, int qscale_pad_stride, int ldQ,
-    int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
-    int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
-    int max_splitk, cudaStream_t stream) {
+    const float *kscale_ptr, const float *pscale_ptr, const float *vscale_ptr, int num_batch,
+    int num_seq_q, int num_head_q, int num_head_k, int num_head_v, int heads_per_group,
+    int num_dim_qk, int num_dim_v, int num_kvcache_blocks, int num_seq_max_blocks,
+    int qscale_pad_stride, int ldQ, int64_t kcache_block_stride, int64_t kcache_token_stride,
+    int64_t kcache_head_stride, int64_t vcache_block_stride, int64_t vcache_token_stride,
+    int64_t vcache_head_stride, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
-  constexpr int kStage = 2;
   constexpr int kHeadsPerGroup = 8;
   constexpr int kWarpGroupN = 1;
 
@@ -77,10 +81,10 @@ static void launch_smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_splitk_
 
   auto splitY = make_tensor(
       make_gmem_ptr(reinterpret_cast<float *>(splitk_out_ptr)),
-      make_shape(num_dim_v, heads_per_group, num_head_k, num_seq_q, max_splitk, num_batch),
+      make_shape(num_dim_v, heads_per_group, num_head_k, num_seq_q, kMaxSplitK, num_batch),
       make_stride(Int<1>{}, num_dim_v, heads_per_group * num_dim_v, num_dim_v * num_head_q,
                   num_dim_v * num_head_q * num_seq_q,
-                  num_dim_v * num_head_q * num_seq_q * max_splitk));
+                  num_dim_v * num_head_q * num_seq_q * kMaxSplitK));
 
   constexpr int kScaleByteSize = sizeof(float);
   const int num_scale_per_row = num_dim_qk / kScaleByteSize;
@@ -116,12 +120,15 @@ static void launch_smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_splitk_
                                          make_shape(Int<kTileV>{}, Int<kBlockSize>{}));
   auto tma_copy_layout_splity = tile_to_shape(GMMA::Layout_MN_SW128_Atom<float>{},
                                               make_shape(Int<kTileV>{}, Int<kHeadsPerGroup>{}));
+  auto tma_copy_layout_ks =
+      make_layout(make_shape(Int<kBlockSize / kTileScale>{}, Int<kTileScale>{}),
+                  make_stride(Int<kTileScale>{}, Int<1>{}));
 
   auto tma_q = make_tma_copy(SM90_TMA_LOAD{}, Q, tma_copy_layout_q);
   auto tma_k = make_tma_copy(SM90_TMA_LOAD{}, K, tma_copy_layout_k);
   auto tma_v = make_tma_copy(SM90_TMA_LOAD{}, V, tma_copy_layout_v);
   auto tma_splity = make_tma_copy(SM90_TMA_STORE{}, splitY, tma_copy_layout_splity);
-  auto tma_ks = make_tma_copy(SM90_TMA_LOAD{}, KS, slayout_ks(_, _, 0));
+  auto tma_ks = make_tma_copy(SM90_TMA_LOAD{}, KS, tma_copy_layout_ks);
 
   auto qk_mma_atom = mma_selector_fp8<kTileM, false>();
   auto sv_mma_atom = mma_selector_fp8<kTileM, true>();
@@ -173,49 +180,96 @@ static void launch_smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_splitk_
 
   cudaLaunchKernelEx(&attn_config, kernel, tma_q, tma_k, tma_v, tma_splity, tma_ks,
                      reinterpret_cast<float *>(splitk_out_ptr), reinterpret_cast<float *>(lse_ptr),
-                     task_map_ptr, block_ids_ptr, qscale_ptr, kscale_ptr, nullptr, vscale_ptr,
+                     task_map_ptr, block_ids_ptr, qscale_ptr, kscale_ptr, pscale_ptr, vscale_ptr,
                      num_batch, num_seq_q, num_dim_qk, num_dim_v, num_head_q, num_head_k,
                      num_head_v, heads_per_group, pad_heads_per_group, num_kvcache_blocks,
-                     num_seq_max_blocks, qscale_pad_stride, one_over_dk_log2e, max_splitk);
+                     num_seq_max_blocks, qscale_pad_stride, one_over_dk_log2e, kMaxSplitK);
 
-  // ---- combine kernel: LSE-weighted reduction across chunks ----
-  constexpr int kCombineWarps = 4;
-  dim3 combine_grid(num_head_q / kCombineWarps, num_seq_q, num_batch);
-  dim3 combine_block(kCombineWarps * 32);
   cutlass::FastDivmod hpg_divider(heads_per_group);
 
-  auto combine_kernel =
-      kernels::attention_decode_dynamic_splitk_combine_kernel<__nv_bfloat16, kCombineWarps>;
-
-  cudaLaunchConfig_t combine_config;
-  memset(&combine_config, 0, sizeof(combine_config));
-  combine_config.gridDim = combine_grid;
-  combine_config.blockDim = combine_block;
-  combine_config.dynamicSmemBytes = sizeof(float) * kCombineWarps * max_splitk;
   cudaLaunchAttribute combine_attrs[1];
   combine_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   combine_attrs[0].val.programmaticStreamSerializationAllowed = 1;
-  combine_config.numAttrs = 1;
-  combine_config.attrs = combine_attrs;
-  combine_config.stream = stream;
 
-  cudaLaunchKernelEx(&combine_config, combine_kernel, reinterpret_cast<__nv_bfloat16 *>(y_ptr),
-                     reinterpret_cast<const float *>(splitk_out_ptr),
-                     reinterpret_cast<const float *>(lse_ptr), task_map_ptr, num_total_ctas,
-                     num_batch, num_seq_q, num_head_q, num_head_k, pad_heads_per_group, num_dim_v,
-                     max_splitk, hpg_divider);
+  const int naive_warps = num_head_q * num_seq_q * num_batch;
+  if (naive_warps >= num_sm * 2) {
+    constexpr int kCombineWarps = 4;
+    cudaLaunchConfig_t combine_config;
+    memset(&combine_config, 0, sizeof(combine_config));
+    combine_config.gridDim = dim3(num_head_q / kCombineWarps, num_seq_q, num_batch);
+    combine_config.blockDim = dim3(kCombineWarps * 32);
+    combine_config.numAttrs = 1;
+    combine_config.attrs = combine_attrs;
+    combine_config.stream = stream;
+    cudaLaunchKernelEx(
+        &combine_config,
+        kernels::attention_decode_dynamic_splitk_combine_dimtiled_kernel<__nv_bfloat16,
+                                                                         kCombineWarps, kMaxSplitK>,
+        reinterpret_cast<__nv_bfloat16 *>(y_ptr), reinterpret_cast<const float *>(splitk_out_ptr),
+        reinterpret_cast<const float *>(lse_ptr), task_map_ptr, num_total_ctas, num_batch,
+        num_seq_q, num_head_q, num_head_k, pad_heads_per_group, num_dim_v, hpg_divider);
+    return;
+  }
+
+  constexpr int kCombineDimTiles = 4;
+  auto launch_combine = [&](auto chunk_split_tag) {
+    constexpr int kChunkSplit = decltype(chunk_split_tag)::value;
+    cudaLaunchConfig_t combine_config;
+    memset(&combine_config, 0, sizeof(combine_config));
+    combine_config.numAttrs = 1;
+    combine_config.attrs = combine_attrs;
+    combine_config.stream = stream;
+
+    auto do_launch = [&](auto combine_kernel) {
+      cudaLaunchKernelEx(&combine_config, combine_kernel, reinterpret_cast<__nv_bfloat16 *>(y_ptr),
+                         reinterpret_cast<const float *>(splitk_out_ptr),
+                         reinterpret_cast<const float *>(lse_ptr), task_map_ptr, num_total_ctas,
+                         num_batch, num_seq_q, num_head_q, num_head_k, pad_heads_per_group,
+                         num_dim_v, hpg_divider);
+    };
+
+    if constexpr (kChunkSplit == 1) {
+      // Base kernel: 2 warps/block, 2 slots packed per block (grid / kCombineWarps).
+      constexpr int kCombineWarps = 2;
+      combine_config.gridDim =
+          dim3(num_head_q * kCombineDimTiles / kCombineWarps, num_seq_q, num_batch);
+      combine_config.blockDim = dim3(kCombineWarps * 32);
+      do_launch(kernels::attention_decode_dynamic_splitk_combine_dimtiled_kernel<
+                __nv_bfloat16, kCombineWarps, kMaxSplitK, kCombineDimTiles>);
+    } else {
+      // Chunk-split kernel: one slot per block, kChunkSplit warps cooperating on it.
+      combine_config.gridDim = dim3(num_head_q * kCombineDimTiles, num_seq_q, num_batch);
+      combine_config.blockDim = dim3(kChunkSplit * 32);
+      do_launch(kernels::attention_decode_dynamic_splitk_combine_chunksplit_kernel<
+                __nv_bfloat16, kChunkSplit, kMaxSplitK, kCombineDimTiles, kChunkSplit>);
+    }
+  };
+
+  const int csplit_blocks = num_head_q * kCombineDimTiles * num_batch * num_seq_q;
+  const int target_warps = num_sm * 5;
+  const int want = (target_warps + csplit_blocks - 1) / csplit_blocks;
+
+  if (want >= 8) {
+    launch_combine(std::integral_constant<int, 8>{});
+  } else if (want >= 4) {
+    launch_combine(std::integral_constant<int, 4>{});
+  } else if (want >= 2) {
+    launch_combine(std::integral_constant<int, 2>{});
+  } else {
+    launch_combine(std::integral_constant<int, 1>{});
+  }
 }
 
-bool smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_async(
+bool smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_adaptive_async(
     void *y_ptr, void *lse_ptr, void *splitk_out_ptr, const int *task_map_ptr, const void *q_ptr,
     void *kcache_ptr, void *vcache_ptr, const int *block_ids_ptr, const int *num_seq_kvcache_ptr,
-    const float *qscale_ptr, const float *kscale_ptr, const float *vscale_ptr, int *split_flag_ptr,
-    bool new_kv_included, int splitk, int splitk_min_len, int consumers, int num_batch,
-    int num_seq_q, int num_head_q, int num_head_k, int num_head_v, int num_dim_qk, int num_dim_v,
-    int num_kvcache_blocks, int block_size, int num_seq_max_blocks, int qscale_pad_stride, int ldY,
-    int ldQ, int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
-    int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
-    cudaStream_t stream) {
+    const float *qscale_ptr, const float *kscale_ptr, const float *pscale_ptr,
+    const float *vscale_ptr, int *split_flag_ptr, bool new_kv_included, int splitk,
+    int splitk_min_len, int consumers, int num_batch, int num_seq_q, int num_head_q, int num_head_k,
+    int num_head_v, int num_dim_qk, int num_dim_v, int num_kvcache_blocks, int block_size,
+    int num_seq_max_blocks, int qscale_pad_stride, int ldY, int ldQ, int64_t kcache_block_stride,
+    int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
+    int64_t vcache_token_stride, int64_t vcache_head_stride, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   constexpr int kTileN = 64;
@@ -238,34 +292,57 @@ bool smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_async(
     return false;
   }
 
-  auto launch = [&](auto tilem_tag, auto block_size_tag) {
+  auto launch_ks = [&](auto splitk_tag, auto tilem_tag, auto block_size_tag, auto kstage_tag) {
     constexpr int kTileM = decltype(tilem_tag)::value;
     constexpr int kBlockSize = decltype(block_size_tag)::value;
-    launch_smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_splitk_kernel<
-        kTileM, kTileN, kTileK, kTileV, kBlockSize>(
+    constexpr int kSplitK = decltype(splitk_tag)::value;
+    constexpr int kStageV = decltype(kstage_tag)::value;
+    launch_smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_adaptive_splitk_kernel<
+        kTileM, kTileN, kTileK, kTileV, kBlockSize, kSplitK, kStageV>(
         y_ptr, splitk_out_ptr, lse_ptr, task_map_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
-        qscale_ptr, kscale_ptr, vscale_ptr, num_batch, num_seq_q, num_head_q, num_head_k,
-        num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks, num_seq_max_blocks,
-        qscale_pad_stride, ldQ, kcache_block_stride, kcache_token_stride, kcache_head_stride,
-        vcache_block_stride, vcache_token_stride, vcache_head_stride, splitk, stream);
+        qscale_ptr, kscale_ptr, pscale_ptr, vscale_ptr, num_batch, num_seq_q, num_head_q,
+        num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
+        num_seq_max_blocks, qscale_pad_stride, ldQ, kcache_block_stride, kcache_token_stride,
+        kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
   };
-
-  auto dispatch_block_size = [&](auto tilem_tag) {
-    if (block_size == 32) {
-      launch(tilem_tag, std::integral_constant<int, 32>{});
-    } else if (block_size == 64) {
-      launch(tilem_tag, std::integral_constant<int, 64>{});
+  auto launch = [&](auto splitk_tag, auto tilem_tag, auto block_size_tag) {
+    if (num_batch * num_head_k >= 32) {
+      launch_ks(splitk_tag, tilem_tag, block_size_tag, std::integral_constant<int, 3>{});
+    } else {
+      launch_ks(splitk_tag, tilem_tag, block_size_tag, std::integral_constant<int, 2>{});
     }
   };
 
-  if (num_seq_q == 1) {
-    dispatch_block_size(std::integral_constant<int, 8>{});
-  } else if (num_seq_q == 2) {
-    dispatch_block_size(std::integral_constant<int, 16>{});
-  } else if (num_seq_q == 3) {
-    dispatch_block_size(std::integral_constant<int, 24>{});
-  } else if (num_seq_q == 4) {
-    dispatch_block_size(std::integral_constant<int, 32>{});
+  auto dispatch_block_size = [&](auto splitk_tag, auto tilem_tag) {
+    if (block_size == 32) {
+      launch(splitk_tag, tilem_tag, std::integral_constant<int, 32>{});
+    } else if (block_size == 64) {
+      launch(splitk_tag, tilem_tag, std::integral_constant<int, 64>{});
+    }
+  };
+
+  auto dispatch_mtp = [&](auto splitk_tag) {
+    if (num_seq_q == 1) {
+      dispatch_block_size(splitk_tag, std::integral_constant<int, 8>{});
+    } else if (num_seq_q == 2) {
+      dispatch_block_size(splitk_tag, std::integral_constant<int, 16>{});
+    } else if (num_seq_q == 3) {
+      dispatch_block_size(splitk_tag, std::integral_constant<int, 24>{});
+    } else if (num_seq_q == 4) {
+      dispatch_block_size(splitk_tag, std::integral_constant<int, 32>{});
+    } else if (num_seq_q == 5) {
+      dispatch_block_size(splitk_tag, std::integral_constant<int, 40>{});
+    }
+  };
+
+  if (splitk == 78 * 4) {
+    dispatch_mtp(std::integral_constant<int, 78 * 4>{});
+  } else if (splitk == 78 * 3) {
+    dispatch_mtp(std::integral_constant<int, 78 * 3>{});
+  } else if (splitk == 78 * 2) {
+    dispatch_mtp(std::integral_constant<int, 78 * 2>{});
+  } else {
+    dispatch_mtp(std::integral_constant<int, 64>{});
   }
 
   return true;

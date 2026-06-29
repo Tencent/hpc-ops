@@ -64,7 +64,7 @@ def naive_blockwise_gemm(x, w, x_scale, w_scale, bias):
 
 @pytest.mark.parametrize("m", [4, 8, 9614])
 @pytest.mark.parametrize("n", [512, 5120, 13824])
-@pytest.mark.parametrize("k", [5120, 13824])
+@pytest.mark.parametrize("k", [5120, 13824, 6912])
 def test_gemm_blockwise_with_bias(m, n, k):
     dtype = torch.float8_e4m3fn
 
@@ -87,7 +87,7 @@ def test_gemm_blockwise_with_bias(m, n, k):
 
 @pytest.mark.parametrize("m", [1, 2, 16, 128, 4099])
 @pytest.mark.parametrize("n", [7168, 2112, 3072, 512])
-@pytest.mark.parametrize("k", [2048, 7168, 1536, 256])
+@pytest.mark.parametrize("k", [2048, 7168, 1536, 256, 6912, 3456])
 def test_gemm_blockwise(m, n, k):
     assert k % 128 == 0
     dtype = torch.float8_e4m3fn

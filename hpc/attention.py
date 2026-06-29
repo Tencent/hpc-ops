@@ -134,7 +134,7 @@ def attention_with_kvcache_prefill_bf16(
         seqlens_kvcache: number tokens in kvcache before cur iteration.
             Shape: [num_batch]
             Dtype: int32
-        max_seqlens_q: max seqlens amang all batchs
+        max_seqlens_q: max query length across all batches.
             Shape: scalar
             Dtype: int
 
@@ -162,6 +162,73 @@ def attention_with_kvcache_prefill_bf16(
         block_ids,
         seqlens_kvcache,
         max_seqlens_q,
+        output,
+    )
+
+
+def attention_with_kvcache_prefill_bf16_hybrid_mask(
+    q: Tensor,
+    kcache: Tensor,
+    vcache: Tensor,
+    cu_seqlens_q: Tensor,
+    block_ids: Tensor,
+    seqlens_kvcache: Tensor,
+    max_seqlens_q: int,
+    mm_prefix_range: Tensor = None,
+    output: Tensor = None,
+) -> Tensor:
+    """Computes paged KV-cache attention prefill in bfloat16 with a hybrid mask.
+
+    Identical to :func:`attention_with_kvcache_prefill_bf16` except that the
+    causal mask is replaced by a hybrid multimodal mask derived on the fly from
+    per-sequence image spans ``mm_prefix_range``. Each query attends causally
+    (``bound = pos + 1``) unless it falls inside an inclusive image span
+    ``[s, e]``, in which case it attends bidirectionally within the span
+    (``bound = e + 1``).
+
+    Args:
+        q: Query tensor for attention computation
+            Shape: [total_seq, num_head_q, num_dim_qk]
+            Dtype: bfloat16
+        kcache: Paged key cache tensor.
+            Logical shape: [num_blocks, block_size, num_head_kv, num_dim_qk]
+            Dtype: bfloat16
+        vcache: Paged value cache tensor.
+            Logical shape: [num_blocks, block_size, num_head_kv, num_dim_v]
+            Dtype: bfloat16
+        cu_seqlens_q: start_seq_q for each batch
+            Shape: [num_batch + 1]
+            Dtype: int32
+        block_ids: kvcache page block index tensor for get paged kvcache.
+            Shape: [num_batch, max_blocks]
+            Dtype: int32
+        seqlens_kvcache: number tokens in kvcache before cur iteration.
+            Shape: [num_batch]
+            Dtype: int32
+        max_seqlens_q: max query length across all batches.
+            Shape: scalar
+            Dtype: int
+        mm_prefix_range: padded per-sequence inclusive image spans ``[s, e]``.
+            Row ``b`` lists sequence ``b``'s spans (sequence-local coords), padded
+            with ``-1`` (padded slots never match ``q_abs >= 0``). Spans may be
+            unclamped; out-of-range / inverted spans are ignored by the kernel.
+            Shape: [num_batch, max_spans, 2]
+            Dtype: int32
+
+    Returns:
+        Tensor: Attention output tensor in bfloat16 format on CUDA device
+            Shape: [total_seq, num_head_q, num_dim_v]
+            Dtype: bfloat16
+    """
+    return torch.ops.hpc.attention_with_kvcache_prefill_bf16_hybrid_mask(
+        q,
+        kcache,
+        vcache,
+        cu_seqlens_q,
+        block_ids,
+        seqlens_kvcache,
+        max_seqlens_q,
+        mm_prefix_range,
         output,
     )
 
@@ -546,6 +613,40 @@ def attention_with_kvcache_prefill_fp8_packed_cutedsl_q_pertoken_kv_pertensor(
     )
 
 
+def attention_with_kvcache_prefill_fp8_hybrid_mask(
+    q: Tensor,
+    kcache: Tensor,
+    vcache: Tensor,
+    qscale: Tensor,
+    kscale: Tensor,
+    vscale: Tensor,
+    cu_seqlens_q: Tensor,
+    block_ids: Tensor,
+    seqlens_kvcache: Tensor,
+    max_seqlens_q: int,
+    mm_prefix_range: Tensor = None,
+    p_scale: Tensor = None,
+    quant_type: QuantType = QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
+    output: Tensor = None,
+) -> Tensor:
+    return torch.ops.hpc.attention_with_kvcache_prefill_fp8_hybrid_mask(
+        q,
+        kcache,
+        vcache,
+        qscale,
+        kscale,
+        vscale,
+        cu_seqlens_q,
+        block_ids,
+        seqlens_kvcache,
+        max_seqlens_q,
+        mm_prefix_range,
+        p_scale,
+        quant_type.value,
+        output,
+    )
+
+
 def attention_with_kvcache_blocksparse_prefill_fp8(
     q: Tensor,
     kcache: Tensor,
@@ -708,6 +809,90 @@ def attention_decode_bf16(
     )
 
 
+def attention_decode_bf16_adaptive(
+    q: Tensor,
+    kcache: Tensor,
+    vcache: Tensor,
+    block_ids: Tensor,
+    num_seq_kvcache: Tensor,
+    mtp: int = 0,
+    new_kv_included: bool = False,
+    task_map: Tensor = None,
+    splitk: bool = True,
+    split_flag: Tensor = None,
+    output: Tensor = None,
+) -> Tensor:
+    """Computes attention decode using bfloat16 precision.
+
+    This function performs the attention decode computation using custom hardware
+    operations optimized for bfloat16 data type.
+
+    Dispatches to the adaptive-combine dynamic split-k kernels; ``task_map`` is required
+    and must be pre-built with :func:`get_attention_decode_task_workspace_adaptive` +
+    :func:`assign_attention_decode_task_adaptive`.
+
+    Args:
+        q: Query tensor for attention computation
+            Shape: [num_batch * num_seq_q, num_head_q, num_dim_qk]
+            Dtype: bfloat16
+        kcache: Key tensor for attention computation in paged format.
+                 Constrainst the unused slots in last block of vcache for each request to be set zeros.
+            Shape: [num_blocks, block_size, num_head_kv, num_dim_qk]
+            Dtype: bfloat16
+        vcache: Value tensor for attention computation in paged format.
+                 Constrainst the unused slots in last block of vcache for each request to be set zeros.
+            Shape: [num_blocks, block_size, num_head_kv, num_dim_qk]
+            Dtype: bfloat16
+        block_ids: kvcache page block index tensor for get paged kvcache.
+            Shape: [num_batch, max_blocks]
+            Dtype: int32
+        num_seq_kvcache: number tokens in kvcache before cur iteration.
+            Shape: [num_batch]
+            Dtype: int32
+        mtp: number draft tokens.
+            Shape: scalar
+            Dtype: int32
+        new_kv_included: the seqlen in num_seq_kvcache include new kv or not.
+            Shape: scalar
+            Dtype: bool
+        task_map: required pre-built persistent-kernel task map (see
+            :func:`get_attention_decode_task_workspace_adaptive` /
+            :func:`assign_attention_decode_task_adaptive`).
+        splitk: use the split k implemention or not. (deprecated)
+            Shape: scalar
+            Dtype: bool
+        split_flag: split-k completion-flag workspace. (deprecated)
+        output: Output tensor for store output value inplace.
+            Shape: [num_batch * num_seq_q, num_head_q, num_dim_qk]
+            Dtype: bfloat16
+    Returns:
+        output: Output tensor for store output value.
+            Shape: [num_batch * num_seq_q, num_head_q, num_dim_qk]
+            Dtype: bfloat16
+
+    Raises:
+        RuntimeError: If the shapes or dtypes do not satisfy the constraints above.
+
+    Note:
+        - All input tensors must be on CUDA device and in bfloat16 format
+        - The query and key tensors must have the same embedding dimension (num_dim_qk)
+        - The batch size (num_batch) must be consistent across all input tensors
+    """
+    return torch.ops.hpc.attention_decode_bf16_adaptive(
+        q,
+        kcache,
+        vcache,
+        block_ids,
+        num_seq_kvcache,
+        mtp,
+        new_kv_included,
+        task_map,
+        splitk,
+        split_flag,
+        output,
+    )
+
+
 def attention_decode_fp8(
     q: Tensor,
     kcache: Tensor,
@@ -725,24 +910,24 @@ def attention_decode_fp8(
     split_flag: Tensor = None,
     output: Tensor = None,
 ) -> Tensor:
-    """Computes attention decode using bfloat16 precision.
+    """Computes attention decode using fp8 precision.
 
     This function performs the attention decode computation using custom hardware
-    operations optimized for bfloat16 data type.
+    operations optimized for fp8 data type.
     Perform fp8 attention: softmax(Q*K^T * qscale * kscale / sqrt(head_dim)) * V * vscale.
 
     Args:
         q: Query tensor for attention computation
             Shape: [num_batch * num_seq_q, num_head_q, num_dim_qk]
-            Dtype: bfloat16
+            Dtype: float8_e4m3fn
         kcache: Key tensor for attention computation in paged format.
                  Constrainst the unused slots in last block of vcache for each request to be set zeros.
             Shape: [num_blocks, block_size, num_head_kv, num_dim_qk]
-            Dtype: bfloat16
+            Dtype: float8_e4m3fn
         vcache: Value tensor for attention computation in paged format.
                  Constrainst the unused slots in last block of vcache for each request to be set zeros.
             Shape: [num_blocks, block_size, num_head_kv, num_dim_qk]
-            Dtype: bfloat16
+            Dtype: float8_e4m3fn
         qscale: Q fp8 quant scale. Per Token Per Head Fp8 Quant.
             Shape: [num_batch, num_head_q]
             Dtype: float32
@@ -776,7 +961,7 @@ def attention_decode_fp8(
         RuntimeError: If the shapes or dtypes do not satisfy the constraints above.
 
     Note:
-        - All input tensors must be on CUDA device and in bfloat16 format
+        - q, kcache and vcache must be on CUDA device and in fp8 (float8_e4m3fn); output is bfloat16
         - The query and key tensors must have the same embedding dimension (num_dim_qk)
         - The batch size (num_batch) must be consistent across all input tensors
     """
@@ -795,6 +980,116 @@ def attention_decode_fp8(
         splitk,
         task_map,
         split_flag,
+        output,
+    )
+
+
+def attention_decode_fp8_adaptive(
+    q: Tensor,
+    kcache: Tensor,
+    vcache: Tensor,
+    block_ids: Tensor,
+    num_seq_kvcache: Tensor,
+    qscale: Tensor,
+    kscale: Tensor,
+    vscale: Tensor,
+    mtp: int = 0,
+    new_kv_included: bool = False,
+    quant_type: QuantType = QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
+    splitk: bool = True,
+    task_map: Tensor = None,
+    split_flag: Tensor = None,
+    p_scale: Optional[Tensor] = None,
+    output: Tensor = None,
+) -> Tensor:
+    """Computes attention decode using fp8 precision.
+
+    This function performs the attention decode computation using custom hardware
+    operations optimized for fp8 data type.
+    Perform fp8 attention: (softmax(Q*K^T * qscale * kscale / sqrt(head_dim)) * pscale) * V * vscale / pscale.
+
+    Dispatches to the adaptive-combine dynamic split-k kernels; ``task_map`` is required
+    and must be pre-built with :func:`get_attention_decode_task_workspace_adaptive` +
+    :func:`assign_attention_decode_task_adaptive`.
+
+    Args:
+        q: Query tensor for attention computation
+            Shape: [num_batch * num_seq_q, num_head_q, num_dim_qk]
+            Dtype: float8_e4m3fn
+        kcache: Key tensor for attention computation in paged format.
+                 Constrainst the unused slots in last block of vcache for each request to be set zeros.
+            Shape: [num_blocks, block_size, num_head_kv, num_dim_qk]
+            Dtype: float8_e4m3fn
+        vcache: Value tensor for attention computation in paged format.
+                 Constrainst the unused slots in last block of vcache for each request to be set zeros.
+            Shape: [num_blocks, block_size, num_head_kv, num_dim_qk]
+            Dtype: float8_e4m3fn
+        qscale: Q fp8 quant scale. Per Token Per Head Fp8 Quant.
+            Shape: [num_batch, num_head_q]
+            Dtype: float32
+        kscale: K fp8 quant scale. Per Tensor Fp8 Quant.
+            Shape: [1]
+            Dtype: float32
+        vscale: V fp8 quant scale. Per Tensor Fp8 Quant.
+            Shape: [1]
+            Dtype: float32
+        block_ids: kvcache page block index tensor for get paged kvcache.
+            Shape: [num_batch, max_blocks]
+            Dtype: int32
+        num_seq_kvcache: number tokens in kvcache before cur iteration.
+            Shape: [num_batch]
+            Dtype: int32
+        mtp: number draft tokens.
+            Shape: scalar
+            Dtype: int32
+        new_kv_included: the seqlen in num_seq_kvcache include new kv or not. (deprecated)
+            Shape: scalar
+            Dtype: bool
+        quant_type: fp8 quantization layout selector.
+            Shape: scalar
+            Dtype: QuantType
+        splitk: use the split k implemention or not. (deprecated)
+            Shape: scalar
+            Dtype: bool
+        task_map: required pre-built persistent-kernel task map (see
+            :func:`get_attention_decode_task_workspace_adaptive` /
+            :func:`assign_attention_decode_task_adaptive`).
+        split_flag: split-k completion-flag workspace. (deprecated)
+        p_scale: P fp8 quant scale, per head. Optional.
+            Shape: [num_head_q]
+            Dtype: float32
+        output: Output tensor for store output value inplace.
+            Shape: [num_batch * num_seq_q, num_head_q, num_dim_qk]
+            Dtype: bfloat16
+    Returns:
+        output: Output tensor for store output value.
+            Shape: [num_batch * num_seq_q, num_head_q, num_dim_qk]
+            Dtype: bfloat16
+
+    Raises:
+        RuntimeError: If the shapes or dtypes do not satisfy the constraints above.
+
+    Note:
+        - q, kcache and vcache must be on CUDA device and in fp8 (float8_e4m3fn); output is bfloat16
+        - The query and key tensors must have the same embedding dimension (num_dim_qk)
+        - The batch size (num_batch) must be consistent across all input tensors
+    """
+    return torch.ops.hpc.attention_decode_fp8_adaptive(
+        q,
+        kcache,
+        vcache,
+        block_ids,
+        num_seq_kvcache,
+        qscale,
+        kscale,
+        vscale,
+        mtp,
+        new_kv_included,
+        quant_type.value,
+        splitk,
+        task_map,
+        split_flag,
+        p_scale,
         output,
     )
 
@@ -1225,6 +1520,33 @@ def mla_prefill_bf16(
     )
 
 
+def _decode_dynamic_min_process_len(num_batch: int, num_head_kv: int, max_seqlen: int) -> int:
+    """Split granularity (min tokens/chunk) for the persistent dynamic decode path.
+
+    Args:
+        num_batch: number of batches
+        num_head_kv: number of key/value heads
+        max_seqlen: maximum sequence length
+
+    Returns:
+        int: minimum number of tokens per chunk
+    """
+    try:
+        sm_count = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+    except Exception:
+        sm_count = 78
+    decode_dynamic_tile_n = 64
+    decode_dynamic_min_tiles_per_chunk = 4
+    base_ctas = num_batch * num_head_kv
+    tiles_per_head = (max_seqlen + decode_dynamic_tile_n - 1) // decode_dynamic_tile_n
+    total_tiles = base_ctas * tiles_per_head
+    target_active_ctas = max(1, 2 * sm_count)
+    tiles_per_chunk = max(total_tiles // target_active_ctas, decode_dynamic_min_tiles_per_chunk)
+    return tiles_per_chunk * decode_dynamic_tile_n
+
+
 def get_attention_decode_task_workspace(
     max_num_batch: int, max_seqlen: int, num_head_kv: int, min_process_len: int = 512
 ):
@@ -1260,6 +1582,72 @@ def get_attention_decode_task_workspace(
         (max_num_tasks + max_num_cta_count - 1) // max_num_cta_count, min_process_len // kMinTileN
     )
     max_num_tasks = max_num_tile_per_cta * max_num_cta_count
+    finish_tasks = max_num_cta_count
+
+    num_tile_per_cta_store_task = 1
+    int_size = 4
+
+    num_chunks_bytes = max_num_batch * num_head_kv * int_size
+    max_num_batch_pad = (
+        (num_chunks_bytes + kTaskInfoByteSize - 1) // kTaskInfoByteSize * kTaskInfoByteSize
+    )
+    kTaskStrideInts = kTaskInfoByteSize // int_size  # 12
+    num_cta_count_pad_ints = (
+        (max_num_cta_count + kTaskStrideInts - 1) // kTaskStrideInts * kTaskStrideInts
+    )
+    num_cta_count_pad = num_cta_count_pad_ints * int_size
+
+    sched_need_byte_size = (
+        max_num_tasks + finish_tasks + num_tile_per_cta_store_task
+    ) * kTaskInfoByteSize + max_num_batch_pad
+    workspace_byte_size = sched_need_byte_size + 2 * num_cta_count_pad
+    workspace = torch.zeros(
+        workspace_byte_size,
+        dtype=torch.int8,
+        device="cuda",
+    )
+
+    workspace.view(torch.int32)[2] = num_head_kv
+    workspace.view(torch.int32)[3] = max_num_batch
+    workspace.view(torch.int32)[4] = sched_need_byte_size
+
+    return workspace
+
+
+def get_attention_decode_task_workspace_adaptive(
+    max_num_batch: int, max_seqlen: int, num_head_kv: int, min_process_len: Optional[int] = None
+):
+    """Allocate task map for attention decode.
+
+    On sm90 this dispatches to the dynamic flat-bin workspace (kTileN=64); on
+    other archs it uses the legacy per-SM workspace (kTileN=128). The returned
+    tensor layout differs between the two — always pair it with
+    ``assign_attention_decode_task_adaptive`` / the matching attention kernel from the
+    same process, never reuse it across GPUs with different capabilities.
+
+    Args:
+        max_num_batch: max batch size decode will process
+        max_seqlen: max seqlen of service support.
+        num_head_kv:
+        min_process_len: min tokens per chunk. None picks a workload-aware
+            default (see :func:`_decode_dynamic_min_process_len`); must match the
+            value used in :func:`assign_attention_decode_task_adaptive` for this task_map.
+
+    Returns:
+        Tensor: Shape [task_map_byte_size], Dtype: int8.
+    """
+    if min_process_len is None:
+        min_process_len = _decode_dynamic_min_process_len(max_num_batch, num_head_kv, max_seqlen)
+    # Per-task size: must match DynamicTaskInfo (12 int32 = 48 B).
+    kTaskInfoByteSize = 48
+    max_num_cta_count = torch.ops.hpc.get_decode_max_cta_count()
+
+    kMinTileN = 64
+    total_tiles = max_num_batch * num_head_kv * ((max_seqlen + kMinTileN - 1) // kMinTileN)
+    min_tiles_per_cta = min_process_len // kMinTileN
+    max_num_tasks = max(
+        total_tiles + 2 * max_num_cta_count, (min_tiles_per_cta + 1) * max_num_cta_count
+    )
     finish_tasks = max_num_cta_count
 
     num_tile_per_cta_store_task = 1
@@ -1331,6 +1719,62 @@ def assign_attention_decode_task(
     else:
         return torch.ops.hpc.assign_attention_decode_task(
             num_seq_kvcache, num_head_kv, mtp, new_kv_included, min_process_len, task_map
+        )
+
+
+def assign_attention_decode_task_adaptive(
+    num_seq_kvcache: Tensor,
+    task_map: Tensor,
+    num_head_kv: int,
+    num_seq_q: int,
+    new_kv_included: bool,
+    min_process_len: Optional[int] = None,
+) -> Tensor:
+    """Populate the task_map returned by ``get_attention_decode_task_workspace_adaptive``.
+
+    Dispatches by device capability to match the allocator: sm90 → dynamic
+    assigner; other archs → legacy per-SM assigner. Both impls support
+    ``num_seq_kvcache`` on either CUDA or CPU; the CPU path is for tests that
+    want to allclose a host reference against the CUDA output.
+
+    Args:
+        num_seq_kvcache: number tokens in kvcache before cur iteration.
+            Shape: [num_batch]
+            Dtype: int32
+        task_map: task_map for store output
+            Shape: [task_map_byte_size]
+            Dtype: int8
+        num_head_kv: num_head_kv.
+        num_seq_q: query length per request (= mtp + 1). NOTE: this is the
+            number of query tokens, NOT the mtp/draft-token count. It must
+            match ``mtp + 1`` of the attention kernel call that consumes this
+            task_map; the persistent grid size is derived from it via
+            ``kCtaPerSmMap[sm_major][num_seq_q - 1]``. Passing ``mtp`` here
+            (i.e. num_seq_q - 1) yields an empty task_map and a CUDA illegal
+            memory access at decode time.
+        new_kv_included: whether ``num_seq_kvcache`` already counts new KV.
+        min_process_len: min tokens per chunk. None picks a workload-aware
+            default (see :func:`_decode_dynamic_min_process_len`).
+    """
+    if min_process_len is None:
+        heuristic_seqlen = int(num_seq_kvcache.max().item())
+        if not new_kv_included:
+            heuristic_seqlen += num_seq_q
+        min_process_len = _decode_dynamic_min_process_len(
+            num_seq_kvcache.shape[0], num_head_kv, heuristic_seqlen
+        )
+    if num_seq_kvcache.device.type == "cpu":
+        task_map_host = torch.ops.hpc.assign_attention_decode_task(
+            num_seq_kvcache, num_head_kv, num_seq_q, new_kv_included, min_process_len, None
+        )
+        task_map[:8].copy_(task_map_host.reshape(-1)[:8], non_blocking=True)
+        task_map[48 : task_map_host.numel()].copy_(
+            task_map_host.reshape(-1)[48:], non_blocking=True
+        )
+        return task_map
+    else:
+        return torch.ops.hpc.assign_attention_decode_task(
+            num_seq_kvcache, num_head_kv, num_seq_q, new_kv_included, min_process_len, task_map
         )
 
 
@@ -1418,6 +1862,23 @@ def attention_with_kvcache_prefill_bf16_fake(
     )
 
 
+@torch.library.register_fake("hpc::attention_with_kvcache_prefill_bf16_hybrid_mask")
+def attention_with_kvcache_prefill_bf16_hybrid_mask_fake(
+    q,
+    kcache,
+    vcache,
+    cu_seqlens_q,
+    block_ids,
+    seqlens_kvcache,
+    max_seqlens_q,
+    mm_prefix_range,
+    output,
+):
+    return torch.empty(
+        (q.size(0), q.size(1), vcache.size(-1)), dtype=torch.bfloat16, device=q.device
+    )
+
+
 @torch.library.register_fake("hpc::attention_with_kvcache_prefill_fp8")
 def attention_with_kvcache_prefill_fp8_fake(
     q,
@@ -1430,6 +1891,28 @@ def attention_with_kvcache_prefill_fp8_fake(
     block_ids,
     seqlens_kvcache,
     max_seqlens_q,
+    quant_type,
+    output=None,
+):
+    return torch.empty(
+        (q.size(0), q.size(1), vcache.size(-1)), dtype=torch.bfloat16, device=q.device
+    )
+
+
+@torch.library.register_fake("hpc::attention_with_kvcache_prefill_fp8_hybrid_mask")
+def attention_with_kvcache_prefill_fp8_hybrid_mask_fake(
+    q,
+    kcache,
+    vcache,
+    qscale,
+    kscale,
+    vscale,
+    cu_seqlens_q,
+    block_ids,
+    seqlens_kvcache,
+    max_seqlens_q,
+    mm_prefix_range,
+    p_scale,
     quant_type,
     output=None,
 ):
@@ -1480,7 +1963,24 @@ def attention_blocksparse_prefill_fp8_dim192_fake(
 
 @torch.library.register_fake("hpc::attention_decode_bf16")
 def attention_decode_bf16_fake(
-    q, kcache, vcache, block_ids, num_seq_kvcache, new_kv_included, splitk, output
+    q, kcache, vcache, block_ids, num_seq_kvcache, mtp, new_kv_included, splitk, split_flag, output
+):
+    return torch.empty_like(q)
+
+
+@torch.library.register_fake("hpc::attention_decode_bf16_adaptive")
+def attention_decode_bf16_adaptive_fake(
+    q,
+    kcache,
+    vcache,
+    block_ids,
+    num_seq_kvcache,
+    mtp,
+    new_kv_included,
+    task_map,
+    splitk,
+    split_flag,
+    output,
 ):
     return torch.empty_like(q)
 
@@ -1504,6 +2004,30 @@ def attention_decode_fp8_fake(
     output=None,
 ):
     return torch.empty_like(q)
+
+
+@torch.library.register_fake("hpc::attention_decode_fp8_adaptive")
+def attention_decode_fp8_adaptive_fake(
+    q,
+    kcache,
+    vcache,
+    block_ids,
+    num_seq_kvcache,
+    qscale,
+    kscale,
+    vscale,
+    mtp,
+    new_kv_included,
+    quant_type,
+    splitk,
+    task_map=None,
+    split_flag=None,
+    p_scale=None,
+    output=None,
+):
+    return torch.empty(
+        (q.size(0), q.size(1), vcache.size(-1)), dtype=torch.bfloat16, device=q.device
+    )
 
 
 @torch.library.register_fake("hpc::attention_mla_with_kvcache_bf16")

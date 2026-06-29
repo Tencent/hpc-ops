@@ -42,6 +42,14 @@ __global__ void pad_and_transpose(float *new_scale_ptr, const float *scale_ptr, 
   __syncthreads();
 
   // s -> g
+  // Stage-2 stores 4 floats per thread (vec_t<float, 4>), so it only needs
+  // TM * TN / 4 active threads regardless of how stage-1 was launched.
+  // Stage-1 may launch up to TM * TN threads (when kElementsPerThread == 1),
+  // so early-return the surplus here to avoid out-of-range shared-memory reads.
+  constexpr int kStoreThreads = TM * TN / 4;
+  if (idx >= kStoreThreads) {
+    return;
+  }
   int v_idx = idx * 4;
   local_row = v_idx % TM;
   local_col = v_idx / TM;

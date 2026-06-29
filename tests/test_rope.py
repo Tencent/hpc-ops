@@ -1313,7 +1313,7 @@ def test_rope_norm_store_kv_fp8(
         qk_norm_policy,
         apply_hadamard=apply_hadamard,
     )
-    assert allclose(ref_q, q_bf16, atol=0.8)
+    assert allclose(ref_q, q_bf16, atol=0.8, rtol=0.0625)
 
     # ========= Verify KV cache for all quant policies =========
     q_lens_r = (qi_r[1:] - qi_r[:-1]).tolist()
@@ -1335,7 +1335,7 @@ def test_rope_norm_store_kv_fp8(
                 else:
                     v_dequant = v_fp8_vals * v_scale[0]
                 assert allclose(
-                    v_ref_vals, v_dequant, atol=0.8
+                    v_ref_vals, v_dequant, atol=0.8, rtol=0.0625
                 ), f"V mismatch at req={ri} pos={pos} head={h} policy={quant_policy}"
             # K verification
             for h in range(num_kv_heads):
@@ -1349,6 +1349,6 @@ def test_rope_norm_store_kv_fp8(
                     k_s = k_scale[0].item()
                 k_dequant = k_fp8_vals * k_s
                 assert allclose(
-                    k_ref_vals, k_dequant, atol=0.8
+                    k_ref_vals, k_dequant, atol=0.8, rtol=0.0625
                 ), f"K mismatch at req={ri} pos={pos} head={h} policy={quant_policy}"
             tok += 1

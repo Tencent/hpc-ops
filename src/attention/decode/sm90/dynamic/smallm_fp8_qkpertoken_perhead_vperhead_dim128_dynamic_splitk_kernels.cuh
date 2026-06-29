@@ -31,10 +31,10 @@ __global__ void smallm_attention_decode_fp8_qkpertoken_perhead_vperhead_dynamic_
     const __grid_constant__ TmaV tma_v, const __grid_constant__ TmaSplitY tma_splity,
     const __grid_constant__ TmaKS tma_ks, float* split_y_ptr, float* lse_ptr,
     const int* task_map_ptr, const int* block_ids_ptr, const float* qscale_ptr,
-    const float* kscale_ptr, const float* vscale_ptr, int num_batch, int num_seq_q, int num_dim_qk,
-    int num_dim_v, int num_head_q, int num_head_k, int num_head_v, int heads_per_group,
-    int lse_pad_heads_per_group, int num_kvcache_blocks, int num_seq_max_blocks,
-    int qscale_pad_stride, float one_over_dk_log2e, int max_splitk) {
+    const float* kscale_ptr, const float* pscale_ptr, const float* vscale_ptr, int num_batch,
+    int num_seq_q, int num_dim_qk, int num_dim_v, int num_head_q, int num_head_k, int num_head_v,
+    int heads_per_group, int lse_pad_heads_per_group, int num_kvcache_blocks,
+    int num_seq_max_blocks, int qscale_pad_stride, float one_over_dk_log2e, int max_splitk) {
   using namespace cute;  // NOLINT
 
   constexpr int kWarpGroupN = 1;
@@ -239,6 +239,7 @@ __global__ void smallm_attention_decode_fp8_qkpertoken_perhead_vperhead_dynamic_
     Tensor gMax = make_tensor<float>(Int<kM>{});
     Tensor gSum = make_tensor<float>(Int<kM>{});
     Tensor qscales = make_tensor<float>(Int<kM>{});
+    Tensor pscales = make_tensor<float>(Int<kM>{});
     Tensor kscales = make_tensor<float>(Int<kN>{});
     Tensor gSoftmaxScale = make_tensor<float>(Int<kM>{});
 
@@ -287,7 +288,7 @@ __global__ void smallm_attention_decode_fp8_qkpertoken_perhead_vperhead_dynamic_
       const int num_tile_causal = task.num_tile_causal;
 
       if (ihead_kv != ihead_kv_pre) {
-        vscale = vscale_ptr[ihead_kv] / 256;
+        vscale = vscale_ptr[ihead_kv];
         ihead_kv_pre = ihead_kv;
       }
 
@@ -306,8 +307,11 @@ __global__ void smallm_attention_decode_fp8_qkpertoken_perhead_vperhead_dynamic_
         int iqhead = im % kHeadsPerGroup;
         if (iqhead < heads_per_group) {
           qscales(i) = qscales_batch[iseqq * num_head_q + iqhead];
+          pscales(i) =
+              (pscale_ptr != nullptr) ? pscale_ptr[ihead_kv * heads_per_group + iqhead] : 256.0f;
         } else {
           qscales(i) = 1;
+          pscales(i) = 256.0f;
         }
       }
 
@@ -350,7 +354,7 @@ __global__ void smallm_attention_decode_fp8_qkpertoken_perhead_vperhead_dynamic_
         for (int im = 0; im < kM; ++im) {
 #pragma unroll
           for (int in = 0; in < kN; ++in) {
-            tAttr_nm(in, im) *= 256;
+            tAttr_nm(in, im) *= pscales(im);
           }
         }
 
@@ -407,7 +411,7 @@ __global__ void smallm_attention_decode_fp8_qkpertoken_perhead_vperhead_dynamic_
         for (int im = 0; im < kM; ++im) {
 #pragma unroll
           for (int in = 0; in < kN; ++in) {
-            tAttr_nm(in, im) *= 256;
+            tAttr_nm(in, im) *= pscales(im);
           }
         }
 
@@ -438,8 +442,12 @@ __global__ void smallm_attention_decode_fp8_qkpertoken_perhead_vperhead_dynamic_
       }
 
 #pragma unroll
-      for (int i = 0; i < size(tYr); ++i) {
-        tYr(i) *= vscale;
+      for (int im = 0; im < kM; ++im) {
+        const float yscale = vscale / pscales(im);
+#pragma unroll
+        for (int in = 0; in < size<0>(tYr_nm); ++in) {
+          tYr_nm(in, im) *= yscale;
+        }
       }
 
       bar_sync<kWarpGroupN * 128>(kWarpGroupN);

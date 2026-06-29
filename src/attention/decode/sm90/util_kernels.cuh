@@ -49,8 +49,9 @@ __device__ __forceinline__ bool get_task(const int* num_seq_kvcache_ptr, bool ne
     return false;
   }
 
+  int chunk_align = (kTileN > kBlockSize) ? kTileN : kBlockSize;
   int num_seq_per_chunk = (num_seq_kv + kSplitK - 1) / kSplitK;
-  num_seq_per_chunk = (num_seq_per_chunk + kTileN - 1) / kTileN * kTileN;
+  num_seq_per_chunk = (num_seq_per_chunk + chunk_align - 1) / chunk_align * chunk_align;
   num_seq_per_chunk = max(num_seq_per_chunk, kSplitMinLen);
 
   int iseq_start = ichunk * num_seq_per_chunk;
@@ -70,26 +71,19 @@ __device__ __forceinline__ bool get_task(const int* num_seq_kvcache_ptr, bool ne
 
   num_chunks = (num_seq_kv + num_seq_per_chunk - 1) / num_seq_per_chunk;
 
+  int num_seq_context = num_seq_kv - num_seq_q;
+
   num_seq_kv = min(num_seq_kv - iseq_start, num_seq_per_chunk);
 
-  if (is_last_chunk) {
-    num_seq_kvcache = num_seq_kv - num_seq_q;
-  } else {
-    num_seq_kvcache = num_seq_kv;
-  }
+  num_seq_kvcache = num_seq_context - iseq_start;
 
   num_blocks = (num_seq_kv + kBlockSize - 1) / kBlockSize;
   num_blocks_per_chunk = (num_seq_per_chunk + kBlockSize - 1) / kBlockSize;
 
   num_tile_kv = (num_seq_kv + kTileN - 1) / kTileN;
   num_tile_full = num_seq_kvcache / kTileN;
-
-  if (is_last_chunk) {
-    num_tile_causal = num_tile_kv - num_tile_full;
-  } else {
-    num_tile_causal = 0;
-  }
-  num_tile_full = num_tile_kv - num_tile_causal;
+  num_tile_full = max(0, min(num_tile_full, num_tile_kv));
+  num_tile_causal = num_tile_kv - num_tile_full;
 
   return true;
 }
@@ -365,6 +359,13 @@ __device__ __forceinline__ void online_softmax(TensorA& tAttr_nm, TensorM& gMax,
       vec_t<float, 4> warp_max2 = *reinterpret_cast<vec_t<float, 4>*>(&warp_max[4]);
       store(smem_max + iwarp * kTileM + ilane * 8, warp_max1);
       store(smem_max + iwarp * kTileM + ilane * 8 + 4, warp_max2);
+    } else if constexpr (kM == 10) {
+      vec_t<float, 4> warp_max1 = *reinterpret_cast<vec_t<float, 4>*>(&warp_max[0]);
+      vec_t<float, 4> warp_max2 = *reinterpret_cast<vec_t<float, 4>*>(&warp_max[4]);
+      vec_t<float, 2> warp_max3 = *reinterpret_cast<vec_t<float, 2>*>(&warp_max[8]);
+      store(smem_max + iwarp * kTileM + ilane * 4, warp_max1);
+      store(smem_max + iwarp * kTileM + ilane * 4 + 16, warp_max2);
+      store(smem_max + iwarp * kTileM + ilane * 2 + 32, warp_max3);
     }
   }
 
@@ -388,6 +389,14 @@ __device__ __forceinline__ void online_softmax(TensorA& tAttr_nm, TensorM& gMax,
 
         reduce_max1 = load<float, 4>(smem_max + i * kTileM + ilane * 8);
         reduce_max2 = load<float, 4>(smem_max + i * kTileM + ilane * 8 + 4);
+      } else if constexpr (kM == 10) {
+        vec_t<float, 4>& reduce_max1 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_max[0]);
+        vec_t<float, 4>& reduce_max2 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_max[4]);
+        vec_t<float, 2>& reduce_max3 = *reinterpret_cast<vec_t<float, 2>*>(&reduce_max[8]);
+
+        reduce_max1 = load<float, 4>(smem_max + i * kTileM + ilane * 4);
+        reduce_max2 = load<float, 4>(smem_max + i * kTileM + ilane * 4 + 16);
+        reduce_max3 = load<float, 2>(smem_max + i * kTileM + ilane * 2 + 32);
       }
 #pragma unroll
       for (int im = 0; im < kM; ++im) {
@@ -536,6 +545,13 @@ __device__ __forceinline__ void final_online_softmax(TensorY& tYr_nm, TensorS& g
       vec_t<float, 4> warp_sum2 = *reinterpret_cast<vec_t<float, 4>*>(&warp_sum[4]);
       store(smem_sum + iwarp * kTileM + ilane * 8, warp_sum1);
       store(smem_sum + iwarp * kTileM + ilane * 8 + 4, warp_sum2);
+    } else if constexpr (kM == 10) {
+      vec_t<float, 4> warp_sum1 = *reinterpret_cast<vec_t<float, 4>*>(&warp_sum[0]);
+      vec_t<float, 4> warp_sum2 = *reinterpret_cast<vec_t<float, 4>*>(&warp_sum[4]);
+      vec_t<float, 2> warp_sum3 = *reinterpret_cast<vec_t<float, 2>*>(&warp_sum[8]);
+      store(smem_sum + iwarp * kTileM + ilane * 4, warp_sum1);
+      store(smem_sum + iwarp * kTileM + ilane * 4 + 16, warp_sum2);
+      store(smem_sum + iwarp * kTileM + ilane * 2 + 32, warp_sum3);
     }
   }
 
@@ -563,6 +579,14 @@ __device__ __forceinline__ void final_online_softmax(TensorY& tYr_nm, TensorS& g
 
         reduce_sum1 = load<float, 4>(smem_sum + i * kTileM + ilane * 8);
         reduce_sum2 = load<float, 4>(smem_sum + i * kTileM + ilane * 8 + 4);
+      } else if constexpr (kM == 10) {
+        vec_t<float, 4>& reduce_sum1 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_sum[0]);
+        vec_t<float, 4>& reduce_sum2 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_sum[4]);
+        vec_t<float, 2>& reduce_sum3 = *reinterpret_cast<vec_t<float, 2>*>(&reduce_sum[8]);
+
+        reduce_sum1 = load<float, 4>(smem_sum + i * kTileM + ilane * 4);
+        reduce_sum2 = load<float, 4>(smem_sum + i * kTileM + ilane * 4 + 16);
+        reduce_sum3 = load<float, 2>(smem_sum + i * kTileM + ilane * 2 + 32);
       }
 #pragma unroll
       for (int im = 0; im < kM; ++im) {

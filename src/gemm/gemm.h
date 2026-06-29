@@ -18,6 +18,11 @@ bool gemm_blockwise_fp8_async(void *y_ptr, void *split_y_ptr, void *split_flag_p
                               int k, int m_pad, int num_block_k, int num_block_n, int splitk,
                               cudaStream_t stream);
 
+bool gemm_blockwise_fp8_low_latency_async(void *y_ptr, const void *x_ptr, const void *w_ptr,
+                                          const void *x_scale_ptr, const void *weight_scale_ptr,
+                                          int m, int n, int k, int x_scale_stride,
+                                          int w_scale_stride, cudaStream_t stream);
+
 bool gemm_fp8_async(void *y_ptr, const void *x_ptr, const void *w_ptr, int m, int n, int k,
                     cudaStream_t stream);
 

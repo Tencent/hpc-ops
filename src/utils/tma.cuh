@@ -30,7 +30,7 @@ __device__ __forceinline__ void tma_descriptor_replace_shapes_in_shared_mem(
 }
 
 template <typename Tma, typename GTensor, bool kUpdateShape = true,
-          bool kUpdateMemoryControlBit = false>
+          bool kUpdateMemoryControlBit = true>
 __device__ __forceinline__ void update_tma_gtensor(cute::TmaDescriptor &smem_tma_desc,
                                                    const GTensor &gtensor) {
   cute::array<uint32_t, 5> shape{1, 1, 1, 1, 1};

@@ -1,6 +1,6 @@
 import torch
 from torch import Tensor
-from typing import Union, Tuple, Optional
+from typing import List, Union, Tuple, Optional
 
 
 def fused_rms_norm_with_scale(
@@ -252,6 +252,149 @@ def fused_rmsnorm_rope(
     return torch.ops.hpc.fused_rmsnorm_rope(positions, q, q_weight, k, k_weight, cos_sin_cache, eps)
 
 
+def fused_qk_rmsnorm_rope(
+    qkv: Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    q_norm_weight: Tensor,
+    k_norm_weight: Tensor,
+    norm_eps: float,
+    positions: Tensor,
+    cos_sin_cache: Tensor,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Fused QK RMSNorm + plain RoPE for a single packed QKV tensor.
+
+    This reuses fused_qk_rmsnorm_mrope by treating all tokens as understanding
+    tokens, passing an empty generation tensor, and expanding the plain RoPE
+    positions to identical T/H/W rows.
+
+    Args:
+        qkv: Packed QKV tensor.
+            Shape: [num_tokens, num_heads_q*head_dim + num_heads_k*head_dim + num_heads_v*head_dim]
+            Dtype: bfloat16
+        num_heads_q, num_heads_k, num_heads_v: Head counts.
+        head_dim: Head dimension (currently only 128).
+        q_norm_weight, k_norm_weight: RMSNorm weights for Q/K. Shape: [head_dim], bf16.
+        norm_eps: RMSNorm epsilon.
+        positions: Plain RoPE position indices. Shape: [num_tokens], int64.
+            If a 2D tensor is passed, the first row is used to match fuse_single_qknorm_rope_hy.
+        cos_sin_cache: Precomputed cos/sin table. Shape: [max_pos, head_dim], fp32.
+
+    Returns:
+        (q, k, v):
+            q: [num_tokens, num_heads_q, head_dim], bf16
+            k: [num_tokens, num_heads_k, head_dim], bf16
+            v: [num_tokens, num_heads_v, head_dim], bf16
+    """
+    if positions.dim() == 1:
+        rope_positions = positions
+    elif positions.dim() == 2:
+        rope_positions = positions[0]
+    else:
+        raise ValueError("positions must be 1D or 2D")
+
+    num_tokens = qkv.shape[0]
+    gen_qkv = qkv.new_empty((0, qkv.shape[1]))
+    cat_indices = torch.arange(num_tokens, device=qkv.device, dtype=torch.int64)
+    gen_indices = torch.empty((0,), device=qkv.device, dtype=torch.int64)
+    mrope_positions = rope_positions.unsqueeze(0).expand(3, -1).contiguous()
+
+    return fused_qk_rmsnorm_mrope(
+        qkv,
+        gen_qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        q_norm_weight,
+        k_norm_weight,
+        q_norm_weight,
+        k_norm_weight,
+        norm_eps,
+        mrope_positions,
+        [0, 0, 0],
+        cos_sin_cache,
+        cat_indices,
+        gen_indices,
+        cat_indices,
+    )
+
+
+def fused_qk_rmsnorm_mrope(
+    und_qkv: Tensor,
+    gen_qkv: Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    und_q_norm_weight: Tensor,
+    und_k_norm_weight: Tensor,
+    gen_q_norm_weight: Tensor,
+    gen_k_norm_weight: Tensor,
+    norm_eps: float,
+    positions: Tensor,
+    mrope_section: List[int],
+    cos_sin_cache: Tensor,
+    und_indices: Tensor,
+    gen_indices: Tensor,
+    cat_indices: Tensor,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Fused QK RMSNorm + 3D MRoPE + und/gen concat reorder.
+
+    Performs:
+        1. Split packed und_qkv/gen_qkv into Q/K/V
+        2. RMSNorm on Q/K per-head using respective norm weights
+        3. Concat und+gen and reorder by cat_indices
+        4. Apply 3D MRoPE (T/H/W) to Q/K using positions and mrope_section
+        5. Return reordered Q/K/V
+
+    Args:
+        und_qkv: Packed QKV for understanding tokens.
+            Shape: [und_len, num_heads_q*head_dim + num_heads_k*head_dim + num_heads_v*head_dim]
+            Dtype: bfloat16
+        gen_qkv: Packed QKV for generation tokens.
+            Shape: [gen_len, same_hidden]
+            Dtype: bfloat16
+        num_heads_q, num_heads_k, num_heads_v: Head counts.
+        head_dim: Head dimension (currently only 128).
+        und_q_norm_weight, und_k_norm_weight: RMSNorm weights for und Q/K. Shape: [head_dim], bf16.
+        gen_q_norm_weight, gen_k_norm_weight: RMSNorm weights for gen Q/K. Shape: [head_dim], bf16.
+        norm_eps: RMSNorm epsilon.
+        positions: 3D MRoPE position indices. Shape: [3, total_tokens], int64.
+        mrope_section: [T_section, H_section, W_section] controlling frequency axis assignment.
+        cos_sin_cache: Precomputed cos/sin table. Shape: [max_pos, head_dim], fp32.
+            Layout: [cos_half | sin_half].
+        und_indices, gen_indices: Accepted for API parity (unused by kernel).
+        cat_indices: Reorder indices. Shape: [total_tokens], int64.
+
+    Returns:
+        (q, k, v):
+            q: [total_tokens, num_heads_q, head_dim], bf16
+            k: [total_tokens, num_heads_k, head_dim], bf16
+            v: [total_tokens, num_heads_v, head_dim], bf16
+    """
+    return torch.ops.hpc.fused_qk_rmsnorm_mrope(
+        und_qkv,
+        gen_qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        und_q_norm_weight,
+        und_k_norm_weight,
+        gen_q_norm_weight,
+        gen_k_norm_weight,
+        norm_eps,
+        positions,
+        cos_sin_cache,
+        cat_indices,
+        mrope_section[1],
+        mrope_section[2],
+    )
+
+
 @torch.library.register_fake("hpc::fused_rms_norm_with_scale")
 def fused_rms_norm_with_scale_fake(a, weight, eps, scale, is_moe):
     return (
@@ -285,4 +428,32 @@ def fused_layer_norm_with_scale_quant_fake(
             device=x.device,
         ),
         torch.empty_like(x, dtype=torch.bfloat16),
+    )
+
+
+@torch.library.register_fake("hpc::fused_qk_rmsnorm_mrope")
+def fused_qk_rmsnorm_mrope_fake(
+    und_qkv,
+    gen_qkv,
+    num_heads_q,
+    num_heads_k,
+    num_heads_v,
+    head_dim,
+    und_q_norm_weight,
+    und_k_norm_weight,
+    gen_q_norm_weight,
+    gen_k_norm_weight,
+    norm_eps,
+    positions,
+    cos_sin_cache,
+    cat_indices,
+    mrope_section_h,
+    mrope_section_w,
+):
+    total_tokens = und_qkv.shape[0] + gen_qkv.shape[0]
+    device = und_qkv.device
+    return (
+        torch.empty(total_tokens, num_heads_q, head_dim, dtype=torch.bfloat16, device=device),
+        torch.empty(total_tokens, num_heads_k, head_dim, dtype=torch.bfloat16, device=device),
+        torch.empty(total_tokens, num_heads_v, head_dim, dtype=torch.bfloat16, device=device),
     )

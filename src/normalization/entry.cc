@@ -13,6 +13,7 @@
 
 #include "cutlass/float8.h"
 #include "src/normalization/fused_layer_norm_with_scale_quant.h"
+#include "src/normalization/fused_qk_rmsnorm_mrope.h"
 #include "src/normalization/fused_rms_norm_with_scale.h"
 #include "src/normalization/fused_rmsnorm_blockwise_quant.h"
 #include "src/normalization/fused_rmsnorm_rope.h"
@@ -264,6 +265,89 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> fused_rmsnorm_rope_entry
                            dtype, stream);
   return std::make_tuple(y_q, std::nullopt);
 }
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fused_qk_rmsnorm_mrope_entry(
+    const torch::Tensor &und_qkv, const torch::Tensor &gen_qkv, int64_t num_heads_q,
+    int64_t num_heads_k, int64_t num_heads_v, int64_t head_dim,
+    const torch::Tensor &und_q_norm_weight, const torch::Tensor &und_k_norm_weight,
+    const torch::Tensor &gen_q_norm_weight, const torch::Tensor &gen_k_norm_weight, double norm_eps,
+    const torch::Tensor &positions, const torch::Tensor &cos_sin_cache,
+    const torch::Tensor &cat_indices, int64_t mrope_section_h, int64_t mrope_section_w) {
+  auto stream = at::cuda::getCurrentCUDAStream(und_qkv.get_device());
+
+  TORCH_CHECK(und_qkv.is_contiguous(), "und_qkv must be contiguous");
+  TORCH_CHECK(gen_qkv.is_contiguous(), "gen_qkv must be contiguous");
+  TORCH_CHECK(und_qkv.dim() == 2, "und_qkv must be 2D");
+  TORCH_CHECK(gen_qkv.dim() == 2, "gen_qkv must be 2D");
+  TORCH_CHECK(und_qkv.scalar_type() == torch::kBFloat16, "und_qkv must be bfloat16");
+  TORCH_CHECK(gen_qkv.scalar_type() == torch::kBFloat16, "gen_qkv must be bfloat16");
+
+  int und_len = und_qkv.size(0);
+  int gen_len = gen_qkv.size(0);
+  int64_t expected_hidden =
+      num_heads_q * head_dim + num_heads_k * head_dim + num_heads_v * head_dim;
+  TORCH_CHECK(und_qkv.size(1) == expected_hidden, "und_qkv hidden size mismatch");
+  TORCH_CHECK(gen_qkv.size(1) == expected_hidden, "gen_qkv hidden size mismatch");
+
+  TORCH_CHECK(
+      und_q_norm_weight.is_contiguous() && und_q_norm_weight.scalar_type() == torch::kBFloat16,
+      "und_q_norm_weight must be contiguous bf16");
+  TORCH_CHECK(
+      und_k_norm_weight.is_contiguous() && und_k_norm_weight.scalar_type() == torch::kBFloat16,
+      "und_k_norm_weight must be contiguous bf16");
+  TORCH_CHECK(
+      gen_q_norm_weight.is_contiguous() && gen_q_norm_weight.scalar_type() == torch::kBFloat16,
+      "gen_q_norm_weight must be contiguous bf16");
+  TORCH_CHECK(
+      gen_k_norm_weight.is_contiguous() && gen_k_norm_weight.scalar_type() == torch::kBFloat16,
+      "gen_k_norm_weight must be contiguous bf16");
+  TORCH_CHECK(und_q_norm_weight.size(-1) == head_dim, "und_q_norm_weight size mismatch");
+  TORCH_CHECK(und_k_norm_weight.size(-1) == head_dim, "und_k_norm_weight size mismatch");
+  TORCH_CHECK(gen_q_norm_weight.size(-1) == head_dim, "gen_q_norm_weight size mismatch");
+  TORCH_CHECK(gen_k_norm_weight.size(-1) == head_dim, "gen_k_norm_weight size mismatch");
+
+  TORCH_CHECK(positions.is_contiguous() && positions.scalar_type() == torch::kInt64,
+              "positions must be contiguous int64");
+  TORCH_CHECK(positions.dim() == 2 && positions.size(0) == 3,
+              "positions must be [3, total_tokens]");
+  int total_tokens = positions.size(1);
+  TORCH_CHECK(total_tokens == und_len + gen_len, "positions.size(1) must equal und_len + gen_len");
+
+  TORCH_CHECK(cos_sin_cache.is_contiguous() && cos_sin_cache.scalar_type() == torch::kFloat32,
+              "cos_sin_cache must be contiguous fp32");
+  TORCH_CHECK(cos_sin_cache.dim() == 2, "cos_sin_cache must be 2D");
+  TORCH_CHECK(cos_sin_cache.size(1) == head_dim, "cos_sin_cache last dim must equal head_dim");
+
+  TORCH_CHECK(cat_indices.is_contiguous() && cat_indices.scalar_type() == torch::kInt64,
+              "cat_indices must be contiguous int64");
+  TORCH_CHECK(cat_indices.size(0) == total_tokens, "cat_indices size mismatch");
+
+  TORCH_CHECK(head_dim == 128, "currently only head_dim=128 is supported");
+  TORCH_CHECK(num_heads_q >= num_heads_k && num_heads_q >= num_heads_v,
+              "num_heads_q must be >= num_heads_k and >= num_heads_v");
+
+  auto opts = und_qkv.options().dtype(torch::kBFloat16);
+  auto out_q = torch::empty({total_tokens, num_heads_q, head_dim}, opts);
+  auto out_k = torch::empty({total_tokens, num_heads_k, head_dim}, opts);
+  auto out_v = torch::empty({total_tokens, num_heads_v, head_dim}, opts);
+
+  fused_qk_rmsnorm_mrope_async(
+      reinterpret_cast<__nv_bfloat16 *>(out_q.mutable_data_ptr()),
+      reinterpret_cast<__nv_bfloat16 *>(out_k.mutable_data_ptr()),
+      reinterpret_cast<__nv_bfloat16 *>(out_v.mutable_data_ptr()),
+      reinterpret_cast<const __nv_bfloat16 *>(und_qkv.const_data_ptr()),
+      reinterpret_cast<const __nv_bfloat16 *>(gen_qkv.const_data_ptr()),
+      reinterpret_cast<const __nv_bfloat16 *>(und_q_norm_weight.const_data_ptr()),
+      reinterpret_cast<const __nv_bfloat16 *>(und_k_norm_weight.const_data_ptr()),
+      reinterpret_cast<const __nv_bfloat16 *>(gen_q_norm_weight.const_data_ptr()),
+      reinterpret_cast<const __nv_bfloat16 *>(gen_k_norm_weight.const_data_ptr()),
+      positions.const_data_ptr<int64_t>(), cos_sin_cache.const_data_ptr<float>(),
+      cat_indices.const_data_ptr<int64_t>(), und_len, total_tokens, num_heads_q, num_heads_k,
+      num_heads_v, head_dim, mrope_section_h, mrope_section_w, static_cast<float>(norm_eps),
+      cos_sin_cache.size(1), stream);
+
+  return std::make_tuple(out_q, out_k, out_v);
+}
+
 }  // namespace normalization
 }  // namespace hpc
 
@@ -294,4 +378,12 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "fused_rmsnorm_rope(Tensor positions, Tensor q, Tensor ? q_weight,"
       "Tensor ? k, Tensor ? k_weight, Tensor cos_sin_cache, float eps) -> (Tensor, Tensor ?)");
   m.impl("fused_rmsnorm_rope", torch::kCUDA, &hpc::normalization::fused_rmsnorm_rope_entry);
+
+  m.def(
+      "fused_qk_rmsnorm_mrope(Tensor und_qkv, Tensor gen_qkv, int num_heads_q, int num_heads_k, "
+      "int num_heads_v, int head_dim, Tensor und_q_norm_weight, Tensor und_k_norm_weight, "
+      "Tensor gen_q_norm_weight, Tensor gen_k_norm_weight, float norm_eps, "
+      "Tensor positions, Tensor cos_sin_cache, Tensor cat_indices, "
+      "int mrope_section_h, int mrope_section_w) -> (Tensor, Tensor, Tensor)");
+  m.impl("fused_qk_rmsnorm_mrope", torch::kCUDA, &hpc::normalization::fused_qk_rmsnorm_mrope_entry);
 }

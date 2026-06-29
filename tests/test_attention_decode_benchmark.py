@@ -509,7 +509,7 @@ def hpc_attn_func(
                     kvcache[:, 1, :, :, :],
                     block_ids,
                     cache_lens,
-                    splitk=4,
+                    splitk=True,
                 )
         my = my.reshape(s.batch_size * s.qo_len, s.num_heads * s.head_dim)
         outputs.append(my)

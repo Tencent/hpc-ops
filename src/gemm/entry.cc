@@ -5,6 +5,8 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <vector>
+
 #include "src/gemm/gemm.h"
 
 namespace hpc {
@@ -28,6 +30,30 @@ torch::Tensor pad_and_transpose_entry(const torch::Tensor &x) {
   TORCH_CHECK(running, "pad_and_transpose_async launch failed!");
 
   return y;
+}
+
+bool try_gemm_blockwise_low_latency(void *y_ptr, const torch::Tensor &x,
+                                    const torch::Tensor &weight, const torch::Tensor &x_scale,
+                                    const torch::Tensor &weight_scale, bool trans_xscale,
+                                    bool has_bias, int m, int n, int k, int num_block_k,
+                                    cudaStream_t stream) {
+  if (m > 8 || has_bias || n % 16 != 0 || !trans_xscale) {
+    return false;
+  }
+
+  static const std::vector<std::pair<int, int>> ll_shapes = {
+      {1536, 2048}, {2048, 768}, {1536, 3200}, {3200, 768}, {2560, 2048},
+      {2048, 2048}, {768, 2048}, {2048, 384},  {768, 3200}, {3200, 384},
+  };
+  for (const auto &nk : ll_shapes) {
+    if (n == nk.first && k == nk.second) {
+      int x_scale_stride = x_scale.size(1);
+      return gemm_blockwise_fp8_low_latency_async(
+          y_ptr, x.const_data_ptr(), weight.const_data_ptr(), x_scale.const_data_ptr(),
+          weight_scale.const_data_ptr(), m, n, k, x_scale_stride, num_block_k, stream);
+    }
+  }
+  return false;
 }
 
 torch::Tensor gemm_blockwise_entry(const torch::Tensor &x, const torch::Tensor &weight,
@@ -76,6 +102,11 @@ torch::Tensor gemm_blockwise_entry(const torch::Tensor &x, const torch::Tensor &
   const auto *x_scale_ptr = x_scale.const_data_ptr();
   const auto *weight_scale_ptr = weight_scale.const_data_ptr();
   auto *y_ptr = y.mutable_data_ptr();
+
+  if (try_gemm_blockwise_low_latency(y_ptr, x, weight, x_scale, weight_scale, trans_xscale,
+                                     bias.has_value(), m, n, k, num_block_k, stream)) {
+    return y;
+  }
 
   int splitk = 1;
   if (m < 32 && k >= 2048) {

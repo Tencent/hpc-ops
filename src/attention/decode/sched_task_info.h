@@ -32,8 +32,8 @@ struct alignas(16) TaskScheduleInfo {
 
 constexpr int kTaskScheduleInfoStride = sizeof(TaskScheduleInfo) / sizeof(int);
 
-static const std::unordered_map<int, std::vector<int>> kCtaPerSmMap = {{9, {4, 3, 3, 2}},
-                                                                       {10, {1, 1, 1, 1}}};
+static const std::unordered_map<int, std::vector<int>> kCtaPerSmMap = {{9, {4, 3, 3, 2, 2}},
+                                                                       {10, {1, 1, 1, 1, 1}}};
 
 }  // namespace dynamic
 }  // namespace decode
