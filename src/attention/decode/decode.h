@@ -42,7 +42,8 @@ assign_attention_decode_task_sync(const int *num_seq_kvcache, int num_total_ctas
 bool assign_attention_decode_task_async(int *task_map_ptr, const int *num_seq_kvcache,
                                         int num_total_ctas, int num_batch, int num_head_kv,
                                         int num_seq_q, int tilen, bool new_kv_included,
-                                        int min_process_len, cudaStream_t stream);
+                                        int min_process_len, cudaStream_t stream,
+                                        int actual_num_ctas = 0);
 
 }  // namespace decode
 }  // namespace attention
