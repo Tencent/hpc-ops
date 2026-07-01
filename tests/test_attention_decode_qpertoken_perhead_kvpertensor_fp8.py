@@ -3,7 +3,7 @@ import os
 import pytest
 from pathlib import Path
 
-sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import hpc
 import torch
@@ -91,6 +91,7 @@ def attention_decode_fp8_test_func(
     splitk,
     use_dynamic_sched,
     kvcache_shape,
+    use_hint_task_map=False,
 ):
     torch.manual_seed(41)
     torch.cuda.manual_seed(41)
@@ -157,6 +158,24 @@ def attention_decode_fp8_test_func(
         assert torch.allclose(
             task_map_for_cpu[:sched_need_byte_size], task_map_for_cuda[:sched_need_byte_size]
         )
+
+        # Verify hint path produces the same task_map as the full-grid assign.
+        if use_hint_task_map and use_dynamic_sched:
+            task_map_for_hint = hpc.get_attention_decode_task_workspace(
+                num_batch, max_seq_kv + num_seq_q, num_head_kv, min_process_len=1024
+            )
+            hpc.assign_attention_decode_task(
+                num_seq_kvcache + num_seq_q,
+                task_map_for_hint,
+                num_head_kv,
+                num_seq_q,
+                new_kv_included,
+                min_process_len=1024,
+                num_seq_kvcache_cpu=(num_seq_kvcache + num_seq_q).cpu(),
+            )
+            assert torch.allclose(
+                task_map_for_hint[:sched_need_byte_size], task_map_for_cuda[:sched_need_byte_size]
+            )
 
         task_map = task_map_for_cuda
         # hpc.print_attention_decode_task(task_map)
@@ -270,6 +289,7 @@ def attention_decode_fp8_test_func(
 @pytest.mark.parametrize("use_output", [False])
 @pytest.mark.parametrize("splitk", [True])
 @pytest.mark.parametrize("use_dynamic_sched", [True, False])
+@pytest.mark.parametrize("use_hint_task_map", [True])
 @pytest.mark.parametrize("kvcache_shape", ["NHD", "HND"])
 def test_attn_fp8_sm90(
     num_batch,
@@ -282,6 +302,7 @@ def test_attn_fp8_sm90(
     use_output,
     splitk,
     use_dynamic_sched,
+    use_hint_task_map,
     kvcache_shape,
 ):
     attention_decode_fp8_test_func(
@@ -296,4 +317,5 @@ def test_attn_fp8_sm90(
         splitk,
         use_dynamic_sched,
         kvcache_shape,
+        use_hint_task_map=use_hint_task_map,
     )

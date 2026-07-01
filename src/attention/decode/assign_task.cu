@@ -72,7 +72,7 @@ __global__ void assign_attention_decode_task_kernel(int* task_map_ptr, const int
 
   int total_tiles_all_heads = smem_total_tiles[0] * num_head_kv;
 
-  // Must use max_splitk (not actual_num_ctas) to keep bin layout consistent
+  // Use max_splitk (not actual_num_ctas) to keep bin layout consistent
   // with the workspace allocated by get_attention_decode_task_workspace.
   int num_tile_per_cta = std::max((total_tiles_all_heads + max_splitk - 1) / max_splitk,
                                   min_process_len / kTileN);
