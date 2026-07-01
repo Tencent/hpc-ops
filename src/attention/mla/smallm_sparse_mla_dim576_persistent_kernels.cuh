@@ -148,7 +148,7 @@ __global__ void __launch_bounds__(kNumMathWG * 128 + 128, 1)
     // across both copies, and we only need one identity tensor.
     auto kv_g2s_tiled_copy = make_tiled_copy(
         Copy_Atom<Copy_Traits<SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>>, Tin>{},
-        make_layout(make_shape(Int<16>{}, Int<8>{}), make_stride(Int<1>{}, Int<16>{})),
+        make_layout(make_shape(Int<16>{}, Int<8>{}), make_stride(Int<8>{}, Int<1>{})),
         make_layout(make_shape(Int<1>{}, Int<8>{})));
 
     auto thr_copy = kv_g2s_tiled_copy.get_slice(load_idx);
