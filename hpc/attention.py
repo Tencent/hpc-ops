@@ -542,14 +542,14 @@ def get_attention_decode_task_workspace(
     max_num_cta_count = num_sm_count * kMaxCtaPerSm
 
     kMinTileN = 64
-    max_num_tasks = max_num_batch * num_head_kv * ((max_seqlen + kMinTileN - 1) // kMinTileN)
-    max_num_tile_per_cta = max(
-        (max_num_tasks + max_num_cta_count - 1) // max_num_cta_count, min_process_len // kMinTileN
-    )
-    max_num_tasks = max_num_tile_per_cta * max_num_cta_count
-    finish_tasks = max_num_cta_count
+    kCtaPerSmOptions = (4, 3, 2, 1)
+    total_tiles = max_num_batch * num_head_kv * ((max_seqlen + kMinTileN - 1) // kMinTileN)
+    max_num_tasks = 0
+    for cta_per_sm in kCtaPerSmOptions:
+        num_ctas = num_sm_count * cta_per_sm
+        tile_per_cta = max((total_tiles + num_ctas - 1) // num_ctas, min_process_len // kMinTileN)
+        max_num_tasks = max(max_num_tasks, (tile_per_cta + 1) * num_ctas + 1)
 
-    num_tile_per_cta_store_task = 1
     int_size = 4
 
     num_chunks_bytes = max_num_batch * num_head_kv * int_size
@@ -562,9 +562,7 @@ def get_attention_decode_task_workspace(
     )
     num_cta_count_pad = num_cta_count_pad_ints * int_size
 
-    sched_need_byte_size = (
-        max_num_tasks + finish_tasks + num_tile_per_cta_store_task
-    ) * kTaskInfoByteSize + max_num_batch_pad
+    sched_need_byte_size = max_num_tasks * kTaskInfoByteSize + max_num_batch_pad
     workspace_byte_size = sched_need_byte_size + 2 * num_cta_count_pad
     workspace = torch.zeros(
         workspace_byte_size,
