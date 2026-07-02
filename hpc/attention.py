@@ -584,6 +584,7 @@ def assign_attention_decode_task(
     mtp: int,
     new_kv_included: bool,
     min_process_len: int = 512,
+    num_seq_kvcache_cpu: Optional[Tensor] = None,
 ) -> Tensor:
     """Populate the task_map returned by ``get_attention_decode_task_workspace``.
 
@@ -603,10 +604,12 @@ def assign_attention_decode_task(
         mtp: number draft tokens.
         new_kv_included: whether ``num_seq_kvcache`` already counts new KV.
         min_process_len: each sm will process at_least 'min_process_len' token.
+        num_seq_kvcache_cpu: optional CPU copy of num_seq_kvcache (int32),
+            used to shrink the launch grid for sparse/short workloads.
     """
     if num_seq_kvcache.device.type == "cpu":
         task_map_host = torch.ops.hpc.assign_attention_decode_task(
-            num_seq_kvcache, num_head_kv, mtp, new_kv_included, min_process_len, None
+            num_seq_kvcache, num_head_kv, mtp, new_kv_included, min_process_len, None, None
         )
         task_map[:8].copy_(task_map_host.reshape(-1)[:8], non_blocking=True)
         task_map[48 : task_map_host.numel()].copy_(
@@ -615,7 +618,8 @@ def assign_attention_decode_task(
         return task_map
     else:
         return torch.ops.hpc.assign_attention_decode_task(
-            num_seq_kvcache, num_head_kv, mtp, new_kv_included, min_process_len, task_map
+            num_seq_kvcache, num_head_kv, mtp, new_kv_included, min_process_len, task_map,
+            num_seq_kvcache_cpu
         )
 
 

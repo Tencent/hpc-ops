@@ -72,12 +72,16 @@ __global__ void assign_attention_decode_task_kernel(int* task_map_ptr, const int
 
   int total_tiles_all_heads = smem_total_tiles[0] * num_head_kv;
 
-  int num_tile_per_cta = std::max((total_tiles_all_heads + num_total_ctas - 1) / num_total_ctas,
+  // Use max_splitk (not actual_num_ctas) to keep bin layout consistent
+  // with the workspace allocated by get_attention_decode_task_workspace.
+  int num_tile_per_cta = std::max((total_tiles_all_heads + max_splitk - 1) / max_splitk,
                                   min_process_len / kTileN);
 
   if (icta == 0 && idx == 1) {
     task_map_ptr[0] = num_tile_per_cta + 1;
-    task_map_ptr[1] = num_total_ctas;
+    // Store max_splitk (not actual_num_ctas) so combine kernels always find
+    // num_chunks at the correct offset regardless of actual grid size.
+    task_map_ptr[1] = max_splitk;
   }
 
   if (idx != 0) {
@@ -138,12 +142,16 @@ __global__ void assign_attention_decode_task_kernel(int* task_map_ptr, const int
   int max_num_batch_with_head = max_num_batch * num_head_kv;
   int max_num_batch_with_head_pad =
       (max_num_batch_with_head + kTaskStride - 1) / kTaskStride * kTaskStride;
-  int num_cta_count_pad = (num_total_ctas + kTaskStride - 1) / kTaskStride * kTaskStride;
+  // Use max_splitk for pointer arithmetic to keep chunk/sm_finish offsets stable.
+  int num_cta_count_pad = (max_splitk + kTaskStride - 1) / kTaskStride * kTaskStride;
 
   auto* task_map_chunk_ptr =
-      task_map_ptr + kTaskStride * ((num_tile_per_cta + 1) * num_total_ctas + 1);
+      task_map_ptr + kTaskStride * ((num_tile_per_cta + 1) * max_splitk + 1);
   auto* task_map_sm_finish_ptr = task_map_chunk_ptr + max_num_batch_with_head_pad;
   auto* num_task_map_ptr = task_map_sm_finish_ptr + num_cta_count_pad;
+  // Save base pointer before advancing; icta==0 needs it to write terminators
+  // into un-launched bins after all launched CTAs have finished.
+  int* task_map_base_ptr = task_map_ptr;
   task_map_ptr += ((num_tile_per_cta + 1) * icta + 1) * kTaskStride;
 
   int itask = 0;
@@ -288,8 +296,16 @@ __global__ void assign_attention_decode_task_kernel(int* task_map_ptr, const int
       }
     }
 
-    for (int i = 0; i < (num_total_ctas + 3) / 4; i++) {
+    // Clear full sm_finish_ptr (max_splitk slots) to avoid stale '2' values.
+    for (int i = 0; i < (max_splitk + 3) / 4; i++) {
       store(task_map_sm_finish_ptr + 4 * i, zeros);
+    }
+
+    // Write terminators into un-launched bins [num_total_ctas..max_splitk-1].
+    for (int i = num_total_ctas; i < max_splitk; i++) {
+      int* bin_ptr = task_map_base_ptr + ((num_tile_per_cta + 1) * i + 1) * kTaskStride;
+      bin_ptr[0] = -1;
+      bin_ptr[1] = -1;
     }
   }
 }
@@ -299,21 +315,25 @@ __global__ void assign_attention_decode_task_kernel(int* task_map_ptr, const int
 bool assign_attention_decode_task_async(int* task_map_ptr, const int* num_seq_kvcache,
                                         int num_total_ctas, int num_batch, int num_head_kv,
                                         int num_seq_q, int tilen, bool new_kv_included,
-                                        int min_process_len, cudaStream_t stream) {
-  dim3 grid(num_total_ctas);
-  dim3 block(128);
+                                        int min_process_len, cudaStream_t stream,
+                                        int actual_num_ctas) {
+  // actual_num_ctas: actual grid size (<= num_total_ctas); 0 means use num_total_ctas.
+  if (actual_num_ctas <= 0 || actual_num_ctas > num_total_ctas) {
+    actual_num_ctas = num_total_ctas;
+  }
 
-  int num_sm = get_sm_count();
+  dim3 grid(actual_num_ctas);
+  dim3 block(128);
 
   constexpr int kMaxNumBatch = 2048;
 
   auto launch = [&](auto tilen_tag) {
     constexpr int kTileN = decltype(tilen_tag)::value;
     int max_splitk = num_total_ctas;
-  
+
     kernels::assign_attention_decode_task_kernel<kMaxNumBatch, kTileN><<<grid, block, 0, stream>>>(
         task_map_ptr, num_seq_kvcache, num_batch, num_head_kv, num_seq_q, new_kv_included,
-        min_process_len, num_total_ctas, max_splitk);
+        min_process_len, actual_num_ctas, max_splitk);
   };
 
   if (tilen == 64) {

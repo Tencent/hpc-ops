@@ -684,7 +684,8 @@ torch::Tensor attention_decode_fp8_entry(const torch::Tensor &q, torch::Tensor &
 torch::Tensor assign_attention_decode_task_cpu_entry(const torch::Tensor &num_seq_kvcache,
                                                      int64_t num_head_kv, int64_t num_seq_q,
                                                      bool new_kv_included, int64_t min_process_len,
-                                                     std::optional<torch::Tensor> placehold) {
+                                                     std::optional<torch::Tensor> placehold,
+                                                     std::optional<torch::Tensor> /*num_seq_kvcache_cpu*/) {
   TORCH_CHECK(num_seq_kvcache.device().is_cpu(), "num_seq_kvcache tensor must be cpu");
   int num_batch = num_seq_kvcache.size(0);
 
@@ -728,7 +729,8 @@ torch::Tensor assign_attention_decode_task_cpu_entry(const torch::Tensor &num_se
 torch::Tensor assign_attention_decode_task_cuda_entry(const torch::Tensor &num_seq_kvcache,
                                                       int64_t num_head_kv, int64_t num_seq_q,
                                                       bool new_kv_included, int64_t min_process_len,
-                                                      std::optional<torch::Tensor> task_map) {
+                                                      std::optional<torch::Tensor> task_map,
+                                                      std::optional<torch::Tensor> num_seq_kvcache_cpu) {
   TORCH_CHECK(num_seq_kvcache.device().is_cuda(), "num_seq_kvcache tensor must be cuda");
   int num_batch = num_seq_kvcache.size(0);
 
@@ -742,22 +744,38 @@ torch::Tensor assign_attention_decode_task_cuda_entry(const torch::Tensor &num_s
   TORCH_CHECK(task_map.has_value(), "assign_attention_decode_task_cuda must use task_map output.")
 
   auto task_map_tensor = task_map.value();
-
   int *task_map_ptr = reinterpret_cast<int *>(task_map_tensor.mutable_data_ptr());
 
   int sm_major_version = get_sm_major_version();
   int num_total_ctas =
       decode::dynamic::kCtaPerSmMap.at(sm_major_version)[num_seq_q - 1] * get_sm_count();
 
-  int tilen = 0;
-  if (sm_major_version == 9) {
-    tilen = 64;
-  } else if (sm_major_version == 10) {
-    tilen = 128;
+  int tilen = (sm_major_version == 9) ? 64 : 128;
+
+  // Shrink launch grid if a CPU hint is available.
+  int actual_num_ctas = num_total_ctas;
+  if (num_seq_kvcache_cpu.has_value()) {
+    const torch::Tensor &cpu_lens = num_seq_kvcache_cpu.value();
+    TORCH_CHECK(cpu_lens.device().is_cpu(), "num_seq_kvcache_cpu must be a CPU tensor");
+    TORCH_CHECK(cpu_lens.dtype() == torch::kInt32, "num_seq_kvcache_cpu must be int32");
+    const int *lens = cpu_lens.const_data_ptr<int>();
+    int total_tiles = 0;
+    for (int i = 0; i < num_batch; i++) {
+      int seq = new_kv_included ? lens[i] : lens[i] + (int)num_seq_q;
+      total_tiles += (seq + tilen - 1) / tilen;
+    }
+    total_tiles *= num_head_kv;
+    int min_tiles_per_cta = std::max(1, (int)min_process_len / tilen);
+    int num_tile_per_cta = std::max((total_tiles + num_total_ctas - 1) / num_total_ctas,
+                                    min_tiles_per_cta);
+    actual_num_ctas = std::min((total_tiles + num_tile_per_cta - 1) / num_tile_per_cta,
+                               num_total_ctas);
+    actual_num_ctas = std::max(actual_num_ctas, 1);
   }
+
   auto running = decode::assign_attention_decode_task_async(
       task_map_ptr, num_seq_kvcache_ptr, num_total_ctas, num_batch, num_head_kv, num_seq_q, tilen,
-      new_kv_included, min_process_len, stream);
+      new_kv_included, min_process_len, stream, actual_num_ctas);
 
   TORCH_CHECK(running, "launch assign_attention_decode_task_async failed");
 
@@ -813,7 +831,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "assign_attention_decode_task(Tensor num_seq_kvcache, int num_head_kv, int num_seq_q, bool "
       "new_kv_included, "
-      "int min_process_len, Tensor? task_map) -> "
+      "int min_process_len, Tensor? task_map, Tensor? num_seq_kvcache_cpu) -> "
       "(Tensor)");
   m.impl("assign_attention_decode_task", torch::kCPU,
          &hpc::attention::assign_attention_decode_task_cpu_entry);
