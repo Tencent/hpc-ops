@@ -367,7 +367,8 @@ __global__ void smallm_attention_decode_fp8_qkpertoken_perhead_vperhead_dynamic_
         syncwarpgroup(kIWarpgroup);
 
         cute::copy(tiled_copy_VT_s2r, tVTs4r(_, _, _, istage_kv), tVTr4s);
-        permute_v_sv_gemm(tiled_mma_sv, tSr, tVr, tYr, v_for_trans, vt_for_trans, kIWarpgroup);
+        permute_v_sv_gemm<true>(tiled_mma_sv, tSr, tVr, tYr, v_for_trans, vt_for_trans,
+                                kIWarpgroup);
 
         if (elected_idx_in_warpgroup) {
           arrive_barrier(v_writable[istage_kv]);
@@ -424,7 +425,8 @@ __global__ void smallm_attention_decode_fp8_qkpertoken_perhead_vperhead_dynamic_
         syncwarpgroup(kIWarpgroup);
 
         cute::copy(tiled_copy_VT_s2r, tVTs4r(_, _, _, istage_kv), tVTr4s);
-        permute_v_sv_gemm(tiled_mma_sv, tSr, tVr, tYr, v_for_trans, vt_for_trans, kIWarpgroup);
+        permute_v_sv_gemm<true>(tiled_mma_sv, tSr, tVr, tYr, v_for_trans, vt_for_trans,
+                                kIWarpgroup);
 
         if (elected_idx_in_warpgroup) {
           arrive_barrier(v_writable[istage_kv]);
