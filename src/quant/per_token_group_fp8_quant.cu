@@ -79,12 +79,12 @@ __global__ void per_token_group_fp8_quant_v2(__nv_bfloat16 const *__restrict__ i
   int const ilane_in_group = ilane & (kLanesPerGroup - 1);
   int const igroup_in_warp = ilane / kLanesPerGroup;
 
-  int const irow = blockIdx.y * kRowsPerBlock + iwarp / kWarpsPerRow;
+  int const irow = blockIdx.x * kRowsPerBlock + iwarp / kWarpsPerRow;
   if (irow >= batch_size) {
     return;
   }
 
-  int const split = blockIdx.x;
+  int const split = blockIdx.y;
   int const iwarp_in_row = iwarp % kWarpsPerRow;
   int const col_split_base = split * kColsPerBlockX;
   int const col_thread_base = (iwarp_in_row * 32 + ilane) * kN;
@@ -138,7 +138,7 @@ __global__ void per_token_group_fp8_quant_v2(__nv_bfloat16 const *__restrict__ i
     // -------------------- Scale + fp32 quant ------------------------
     // inv_scale stays fp32, and the quant multiply runs in fp32 inside the bf16x2->fp8x2 converter.
     float const scale = amax * kInvFp8E4m3Max;
-    float const inv_scale_f32 = rcpf_ftz(scale + quant_eps);
+    float const inv_scale_f32 = (scale > 0.f) ? rcpf_ftz(scale + quant_eps) : 0.f;
 
     if (valid) {
       if constexpr (kN == 8) {
@@ -179,7 +179,7 @@ static void launch_v2(void const *input_ptr, void *output_ptr, void *quant_scale
   constexpr int kRowsPerBlock = kWarpCount / kWarpsPerRow;
 
   dim3 const block(kWarpSize * kWarpCount);
-  dim3 const grid(kBlocksPerRow, (batch_size + kRowsPerBlock - 1) / kRowsPerBlock);
+  dim3 const grid((batch_size + kRowsPerBlock - 1) / kRowsPerBlock, kBlocksPerRow);
 
   per_token_group_fp8_quant_v2<kHiddenSize, kWarpsPerRow, kRowsPerBlock, kN, kBlocksPerRow>
       <<<grid, block, 0, stream>>>(static_cast<__nv_bfloat16 const *>(input_ptr),
@@ -369,43 +369,57 @@ bool per_token_group_fp8_quant_async(const void *input_ptr, void *output_ptr, vo
     launch_per_token_group_fp8_quant<kHiddenSize, kWarpsPerRow>(
         input_ptr, output_ptr, quant_scale, group_size, quant_eps, hidden_size, batch_size, stream);
   } else if (hidden_size == 2048) {
-    dispatch_v2(std::integral_constant<int, 2048>{}, std::integral_constant<int, 4>{},
+    dispatch_v2(std::integral_constant<int, 2048>{}, std::integral_constant<int, 1>{},
                 std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
   } else if (hidden_size == 3072) {
-    dispatch_v2(std::integral_constant<int, 3072>{}, std::integral_constant<int, 4>{},
-                std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
+    dispatch_v2(std::integral_constant<int, 3072>{}, std::integral_constant<int, 1>{},
+                std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
   } else if (hidden_size == 3200) {
     dispatch_v2(std::integral_constant<int, 3200>{}, std::integral_constant<int, 1>{},
                 std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
   } else if (hidden_size == 3456) {
-    dispatch_v2(std::integral_constant<int, 3456>{}, std::integral_constant<int, 8>{},
-                std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
+    dispatch_v2(std::integral_constant<int, 3456>{}, std::integral_constant<int, 1>{},
+                std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
   } else if (hidden_size == 4096) {
-    dispatch_v2(std::integral_constant<int, 4096>{}, std::integral_constant<int, 8>{},
-                std::integral_constant<int, 16>{}, std::integral_constant<int, 2>{});
+    dispatch_v2(std::integral_constant<int, 4096>{}, std::integral_constant<int, 1>{},
+                std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
   } else if (hidden_size == 5120) {
-    dispatch_v2(std::integral_constant<int, 5120>{}, std::integral_constant<int, 4>{},
-                std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
+    dispatch_v2(std::integral_constant<int, 5120>{}, std::integral_constant<int, 1>{},
+                std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
+  } else if (hidden_size == 5504) {
+    dispatch_v2(std::integral_constant<int, 5504>{}, std::integral_constant<int, 1>{},
+                std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
   } else if (hidden_size == 6144) {
-    dispatch_v2(std::integral_constant<int, 6144>{}, std::integral_constant<int, 8>{},
-                std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
+    dispatch_v2(std::integral_constant<int, 6144>{}, std::integral_constant<int, 1>{},
+                std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
   } else if (hidden_size == 6912) {
     dispatch_v2(std::integral_constant<int, 6912>{}, std::integral_constant<int, 1>{},
-                std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
+                std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
   } else if (hidden_size == 7168) {
-    dispatch_v2(std::integral_constant<int, 7168>{}, std::integral_constant<int, 8>{},
+    dispatch_v2(std::integral_constant<int, 7168>{}, std::integral_constant<int, 1>{},
                 std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
   } else if (hidden_size == 8192) {
-    dispatch_v2(std::integral_constant<int, 8192>{}, std::integral_constant<int, 8>{},
-                std::integral_constant<int, 8>{}, std::integral_constant<int, 4>{});
+    dispatch_v2(std::integral_constant<int, 8192>{}, std::integral_constant<int, 1>{},
+                std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
   } else if (hidden_size == 13824) {
-    dispatch_v2(std::integral_constant<int, 13824>{}, std::integral_constant<int, 8>{},
+    dispatch_v2(std::integral_constant<int, 13824>{}, std::integral_constant<int, 1>{},
                 std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
   } else {
     std::cout << "not supported hidden_size for per_token_group_fp8_quant_async:" << hidden_size
               << std::endl;
     return false;
   }
+
+  // Surface launch/config failures instead of silently leaving the output
+  // uninitialized (which downstream reads back as NaN).
+  cudaError_t const launch_err = cudaGetLastError();
+  if (launch_err != cudaSuccess) {
+    std::cout << "per_token_group_fp8_quant_async launch failed (hidden_size=" << hidden_size
+              << ", batch_size=" << batch_size << "): " << cudaGetErrorString(launch_err)
+              << std::endl;
+    return false;
+  }
+
   return true;
 }
 }  // namespace quant
