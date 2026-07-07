@@ -12,6 +12,7 @@
 #include "src/attention/prefill/warp_spec_blocksparse_fp8_dim192.h"
 #include "src/attention/prefill/warp_spec_dim128.h"
 #include "src/attention/prefill/warp_spec_mla.h"
+#include "src/attention/prefill/warp_spec_with_fp8_kvcache_fp16_pv_compute_dim128.h"
 #include "src/attention/prefill/warp_spec_with_kvcache_blocksparse_fp8_dim128.h"
 #include "src/attention/prefill/warp_spec_with_kvcache_dim128.h"
 #include "src/attention/prefill/warp_spec_with_kvcache_fp8_dim128.h"
@@ -88,6 +89,25 @@ void attention_with_kvcache_prefill_bf16_hybrid_mask_async(
         num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks, block_size, num_seq_max_blocks, ldY,
         ldQ, ldK, ldK1, ldK2, ldV, ldV1, ldV2, stream);
   }
+}
+
+void attention_with_kvcache_prefill_fp8_kv_fp16_pv_compute_async(
+    void *y_ptr, const void *q_ptr, const void *kcache_ptr, const void *vcache_ptr,
+    const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
+    const void *cu_seqlens_q_ptr, const void *block_ids_ptr, const void *seqlens_kvcache_ptr,
+    void *tmas_ptr, int num_batch, int total_seq_q, int max_seq_q, int max_seq_q_pad,
+    int num_dim_qk, int num_dim_v, int num_head_q, int num_head_kv, int num_kvcache_blocks,
+    int block_size, int num_seq_max_blocks, int ldY, int ldQ, int ldK, int ldK1, int ldK2, int ldV,
+    int ldV1, int ldV2, int quant_type, cudaStream_t stream) {
+  if (num_dim_qk != 128 || num_dim_v != 128) {
+    return;
+  }
+  // All modes (20/21) are warp-spec (no low-occupancy multi-stage variant).
+  prefill::warp_spec_with_fp8_kvcache_fp16_pv_compute_dim128_async(
+      y_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr, vscale_ptr, cu_seqlens_q_ptr,
+      block_ids_ptr, seqlens_kvcache_ptr, tmas_ptr, num_batch, total_seq_q, max_seq_q,
+      max_seq_q_pad, num_dim_qk, num_dim_v, num_head_q, num_head_kv, num_kvcache_blocks, block_size,
+      num_seq_max_blocks, ldY, ldQ, ldK, ldK1, ldK2, ldV, ldV1, ldV2, quant_type, stream);
 }
 
 void attention_with_kvcache_prefill_qpertoken_perhead_kvpertensor_fp8_async(

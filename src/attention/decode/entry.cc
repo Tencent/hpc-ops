@@ -627,6 +627,189 @@ int64_t get_decode_max_cta_count() {
   return static_cast<int64_t>(max_cta_per_sm) * get_sm_count();
 }
 
+// FP8-storage / BF16-compute decode entry. Q is always bf16 (qscale ignored).
+// quant_type 10 = K per-token+head, V per-head; 11 = K/V per-tensor.
+// Hybrid a8c8-fp16pv decode entry: Q/K/V all fp8; FP8 QK WGMMA + FP16 PV WGMMA.
+// Q is fp8 with a required per-(token,head) qscale. quant_type 20 = K
+// per-token+head / V per-head; 21 = K/V per-tensor.
+torch::Tensor attention_decode_fp8_kv_fp16_pv_compute_entry(
+    const torch::Tensor &q, torch::Tensor &kcache, torch::Tensor &vcache,
+    const torch::Tensor &qscale, const torch::Tensor &kscale, const torch::Tensor &vscale,
+    const torch::Tensor &block_ids, const torch::Tensor &num_seq_kvcache, int64_t mtp,
+    bool new_kv_included, bool use_splitk, std::optional<torch::Tensor> split_flag,
+    int64_t quant_type, std::optional<torch::Tensor> task_map,
+    std::optional<torch::Tensor> output) {
+  auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+
+  TORCH_CHECK(q.device().is_cuda(), "q tensor must be cuda");
+  TORCH_CHECK(kcache.device().is_cuda(), "kcache tensor must be cuda");
+  TORCH_CHECK(vcache.device().is_cuda(), "vcache tensor must be cuda");
+  TORCH_CHECK(qscale.device().is_cuda(), "qscale tensor must be cuda");
+  TORCH_CHECK(kscale.device().is_cuda(), "kscale tensor must be cuda");
+  TORCH_CHECK(vscale.device().is_cuda(), "vscale tensor must be cuda");
+  TORCH_CHECK(block_ids.device().is_cuda(), "block_ids tensor must be cuda");
+  TORCH_CHECK(num_seq_kvcache.device().is_cuda(), "num_seq_kvcache tensor must be cuda");
+  TORCH_CHECK(block_ids.scalar_type() == torch::kInt32, "block_ids dtype must be int32");
+  TORCH_CHECK(num_seq_kvcache.scalar_type() == torch::kInt32,
+              "num_seq_kvcache dtype must be int32");
+  TORCH_CHECK((mtp == 0 || mtp == 1 || mtp == 2 || mtp == 3), "we only support mtp 0, 1, 2, 3.");
+
+  TORCH_CHECK(quant_type == 20 || quant_type == 21,
+              "quant_type must be one of {20, 21} (see hpc.QuantType for "
+              "fp8_kv_fp16_pv_compute decode)");
+
+  TORCH_CHECK(q.scalar_type() == torch::kFloat8_e4m3fn, "q dtype must be float8_e4m3fn");
+  TORCH_CHECK(kcache.dtype().itemsize() == 1, "kcache element type must be fp8_e4m3 (1 byte)");
+  TORCH_CHECK(vcache.dtype().itemsize() == 1, "vcache element type must be fp8_e4m3 (1 byte)");
+
+  const bool kv_per_tensor = (quant_type == 21);
+  if (kv_per_tensor) {
+    TORCH_CHECK(kscale.scalar_type() == torch::kFloat32, "kscale dtype must be float32");
+    TORCH_CHECK(vscale.scalar_type() == torch::kFloat32, "vscale dtype must be float32");
+    TORCH_CHECK(kscale.numel() == 1, "for per-tensor mode (21), kscale must have numel == 1");
+    TORCH_CHECK(vscale.numel() == 1, "for per-tensor mode (21), vscale must have numel == 1");
+  } else {
+    TORCH_CHECK(kscale.dtype().itemsize() == 4 || kscale.dtype().itemsize() == 1,
+                "kscale dtype must be float32 or fp8 (mode 20)");
+    TORCH_CHECK(vscale.scalar_type() == torch::kFloat32,
+                "for per-head V mode (20), vscale dtype must be float32");
+  }
+
+  int num_batch = num_seq_kvcache.size(0);
+  int num_seq_q = q.size(0) / num_batch;
+  TORCH_CHECK(num_seq_q == mtp + 1, "every request num_seq_q must be mtp + 1");
+  int num_head_q = q.size(1);
+  int num_dim_qk = q.size(2);
+  TORCH_CHECK((num_dim_qk == 128), "we only support head dim 128.");
+
+  int num_kvcache_blocks = kcache.size(0);
+  int block_size = kcache.size(1);
+  TORCH_CHECK((block_size == 32 || block_size == 64), "kvcache paged blocksize must be 32 or 64.");
+
+  int num_head_k = kcache.size(2);
+  int num_head_v = vcache.size(2);
+  int num_dim_v = vcache.size(3);
+  int num_seq_max_blocks = block_ids.size(1);
+
+  if (!kv_per_tensor) {
+    TORCH_CHECK(kscale.dim() == 4,
+                "for mode 20, kscale must be 4D "
+                "[num_blocks, scale_block_size, num_head_kv, num_dim_scale]");
+    TORCH_CHECK(kscale.size(0) == num_kvcache_blocks,
+                "kscale.size(0) must equal num_kvcache_blocks");
+    TORCH_CHECK(kscale.size(2) == num_head_k,
+                "kscale.size(2) must equal num_head_kv (kcache.size(2))");
+    TORCH_CHECK(vscale.dim() == 1 && vscale.size(0) == num_head_v,
+                "for mode 20, vscale shape must be [num_head_kv]");
+  }
+
+  int heads_per_group = num_head_q / num_head_k;
+  TORCH_CHECK(heads_per_group == 4 || heads_per_group == 8,
+              "we only support num_head_q / num_head_k == 4 or 8.");
+
+  // qscale: per-(token, head), [num_batch, num_seq_q, num_head_q] fp32.
+  TORCH_CHECK(qscale.scalar_type() == torch::kFloat32, "qscale dtype must be float32");
+
+  const auto *q_ptr = q.const_data_ptr();
+  auto *kcache_ptr = kcache.mutable_data_ptr();
+  auto *vcache_ptr = vcache.mutable_data_ptr();
+  const int *block_ids_ptr = block_ids.const_data_ptr<int>();
+  const int *num_seq_kvcache_ptr = num_seq_kvcache.const_data_ptr<int>();
+  const void *qscale_ptr = qscale.const_data_ptr();
+  const void *kscale_ptr = kscale.const_data_ptr();
+  const void *vscale_ptr = vscale.const_data_ptr();
+
+  auto options = q.options().dtype(torch::kBFloat16);
+  torch::Tensor y;
+  if (output.has_value()) {
+    y = output.value();
+    TORCH_CHECK(y.scalar_type() == torch::kBFloat16, "output dtype must be bfloat16");
+  } else {
+    y = torch::empty({num_batch * num_seq_q, num_head_q, num_dim_v}, options);
+  }
+
+  torch::Tensor lse;
+  torch::Tensor split_out;
+
+  const int *task_map_ptr = nullptr;
+  if (task_map.has_value()) {
+    TORCH_CHECK(task_map.value().device().is_cuda(), "task_map tensor must be cuda");
+    task_map_ptr = reinterpret_cast<const int *>(task_map.value().data_ptr());
+  }
+
+  int splitk = 1;
+  int num_total_ctas = 0;
+  if (use_splitk) {
+    if (task_map_ptr != nullptr) {
+      int sm_major_version = get_sm_major_version();
+      splitk = decode::dynamic::kCtaPerSmMap.at(sm_major_version)[num_seq_q - 1] * get_sm_count();
+      if (splitk != 78 * 2 && splitk != 78 * 3 && splitk != 78 * 4 && splitk != 148) {
+        splitk = 64;
+      }
+      num_total_ctas = splitk;
+    } else if (num_batch <= 32) {
+      splitk = 16;
+    } else {
+      // Mid/large batch: the static grid is (num_head_k, num_batch, splitk).
+      // With splitk=4 a mid batch (e.g. b64, 1 kv-head) launches only
+      // num_batch*4 CTAs, far below the ~num_sm*kMaxCtaPerSm (312 on H20)
+      // needed to fill the GPU -> waves<1, achieved occupancy ~half of peak.
+      // Bump to splitk=16 when (a) it actually raises the wave count and
+      // (b) each split still has >= the splitk=16 min length (512 tokens),
+      // using max KV length (max_blocks*block_size) as a host-side proxy.
+      splitk = 4;
+      int max_kv_len = num_seq_max_blocks * block_size;
+      int total_ctas_4 = num_batch * num_head_k * 4;
+      if (total_ctas_4 < get_sm_count() * 4 && max_kv_len >= 16 * 512) {
+        splitk = 16;
+      }
+    }
+  }
+
+  torch::Tensor split_flag_tensor;
+  if (splitk > 1) {
+    int pad_heads_per_group = ((heads_per_group + 7) / 8) * 8;
+    lse = torch::empty({num_batch, splitk, num_head_k, num_seq_q, pad_heads_per_group},
+                       options.dtype(torch::kFloat32));
+    split_out = torch::empty({num_batch, splitk, num_seq_q, num_head_q, num_dim_v},
+                             options.dtype(torch::kFloat32));
+    if (split_flag.has_value()) {
+      split_flag_tensor = split_flag.value();
+    } else {
+      split_flag_tensor = torch::zeros({num_batch, num_head_k}, options.dtype(torch::kInt32));
+    }
+  }
+
+  auto *lse_ptr = splitk > 1 ? lse.mutable_data_ptr() : nullptr;
+  auto *split_out_ptr = splitk > 1 ? split_out.mutable_data_ptr() : nullptr;
+  auto *split_flag_ptr = splitk > 1 ? split_flag_tensor.mutable_data_ptr<int>() : nullptr;
+
+  auto *y_ptr = y.mutable_data_ptr();
+
+  int qscale_pad_stride = 0;
+  int ldQ = q.stride(0);
+  int kcache_block_stride = kcache.stride(0);
+  int vcache_block_stride = vcache.stride(0);
+  int kcache_token_stride = kcache.stride(1);
+  int vcache_token_stride = vcache.stride(1);
+  int kcache_head_stride = kcache.stride(2);
+  int vcache_head_stride = vcache.stride(2);
+  int ldY = y.stride(0);
+
+  bool running = decode::attention_decode_fp8_kv_fp16_pv_compute_async(
+      y_ptr, lse_ptr, split_out_ptr, q_ptr, kcache_ptr, vcache_ptr, qscale_ptr, kscale_ptr,
+      vscale_ptr, block_ids_ptr, num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, splitk,
+      num_batch, num_seq_q, num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v,
+      num_kvcache_blocks, block_size, num_seq_max_blocks, qscale_pad_stride, ldY, ldQ,
+      kcache_block_stride, kcache_token_stride, kcache_head_stride, vcache_block_stride,
+      vcache_token_stride, vcache_head_stride, static_cast<int>(quant_type), task_map_ptr,
+      num_total_ctas, stream);
+
+  TORCH_CHECK(running, "attn decode fp8_kv_fp16_pv_compute kernel launch failed!");
+
+  return y;
+}
+
 }  // namespace attention
 }  // namespace hpc
 
@@ -660,6 +843,15 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "Tensor? task_map, Tensor? split_flag, Tensor? pscale, Tensor? output) -> (Tensor)");
   m.impl("attention_decode_fp8_adaptive", torch::kCUDA,
          &hpc::attention::attention_decode_fp8_adaptive_entry);
+
+  m.def(
+      "attention_decode_fp8_kv_fp16_pv_compute(Tensor q, Tensor! kcache, Tensor! vcache, "
+      "Tensor qscale, Tensor kscale, Tensor vscale, "
+      "Tensor block_ids, Tensor num_seq_kvcache, "
+      "int mtp, bool new_kv_included, bool use_splitk, "
+      "Tensor? split_flag, int quant_type, Tensor? task_map, Tensor? output) -> (Tensor)");
+  m.impl("attention_decode_fp8_kv_fp16_pv_compute", torch::kCUDA,
+         &hpc::attention::attention_decode_fp8_kv_fp16_pv_compute_entry);
 
   m.def(
       "assign_attention_decode_task(Tensor num_seq_kvcache, int num_head_kv, int num_seq_q, bool "

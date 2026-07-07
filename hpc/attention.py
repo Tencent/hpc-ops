@@ -27,10 +27,13 @@ class QuantType(Enum):
     QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR = 1
     QPERTENSOR_KPERTENSOR_VPERTENSOR = 2
     QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD_QKHADAMARD = 3
-
-    # FP8-storage / BF16-compute attention (Q kept in bf16).
+    # FP8-storage / BF16-compute attention (Q kept in bf16, so no qscale).
     QBF16_KPERTOKEN_PERHEAD_VPERHEAD = 10
     QBF16_KPERTENSOR_VPERTENSOR = 11
+    # Hybrid FP8-storage attention: FP8 QK WGMMA + FP16 PV WGMMA. Q is fp8 with a
+    # per-(token, head) qscale (required).
+    QFP8_KPERTOKEN_PERHEAD_VPERHEAD_FP16PV = 20
+    QFP8_KPERTENSOR_VPERTENSOR_FP16PV = 21
 
 
 def attention_prefill_bf16(
@@ -647,6 +650,94 @@ def attention_with_kvcache_prefill_fp8_hybrid_mask(
     )
 
 
+def attention_with_kvcache_prefill_fp8_kv_fp16_pv_compute(
+    q: Tensor,
+    kcache: Tensor,
+    vcache: Tensor,
+    qscale: Tensor,
+    kscale: Tensor,
+    vscale: Tensor,
+    cu_seqlens_q: Tensor,
+    block_ids: Tensor,
+    seqlens_kvcache: Tensor,
+    max_seqlens_q: int,
+    quant_type: QuantType = QuantType.QFP8_KPERTENSOR_VPERTENSOR_FP16PV,
+    output: Tensor = None,
+) -> Tensor:
+    """Hybrid paged KV-cache prefill: FP8 storage, FP8 QK + FP16 PV WGMMA.
+
+    Q, K, and V are all stored in FP8 (e4m3). Q@Kᵀ runs as FP8 WGMMA (cheap),
+    while P@V runs as FP16 WGMMA with fp32 accumulation (higher accuracy than
+    pure fp8 PV). Output is bfloat16. Q is FP8 with a *required* per-(token,
+    head) ``qscale``; the kernel applies qscale·kscale per element during
+    softmax and post-multiplies the V scale in the bf16 epilogue.
+
+    Supports two quantization modes (selected via ``quant_type``):
+
+      * ``QFP8_KPERTOKEN_PERHEAD_VPERHEAD_FP16PV = 20`` -- Q per-token+head,
+        K per-token+head, V per-head (dynamic).
+      * ``QFP8_KPERTENSOR_VPERTENSOR_FP16PV = 21`` -- Q per-token+head,
+        K/V per-tensor scalars (static).
+
+    Args:
+        q: Query tensor.
+            Shape: [total_seq, num_head_q, num_dim_qk]
+            Dtype: float8_e4m3fn
+        kcache: Paged key cache tensor (FP8 storage).
+            Logical shape: [num_blocks, block_size, num_head_kv, num_dim_qk]
+            Dtype: float8_e4m3fn
+        vcache: Paged value cache tensor (FP8 storage).
+            Logical shape: [num_blocks, block_size, num_head_kv, num_dim_v]
+            Dtype: float8_e4m3fn
+        qscale: Q FP8 quant scale (per-token+per-head). Required.
+            Shape: [num_batch, num_head_q, max_seqlens_q_pad] fp32, where
+            ``max_seqlens_q_pad`` is padded up to a multiple of 128.
+        kscale: K FP8 quant scale.
+            Shape depends on ``quant_type``:
+              - mode 21 (per-tensor): [1]
+              - mode 20 (per-token+per-head):
+                  [num_blocks, scale_block_size, num_head_kv, num_dim_qk/4]
+            Dtype: float32 (or fp8 view of fp32 in the per-token+per-head case)
+        vscale: V FP8 quant scale.
+            Shape depends on ``quant_type``:
+              - mode 21 (per-tensor): [1]
+              - mode 20 (per-head):  [num_head_kv]
+            Dtype: float32
+        cu_seqlens_q: start_seq_q for each batch.
+            Shape: [num_batch + 1]; Dtype: int32
+        block_ids: kvcache page block index tensor.
+            Shape: [num_batch, max_blocks]; Dtype: int32
+        seqlens_kvcache: number of tokens in kvcache before current iteration.
+            Shape: [num_batch]; Dtype: int32
+        max_seqlens_q: max seqlens among all batches.
+        quant_type: One of the two supported modes (20 or 21; see above).
+            Defaults to ``QFP8_KPERTENSOR_VPERTENSOR_FP16PV``.
+        output: Optional bf16 output tensor of shape
+            [total_seq, num_head_q, num_dim_v]. Written in-place if provided.
+
+    Returns:
+        Tensor: Attention output tensor in bfloat16 format on CUDA device.
+            Shape: [total_seq, num_head_q, num_dim_v]; Dtype: bfloat16
+    """
+
+    qt = quant_type.value if hasattr(quant_type, "value") else int(quant_type)
+
+    return torch.ops.hpc.attention_with_kvcache_prefill_fp8_kv_fp16_pv_compute(
+        q,
+        kcache,
+        vcache,
+        qscale,
+        kscale,
+        vscale,
+        cu_seqlens_q,
+        block_ids,
+        seqlens_kvcache,
+        max_seqlens_q,
+        qt,
+        output,
+    )
+
+
 def attention_with_kvcache_blocksparse_prefill_fp8(
     q: Tensor,
     kcache: Tensor,
@@ -1090,6 +1181,92 @@ def attention_decode_fp8_adaptive(
         task_map,
         split_flag,
         p_scale,
+        output,
+    )
+
+
+def attention_decode_fp8_kv_fp16_pv_compute(
+    q: Tensor,
+    kcache: Tensor,
+    vcache: Tensor,
+    qscale: Tensor,
+    kscale: Tensor,
+    vscale: Tensor,
+    block_ids: Tensor,
+    num_seq_kvcache: Tensor,
+    mtp: int = 0,
+    new_kv_included: bool = True,
+    use_splitk: bool = True,
+    split_flag: Optional[Tensor] = None,
+    quant_type=QuantType.QFP8_KPERTENSOR_VPERTENSOR_FP16PV,
+    task_map: Optional[Tensor] = None,
+    output: Optional[Tensor] = None,
+) -> Tensor:
+    """Hybrid paged KV-cache decode: FP8 storage, FP8 QK + FP16 PV WGMMA.
+
+    Decode counterpart to
+    :func:`attention_with_kvcache_prefill_fp8_kv_fp16_pv_compute`. Q, K, and V
+    are all FP8 (e4m3). Q@Kᵀ runs as FP8 WGMMA, P@V as FP16 WGMMA (fp32
+    accumulate). Q is FP8 with a *required* per-(token, head) ``qscale``.
+
+    Supports two quantization modes (selected via ``quant_type``):
+
+      * ``QFP8_KPERTOKEN_PERHEAD_VPERHEAD_FP16PV`` (``20``) -- Q per-token+head,
+        K per-token+head, V per-head.
+      * ``QFP8_KPERTENSOR_VPERTENSOR_FP16PV`` (``21``) -- Q per-token+head,
+        K/V per-tensor scalars.
+
+    Args:
+        q: Query tensor.
+            Shape: [num_batch * num_seq_q, num_head_q, num_dim_qk]
+            Dtype: float8_e4m3fn
+        kcache: Paged key cache tensor (FP8). Logical shape
+            [num_blocks, block_size, num_head_kv, num_dim_qk]; float8_e4m3fn.
+        vcache: Paged value cache tensor (FP8). Logical shape
+            [num_blocks, block_size, num_head_kv, num_dim_v]; float8_e4m3fn.
+        qscale: Q FP8 per-(token, head) scale (required).
+            Shape: [num_batch, num_seq_q, num_head_q] fp32 (flattened over the
+            first two dims to [num_batch * num_seq_q, num_head_q] also works).
+        kscale: K FP8 quant scale. Mode 21 (per-tensor): [1] fp32. Mode 20
+            (per-token+per-head): [num_blocks, scale_block_size, num_head_kv,
+            num_dim_qk/4], fp32 or fp8 view.
+        vscale: V FP8 quant scale. Mode 21 (per-tensor): [1]. Mode 20
+            (per-head): [num_head_kv]. fp32.
+        block_ids: kvcache page block index tensor [num_batch, max_blocks] int32.
+        num_seq_kvcache: tokens in kvcache before current iteration [num_batch]
+            int32.
+        mtp: number of draft tokens (num_seq_q == mtp + 1).
+        new_kv_included: whether num_seq_kvcache already includes new KV tokens.
+        use_splitk: enable the split-K decode path.
+        split_flag: optional pre-allocated split-K flag [num_batch, num_head_kv]
+            int32.
+        quant_type: one of the two supported modes (20, 21). Defaults to
+            ``QFP8_KPERTENSOR_VPERTENSOR_FP16PV``.
+        task_map: optional dynamic-splitk schedule (enables the persistent-CTA
+            path).
+        output: optional bf16 output [num_batch * num_seq_q, num_head_q,
+            num_dim_v].
+
+    Returns:
+        Tensor: bf16 output [num_batch * num_seq_q, num_head_q, num_dim_v].
+    """
+    qt = quant_type.value if hasattr(quant_type, "value") else int(quant_type)
+
+    return torch.ops.hpc.attention_decode_fp8_kv_fp16_pv_compute(
+        q,
+        kcache,
+        vcache,
+        qscale,
+        kscale,
+        vscale,
+        block_ids,
+        num_seq_kvcache,
+        mtp,
+        new_kv_included,
+        use_splitk,
+        split_flag,
+        qt,
+        task_map,
         output,
     )
 
@@ -1919,6 +2096,26 @@ def attention_with_kvcache_prefill_fp8_hybrid_mask_fake(
     )
 
 
+@torch.library.register_fake("hpc::attention_with_kvcache_prefill_fp8_kv_fp16_pv_compute")
+def attention_with_kvcache_prefill_fp8_kv_fp16_pv_compute_fake(
+    q,
+    kcache,
+    vcache,
+    qscale,
+    kscale,
+    vscale,
+    cu_seqlens_q,
+    block_ids,
+    seqlens_kvcache,
+    max_seqlens_q,
+    quant_type,
+    output,
+):
+    return torch.empty(
+        (q.size(0), q.size(1), vcache.size(-1)), dtype=torch.bfloat16, device=q.device
+    )
+
+
 @torch.library.register_fake("hpc::attention_with_kvcache_blocksparse_prefill_fp8")
 def attention_with_kvcache_blocksparse_prefill_fp8_fake(
     q,
@@ -2022,6 +2219,29 @@ def attention_decode_fp8_adaptive_fake(
     split_flag=None,
     p_scale=None,
     output=None,
+):
+    return torch.empty(
+        (q.size(0), q.size(1), vcache.size(-1)), dtype=torch.bfloat16, device=q.device
+    )
+
+
+@torch.library.register_fake("hpc::attention_decode_fp8_kv_fp16_pv_compute")
+def attention_decode_fp8_kv_fp16_pv_compute_fake(
+    q,
+    kcache,
+    vcache,
+    qscale,
+    kscale,
+    vscale,
+    block_ids,
+    num_seq_kvcache,
+    mtp,
+    new_kv_included,
+    use_splitk,
+    split_flag,
+    quant_type,
+    task_map,
+    output,
 ):
     return torch.empty(
         (q.size(0), q.size(1), vcache.size(-1)), dtype=torch.bfloat16, device=q.device

@@ -271,6 +271,35 @@ __device__ __forceinline__ void apply_casual_mask(TensorAtt& tAttr_nm, TensorI& 
   }
 }
 
+// Causal mask + per-(K-token) column scale, applied on the fp32 S accumulator
+// column (in == K-token) instead of on every bf16 K element.
+template <int kTileN, int kHeadsPerGroup, typename TensorAtt, typename TensorI,
+          typename TensorKScale>
+__device__ __forceinline__ void apply_casual_mask_with_kscale(TensorAtt& tAttr_nm, TensorI& tI_nm,
+                                                              TensorKScale& kscales,
+                                                              const int& itile_seq_kv,
+                                                              const int& num_seq_kvcache,
+                                                              const int& num_seq_kv) {
+  using namespace cute;  // NOLINT
+  constexpr int kN = size<0>(TensorAtt{});
+  constexpr int kM = size<1>(TensorAtt{});
+
+#pragma unroll
+  for (int im = 0; im < kM; ++im) {
+#pragma unroll
+    for (int in = 0; in < kN; ++in) {
+      int iposq = num_seq_kvcache + get<1>(tI_nm(in, im)) / kHeadsPerGroup;
+      int iposk = itile_seq_kv * kTileN + get<0>(tI_nm(in, im));
+
+      if ((iposk > iposq) || (iposk >= num_seq_kv)) {
+        tAttr_nm(in, im) = -std::numeric_limits<float>::infinity();
+      } else {
+        tAttr_nm(in, im) *= kscales(in);
+      }
+    }
+  }
+}
+
 template <int kTileN, int kHeadsPerGroup, typename TensorAtt, typename TensorI,
           typename TensorScale>
 __device__ __forceinline__ void apply_casual_mask_with_scale(TensorAtt& tAttr_nm, TensorI& tI_nm,

@@ -56,6 +56,20 @@ bool attention_decode_fp8_adaptive_async(
     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
     cudaStream_t stream);
 
+// Hybrid a8c8-fp16pv decode: Q/K/V all fp8; FP8 QK WGMMA + FP16 PV WGMMA. Q is
+// fp8 with a required per-(token,head) qscale; quant_type modes 20/21. When
+// task_map_ptr is non-null the dynamic-splitk path is used; else static splitk.
+bool attention_decode_fp8_kv_fp16_pv_compute_async(
+    void *y_ptr, void *lse_ptr, void *split_out_ptr, const void *q_ptr, void *kcache_ptr,
+    void *vcache_ptr, const void *qscale_ptr, const void *kscale_ptr, const void *vscale_ptr,
+    const int *block_ids_ptr, const int *num_seq_kvcache_ptr, int *split_flag_ptr,
+    bool new_kv_included, int splitk, int num_batch, int num_seq_q, int num_head_q, int num_head_k,
+    int num_head_v, int num_dim_qk, int num_dim_v, int num_kvcache_blocks, int block_size,
+    int num_seq_max_blocks, int qscale_pad_stride, int ldY, int ldQ, int64_t kcache_block_stride,
+    int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
+    int64_t vcache_token_stride, int64_t vcache_head_stride, int quant_type,
+    const int *task_map_ptr, int num_total_ctas, cudaStream_t stream);
+
 std::pair<std::vector<decode::dynamic::TaskScheduleInfo>, std::vector<int>>
 assign_attention_decode_task_sync(const int *num_seq_kvcache, int num_total_ctas, int num_batch,
                                   int num_head_kv, int num_seq_q, int tilen, bool new_kv_included,
