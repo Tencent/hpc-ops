@@ -5,6 +5,19 @@ import torch
 from torch import Tensor
 
 
+def _try_register_fake(qualname):
+    """Decorator: register fake impl, skipping if the operator is not registered."""
+
+    def decorator(func):
+        try:
+            torch.library.register_fake(qualname)(func)
+        except RuntimeError:
+            pass
+        return func
+
+    return decorator
+
+
 def _to_scalar_float(x: Union[float, torch.Tensor], name: str) -> float:
     """Coerce a Python float / 0-d / 1-element tensor to a Python float.
 
@@ -2163,7 +2176,7 @@ def attention_decode_bf16_fake(
     return torch.empty_like(q)
 
 
-@torch.library.register_fake("hpc::attention_decode_bf16_adaptive")
+@_try_register_fake("hpc::attention_decode_bf16_adaptive")
 def attention_decode_bf16_adaptive_fake(
     q,
     kcache,
@@ -2201,7 +2214,7 @@ def attention_decode_fp8_fake(
     return torch.empty_like(q)
 
 
-@torch.library.register_fake("hpc::attention_decode_fp8_adaptive")
+@_try_register_fake("hpc::attention_decode_fp8_adaptive")
 def attention_decode_fp8_adaptive_fake(
     q,
     kcache,
