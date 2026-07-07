@@ -2527,7 +2527,9 @@ __global__ void __launch_bounds__(384, 1)
 
         constexpr int kNumTilePerWarp = 32 / kTileTransN;
 
-        warpgroup_fence_operand(tYr);
+        auto tOr = make_fragment_like(tYr);
+        warpgroup_fence_operand(tOr);
+        tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
 #pragma unroll
         for (int in = 0; in < size<2>(tVTr); in++) {
 #pragma unroll
@@ -2542,11 +2544,17 @@ __global__ void __launch_bounds__(384, 1)
 
           warpgroup_arrive();
           cute::gemm(tiled_mma_pv, tAttA_fp8(_, _, in),
-                     tVTr(_, _, in, iwarpgroup * kStage + ismem_read), tYr);
+                     tVTr(_, _, in, iwarpgroup * kStage + ismem_read), tOr);
           warpgroup_commit_batch();
+          tiled_mma_pv.accumulate_ = GMMA::ScaleOut::One;
         }
 
         warpgroup_wait<0>();
+        warpgroup_fence_operand(tOr);
+#pragma unroll
+        for (int i = 0; i < size(tYr); ++i) {
+          tYr(i) += tOr(i);
+        }
 
         if (elected_idx_in_warpgroup) {
           arrive_barrier(writable_v[ismem_read]);
@@ -3118,7 +3126,9 @@ __global__ void __launch_bounds__(384, 1)
 
         constexpr int kNumTilePerWarp = 32 / kTileTransN;
 
-        warpgroup_fence_operand(tYr);
+        auto tOr = make_fragment_like(tYr);
+        warpgroup_fence_operand(tOr);
+        tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
 #pragma unroll
         for (int in = 0; in < size<2>(tVTr); in++) {
 #pragma unroll
@@ -3133,11 +3143,17 @@ __global__ void __launch_bounds__(384, 1)
 
           warpgroup_arrive();
           cute::gemm(tiled_mma_pv, tAttA_fp8(_, _, in),
-                     tVTr(_, _, in, iwarpgroup * kStage + ismem_read), tYr);
+                     tVTr(_, _, in, iwarpgroup * kStage + ismem_read), tOr);
           warpgroup_commit_batch();
+          tiled_mma_pv.accumulate_ = GMMA::ScaleOut::One;
         }
 
         warpgroup_wait<0>();
+        warpgroup_fence_operand(tOr);
+#pragma unroll
+        for (int i = 0; i < size(tYr); ++i) {
+          tYr(i) += tOr(i);
+        }
 
         if (elected_idx_in_warpgroup) {
           arrive_barrier(writable_v[ismem_read]);
@@ -4275,7 +4291,9 @@ __global__ void __launch_bounds__(384, 1)
 
         constexpr int kNumTilePerWarp = 32 / kTileTransN;
 
-        warpgroup_fence_operand(tYr);
+        auto tOr = make_fragment_like(tYr);
+        warpgroup_fence_operand(tOr);
+        tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
 #pragma unroll
         for (int in = 0; in < size<2>(tVTr); in++) {
 #pragma unroll
@@ -4290,11 +4308,17 @@ __global__ void __launch_bounds__(384, 1)
 
           warpgroup_arrive();
           cute::gemm(tiled_mma_pv, tAttA_fp8(_, _, in),
-                     tVTr(_, _, in, iwarpgroup * kStage + ismem_read), tYr);
+                     tVTr(_, _, in, iwarpgroup * kStage + ismem_read), tOr);
           warpgroup_commit_batch();
+          tiled_mma_pv.accumulate_ = GMMA::ScaleOut::One;
         }
 
         warpgroup_wait<0>();
+        warpgroup_fence_operand(tOr);
+#pragma unroll
+        for (int i = 0; i < size(tYr); ++i) {
+          tYr(i) += tOr(i);
+        }
 
         if (elected_idx_in_warpgroup) {
           arrive_barrier(writable_v[ismem_read]);
