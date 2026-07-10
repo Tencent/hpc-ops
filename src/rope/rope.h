@@ -48,6 +48,31 @@ bool rope_interleave_bf16_async(void *y_ptr, void *x_ptr, const void *cos_sin_ca
                                 int ldX, int ldCache, int ldY, int ldXHead, int ldYHead,
                                 cudaStream_t stream);
 
+struct Qwen3TtsRopeParams {
+  int64_t batch_size;
+  int64_t seq_len;
+  int64_t num_q_heads;
+  int64_t num_kv_heads;
+  int64_t head_dim;
+  int64_t total_q_rows;
+  int64_t total_rows;
+  int64_t q_s0;
+  int64_t q_s1;
+  int64_t q_s2;
+  int64_t k_s0;
+  int64_t k_s1;
+  int64_t k_s2;
+  int64_t cos_s0;
+  int64_t cos_s1;
+  int64_t sin_s0;
+  int64_t sin_s1;
+};
+
+void qwen3_tts_rope_async(__nv_bfloat16 *q_out, __nv_bfloat16 *k_out, const __nv_bfloat16 *q,
+                          const __nv_bfloat16 *k, const __nv_bfloat16 *cos,
+                          const __nv_bfloat16 *sin, const Qwen3TtsRopeParams &params,
+                          cudaStream_t stream);
+
 }  // namespace rope
 
 namespace rope_v2 {
