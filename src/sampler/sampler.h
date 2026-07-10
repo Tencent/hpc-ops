@@ -42,6 +42,11 @@ void fused_sampler_temperature_async(int32_t* token_ids_out, const void* logits_
                                      const int64_t* draft_token_ids_ptr, int batch_size,
                                      int vocab_size, uint64_t rng_seed, cudaStream_t stream);
 
+void qwen3_tts_topk_gumbel_sample_async(int64_t* token_ids_out, const float* logits_ptr,
+                                        const float* noise_ptr, int batch_size, int vocab_size,
+                                        int logits_row_stride, int topk, float inv_temperature,
+                                        cudaStream_t stream);
+
 }  // namespace sampler
 }  // namespace hpc
 

@@ -18,6 +18,12 @@ def _discover_modules() -> Dict[str, ModuleType]:
 
         module_name = file.stem
 
+        selected = os.getenv("HPC_OPS_IMPORT_MODULES")
+        if selected:
+            selected_modules = {x.strip() for x in selected.split(",") if x.strip()}
+            if module_name not in selected_modules:
+                continue
+
         try:
             module = importlib.import_module(f".{module_name}", package=__package__)
             modules[module_name] = module
@@ -48,8 +54,18 @@ __all__ = []
 
 _export_functions(_discover_modules())
 
-__version__ = torch.ops.hpc.version()
-__built_json__ = torch.ops.hpc.built_json()
+
+def _call_optional_hpc_op(name: str, default: str) -> str:
+    try:
+        return getattr(torch.ops.hpc, name)()
+    except AttributeError:
+        if os.getenv("HPC_OPS_IMPORT_MODULES"):
+            return default
+        raise
+
+
+__version__ = _call_optional_hpc_op("version", "unknown")
+__built_json__ = _call_optional_hpc_op("built_json", "{}")
 
 __doc__ = """
 High Performance Computing Operators Library
