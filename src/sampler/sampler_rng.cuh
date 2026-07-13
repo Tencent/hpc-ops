@@ -31,10 +31,14 @@ namespace rng {
 constexpr uint64_t kPerLaunchOffsetIncrement = 128;
 
 // Gumbel(0) noise from a uniform draw U ~ (0, 1].
-//   inner = max(-log(U), 1e-20)        // guard U -> 1
+// PyTorch's exponential_ handles the identical curand (0, 1] issue in
+// TransformationHelper.h::exponential (the CUDA branch):
+//     auto log = val >= 1 - eps/2 ? -eps/2 : at::log(val);   // eps = FLT_EPSILON eps = 1.1920929e-07
+//     return -1/lambda * log;                                // Exp(1) = -log(U)
 //   g     = -log(inner)                // = -log(-log(U))
 __device__ __forceinline__ float gumbel_noise_from_uniform(float u) {
-  float inner = fmaxf(-logf_ftz(u), 1e-20f);
+  constexpr float kHalfFltEps = 5.9604645e-08f;  // FLT_EPSILON / 2, matches torch
+  float inner = fmaxf(-logf_ftz(u), kHalfFltEps);
   return -logf_ftz(inner);
 }
 
