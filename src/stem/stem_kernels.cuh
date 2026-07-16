@@ -795,7 +795,7 @@ __global__ void __launch_bounds__(384, 1)
 
         // Causal tile-level skip
         if constexpr (kCausal) {
-          int block_offset = num_kb - num_qb;
+          int block_offset = (kv_len - q_len + kStemBlockSize - 1) / kStemBlockSize;
           int qb_max = itile_q * kTileM + kTileM - 1;
           int kb_min = itile_k * kTileN;
           if (qb_max + block_offset < kb_min) {
@@ -878,7 +878,7 @@ __global__ void __launch_bounds__(384, 1)
       }
 
       if constexpr (kCausal) {
-        int block_offset = num_kb - num_qb;
+        int block_offset = (kv_len - q_len + kStemBlockSize - 1) / kStemBlockSize;
         int qb_max = itile_q * kTileM + kTileM - 1;
         int kb_min = itile_k * kTileN;
         if (qb_max + block_offset < kb_min) {
@@ -929,7 +929,7 @@ __global__ void __launch_bounds__(384, 1)
       [[maybe_unused]] int block_offset = 0;
       [[maybe_unused]] bool need_mask = false;
       if constexpr (kCausal) {
-        block_offset = num_kb - num_qb;
+        block_offset = (kv_len - q_len + kStemBlockSize - 1) / kStemBlockSize;
         int qb_start = itile_q * kTileM;
         int kb_start = itile_k * kTileN;
         need_mask = (qb_start + block_offset < kb_start + kTileN) &&
@@ -1032,10 +1032,9 @@ __device__ __forceinline__ bool bf16_isfinite(uint16_t bits) { return (bits & 0x
 
 // Per-row top-k budget: 3-regime k_schedule + linspace decay, both keyed on
 // the FULL prompt KV length (`prompt_kv_blocks`) so the result is chunked-
-// prefill invariant. `ki_blocks` only feeds `kb_offset` for absolute q_pos.
-__device__ __forceinline__ int compute_budget(int q_row, int qi_blocks, int ki_blocks,
-                                              int prompt_kv_blocks, float alpha,
-                                              float k_block_num_rate_medium,
+// prefill invariant. `kb_offset` (token-accurate causal offset) feeds absolute q_pos.
+__device__ __forceinline__ int compute_budget(int q_row, int kb_offset, int prompt_kv_blocks,
+                                              float alpha, float k_block_num_rate_medium,
                                               int k_block_num_bias_medium,
                                               float k_block_num_rate_large,
                                               int k_block_num_bias_large) {
@@ -1051,7 +1050,6 @@ __device__ __forceinline__ int compute_budget(int q_row, int qi_blocks, int ki_b
     k_val = static_cast<int>(prompt_kv_blocks * k_block_num_rate_large) + k_block_num_bias_large;
   }
 
-  const int kb_offset = ki_blocks - qi_blocks;
   const int q_pos = q_row + kb_offset;
 
   int decay_len = prompt_kv_blocks - k_val;
@@ -1159,6 +1157,7 @@ __global__ void __launch_bounds__(kWPC * 32, (kWPR == 1) ? 0 : 1)
   const int qi_blocks = (q_seq_lens[ireq] + block_size - 1) / block_size;
   const int ki_blocks = (kv_seq_lens[ireq] + block_size - 1) / block_size;
   const int prompt_kv_blocks = (num_prompt_tokens[ireq] + block_size - 1) / block_size;
+  const int kb_offset = (kv_seq_lens[ireq] - q_seq_lens[ireq] + block_size - 1) / block_size;
   if (qi_blocks == 0 || ki_blocks == 0 || q_row >= qi_blocks) {
     return;
   }
@@ -1185,7 +1184,7 @@ __global__ void __launch_bounds__(kWPC * 32, (kWPR == 1) ? 0 : 1)
   }
 
   const int budget =
-      compute_budget(q_row, qi_blocks, ki_blocks, prompt_kv_blocks, alpha, k_block_num_rate_medium,
+      compute_budget(q_row, kb_offset, prompt_kv_blocks, alpha, k_block_num_rate_medium,
                      k_block_num_bias_medium, k_block_num_rate_large, k_block_num_bias_large);
 
   // Sum local_finite across all threads in this row.  Reuses smem_warp_counts in radix below.
@@ -1217,10 +1216,12 @@ __global__ void __launch_bounds__(kWPC * 32, (kWPR == 1) ? 0 : 1)
 
   // mask = top-k & initial sink & recent window & diagonal.
   //
-  // Chunked-prefill alignment: Q is the tail of a longer KV, so a Q-block at
-  // local index q_row corresponds to KV-block index (q_row + kb_offset).
-  const int kb_offset = ki_blocks - qi_blocks;
-  const int diag_col = q_row + kb_offset;
+  // Q is the tail of a longer KV; Q-block local index q_row maps to KV-block
+  // (q_row + kb_offset), where kb_offset is the token-accurate ceil offset
+  // computed above (correct even when context_len % block_size != 0).
+  // Clamp: last partial Q-block can overshoot to ki_blocks when both q_len and
+  // context_len are unaligned; without clamp, diagonal/window miss all columns.
+  const int diag_col = min(q_row + kb_offset, ki_blocks - 1);
 #pragma unroll
   for (int j = 0; j < kEPT; ++j) {
     int col = linear_id + j * kThreadsPerRow;
