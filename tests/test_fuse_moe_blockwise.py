@@ -99,31 +99,29 @@ def naive_group_gemm(x, w, num_tokens_per_expert, cu_num_tokens_per_expert, xsca
 
         x_scale_group = xscale[start_idx:end_idx]  # (m, k / 128)
         w_scale_group = wscale[i]  # (n/128, 64)
-        w_scale_group = w_scale_group[:, : k // 128]
+        w_scale_group = w_scale_group[:, : (k + 127) // 128]
 
         assert x_group.size(1) == w_group.size(1)
         assert w_scale_group.size(0) == w_group.size(0) // 128
-        assert w_scale_group.size(1) == w_group.size(1) // 128
+        assert w_scale_group.size(1) == (w_group.size(1) + 127) // 128
 
         output = torch.zeros((m, n), dtype=torch.float32, device=x_group.device)
 
         num_tile_n = n // 128
-        num_tile_k = k // 128
-
-        x_chunks = torch.chunk(x_group, num_tile_k, dim=1)
-        w_chunks = torch.chunk(w_group, num_tile_k, dim=1)
+        num_tile_k = (k + 127) // 128
 
         for n in range(num_tile_n):
             tmp = torch.zeros((m, 128), dtype=torch.float32, device=x_group.device)
             for k in range(num_tile_k):
-                x_i = x_chunks[k]  # （m, 128)
+                start_k = k * 128
+                end_k = min(start_k + 128, x_group.size(1))
+                x_i = x_group[:, start_k:end_k]
                 x_scale_i = x_scale_group[:, k]  # (m, 1)
                 w_scale_i = w_scale_group[n, k]  # (1)
                 assert x_scale_i.size(0) == x_i.size(0)
                 assert w_scale_i.numel() == 1
 
-                w_chunk = w_chunks[k]  # (n, 128)
-                w_i = w_chunk[n * 128 : (n + 1) * 128].t()  # (128, 128)
+                w_i = w_group[n * 128 : (n + 1) * 128, start_k:end_k].t()
 
                 scale_a = torch.tensor([1.0], dtype=torch.float32, device="cuda")
                 scale_b = torch.tensor([1.0], dtype=torch.float32, device="cuda")
@@ -348,3 +346,116 @@ def test_fuse_moe_blockwise_fp8(
     torch.cuda.synchronize()
 
     assert allclose(gt.to(torch.float32), my.to(torch.float32), rtol=0.01, atol=0.01)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size,intermediate_size",
+    [(num_tokens, 256, 256) for num_tokens in [1, 2, 3, 4, 8, 16]]
+    # Intermediate tails are covered only inside the B<=4 route-MMA range.
+    # Tail support in the legacy fallback path is a separate change.
+    + [(num_tokens, 256, 192) for num_tokens in [1, 2, 3, 4]]
+    + [
+        (1, 2048, 768),
+        (2, 4096, 192),
+        (4, 4096, 512),
+    ],
+)
+@pytest.mark.parametrize("size_ep", [1, 2])
+@pytest.mark.parametrize("has_shared_output", [False, True])
+def test_fuse_moe_blockwise_fp8_small_batch_route_mma(
+    num_tokens, hidden_size, intermediate_size, size_ep, has_shared_output
+):
+    dtype = torch.float8_e4m3fn
+    num_expert = 16
+    rank_ep = 0 if size_ep == 1 else 1
+    num_topk = 8
+
+    topk_ids = torch.multinomial(
+        torch.ones((num_tokens, num_expert), dtype=torch.float, device="cuda"),
+        num_topk,
+        replacement=False,
+    ).to(torch.int32)
+    topk_ids, _ = torch.sort(topk_ids, dim=1)
+    topk_scale = torch.rand((num_tokens, num_topk), dtype=torch.float, device="cuda")
+    topk_scale /= topk_scale.sum(dim=1, keepdim=True)
+    x = (torch.randn((num_tokens, hidden_size), device="cuda") / 100).to(dtype)
+
+    def make_scale(shape):
+        # Dequantization scales are positive in production checkpoints. Keep
+        # the original signed stress distribution for the legacy small shapes.
+        if hidden_size > 256:
+            return torch.rand(shape, device="cuda") * 0.02
+        return torch.randn(shape, device="cuda")
+
+    x_scale = make_scale((num_tokens, hidden_size // 128))
+    gate_up_weight = torch.randn(
+        (num_expert // size_ep, intermediate_size * 2, hidden_size), device="cuda"
+    ).to(dtype)
+    gate_up_weight_scale = make_scale(
+        (
+            num_expert // size_ep,
+            intermediate_size * 2 // 128,
+            (hidden_size // 128 + 3) // 4 * 4,
+        )
+    )
+    down_weight = torch.randn(
+        (num_expert // size_ep, hidden_size, intermediate_size), device="cuda"
+    ).to(dtype)
+    down_weight_scale = make_scale(
+        (
+            num_expert // size_ep,
+            hidden_size // 128,
+            ((intermediate_size + 127) // 128 + 3) // 4 * 4,
+        )
+    )
+    shared_output = (
+        torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
+        if has_shared_output
+        else None
+    )
+
+    if hidden_size > 256:
+        output = torch.empty((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
+        my = hpc.fuse_moe_blockwise(
+            x,
+            x_scale,
+            gate_up_weight,
+            gate_up_weight_scale,
+            down_weight,
+            down_weight_scale,
+            topk_ids,
+            topk_scale,
+            rank_ep,
+            num_expert,
+            shared_output,
+            output,
+        )
+        assert my.data_ptr() == output.data_ptr()
+    else:
+        my = hpc.fuse_moe_blockwise_fp8(
+            x,
+            x_scale,
+            gate_up_weight,
+            gate_up_weight_scale,
+            down_weight,
+            down_weight_scale,
+            topk_ids,
+            topk_scale,
+            rank_ep,
+            num_expert,
+            shared_output,
+        )
+    gt = naive_fuse_moe_blockwise_fp8(
+        x,
+        x_scale,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids,
+        topk_scale,
+        rank_ep,
+        num_expert,
+        shared_output,
+    )
+    assert allclose(gt.float(), my.float(), rtol=0.01, atol=0.01)

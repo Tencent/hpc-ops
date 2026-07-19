@@ -5,10 +5,12 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <algorithm>
 #include <tuple>
 
 #include "src/fuse_moe/cp_async/fuse_moe_cp_async.h"
 #include "src/fuse_moe/fuse_moe.h"
+#include "src/fuse_moe/small_batch_route_mma.h"
 #include "src/utils/utils.h"
 
 namespace hpc {
@@ -223,7 +225,12 @@ torch::Tensor fuse_moe_cp_async_entry(
   constexpr int kGemmTileN = 64;
   int gate_up_num_tile_n = (intermediate_size + kGemmTileN - 1) / kGemmTileN;
   int down_num_tile_n = (hidden_size + kGemmTileN - 1) / kGemmTileN;
-  int max_tile_m = total_num_seq / kMinTileM + num_expert_local;
+  // If A groups are non-empty, sum(ceil(c_i / kMinTileM)) is at most
+  // A + floor((total_routes - A) / kMinTileM). The expression increases with
+  // A, whose upper bound is min(total_routes, local_experts).
+  const int max_nonempty_groups = std::min(total_num_seq, num_expert_local);
+  const int max_tile_m = max_nonempty_groups +
+                         (total_num_seq - max_nonempty_groups) / kMinTileM;
   int gateup_task_map_len = max_tile_m * gate_up_num_tile_n;
   int down_task_map_len = max_tile_m * down_num_tile_n;
 
@@ -287,6 +294,7 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
               "gate_up_scale, down_scale, act_and_mul_scale and topk_scale dtype must be float32");
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
   TORCH_CHECK(gate_up_weight.device().is_cuda(), "gate_up_weight tensor must be cuda");
+  TORCH_CHECK(down_weight.device().is_cuda(), "down_weight tensor must be cuda");
   TORCH_CHECK(gate_up_scale.device().is_cuda(), "gate_up_scale tensor must be cuda");
   TORCH_CHECK(down_scale.device().is_cuda(), "down_scale tensor must be cuda");
   TORCH_CHECK(act_and_mul_scale.device().is_cuda(), "act_and_mul_scale tensor must be cuda");
@@ -332,24 +340,76 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   int num_tokens_per_group_avg = num_seq * num_topk / num_expert_total;
   TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
-  if (intermediate_size / 2 <= 512 && (intermediate_size / 2) % 64 == 0 && hidden_size % 64 == 0) {
-    return fuse_moe_cp_async_entry(x, gate_up_weight, down_weight, gate_up_scale, down_scale,
-                                   act_and_mul_scale, topk_ids, topk_scale, shared_output, rank_ep,
-                                   num_expert_total, use_bf16_mul, output);
-  }
-
   auto options = x.options();
   torch::Tensor y;
-  void *y_ptr = nullptr;
   if (output.has_value()) {
-    TORCH_CHECK(output.value().size(0) == num_seq && output.value().size(1) == hidden_size,
+    y = output.value();
+    TORCH_CHECK(y.size(0) == num_seq && y.size(1) == hidden_size,
                 "output shape must be [num_tokens, hidden_size]");
-    TORCH_CHECK(output.value().dtype() == torch::kBFloat16, "output dtype must be bfloat16");
-    TORCH_CHECK(output.value().device().is_cuda(), "output must be cuda tensor");
-    y_ptr = output.value().mutable_data_ptr();
+    TORCH_CHECK(y.dtype() == torch::kBFloat16, "output dtype must be bfloat16");
+    TORCH_CHECK(y.device().is_cuda(), "output must be cuda tensor");
+    TORCH_CHECK(y.is_contiguous(), "output must be contiguous");
   } else {
     y = torch::empty({num_seq, hidden_size}, options.dtype(torch::kBFloat16));
-    y_ptr = y.mutable_data_ptr();
+  }
+  void *y_ptr = y.mutable_data_ptr();
+
+  TORCH_CHECK(intermediate_size % 2 == 0,
+              "gate_up_weight output dimension must be even");
+  const int actual_intermediate_size = intermediate_size / 2;
+  TORCH_CHECK(down_weight.size(1) == hidden_size &&
+                  down_weight.size(2) == actual_intermediate_size,
+              "down_weight shape must be [num_expert, hidden_size, intermediate_size]");
+  const bool use_small_batch_route_mma =
+      num_seq > 0 && num_seq <= 4 && num_topk == 8 &&
+      actual_intermediate_size > 0 && actual_intermediate_size <= 512 &&
+      actual_intermediate_size % 64 == 0 && hidden_size % 64 == 0;
+  if (use_small_batch_route_mma) {
+    // Route-direct work stays close to the number of active experts for B<=4.
+    // Split the long Gate/Up K dimension only when more CTAs are needed to
+    // provide roughly four waves of work; all other shapes use the normal path.
+    const int64_t num_routes = static_cast<int64_t>(num_seq) * num_topk;
+    int num_splits = 1;
+    if (hidden_size > 2048) {
+      const int gate_tile_k = hidden_size % 128 == 0 ? 128 : 64;
+      const int num_k_tiles = hidden_size / gate_tile_k;
+      const int gate_tasks_without_split =
+          static_cast<int>(num_routes) * (intermediate_size / 64);
+      const int target_gate_tasks = get_sm_count() * 4;
+      const int desired_splits =
+          (target_gate_tasks + gate_tasks_without_split - 1) /
+          gate_tasks_without_split;
+      for (int candidate : {1, 2, 4, 8}) {
+        if (candidate >= desired_splits && num_k_tiles % candidate == 0) {
+          num_splits = candidate;
+          break;
+        }
+        if (num_k_tiles % candidate == 0) {
+          num_splits = candidate;
+        }
+      }
+    }
+    const int64_t workspace_bytes =
+        num_routes * num_splits * intermediate_size * sizeof(at::BFloat16) +
+        num_routes * actual_intermediate_size +
+        num_routes * hidden_size * sizeof(at::BFloat16);
+    torch::Tensor workspace =
+        torch::empty({workspace_bytes}, options.dtype(torch::kUInt8));
+    fuse_moe_small_batch_route_mma_async(
+        y_ptr, x.const_data_ptr(), workspace.mutable_data_ptr(),
+        gate_up_weight.const_data_ptr(), gate_up_scale.const_data_ptr(),
+        act_and_mul_scale.const_data_ptr(), down_weight.const_data_ptr(),
+        down_scale.const_data_ptr(), topk_ids.const_data_ptr(), topk_scale.const_data_ptr(),
+        shared_output_ptr, num_seq, hidden_size, actual_intermediate_size, num_topk,
+        num_splits, num_expert, rank_ep, use_bf16_mul, stream);
+    return y;
+  }
+
+  if (actual_intermediate_size <= 512 && actual_intermediate_size % 64 == 0 &&
+      hidden_size % 64 == 0) {
+    return fuse_moe_cp_async_entry(x, gate_up_weight, down_weight, gate_up_scale, down_scale,
+                                   act_and_mul_scale, topk_ids, topk_scale, shared_output, rank_ep,
+                                   num_expert_total, use_bf16_mul, y);
   }
 
   torch::Tensor gate_up_input = torch::empty({num_seq * num_topk, hidden_size}, options);
@@ -435,11 +495,7 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
                  shared_output_ptr, gateup_task_map_ptr, down_task_map_ptr, num_gateup_waves,
                  num_down_waves, num_seq, hidden_size, intermediate_size, num_topk,
                  num_expert_total, num_expert, rank_ep, use_bf16_mul, stream);
-  if (output.has_value()) {
-    return output.value();
-  } else {
-    return y;
-  }
+  return y;
 }
 
 torch::Tensor fuse_moe_blockwise_entry(
@@ -455,10 +511,11 @@ torch::Tensor fuse_moe_blockwise_entry(
                   down_weight.dtype() == torch::kFloat8_e4m3fn,
               "x, gate_up_weight and down_weight dtype must be fp8_e4m3");
   TORCH_CHECK(topk_ids.dtype() == torch::kInt32, "topk_ids dtype must be int32");
-  TORCH_CHECK(gate_up_weight_scale.dtype() == torch::kFloat32 &&
+  TORCH_CHECK(x_scale.dtype() == torch::kFloat32 &&
+                  gate_up_weight_scale.dtype() == torch::kFloat32 &&
                   down_weight_scale.dtype() == torch::kFloat32 &&
                   topk_scale.dtype() == torch::kFloat32,
-              "gate_up_scale, down_scale, act_and_mul_scale and topk_scale dtype must be float32");
+              "x_scale, gate_up_scale, down_scale and topk_scale dtype must be float32");
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
   TORCH_CHECK(x_scale.device().is_cuda(), "x_scale tensor must be cuda");
   TORCH_CHECK(gate_up_weight.device().is_cuda(), "gate_up_weight tensor must be cuda");
@@ -522,6 +579,80 @@ torch::Tensor fuse_moe_blockwise_entry(
 
   TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
+  // Small decode batches do not have enough rows per expert to amortize routing
+  // and task-map construction. The route-direct path applies each 128-element
+  // activation/weight scale while accumulating FP8 WGMMA results.
+  TORCH_CHECK(intermediate_size % 2 == 0,
+              "gate_up_weight output dimension must be even");
+  const int actual_intermediate_size = intermediate_size / 2;
+  TORCH_CHECK(actual_intermediate_size > 0,
+              "intermediate_size must be positive");
+  TORCH_CHECK(down_weight.size(1) == hidden_size &&
+                  down_weight.size(2) == actual_intermediate_size,
+              "down_weight shape must be [num_expert, hidden_size, intermediate_size]");
+  const bool use_small_batch_route_mma =
+      num_tokens > 0 && num_tokens <= 4 && num_topk == 8 && hidden_size <= 4096 &&
+      actual_intermediate_size >= 128 && actual_intermediate_size <= 768 &&
+      hidden_size % 128 == 0 &&
+      actual_intermediate_size % 64 == 0;
+
+  auto options = x.options();
+  torch::Tensor y;
+  if (output.has_value()) {
+    y = output.value();
+    TORCH_CHECK(y.size(0) == num_tokens && y.size(1) == hidden_size,
+                "output shape must be [num_tokens, hidden_size]");
+    TORCH_CHECK(y.dtype() == torch::kBFloat16, "output dtype must be bfloat16");
+    TORCH_CHECK(y.device().is_cuda(), "output must be cuda tensor");
+    TORCH_CHECK(y.is_contiguous(), "output must be contiguous");
+  } else {
+    y = torch::empty({num_tokens, hidden_size}, options.dtype(torch::kBFloat16));
+  }
+  void *y_ptr = y.mutable_data_ptr();
+
+  if (use_small_batch_route_mma) {
+    const int64_t num_routes = static_cast<int64_t>(num_tokens) * num_topk;
+    int num_splits = 1;
+    if (hidden_size > 2048) {
+      const int num_k_tiles = hidden_size / 128;
+      const int gate_tasks_without_split =
+          static_cast<int>(num_routes) * (intermediate_size / 64);
+      const int target_gate_tasks = get_sm_count() * 4;
+      const int desired_splits =
+          (target_gate_tasks + gate_tasks_without_split - 1) /
+          gate_tasks_without_split;
+      for (int candidate : {1, 2, 4, 8}) {
+        if (candidate >= desired_splits && num_k_tiles % candidate == 0) {
+          num_splits = candidate;
+          break;
+        }
+        if (num_k_tiles % candidate == 0) {
+          num_splits = candidate;
+        }
+      }
+    }
+    const int64_t num_intermediate_blocks =
+        (actual_intermediate_size + 127) / 128;
+    const int64_t workspace_bytes =
+        num_routes * num_splits * 2 * actual_intermediate_size *
+            sizeof(at::BFloat16) +
+        num_routes * actual_intermediate_size +
+        num_routes * num_intermediate_blocks * sizeof(float) +
+        num_routes * hidden_size * sizeof(at::BFloat16);
+    torch::Tensor workspace =
+        torch::empty({workspace_bytes}, options.dtype(torch::kUInt8));
+    fuse_moe_blockwise_small_batch_route_mma_async(
+        y_ptr, x.const_data_ptr(), x_scale.const_data_ptr(),
+        workspace.mutable_data_ptr(), gate_up_weight.const_data_ptr(),
+        gate_up_weight_scale.const_data_ptr(), down_weight.const_data_ptr(),
+        down_weight_scale.const_data_ptr(), topk_ids.const_data_ptr(),
+        topk_scale.const_data_ptr(), shared_output_ptr, num_tokens, hidden_size,
+        actual_intermediate_size, num_topk, num_splits, num_experts,
+        gate_up_weight_scale_lastdim_pad4, down_weight_scale_lastdim_pad4, rank_ep,
+        stream);
+    return y;
+  }
+
   if (num_tokens_per_group_avg <= 8) {
     aligned_size = 8;
   } else if (num_tokens_per_group_avg <= 16) {
@@ -545,19 +676,6 @@ torch::Tensor fuse_moe_blockwise_entry(
       (num_tokens * num_topk + num_expert_total * aligned_size + aligned_size - 1) / aligned_size *
       aligned_size;
 
-  auto options = x.options();
-  torch::Tensor y;
-  void *y_ptr = nullptr;
-  if (output.has_value()) {
-    TORCH_CHECK(output.value().size(0) == num_tokens && output.value().size(1) == hidden_size,
-                "output shape must be [num_tokens, hidden_size]");
-    TORCH_CHECK(output.value().dtype() == torch::kBFloat16, "output dtype must be bfloat16");
-    TORCH_CHECK(output.value().device().is_cuda(), "output must be cuda tensor");
-    y_ptr = output.value().mutable_data_ptr();
-  } else {
-    y = torch::empty({num_tokens, hidden_size}, options.dtype(torch::kBFloat16));
-    y_ptr = y.mutable_data_ptr();
-  }
   torch::Tensor gate_up_input =
       torch::empty({num_tokens * num_topk, hidden_size}, options.dtype(torch::kFloat8_e4m3fn));
   torch::Tensor gate_up_input_scale =
@@ -631,11 +749,7 @@ torch::Tensor fuse_moe_blockwise_entry(
       down_task_map_ptr, num_gateup_waves, num_down_waves, num_tokens, num_padded_tokens,
       hidden_size, intermediate_size, num_topk, num_expert_total, num_experts,
       gate_up_weight_scale_lastdim_pad4, down_weight_scale_lastdim_pad4, rank_ep, stream);
-  if (output.has_value()) {
-    return output.value();
-  } else {
-    return y;
-  }
+  return y;
 }
 
 }  // namespace fuse_moe
