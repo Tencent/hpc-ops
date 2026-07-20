@@ -251,6 +251,37 @@ torch::Tensor fused_sampler_temperature_sample_entry(const torch::Tensor& logits
   return token_ids;
 }
 
+// qwen3_tts_topk_gumbel_sample: Qwen3-TTS short-vocab fast path. Kernel in
+// src/sampler/qwen3_tts_topk_gumbel_sample.cu.
+torch::Tensor qwen3_tts_topk_gumbel_sample_entry(const torch::Tensor& logits,
+                                                 const torch::Tensor& noise, int64_t topk,
+                                                 double inv_temperature) {
+  TORCH_CHECK(logits.is_contiguous(), "logits tensor must be contiguous");
+  TORCH_CHECK(noise.is_contiguous(), "noise tensor must be contiguous");
+  TORCH_CHECK(logits.dim() == 2, "logits tensor must be dim == 2");
+  TORCH_CHECK(noise.sizes() == logits.sizes(), "noise shape must match logits");
+  TORCH_CHECK(logits.scalar_type() == torch::kFloat32, "logits must be float32");
+  TORCH_CHECK(noise.scalar_type() == torch::kFloat32, "noise must be float32");
+  TORCH_CHECK(topk > 0 && topk <= 64, "topk must be in (0, 64]");
+
+  const int batch_size = logits.size(0);
+  const int vocab_size = logits.size(1);
+  const int64_t logits_row_stride = logits.stride(0);
+  TORCH_CHECK(vocab_size <= 2048,
+              "qwen3_tts_topk_gumbel_sample only supports vocab_size <= 2048");
+  TORCH_CHECK(topk <= vocab_size, "topk must be <= vocab_size, got topk=", topk,
+              ", vocab_size=", vocab_size);
+
+  torch::Tensor token_ids =
+      torch::empty({batch_size, 1}, torch::dtype(torch::kInt64).device(logits.device()));
+  auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
+  qwen3_tts_topk_gumbel_sample_async(
+      token_ids.mutable_data_ptr<int64_t>(), logits.const_data_ptr<float>(),
+      noise.const_data_ptr<float>(), batch_size, vocab_size, static_cast<int>(logits_row_stride),
+      static_cast<int>(topk), static_cast<float>(inv_temperature), stream);
+  return token_ids;
+}
+
 }  // namespace sampler
 }  // namespace hpc
 
@@ -272,4 +303,9 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "int seed=0) -> Tensor");
   m.impl("fused_sampler_temperature_sample", torch::kCUDA,
          &hpc::sampler::fused_sampler_temperature_sample_entry);
+  m.def(
+      "qwen3_tts_topk_gumbel_sample(Tensor logits, Tensor noise, int topk, "
+      "float inv_temperature) -> Tensor");
+  m.impl("qwen3_tts_topk_gumbel_sample", torch::kCUDA,
+         &hpc::sampler::qwen3_tts_topk_gumbel_sample_entry);
 }
