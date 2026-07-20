@@ -198,6 +198,12 @@ if(USE_ROCM)
     $<$<COMPILE_LANGUAGE:HIP>:
       -std=c++17
       -DNDEBUG
+      # Preload kernel arguments into SGPRs so each wave skips the per-launch
+      # s_load + s_waitcnt of the kernarg segment. Matches what Triton emits by
+      # default on gfx9; measurably reduces launch overhead for these short,
+      # wave-dense normalization kernels.
+      -mllvm
+      -amdgpu-kernarg-preload-count=16
     >
     $<$<COMPILE_LANGUAGE:CXX>:
       -Wno-unused-result
