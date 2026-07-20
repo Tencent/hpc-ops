@@ -62,6 +62,23 @@ __device__ __forceinline__ float warp_abs_max(vec_t<T, N> &data) {
   return warp_reduce_max_xor(m);
 }
 
+/// Load a NeoX-layout BF16 head into float registers.
+template <int kQKHeadDim, int kNumItemPerThread, int kWarpSize = 32>
+__device__ __forceinline__ void vectorized_load_neox(vec_t<float, kNumItemPerThread> &data,
+                                                     const __nv_bfloat16 *src, int ilane) {
+  constexpr int kNumRoundsHalf = ceil_div<kQKHeadDim / 2, kWarpSize>();
+  static_assert(kNumItemPerThread == kNumRoundsHalf * 2,
+                "kNumItemPerThread must match NeoX load rounds");
+#pragma unroll
+  for (int r = 0; r < kNumRoundsHalf; ++r) {
+    int i = r * kWarpSize + ilane;
+    if (i < kQKHeadDim / 2) {
+      data[r * 2] = __bfloat162float(src[i]);
+      data[r * 2 + 1] = __bfloat162float(src[i + kQKHeadDim / 2]);
+    }
+  }
+}
+
 /// Zero rows [from_row, to_row) of a KV cache block
 template <typename CacheT, int kElemPerRow, int kWarpSize = 32>
 __device__ __forceinline__ void zero_kv_rows(CacheT *block_start, int from_row, int to_row,
@@ -88,11 +105,22 @@ __global__ void rope_norm_store_kv_kernel(
     cutlass::FastDivmod kv_block_size_divider, int num_rows, int num_compute_blocks) {
   using DType = __nv_bfloat16;
 
+  static_assert(kNumQHeads % kNumKVHeads == 0, "kNumQHeads must be divisible by kNumKVHeads");
+  constexpr int kQPerKV = kNumQHeads / kNumKVHeads;
+  constexpr int kKVPerCTA = 1;
+  constexpr int kQPerCTA = kQPerKV;
+  const int kv_head_start = blockIdx.y;
+  const int q_head_start = kv_head_start * kQPerKV;
+
   constexpr int kWarpSize = 32;
   constexpr int kNumElemPerRow =
       kNumQHeads * kQKHeadDim + kNumKVHeads * kQKHeadDim + kNumKVHeads * kVHeadDim;
   constexpr int kNumRoundsHalf = ceil_div<kQKHeadDim / 2, kWarpSize>();
   constexpr int kNumItemPerThread = kNumRoundsHalf * 2;
+
+  constexpr int kNumSmemQElemPerRow = kQPerCTA * kQKHeadDim;
+  constexpr int kNumSmemKElemPerRow = kKVPerCTA * kQKHeadDim;
+  constexpr int kNumSmemElemPerRow = kNumSmemQElemPerRow + kNumSmemKElemPerRow;
 
   int tid = threadIdx.x;
   int bid = blockIdx.x;
@@ -104,8 +132,10 @@ __global__ void rope_norm_store_kv_kernel(
   __shared__ float smem_k_norm_w[kQKHeadDim];
   __shared__ int smem_batch_id[kWarpsPerBlock];
   __shared__ int smem_token_pos[kWarpsPerBlock];
+  extern __shared__ DType smem_qkv[];
 
   // ---- Clear blocks: bid >= num_compute_blocks → one block per request -----
+  // Each clear block clears one KV head slice.
   if (bid >= num_compute_blocks) {
     int req_id = bid - num_compute_blocks;
     if (req_id >= num_batch) return;
@@ -122,54 +152,67 @@ __global__ void rope_norm_store_kv_kernel(
     int zero_from = pos_in_block + 1;
     int zero_to = kv_block_size_divider.divisor;
     if (zero_from < zero_to) {
-      // Use all kWarpsPerBlock warps cooperatively to zero rows
-      for (int row = zero_from + iwarp; row < zero_to; row += kWarpsPerBlock) {
-        DType *k_row = kcache_ptr + (int64_t)phys_block_id * (int64_t)kcache_block_offset +
-                       row * (kNumKVHeads * kQKHeadDim);
-        DType *v_row = vcache_ptr + (int64_t)phys_block_id * (int64_t)vcache_block_offset +
-                       row * (kNumKVHeads * kVHeadDim);
-        constexpr int kKItemPerThread = 16 / sizeof(DType);
-        vec_t<DType, kKItemPerThread> zero_vec;
+      constexpr int kKItemPerThread = 16 / sizeof(DType);
+      static_assert(kQKHeadDim % kKItemPerThread == 0,
+                    "kQKHeadDim must be divisible by kKItemPerThread");
+      static_assert(kVHeadDim % kKItemPerThread == 0,
+                    "kVHeadDim must be divisible by kKItemPerThread");
+      vec_t<DType, kKItemPerThread> zero_vec;
 #pragma unroll
-        for (int z = 0; z < kKItemPerThread; ++z) zero_vec[z] = DType(0);
-        for (int idx = ilane * kKItemPerThread; idx < kNumKVHeads * kQKHeadDim;
-             idx += kWarpSize * kKItemPerThread)
-          store(k_row + idx, zero_vec);
-        for (int idx = ilane * kKItemPerThread; idx < kNumKVHeads * kVHeadDim;
-             idx += kWarpSize * kKItemPerThread)
-          store(v_row + idx, zero_vec);
+      for (int z = 0; z < kKItemPerThread; ++z) zero_vec[z] = DType(0);
+      // Each clear block clears the kKVPerCTA KV head slice it owns.
+      for (int row = zero_from + iwarp; row < zero_to; row += kWarpsPerBlock) {
+#pragma unroll
+        for (int h = 0; h < kKVPerCTA; ++h) {
+          int kv_head = kv_head_start + h;
+          DType *k_row = kcache_ptr + (int64_t)phys_block_id * (int64_t)kcache_block_offset +
+                         row * (kNumKVHeads * kQKHeadDim) + kv_head * kQKHeadDim;
+          DType *v_row = vcache_ptr + (int64_t)phys_block_id * (int64_t)vcache_block_offset +
+                         row * (kNumKVHeads * kVHeadDim) + kv_head * kVHeadDim;
+          for (int idx = ilane * kKItemPerThread; idx < kQKHeadDim;
+               idx += kWarpSize * kKItemPerThread)
+            store(k_row + idx, zero_vec);
+          for (int idx = ilane * kKItemPerThread; idx < kVHeadDim;
+               idx += kWarpSize * kKItemPerThread)
+            store(v_row + idx, zero_vec);
+        }
       }
     }
     return;
   }
 
-  // Search q_index to find batch_id
+  // Search q_index to find batch_id.
   int batch_id = 0;
   int token_id = 0;
   int irow = bid * kWarpsPerBlock + iwarp;
 
-  // First kWarpsPerBlock threads do the q_index search for the whole block
+  // Initialize sentinels for padding rows.
   if (tid < kWarpsPerBlock) {
-    int global_row = bid * kWarpsPerBlock + tid;
-    if (global_row < num_rows) {
-      int b = -1;
-      for (int i = 0; i < num_batch; ++i) {
-        if (global_row < q_index_ptr[i + 1]) {
-          b = i;
-          break;
+    smem_batch_id[tid] = -1;
+    smem_token_pos[tid] = -1;
+  }
+  __syncthreads();
+
+  // Each thread claims one batch id and checks whether it covers any of this
+  // block's kWarpsPerBlock rows. q_index segments are non-overlapping so at
+  // most one thread writes each smem[iw].
+  {
+    constexpr int kNumSearchThreads = kWarpSize * kWarpsPerBlock;
+    int num_search_rounds = (num_batch + kNumSearchThreads - 1) / kNumSearchThreads;
+    for (int round = 0; round < num_search_rounds; round++) {
+      int b = round * kNumSearchThreads + tid;
+      if (b < num_batch) {
+        int q_begin = q_index_ptr[b];
+        int q_end = q_index_ptr[b + 1];
+#pragma unroll
+        for (int iw = 0; iw < kWarpsPerBlock; iw++) {
+          int global_row = bid * kWarpsPerBlock + iw;
+          if (q_begin <= global_row && global_row < q_end) {
+            smem_batch_id[iw] = b;
+            smem_token_pos[iw] = global_row + num_seqlen_per_req_ptr[b] - q_index_ptr[b + 1];
+          }
         }
       }
-      if (b >= 0) {
-        smem_batch_id[tid] = b;
-        smem_token_pos[tid] = global_row + num_seqlen_per_req_ptr[b] - q_index_ptr[b + 1];
-      } else {
-        // Padding row: global_row >= q_index[num_batch] (CUDA graph padding)
-        smem_batch_id[tid] = -1;
-        smem_token_pos[tid] = -1;
-      }
-    } else {
-      smem_batch_id[tid] = -1;
-      smem_token_pos[tid] = -1;
     }
   }
 
@@ -184,6 +227,41 @@ __global__ void rope_norm_store_kv_kernel(
       int ioffset = tid * kItemPerThread;
       store(smem_q_norm_w + ioffset, load<float, kItemPerThread>(q_norm_weight_ptr + ioffset));
       store(smem_k_norm_w + ioffset, load<float, kItemPerThread>(k_norm_weight_ptr + ioffset));
+    }
+  }
+
+  // Stage this CTA's Q/K slice into shared memory. V is streamed from global memory.
+  {
+    constexpr int kElemPerThread = 16 / sizeof(DType);
+    static_assert(kNumSmemQElemPerRow % kElemPerThread == 0,
+                  "Q slice must align to packed load width");
+    static_assert(kNumSmemKElemPerRow % kElemPerThread == 0,
+                  "K slice must align to packed load width");
+    constexpr int kQPacks = kNumSmemQElemPerRow / kElemPerThread;
+    constexpr int kKPacks = kNumSmemKElemPerRow / kElemPerThread;
+    constexpr int kQRounds = ceil_div<kQPacks, kWarpSize>();
+    constexpr int kKRounds = ceil_div<kKPacks, kWarpSize>();
+    int irow_local = bid * kWarpsPerBlock + iwarp;
+    if (irow_local < num_rows) {
+      const DType *src_q = in_qkv_ptr + irow_local * kNumElemPerRow + q_head_start * kQKHeadDim;
+      const DType *src_k = in_qkv_ptr + irow_local * kNumElemPerRow + kNumQHeads * kQKHeadDim +
+                           kv_head_start * kQKHeadDim;
+      DType *dst_q = smem_qkv + iwarp * kNumSmemElemPerRow;
+      DType *dst_k = dst_q + kNumSmemQElemPerRow;
+#pragma unroll
+      for (int r = 0; r < kQRounds; ++r) {
+        int ioffset = (r * kWarpSize + ilane) * kElemPerThread;
+        if (ioffset < kNumSmemQElemPerRow) {
+          store(dst_q + ioffset, load<DType, kElemPerThread>(src_q + ioffset));
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < kKRounds; ++r) {
+        int ioffset = (r * kWarpSize + ilane) * kElemPerThread;
+        if (ioffset < kNumSmemKElemPerRow) {
+          store(dst_k + ioffset, load<DType, kElemPerThread>(src_k + ioffset));
+        }
+      }
     }
   }
 
@@ -220,25 +298,23 @@ __global__ void rope_norm_store_kv_kernel(
   DType *v_cache_row_start = vcache_ptr + (int64_t)phys_block_id * (int64_t)vcache_block_offset +
                              block_row * (kNumKVHeads * kVHeadDim);
 
-  const DType *qkv_row = in_qkv_ptr + irow * kNumElemPerRow;
+  // Q/K heads for this CTA are staged in smem_qkv. V is streamed from global memory.
+  const DType *qkv_row_smem = smem_qkv + iwarp * kNumSmemElemPerRow;
+  const DType *qkv_row_global = in_qkv_ptr + irow * kNumElemPerRow;
 
-  // Process Q heads – load from global, optional norm, RoPE, optional norm, store
+  // Process Q heads for this CTA's KV group range:
+  // [q_head_start, q_head_start + kQPerCTA)
 #pragma unroll
-  for (int q_head = 0; q_head < kNumQHeads; ++q_head) {
-    const DType *q_src = qkv_row + q_head * kQKHeadDim;
+  for (int dq = 0; dq < kQPerCTA; ++dq) {
+    int q_head = q_head_start + dq;
+    // Q is indexed by dq within this CTA's Q slice.
+    const DType *q_src = qkv_row_smem + dq * kQKHeadDim;
     DType *q_dst = out_q_ptr + irow * kNumQHeads * kQKHeadDim + q_head * kQKHeadDim;
 
     vec_t<float, kNumItemPerThread> data = {0};
 
-    // Load Q head from global memory directly into registers
-#pragma unroll
-    for (int r = 0; r < kNumRoundsHalf; ++r) {
-      int i = r * kWarpSize + ilane;
-      if (i < kQKHeadDim / 2) {
-        data[r * 2] = __bfloat162float(q_src[i]);
-        data[r * 2 + 1] = __bfloat162float(q_src[i + kQKHeadDim / 2]);
-      }
-    }
+    // Load Q head from shared memory into registers.
+    vectorized_load_neox<kQKHeadDim, kNumItemPerThread, kWarpSize>(data, q_src, ilane);
 
     // norm-then-rope
     if constexpr (kNormPolicy == 2) {
@@ -271,22 +347,16 @@ __global__ void rope_norm_store_kv_kernel(
     }
   }
 
-  // Process K heads – load from global, optional norm, RoPE, optional norm,
-  // write to KV cache (or out_k_ptr if non-null)
+  // Process K heads owned by this CTA: [kv_head_start, kv_head_start + kKVPerCTA)
 #pragma unroll
-  for (int kv_head = 0; kv_head < kNumKVHeads; ++kv_head) {
-    const DType *k_src = qkv_row + kNumQHeads * kQKHeadDim + kv_head * kQKHeadDim;
+  for (int dh = 0; dh < kKVPerCTA; ++dh) {
+    const int kv_head = kv_head_start + dh;
+    // K is indexed by dh within this CTA's K slice.
+    const DType *k_src = qkv_row_smem + kNumSmemQElemPerRow + dh * kQKHeadDim;
 
     vec_t<float, kNumItemPerThread> data = {0};
 
-#pragma unroll
-    for (int r = 0; r < kNumRoundsHalf; ++r) {
-      int i = r * kWarpSize + ilane;
-      if (i < kQKHeadDim / 2) {
-        data[r * 2] = __bfloat162float(k_src[i]);
-        data[r * 2 + 1] = __bfloat162float(k_src[i + kQKHeadDim / 2]);
-      }
-    }
+    vectorized_load_neox<kQKHeadDim, kNumItemPerThread, kWarpSize>(data, k_src, ilane);
 
     if constexpr (kNormPolicy == 2) {
       rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_k_norm_w, ilane);
@@ -320,24 +390,26 @@ __global__ void rope_norm_store_kv_kernel(
     }
   }
 
-  // Process V heads – no RoPE
+  // Process V heads owned by this CTA: [kv_head_start, kv_head_start + kKVPerCTA)
   {
-    constexpr int kNumVElemPerRow = kNumKVHeads * kVHeadDim;
     constexpr int kItemPerThread = 16 / sizeof(DType);
-    static_assert(kNumVElemPerRow % kItemPerThread == 0,
-                  "kNumKVHeads * kVHeadDim must be multiple of kItemPerThread");
-    constexpr int kNumPackPerRow = kNumVElemPerRow / kItemPerThread;
-
-    const DType *v_src = qkv_row + (kNumQHeads + kNumKVHeads) * kQKHeadDim;
-    DType *v_dst =
-        (out_v_ptr != nullptr) ? out_v_ptr + irow * kNumKVHeads * kVHeadDim : v_cache_row_start;
-
-    constexpr int kNumLoadRound = ceil_div<kNumPackPerRow, kWarpSize>();
+    static_assert(kVHeadDim % kItemPerThread == 0, "kVHeadDim must be divisible by kItemPerThread");
+    constexpr int kNumPackPerHead = kVHeadDim / kItemPerThread;
+    constexpr int kNumLoadRound = ceil_div<kNumPackPerHead, kWarpSize>();
 #pragma unroll
-    for (int r = 0; r < kNumLoadRound; ++r) {
-      int ioffset = (r * kWarpSize + ilane) * kItemPerThread;
-      if (ioffset < kNumVElemPerRow) {
-        store(v_dst + ioffset, load<DType, kItemPerThread>(v_src + ioffset));
+    for (int dh = 0; dh < kKVPerCTA; ++dh) {
+      const int kv_head = kv_head_start + dh;
+      const DType *v_src =
+          qkv_row_global + (kNumQHeads + kNumKVHeads) * kQKHeadDim + kv_head * kVHeadDim;
+      DType *v_dst = (out_v_ptr != nullptr)
+                         ? out_v_ptr + irow * kNumKVHeads * kVHeadDim + kv_head * kVHeadDim
+                         : v_cache_row_start + kv_head * kVHeadDim;
+#pragma unroll
+      for (int r = 0; r < kNumLoadRound; ++r) {
+        int ioffset = (r * kWarpSize + ilane) * kItemPerThread;
+        if (ioffset < kVHeadDim) {
+          store(v_dst + ioffset, load<DType, kItemPerThread>(v_src + ioffset));
+        }
       }
     }
   }
@@ -358,11 +430,21 @@ __global__ void rope_norm_store_kv_fp8_kernel(
   using DType = __nv_bfloat16;
   using QType = __nv_fp8_e4m3;
 
+  static_assert(kNumQHeads % kNumKVHeads == 0, "kNumQHeads must be divisible by kNumKVHeads");
+  constexpr int kQPerKV = kNumQHeads / kNumKVHeads;
+  constexpr int kKVPerCTA = 1;
+  constexpr int kQPerCTA = kQPerKV;
+  const int kv_head_start = blockIdx.y;
+  const int q_head_start = kv_head_start * kQPerKV;
+
   constexpr int kWarpSize = 32;
   constexpr int kNumElemPerRow =
       kNumQHeads * kQKHeadDim + kNumKVHeads * kQKHeadDim + kNumKVHeads * kVHeadDim;
   constexpr int kNumRoundsHalf = ceil_div<kQKHeadDim / 2, kWarpSize>();
   constexpr int kNumItemPerThread = kNumRoundsHalf * 2;
+  constexpr int kNumSmemQElemPerRow = kQPerCTA * kQKHeadDim;
+  constexpr int kNumSmemKElemPerRow = kKVPerCTA * kQKHeadDim;
+  constexpr int kNumSmemElemPerRow = kNumSmemQElemPerRow + kNumSmemKElemPerRow;
 
   int tid = threadIdx.x;
   int bid = blockIdx.x;
@@ -375,6 +457,7 @@ __global__ void rope_norm_store_kv_fp8_kernel(
   __shared__ float smem_k_norm_w[kQKHeadDim];
   __shared__ int smem_batch_id[kWarpsPerBlock];
   __shared__ int smem_token_pos[kWarpsPerBlock];
+  extern __shared__ DType smem_qkv[];
 
   // ---- Clear blocks: bid >= num_compute_blocks → one block per request -----
   if (bid >= num_compute_blocks) {
@@ -392,51 +475,62 @@ __global__ void rope_norm_store_kv_fp8_kernel(
     int zero_from = pos_in_block + 1;
     int zero_to = kv_block_size_divider.divisor;
     if (zero_from < zero_to) {
-      for (int row = zero_from + iwarp; row < zero_to; row += kWarpsPerBlock) {
-        QType *k_row = kcache_ptr + (int64_t)phys_block_id * (int64_t)kcache_block_offset +
-                       row * (kNumKVHeads * kQKHeadDim);
-        QType *v_row = vcache_ptr + (int64_t)phys_block_id * (int64_t)vcache_block_offset +
-                       row * (kNumKVHeads * kVHeadDim);
-        constexpr int kKItemPerThread = 16 / sizeof(QType);
-        vec_t<QType, kKItemPerThread> zero_vec;
+      constexpr int kKItemPerThread = 16 / sizeof(QType);
+      static_assert(kQKHeadDim % kKItemPerThread == 0,
+                    "kQKHeadDim must be divisible by kKItemPerThread");
+      static_assert(kVHeadDim % kKItemPerThread == 0,
+                    "kVHeadDim must be divisible by kKItemPerThread");
+      vec_t<QType, kKItemPerThread> zero_vec;
 #pragma unroll
-        for (int z = 0; z < kKItemPerThread; ++z) zero_vec[z] = QType(0);
-        for (int idx = ilane * kKItemPerThread; idx < kNumKVHeads * kQKHeadDim;
-             idx += kWarpSize * kKItemPerThread)
-          store(k_row + idx, zero_vec);
-        for (int idx = ilane * kKItemPerThread; idx < kNumKVHeads * kVHeadDim;
-             idx += kWarpSize * kKItemPerThread)
-          store(v_row + idx, zero_vec);
+      for (int z = 0; z < kKItemPerThread; ++z) zero_vec[z] = QType(0);
+      for (int row = zero_from + iwarp; row < zero_to; row += kWarpsPerBlock) {
+#pragma unroll
+        for (int h = 0; h < kKVPerCTA; ++h) {
+          int kv_head = kv_head_start + h;
+          QType *k_row = kcache_ptr + (int64_t)phys_block_id * (int64_t)kcache_block_offset +
+                         row * (kNumKVHeads * kQKHeadDim) + kv_head * kQKHeadDim;
+          QType *v_row = vcache_ptr + (int64_t)phys_block_id * (int64_t)vcache_block_offset +
+                         row * (kNumKVHeads * kVHeadDim) + kv_head * kVHeadDim;
+          for (int idx = ilane * kKItemPerThread; idx < kQKHeadDim;
+               idx += kWarpSize * kKItemPerThread)
+            store(k_row + idx, zero_vec);
+          for (int idx = ilane * kKItemPerThread; idx < kVHeadDim;
+               idx += kWarpSize * kKItemPerThread)
+            store(v_row + idx, zero_vec);
+        }
       }
     }
     return;
   }
 
-  // Determine batch_id and token position — unified for prefill and decode
+  // Determine batch_id and token position.
   int batch_id = 0;
   int token_id = 0;
   int irow = bid * kWarpsPerBlock + iwarp;
 
   if (tid < kWarpsPerBlock) {
-    int global_row = bid * kWarpsPerBlock + tid;
-    if (global_row < num_rows) {
-      int b = -1;
-      for (int i = 0; i < num_batch; ++i) {
-        if (global_row < q_index_ptr[i + 1]) {
-          b = i;
-          break;
+    smem_batch_id[tid] = -1;
+    smem_token_pos[tid] = -1;
+  }
+  __syncthreads();
+
+  {
+    constexpr int kNumSearchThreads = kWarpSize * kWarpsPerBlock;
+    int num_search_rounds = (num_batch + kNumSearchThreads - 1) / kNumSearchThreads;
+    for (int round = 0; round < num_search_rounds; round++) {
+      int b = round * kNumSearchThreads + tid;
+      if (b < num_batch) {
+        int q_begin = q_index_ptr[b];
+        int q_end = q_index_ptr[b + 1];
+#pragma unroll
+        for (int iw = 0; iw < kWarpsPerBlock; iw++) {
+          int global_row = bid * kWarpsPerBlock + iw;
+          if (q_begin <= global_row && global_row < q_end) {
+            smem_batch_id[iw] = b;
+            smem_token_pos[iw] = global_row + num_seqlen_per_req_ptr[b] - q_index_ptr[b + 1];
+          }
         }
       }
-      if (b >= 0) {
-        smem_batch_id[tid] = b;
-        smem_token_pos[tid] = global_row + num_seqlen_per_req_ptr[b] - q_index_ptr[b + 1];
-      } else {
-        smem_batch_id[tid] = -1;
-        smem_token_pos[tid] = -1;
-      }
-    } else {
-      smem_batch_id[tid] = -1;
-      smem_token_pos[tid] = -1;
     }
   }
 
@@ -453,7 +547,42 @@ __global__ void rope_norm_store_kv_fp8_kernel(
     }
   }
 
-  // Single barrier: makes batch_id, token_pos, and norm weights visible
+  // Stage this CTA's Q/K slice into shared memory. V is streamed from global memory.
+  {
+    constexpr int kElemPerThread = 16 / sizeof(DType);
+    static_assert(kNumSmemQElemPerRow % kElemPerThread == 0,
+                  "Q slice must align to packed load width");
+    static_assert(kNumSmemKElemPerRow % kElemPerThread == 0,
+                  "K slice must align to packed load width");
+    constexpr int kQPacks = kNumSmemQElemPerRow / kElemPerThread;
+    constexpr int kKPacks = kNumSmemKElemPerRow / kElemPerThread;
+    constexpr int kQRounds = ceil_div<kQPacks, kWarpSize>();
+    constexpr int kKRounds = ceil_div<kKPacks, kWarpSize>();
+    int irow_local = bid * kWarpsPerBlock + iwarp;
+    if (irow_local < num_rows) {
+      const DType *src_q = in_qkv_ptr + irow_local * kNumElemPerRow + q_head_start * kQKHeadDim;
+      const DType *src_k = in_qkv_ptr + irow_local * kNumElemPerRow + kNumQHeads * kQKHeadDim +
+                           kv_head_start * kQKHeadDim;
+      DType *dst_q = smem_qkv + iwarp * kNumSmemElemPerRow;
+      DType *dst_k = dst_q + kNumSmemQElemPerRow;
+#pragma unroll
+      for (int r = 0; r < kQRounds; ++r) {
+        int ioffset = (r * kWarpSize + ilane) * kElemPerThread;
+        if (ioffset < kNumSmemQElemPerRow) {
+          store(dst_q + ioffset, load<DType, kElemPerThread>(src_q + ioffset));
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < kKRounds; ++r) {
+        int ioffset = (r * kWarpSize + ilane) * kElemPerThread;
+        if (ioffset < kNumSmemKElemPerRow) {
+          store(dst_k + ioffset, load<DType, kElemPerThread>(src_k + ioffset));
+        }
+      }
+    }
+  }
+
+  // Single barrier: makes batch_id, token_pos, norm weights, and Q/K smem visible.
   __syncthreads();
 
   // Early-exit for invalid/padding rows
@@ -485,24 +614,21 @@ __global__ void rope_norm_store_kv_fp8_kernel(
   QType *v_cache_row_start = vcache_ptr + (int64_t)phys_block_id * (int64_t)vcache_block_offset +
                              block_row * (kNumKVHeads * kVHeadDim);
 
-  const DType *qkv_row = in_qkv_ptr + irow * kNumElemPerRow;
+  // Q/K heads for this CTA are staged in smem_qkv. V is streamed from global memory.
+  const DType *qkv_row_smem = smem_qkv + iwarp * kNumSmemElemPerRow;
+  const DType *qkv_row_global = in_qkv_ptr + irow * kNumElemPerRow;
 
-  // ========= Process Q heads =========
+  // ========= Process Q heads for this CTA's KV group range =========
 #pragma unroll
-  for (int q_head = 0; q_head < kNumQHeads; ++q_head) {
-    const DType *q_src = qkv_row + q_head * kQKHeadDim;
+  for (int dq = 0; dq < kQPerCTA; ++dq) {
+    int q_head = q_head_start + dq;
+    // Q is indexed by dq within this CTA's Q slice.
+    const DType *q_src = qkv_row_smem + dq * kQKHeadDim;
     QType *q_dst = out_q_ptr + irow * kNumQHeads * kQKHeadDim + q_head * kQKHeadDim;
 
     vec_t<float, kNumItemPerThread> data = {0};
 
-#pragma unroll
-    for (int r = 0; r < kNumRoundsHalf; ++r) {
-      int i = r * kWarpSize + ilane;
-      if (i < kQKHeadDim / 2) {
-        data[r * 2] = __bfloat162float(q_src[i]);
-        data[r * 2 + 1] = __bfloat162float(q_src[i + kQKHeadDim / 2]);
-      }
-    }
+    vectorized_load_neox<kQKHeadDim, kNumItemPerThread, kWarpSize>(data, q_src, ilane);
 
     if constexpr (kNormPolicy == 2) {
       rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_q_norm_w, ilane);
@@ -529,18 +655,15 @@ __global__ void rope_norm_store_kv_fp8_kernel(
       float q_scale_val = max_abs / upper_max;
       if (ilane == 0) {
         if (is_prefill) {
-          // Prefill layout: [batch_id, q_head, tok_in_chunk]
           int tok_in_chunk = irow - q_index_ptr[batch_id];
           q_scale_ptr[batch_id * kNumQHeads * max_seqlen_aligned + q_head * max_seqlen_aligned +
                       tok_in_chunk] = q_scale_val;
         } else {
-          // Decode layout: [irow, q_head]
           q_scale_ptr[irow * kNumQHeads + q_head] = q_scale_val;
         }
       }
       q_mult = __frcp_rn(q_scale_val);
     } else if constexpr (kQuantPolicy == 2) {
-      // sqskv: static per-tensor
       q_mult = q_scale_inv_ptr[0];
     }
 
@@ -555,85 +678,90 @@ __global__ void rope_norm_store_kv_fp8_kernel(
     }
   }
 
-  // ========= Process K heads =========
-  float k_scale_inv = __frcp_rn(k_scale_ptr[0]);
+  // ========= Process K heads owned by this CTA =========
+  {
+    float k_scale_inv = __frcp_rn(k_scale_ptr[0]);
+
+    // Zero split_k_flag once per (batch, kv_head). Only the CTA carrying the
+    // first row of this batch writes it, to avoid repeated writes.
+    if (irow == q_index_ptr[batch_id] && ilane == 0) {
 #pragma unroll
-  for (int kv_head = 0; kv_head < kNumKVHeads; ++kv_head) {
-    const DType *k_src = qkv_row + kNumQHeads * kQKHeadDim + kv_head * kQKHeadDim;
-
-    // Zero split_k_flag inside K loop
-    if (ilane == 0) {
-      split_k_flag_ptr[batch_id * kNumKVHeads + kv_head] = 0;
-    }
-
-    vec_t<float, kNumItemPerThread> data = {0};
-
-#pragma unroll
-    for (int r = 0; r < kNumRoundsHalf; ++r) {
-      int i = r * kWarpSize + ilane;
-      if (i < kQKHeadDim / 2) {
-        data[r * 2] = __bfloat162float(k_src[i]);
-        data[r * 2 + 1] = __bfloat162float(k_src[i + kQKHeadDim / 2]);
+      for (int dh = 0; dh < kKVPerCTA; ++dh) {
+        split_k_flag_ptr[batch_id * kNumKVHeads + kv_head_start + dh] = 0;
       }
     }
 
-    if constexpr (kNormPolicy == 2) {
-      rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_k_norm_w, ilane);
-    }
-
 #pragma unroll
-    for (int r = 0; r < kNumRoundsHalf; ++r) {
-      int i = r * kWarpSize + ilane;
-      if (i < kQKHeadDim / 2) {
-        rope_rotate_pair(data[r * 2], data[r * 2 + 1], smem_cos_sin[iwarp][i],
-                         smem_cos_sin[iwarp][i + kQKHeadDim / 2]);
+    for (int dh = 0; dh < kKVPerCTA; ++dh) {
+      const int kv_head = kv_head_start + dh;
+      // K is indexed by dh within this CTA's K slice.
+      const DType *k_src = qkv_row_smem + kNumSmemQElemPerRow + dh * kQKHeadDim;
+
+      vec_t<float, kNumItemPerThread> data = {0};
+
+      vectorized_load_neox<kQKHeadDim, kNumItemPerThread, kWarpSize>(data, k_src, ilane);
+
+      if constexpr (kNormPolicy == 2) {
+        rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_k_norm_w, ilane);
       }
-    }
-
-    if constexpr (kNormPolicy == 1) {
-      rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_k_norm_w, ilane);
-    }
-
-    QType *k_dst = (out_k_ptr != nullptr)
-                       ? out_k_ptr + irow * kNumKVHeads * kQKHeadDim + kv_head * kQKHeadDim
-                       : k_cache_row_start + kv_head * kQKHeadDim;
 
 #pragma unroll
-    for (int r = 0; r < kNumRoundsHalf; ++r) {
-      int i = r * kWarpSize + ilane;
-      if (i < kQKHeadDim / 2) {
-        k_dst[i] = QType(data[r * 2] * k_scale_inv);
-        k_dst[i + kQKHeadDim / 2] = QType(data[r * 2 + 1] * k_scale_inv);
+      for (int r = 0; r < kNumRoundsHalf; ++r) {
+        int i = r * kWarpSize + ilane;
+        if (i < kQKHeadDim / 2) {
+          rope_rotate_pair(data[r * 2], data[r * 2 + 1], smem_cos_sin[iwarp][i],
+                           smem_cos_sin[iwarp][i + kQKHeadDim / 2]);
+        }
+      }
+
+      if constexpr (kNormPolicy == 1) {
+        rms_norm_apply<kNumItemPerThread, kQKHeadDim>(data, smem_k_norm_w, ilane);
+      }
+
+      QType *k_dst = (out_k_ptr != nullptr)
+                         ? out_k_ptr + irow * kNumKVHeads * kQKHeadDim + kv_head * kQKHeadDim
+                         : k_cache_row_start + kv_head * kQKHeadDim;
+
+#pragma unroll
+      for (int r = 0; r < kNumRoundsHalf; ++r) {
+        int i = r * kWarpSize + ilane;
+        if (i < kQKHeadDim / 2) {
+          k_dst[i] = QType(data[r * 2] * k_scale_inv);
+          k_dst[i + kQKHeadDim / 2] = QType(data[r * 2 + 1] * k_scale_inv);
+        }
       }
     }
   }
 
-  // ========= Process V heads (no RoPE, bf16→fp8) =========
+  // ========= Process V heads owned by this CTA (no RoPE, bf16→fp8) =========
   {
     float v_scale_inv = __frcp_rn(v_scale_ptr[0]);
     using LoadDType = __nv_bfloat162;
     using PackQType = __nv_fp8x4_e4m3;
-    constexpr int kNumVElemPerRow = kNumKVHeads * kVHeadDim;
     constexpr int kItemPerThread = 16 / sizeof(DType);
-    static_assert(kNumVElemPerRow % kItemPerThread == 0, "");
-    constexpr int kNumPackPerRow = kNumVElemPerRow / kItemPerThread;
-
-    const DType *v_src = qkv_row + (kNumQHeads + kNumKVHeads) * kQKHeadDim;
-    QType *v_dst = (out_v_ptr != nullptr) ? out_v_ptr + irow * kNumKVHeads * kVHeadDim
-                                          : reinterpret_cast<QType *>(v_cache_row_start);
-
-    constexpr int kNumLoadRound = ceil_div<kNumPackPerRow, kWarpSize>();
+    static_assert(kVHeadDim % kItemPerThread == 0, "kVHeadDim must be divisible by kItemPerThread");
+    constexpr int kNumPackPerHead = kVHeadDim / kItemPerThread;
+    constexpr int kNumLoadRound = ceil_div<kNumPackPerHead, kWarpSize>();
 #pragma unroll
-    for (int r = 0; r < kNumLoadRound; ++r) {
-      int ioffset = (r * kWarpSize + ilane) * kItemPerThread;
-      if (ioffset < kNumVElemPerRow) {
-        auto vec_bf162 = load<LoadDType, kItemPerThread / 2>(v_src + ioffset);
-        auto vec_float = to<float>(vec_bf162);
+    for (int dh = 0; dh < kKVPerCTA; ++dh) {
+      const int kv_head = kv_head_start + dh;
+      const DType *v_src =
+          qkv_row_global + (kNumQHeads + kNumKVHeads) * kQKHeadDim + kv_head * kVHeadDim;
+      QType *v_dst = (out_v_ptr != nullptr)
+                         ? out_v_ptr + irow * kNumKVHeads * kVHeadDim + kv_head * kVHeadDim
+                         : reinterpret_cast<QType *>(v_cache_row_start) + kv_head * kVHeadDim;
 #pragma unroll
-        for (int i = 0; i < size(vec_float); i++) {
-          vec_float[i] = vec_float[i] * v_scale_inv;
+      for (int r = 0; r < kNumLoadRound; ++r) {
+        int ioffset = (r * kWarpSize + ilane) * kItemPerThread;
+        if (ioffset < kVHeadDim) {
+          auto vec_bf162 = load<LoadDType, kItemPerThread / 2>(v_src + ioffset);
+          auto vec_float = to<float>(vec_bf162);
+#pragma unroll
+          for (int i = 0; i < size(vec_float); i++) {
+            vec_float[i] = vec_float[i] * v_scale_inv;
+          }
+          store(v_dst + ioffset, to<PackQType>(vec_float));
         }
-        store(v_dst + ioffset, to<PackQType>(vec_float));
       }
     }
   }
@@ -656,13 +784,23 @@ void launch_rope_norm_store_kv(__nv_bfloat16 *out_q_ptr, __nv_bfloat16 *kcache_p
   constexpr int kWarpSize = 32;
 
   int num_compute_blocks = (num_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  int num_grid_x = num_compute_blocks + num_batch;
+
+  // Each blockIdx.y processes one KV head and its corresponding Q heads.
   dim3 block(kWarpsPerBlock * kWarpSize);
-  dim3 grid(num_compute_blocks + num_batch);  // compute blocks + 1 clear block per request
+  dim3 grid(num_grid_x, kNumKVHeads);
 
   auto launch = [&](auto norm_tag) {
     constexpr int kNP = decltype(norm_tag)::value;
-    kernels::rope_norm_store_kv_kernel<kWarpsPerBlock, kNumQHeads, kNumKVHeads, kQKHeadDim,
-                                       kVHeadDim, kNP><<<grid, block, 0, stream>>>(
+    constexpr int kQPerKV = kNumQHeads / kNumKVHeads;
+    constexpr int kNumSmemElemPerRow = (kQPerKV + 1) * kQKHeadDim;
+    constexpr int kDynSmemBytes = kWarpsPerBlock * kNumSmemElemPerRow * sizeof(__nv_bfloat16);
+    auto *kernel = kernels::rope_norm_store_kv_kernel<kWarpsPerBlock, kNumQHeads, kNumKVHeads,
+                                                      kQKHeadDim, kVHeadDim, kNP>;
+    if constexpr (kDynSmemBytes > 48 * 1024) {
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kDynSmemBytes);
+    }
+    kernel<<<grid, block, kDynSmemBytes, stream>>>(
         out_q_ptr, kcache_ptr, vcache_ptr, out_k_ptr, out_v_ptr, in_qkv_ptr, cos_sin_ptr,
         num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr, q_norm_weight_ptr,
         k_norm_weight_ptr, kcache_block_offset, vcache_block_offset, num_batch,
@@ -727,14 +865,24 @@ void launch_rope_norm_store_kv_fp8(
   constexpr int kWarpSize = 32;
 
   int num_compute_blocks = (num_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  int num_grid_x = num_compute_blocks + num_batch;
+
+  // Each blockIdx.y processes one KV head and its corresponding Q heads.
   dim3 block(kWarpsPerBlock * kWarpSize);
-  dim3 grid(num_compute_blocks + num_batch);
+  dim3 grid(num_grid_x, kNumKVHeads);
 
   auto launch = [&](auto quant_tag, auto norm_tag) {
     constexpr int kQP = decltype(quant_tag)::value;
     constexpr int kNP = decltype(norm_tag)::value;
-    kernels::rope_norm_store_kv_fp8_kernel<kQP, kWarpsPerBlock, kNumQHeads, kNumKVHeads, kQKHeadDim,
-                                           kVHeadDim, kNP><<<grid, block, 0, stream>>>(
+    constexpr int kQPerKV = kNumQHeads / kNumKVHeads;
+    constexpr int kNumSmemElemPerRow = (kQPerKV + 1) * kQKHeadDim;
+    constexpr int kDynSmemBytes = kWarpsPerBlock * kNumSmemElemPerRow * sizeof(__nv_bfloat16);
+    auto *kernel = kernels::rope_norm_store_kv_fp8_kernel<kQP, kWarpsPerBlock, kNumQHeads,
+                                                          kNumKVHeads, kQKHeadDim, kVHeadDim, kNP>;
+    if constexpr (kDynSmemBytes > 48 * 1024) {
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kDynSmemBytes);
+    }
+    kernel<<<grid, block, kDynSmemBytes, stream>>>(
         out_q_ptr, kcache_ptr, vcache_ptr, out_k_ptr, out_v_ptr, split_k_flag_ptr, q_scale_ptr,
         in_qkv_ptr, cos_sin_ptr, num_seqlen_per_req_ptr, q_index_ptr, kvcache_indices_ptr,
         q_norm_weight_ptr, k_norm_weight_ptr, k_scale_ptr, v_scale_ptr, q_scale_inv_ptr, upper_max,

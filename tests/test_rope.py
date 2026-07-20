@@ -330,6 +330,7 @@ def test_rope_norm_store_kv_fp8(
 
     assert split_k_flag.shape == (num_seqlen.shape[0], num_kv_heads)
     assert split_k_flag.dtype == torch.int32
+    assert torch.all(split_k_flag[:num_req] == 0)
 
     if quant_policy == 1:  # dqskv: kernel computes dynamic per-token per-head scale
         if is_prefill:
