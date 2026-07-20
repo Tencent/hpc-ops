@@ -365,9 +365,6 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
       actual_intermediate_size > 0 && actual_intermediate_size <= 512 &&
       actual_intermediate_size % 64 == 0 && hidden_size % 64 == 0;
   if (use_small_batch_route_mma) {
-    // Route-direct work stays close to the number of active experts for B<=4.
-    // Split the long Gate/Up K dimension only when more CTAs are needed to
-    // provide roughly four waves of work; all other shapes use the normal path.
     const int64_t num_routes = static_cast<int64_t>(num_seq) * num_topk;
     int num_splits = 1;
     if (hidden_size > 2048) {
@@ -551,8 +548,6 @@ torch::Tensor fuse_moe_blockwise_entry(
               "gate_up_weight must be per 128 blockwise quant and must be aligned to 4");
   TORCH_CHECK(down_weight_scale.size(1) == down_weight.size(1) / 128,
               "down_weight must be per 128 blockwise quant");
-  TORCH_CHECK(down_weight_scale.size(2) == (down_weight.size(2) / 128 + 3) / 4 * 4,
-              "down_weight must be per 128 blockwise quant and must be aligned to 4");
 
   const void *shared_output_ptr = nullptr;
   if (shared_output.has_value()) {
@@ -579,22 +574,18 @@ torch::Tensor fuse_moe_blockwise_entry(
 
   TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
 
-  // Small decode batches do not have enough rows per expert to amortize routing
-  // and task-map construction. The route-direct path applies each 128-element
-  // activation/weight scale while accumulating FP8 WGMMA results.
-  TORCH_CHECK(intermediate_size % 2 == 0,
-              "gate_up_weight output dimension must be even");
   const int actual_intermediate_size = intermediate_size / 2;
-  TORCH_CHECK(actual_intermediate_size > 0,
-              "intermediate_size must be positive");
-  TORCH_CHECK(down_weight.size(1) == hidden_size &&
-                  down_weight.size(2) == actual_intermediate_size,
-              "down_weight shape must be [num_expert, hidden_size, intermediate_size]");
   const bool use_small_batch_route_mma =
       num_tokens > 0 && num_tokens <= 4 && num_topk == 8 && hidden_size <= 4096 &&
       actual_intermediate_size >= 128 && actual_intermediate_size <= 768 &&
       hidden_size % 128 == 0 &&
       actual_intermediate_size % 64 == 0;
+  const int down_weight_scale_num_blocks =
+      use_small_batch_route_mma ? (actual_intermediate_size + 127) / 128
+                                : actual_intermediate_size / 128;
+  TORCH_CHECK(down_weight_scale.size(2) ==
+                  (down_weight_scale_num_blocks + 3) / 4 * 4,
+              "down_weight must be per 128 blockwise quant and must be aligned to 4");
 
   auto options = x.options();
   torch::Tensor y;
