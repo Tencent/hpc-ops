@@ -159,15 +159,16 @@ bool smallm_bf16_dim128_static_async(
   constexpr int kTileK = 128;
   constexpr int kTileV = 128;
 
+  int heads_per_group = num_head_q / num_head_k;
+
   if (num_dim_qk != kTileK || num_dim_v != kTileV || (block_size != 32 && block_size != 64) ||
-      (splitk != 1 && splitk != 4 && splitk != 16)) {
+      (splitk != 1 && splitk != 4 && splitk != 16) || heads_per_group > 8) {
     std::cout << "launch launch_attention_decode_bf16_dim128_smallm failed with "
               << "  num_dim_qk: " << num_dim_qk << ", num_dim_v: " << num_dim_v
-              << ", block_size:" << block_size << std::endl;
+              << ", block_size:" << block_size << ", heads_per_group:" << heads_per_group
+              << std::endl;
     return false;
   }
-
-  int heads_per_group = num_head_q / num_head_k;
 
   auto launch = [&](auto splitk_tag, auto min_len_tag, auto tilem_tag, auto block_size_tag) {
     constexpr int kSplitK = decltype(splitk_tag)::value;

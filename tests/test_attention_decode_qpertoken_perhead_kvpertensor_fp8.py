@@ -264,7 +264,20 @@ def attention_decode_fp8_test_func(
 @pytest.mark.parametrize("num_seq_q", [1, 2, 3, 4])
 @pytest.mark.parametrize("max_seq_kv", [1024, 4096])
 @pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("kv_head_q_head", [(1, 8), (4, 32)])
+@pytest.mark.parametrize(
+    "kv_head_q_head",
+    [
+        (8, 8),   # heads_per_group=1
+        (8, 16),  # heads_per_group=2
+        (8, 24),  # heads_per_group=3
+        (1, 4),   # heads_per_group=4
+        (8, 40),  # heads_per_group=5
+        (4, 24),  # heads_per_group=6
+        (4, 28),  # heads_per_group=7
+        (1, 8),   # heads_per_group=8
+        (4, 32),  # heads_per_group=8
+    ],
+)
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("new_kv_included", [True])
 @pytest.mark.parametrize("use_output", [False])
