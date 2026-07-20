@@ -469,10 +469,12 @@ __device__ __forceinline__ void permute_v_sv_gemm(TiledMmaSV& tiled_mma_sv, Tens
                                                   TensorV& tVr, TensorY& tYr, TensorVV& v,
                                                   TensorVVt& vt, int iwarpgroup) {
   using namespace cute;  // NOLINT
-  warpgroup_fence_operand(tYr);
+  auto tOr = make_fragment_like(tYr);
+  warpgroup_fence_operand(tOr);
 
 #pragma unroll
   for (int iv = 0; iv < size<1>(tVr); iv++) {
+    tiled_mma_sv.accumulate_ = GMMA::ScaleOut::Zero;
 #pragma unroll
     for (int in = 0; in < size<2>(tVr); in++) {
       vt(0, iv, in) = __byte_perm(v(0, iv, in), v(1, iv, in), 0x6240);
@@ -482,9 +484,18 @@ __device__ __forceinline__ void permute_v_sv_gemm(TiledMmaSV& tiled_mma_sv, Tens
       vt(3, iv, in) = __byte_perm(v(2, iv, in), v(3, iv, in), 0x7351);
 
       warpgroup_arrive();
-      cute::gemm(tiled_mma_sv, tVr(_, iv, in), tSr(_, 0, in, iwarpgroup), tYr(_, iv, 0));
+      cute::gemm(tiled_mma_sv, tVr(_, iv, in), tSr(_, 0, in, iwarpgroup), tOr(_, iv, 0));
       warpgroup_commit_batch();
+      tiled_mma_sv.accumulate_ = GMMA::ScaleOut::One;
     }
+  }
+
+  warpgroup_wait<0>();
+  warpgroup_fence_operand(tOr);
+
+#pragma unroll
+  for (int i = 0; i < size(tYr); ++i) {
+    tYr(i) += tOr(i);
   }
 }
 
