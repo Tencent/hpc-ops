@@ -25,14 +25,24 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fused_rmsnorm_with_scale
               "input and weight must be bfloat16.");
 
   torch::Tensor output = torch::empty_like(input, torch::kFloat8_e4m3fn);
-  torch::Tensor output_fp32 = torch::empty_like(input, torch::kFloat32);
-  torch::Tensor output_scale2 = torch::empty_like(input, torch::kFloat8_e4m3fn);
 
+  // output_fp32 / output_scale2 are only produced (and only read by the Python
+  // wrapper) on the MoE path; on the non-MoE path they are unused, so allocate
+  // zero-element placeholders instead of full input-sized buffers (the fp32 one
+  // is 4x the input bytes) to drop that per-call allocation cost.
+  torch::Tensor output_fp32;
+  torch::Tensor output_scale2;
   void *output_fp32_ptr = nullptr;
   void *output_scale2_ptr = nullptr;
   if (is_moe) {
+    output_fp32 = torch::empty_like(input, torch::kFloat32);
+    output_scale2 = torch::empty_like(input, torch::kFloat8_e4m3fn);
     output_fp32_ptr = output_fp32.mutable_data_ptr();
     output_scale2_ptr = output_scale2.mutable_data_ptr();
+  } else {
+    auto opts = input.options();
+    output_fp32 = torch::empty({0}, opts.dtype(torch::kFloat32));
+    output_scale2 = torch::empty({0}, opts.dtype(torch::kFloat8_e4m3fn));
   }
 
   int hidden_state = input.size(input.dim() - 1);
