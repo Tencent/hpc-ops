@@ -11,7 +11,7 @@ Default workloads:
 Recommended command:
     python3 benchmark/attention_decode/bench_attention_decode_bf16.py --csv attention_decode_bf16.csv
 
-The benchmark compares HPC static split-k, HPC dynamic task map, FlashAttention,
+The benchmark compares HPC static split-k, HPC dynamic task map, FlashAttention-3,
 and FlashInfer. Latency is reported in microseconds per operator call.
 """
 from __future__ import annotations
@@ -45,6 +45,24 @@ DEFAULT_KV_HEADS = 1
 DEFAULT_Q_HEADS = 8
 
 METHODS = ("static", "dynamic", "flashattn", "flashinfer")
+
+
+def _import_fa3_kvcache():
+    """Import FA3 flash_attn_with_kvcache."""
+    try:
+        from flash_attn_interface import flash_attn_with_kvcache
+
+        return flash_attn_with_kvcache
+    except Exception:
+        pass
+    try:
+        from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache
+
+        return flash_attn_with_kvcache
+    except Exception as e:
+        raise ImportError(
+            "FlashAttention-3 is required for --methods flashattn. "
+        ) from e
 
 
 CASES = {
@@ -152,7 +170,8 @@ def run_kernel(inputs: Inputs, task_map: torch.Tensor | None = None) -> torch.Te
 
 
 def make_flashattn_fn(inputs: Inputs, num_head_kv: int, head_dim: int) -> Callable[[], None]:
-    from flash_attn.flash_attn_interface import flash_attn_with_kvcache
+    """FA3 BF16 decode with paged KV cache."""
+    flash_attn_with_kvcache = _import_fa3_kvcache()
 
     nblocks_fa = (inputs.kv_lens + FA_BLOCK_SIZE - 1) // FA_BLOCK_SIZE
     max_num_blocks_fa = int(nblocks_fa.sum().item() * 1.2) + inputs.num_batch + 4
@@ -163,11 +182,11 @@ def make_flashattn_fn(inputs: Inputs, num_head_kv: int, head_dim: int) -> Callab
     v_cache_fa = torch.randn(
         max_num_blocks_fa, FA_BLOCK_SIZE, num_head_kv, head_dim, dtype=torch.bfloat16, device="cuda"
     )
-    block_table_fa = torch.zeros(inputs.num_batch, max_pages, dtype=torch.int32, device="cuda")
+    page_table = torch.zeros(inputs.num_batch, max_pages, dtype=torch.int32, device="cuda")
     offset = 0
     for i in range(inputs.num_batch):
         nb = int(nblocks_fa[i])
-        block_table_fa[i, :nb] = torch.arange(offset, offset + nb, dtype=torch.int32, device="cuda")
+        page_table[i, :nb] = torch.arange(offset, offset + nb, dtype=torch.int32, device="cuda")
         offset += nb
     q_fa = inputs.q.unsqueeze(1)
     cache_seqlens = inputs.kv_lens.to(torch.int32)
@@ -178,7 +197,7 @@ def make_flashattn_fn(inputs: Inputs, num_head_kv: int, head_dim: int) -> Callab
             k_cache=k_cache_fa,
             v_cache=v_cache_fa,
             cache_seqlens=cache_seqlens,
-            block_table=block_table_fa,
+            page_table=page_table,
             causal=True,
         )
 
@@ -526,7 +545,7 @@ def print_table(rows: list[dict]) -> None:
     print("")
     print("=" * width)
     print(
-        "Attention Decode BF16 dynamic scheduling | latency in us (lower is better); x/* = baseline / dynamic"
+        "Attention Decode BF16 | HPC vs FA3/FlashInfer | latency in us; x/* = baseline / dynamic"
     )
     print("-" * width)
     print(
@@ -565,7 +584,7 @@ def write_jsonl(path: str, rows: list[dict]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark Attention Decode BF16: HPC static/dynamic vs FlashAttention/FlashInfer."
+        description="Benchmark Attention Decode BF16: HPC static/dynamic vs FlashAttention-3/FlashInfer."
     )
     parser.add_argument("--cases", nargs="+", default=list(CASES), choices=list(CASES))
     parser.add_argument("--methods", nargs="+", default=list(METHODS), choices=list(METHODS))

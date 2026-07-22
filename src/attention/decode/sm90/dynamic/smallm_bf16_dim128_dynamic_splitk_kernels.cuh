@@ -214,11 +214,10 @@ __global__ void smallm_attention_decode_bf16_dynamic_splitk_kernel(
 
     auto gI = make_identity_tensor(gAtt.shape());
     auto tI = thr_mma_qk.partition_C(gI);
-
     auto tI_nm = retile_fragment(tI);
     auto tYr_nm = retile_fragment(tYr);
-
     auto tAttr_nm = retile_fragment(tAttr);
+
     constexpr int kN = size<0>(tAttr_nm);
     constexpr int kM = size<1>(tAttr_nm);
     Tensor gMax = make_tensor<float>(Int<kM>{});
@@ -261,7 +260,6 @@ __global__ void smallm_attention_decode_bf16_dynamic_splitk_kernel(
       clear(gSum);
       fill(gMax, -std::numeric_limits<float>::infinity());
       fill(gSoftmaxScale, one_over_dk_log2e);
-
       clear(tYr);
       tiled_mma_sv.accumulate_ = GMMA::ScaleOut::One;
 
@@ -271,76 +269,60 @@ __global__ void smallm_attention_decode_bf16_dynamic_splitk_kernel(
 #pragma unroll 1
       for (int itile_seq_kv = num_tile_full; itile_seq_kv < num_tile_kv; ++itile_seq_kv) {
         wait_barrier(k_readable[istage_kv], phase_kv);
-
         qk_gemm(tiled_mma_qk, tQr, tKr, tAttr, istage_kv);
-
         if (is_leader) {
           arrive_barrier(k_writable[istage_kv]);
         }
 
         apply_casual_mask<kTileN, kHeadsPerGroup>(tAttr_nm, tI_nm, itile_seq_kv, num_seq_kvcache,
                                                   num_seq_kv);
-
         online_softmax<true, kTileM>(tAttr_nm, gMax, gSum, tYr_nm, gSoftmaxScale, shm_max,
                                      kIWarpgroup, iwarp, ilane);
-
         cast_fp32reg<Tin>(tAttr, tAttAbf16);
         cute::copy(tiled_copy_P_r2s, tPr4s, tPs4r);
 
         wait_barrier(v_readable[istage_kv], phase_kv);
         cutlass::arch::fence_view_async_shared();
         syncwarpgroup(kIWarpgroup);
-
         sv_gemm(tiled_mma_sv, tSr, tVr, tYr, istage_kv);
-
         if (is_leader) {
           arrive_barrier(v_writable[istage_kv]);
         }
-
         advance_stage<kStage>(istage_kv, phase_kv);
       }
 
 #pragma unroll 1
       for (int itile_seq_kv = 0; itile_seq_kv < num_tile_full; ++itile_seq_kv) {
         wait_barrier(k_readable[istage_kv], phase_kv);
-
         qk_gemm(tiled_mma_qk, tQr, tKr, tAttr, istage_kv);
-
         if (is_leader) {
           arrive_barrier(k_writable[istage_kv]);
         }
 
         online_softmax<false, kTileM>(tAttr_nm, gMax, gSum, tYr_nm, gSoftmaxScale, shm_max,
                                       kIWarpgroup, iwarp, ilane);
-
         cast_fp32reg<Tin>(tAttr, tAttAbf16);
         cute::copy(tiled_copy_P_r2s, tPr4s, tPs4r);
 
         wait_barrier(v_readable[istage_kv], phase_kv);
         cutlass::arch::fence_view_async_shared();
         syncwarpgroup(kIWarpgroup);
-
         sv_gemm(tiled_mma_sv, tSr, tVr, tYr, istage_kv);
-
         if (is_leader) {
           arrive_barrier(v_writable[istage_kv]);
         }
-
         advance_stage<kStage>(istage_kv, phase_kv);
       }
 
       final_online_softmax<kTileM>(tYr_nm, gSum, shm_max, kIWarpgroup, iwarp, ilane);
-
       store_output<true, 1>(tiled_copy_SplitY_r2s, tma_splity, tYr, sSplitY, gSplitY, ihead_kv,
                             ibatch, ichunk, num_seq_q, idx, kIWarpgroup, is_leader);
       store_lse(lse_batch, gMax, gSum, heads_per_group, ilane, iwarp);
-
       tma_store_wait<0>();
 
       if (is_leader) {
         arrive_barrier(q_writable);
       }
-
       block_task_ptr += kTaskStride;
     }
   }

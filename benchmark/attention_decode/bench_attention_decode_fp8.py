@@ -11,8 +11,12 @@ Default workloads:
 Recommended command:
     python3 benchmark/attention_decode/bench_attention_decode_fp8.py --csv attention_decode_fp8.csv
 
-The benchmark compares static split-k with the dynamic task map used by the
-SM90 FP8 decode kernels. Latency is reported in microseconds per operator call.
+Quantization:
+    - HPC static/dynamic: qpertoken_perhead + kvpertensor
+    - FlashAttention-3 / FlashInfer: qkvpertensor (scalar per-tensor scales)
+
+The benchmark compares HPC static split-k, HPC dynamic task map, FlashAttention-3,
+and FlashInfer. Latency is reported in microseconds per operator call.
 """
 from __future__ import annotations
 
@@ -26,8 +30,8 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import mean, median
-from typing import Iterable
+from statistics import median
+from typing import Callable, Iterable
 
 import torch
 
@@ -38,15 +42,16 @@ import hpc  # noqa: E402
 
 
 BLOCK_SIZE = 64
+FA_BLOCK_SIZE = 256
 DEFAULT_NUM_SEQ_Q = 1
 DEFAULT_HEAD_DIM = 128
 DEFAULT_KV_HEADS = 1
 DEFAULT_Q_HEADS = 8
 
-QUANT_TYPES = {
-    "qkpertoken_perhead_vperhead": hpc.QuantType.QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD,
-    "qpertoken_perhead_kvpertensor": hpc.QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR,
-}
+# HPC path: Q per-token-per-head, K/V per-tensor.
+HPC_QUANT_TYPE = hpc.QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR
+
+METHODS = ("static", "dynamic", "flashattn", "flashinfer")
 
 
 CASES = {
@@ -77,45 +82,22 @@ class Inputs:
     max_seq_kv: int
 
 
-def quant_paged_cache_pertoken(
-    cache: torch.Tensor, block_size: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    num_blocks = cache.shape[0]
-    head_dim = cache.shape[-1]
-    num_head_kv = cache.shape[-2]
-    scale = cache[:, :block_size, :, :].float().abs().max(-1)[0].clamp_min(1e-6) / 448
-    cache_fp8 = torch.empty_like(cache, dtype=torch.float8_e4m3fn)
-    cache_fp8[:, :block_size, :, :] = (cache[:, :block_size, :, :] / scale[:, :, :, None]).to(
-        torch.float8_e4m3fn
-    )
-    scale = (
-        scale.permute(0, 2, 1)
-        .contiguous()
-        .view(torch.float8_e4m3fn)
-        .reshape(num_blocks, num_head_kv, -1, head_dim)
-        .permute(0, 2, 1, 3)
-        .contiguous()
-    )
-    cache_fp8[:, block_size:, :, :] = scale
-    return cache_fp8, cache_fp8[:, block_size:, :, :]
+def _import_fa3_kvcache():
+    """Import FA3 flash_attn_with_kvcache (supports FP8 + q/k/v_descale)."""
+    try:
+        from flash_attn_interface import flash_attn_with_kvcache
 
+        return flash_attn_with_kvcache
+    except Exception:
+        pass
+    try:
+        from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache
 
-def quant_paged_cache_perhead(
-    cache: torch.Tensor, block_size: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    num_head_kv = cache.shape[-2]
-    scale = (
-        cache[:, :block_size, :, :]
-        .float()
-        .abs()
-        .permute(2, 0, 1, 3)
-        .reshape(num_head_kv, -1)
-        .max(-1)[0]
-        .clamp_min(1e-6)
-        / 448
-    )
-    cache_fp8 = (cache.float() / scale[None, None, :, None]).to(torch.float8_e4m3fn)
-    return cache_fp8, scale
+        return flash_attn_with_kvcache
+    except Exception as e:
+        raise ImportError(
+            "FlashAttention-3 with FP8 is required for --methods flashattn. "
+        ) from e
 
 
 def build_block_ids(kv_lens: torch.Tensor, block_size: int, max_num_blocks: int) -> torch.Tensor:
@@ -152,12 +134,12 @@ def make_task_map(
 
 def make_inputs(
     kv_lengths: Iterable[int],
-    quant_name: str,
     num_seq_q: int,
     num_head_kv: int,
     num_head_q: int,
     head_dim: int,
 ) -> Inputs:
+    """Build HPC inputs: Q per-token-per-head FP8, K/V per-tensor FP8."""
     torch.manual_seed(41)
     torch.cuda.manual_seed(41)
 
@@ -167,40 +149,27 @@ def make_inputs(
     nblocks = (kv_lens + BLOCK_SIZE - 1) // BLOCK_SIZE
     max_num_blocks = int(nblocks.sum().item() * 1.2) + num_batch + 8
 
-    q = torch.randn(
+    q_bf16 = torch.randn(
         (num_batch * num_seq_q, num_head_q, head_dim),
         dtype=torch.bfloat16,
         device="cuda",
     ) / math.sqrt(head_dim)
-    q_scale = q.float().abs().max(-1)[0].clamp_min(1e-6)
-    q = (q / q_scale[:, :, None]).to(torch.float8_e4m3fn)
-    block_ids = build_block_ids(kv_lens, BLOCK_SIZE, max_num_blocks)
+    q_scale = q_bf16.float().abs().max(-1)[0].clamp_min(1e-6)
+    q = (q_bf16 / q_scale[:, :, None]).to(torch.float8_e4m3fn)
 
-    if quant_name == "qpertoken_perhead_kvpertensor":
-        k_cache = torch.randn(
+    k_cache = (
+        torch.randn(
             max_num_blocks, BLOCK_SIZE, num_head_kv, head_dim, dtype=torch.bfloat16, device="cuda"
         )
-        v_cache = torch.randn_like(k_cache)
-        k_cache = (k_cache / math.sqrt(head_dim)).to(torch.float8_e4m3fn)
-        v_cache = v_cache.to(torch.float8_e4m3fn)
-        k_scale = torch.rand((1,), dtype=torch.float32, device="cuda").clamp_min(1e-6)
-        v_scale = torch.rand((1,), dtype=torch.float32, device="cuda").clamp_min(1e-6)
-    else:
-        scale_rows = BLOCK_SIZE * 4 // head_dim
-        raw_cache = torch.randn(
-            max_num_blocks,
-            2,
-            BLOCK_SIZE + scale_rows,
-            num_head_kv,
-            head_dim,
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        k_cache, k_scale = quant_paged_cache_pertoken(raw_cache[:, 0], BLOCK_SIZE)
-        v_cache, v_scale = quant_paged_cache_perhead(raw_cache[:, 1], BLOCK_SIZE)
-        k_cache = k_cache[:, :BLOCK_SIZE]
-        v_cache = v_cache[:, :BLOCK_SIZE]
+        / math.sqrt(head_dim)
+    ).to(torch.float8_e4m3fn)
+    v_cache = torch.randn(
+        max_num_blocks, BLOCK_SIZE, num_head_kv, head_dim, dtype=torch.bfloat16, device="cuda"
+    ).to(torch.float8_e4m3fn)
+    k_scale = torch.rand((1,), dtype=torch.float32, device="cuda").clamp_min(1e-6)
+    v_scale = torch.rand((1,), dtype=torch.float32, device="cuda").clamp_min(1e-6)
 
+    block_ids = build_block_ids(kv_lens, BLOCK_SIZE, max_num_blocks)
     output = torch.empty_like(q, dtype=torch.bfloat16)
     return Inputs(
         q,
@@ -217,9 +186,7 @@ def make_inputs(
     )
 
 
-def run_kernel(
-    inputs: Inputs, quant_name: str, task_map: torch.Tensor | None = None
-) -> torch.Tensor:
+def run_kernel(inputs: Inputs, task_map: torch.Tensor | None = None) -> torch.Tensor:
     return hpc.attention_decode_fp8(
         inputs.q,
         inputs.k_cache,
@@ -231,11 +198,199 @@ def run_kernel(
         inputs.v_scale,
         mtp=DEFAULT_NUM_SEQ_Q - 1,
         new_kv_included=True,
-        quant_type=QUANT_TYPES[quant_name],
+        quant_type=HPC_QUANT_TYPE,
         splitk=True,
         task_map=task_map,
         output=inputs.output,
     )
+
+
+def make_flashattn_fn(inputs: Inputs, num_head_kv: int, head_dim: int) -> Callable[[], None]:
+    """FA3 FP8 decode with qkvpertensor scales."""
+    flash_attn_with_kvcache = _import_fa3_kvcache()
+
+    nblocks_fa = (inputs.kv_lens + FA_BLOCK_SIZE - 1) // FA_BLOCK_SIZE
+    max_num_blocks_fa = int(nblocks_fa.sum().item() * 1.2) + inputs.num_batch + 4
+    max_pages = int(nblocks_fa.max().item())
+
+    # qkvpertensor: one scale for Q / K / V each.
+    q_scale = float(torch.rand((), device="cuda").clamp_min(1e-6).item())
+    k_scale = float(torch.rand((), device="cuda").clamp_min(1e-6).item())
+    v_scale = float(torch.rand((), device="cuda").clamp_min(1e-6).item())
+
+    q_fa = (torch.randn_like(inputs.q, dtype=torch.bfloat16) / q_scale).to(torch.float8_e4m3fn)
+    q_fa = q_fa.unsqueeze(1)  # (B*Sq, 1, Hq, D) for decode
+    k_cache_fa = (
+        torch.randn(
+            max_num_blocks_fa,
+            FA_BLOCK_SIZE,
+            num_head_kv,
+            head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / k_scale
+    ).to(torch.float8_e4m3fn)
+    v_cache_fa = (
+        torch.randn(
+            max_num_blocks_fa,
+            FA_BLOCK_SIZE,
+            num_head_kv,
+            head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / v_scale
+    ).to(torch.float8_e4m3fn)
+
+    page_table = torch.zeros(inputs.num_batch, max_pages, dtype=torch.int32, device="cuda")
+    offset = 0
+    for i in range(inputs.num_batch):
+        nb = int(nblocks_fa[i])
+        page_table[i, :nb] = torch.arange(offset, offset + nb, dtype=torch.int32, device="cuda")
+        offset += nb
+    cache_seqlens = inputs.kv_lens.to(torch.int32)
+
+    # FA3 descales are (batch, nheads_kv); broadcast tensor scales.
+    q_descale = torch.full(
+        (inputs.num_batch, num_head_kv), q_scale, dtype=torch.float32, device="cuda"
+    )
+    k_descale = torch.full(
+        (inputs.num_batch, num_head_kv), k_scale, dtype=torch.float32, device="cuda"
+    )
+    v_descale = torch.full(
+        (inputs.num_batch, num_head_kv), v_scale, dtype=torch.float32, device="cuda"
+    )
+
+    def call_fn():
+        flash_attn_with_kvcache(
+            q=q_fa,
+            k_cache=k_cache_fa,
+            v_cache=v_cache_fa,
+            cache_seqlens=cache_seqlens,
+            page_table=page_table,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            causal=True,
+        )
+
+    return call_fn
+
+
+def make_flashinfer_fn(
+    inputs: Inputs, num_head_kv: int, num_head_q: int, head_dim: int
+) -> Callable[[], None]:
+    """FlashInfer FP8 decode with qkvpertensor (scalar) scales."""
+    import flashinfer
+
+    nblocks_fi = (inputs.kv_lens + BLOCK_SIZE - 1) // BLOCK_SIZE
+    kv_indptr = torch.zeros(inputs.num_batch + 1, dtype=torch.int32, device="cuda")
+    torch.cumsum(nblocks_fi, dim=0, out=kv_indptr[1:])
+    kv_indices = torch.zeros(int(nblocks_fi.sum()), dtype=torch.int32, device="cuda")
+    offset = 0
+    for i in range(inputs.num_batch):
+        nb = int(nblocks_fi[i])
+        kv_indices[offset : offset + nb] = torch.arange(
+            offset, offset + nb, dtype=torch.int32, device="cuda"
+        )
+        offset += nb
+    kv_last_page_len = ((inputs.kv_lens - 1) % BLOCK_SIZE + 1).to(torch.int32)
+
+    q_scale = float(torch.rand((), device="cuda").clamp_min(1e-6).item())
+    k_scale = float(torch.rand((), device="cuda").clamp_min(1e-6).item())
+    v_scale = float(torch.rand((), device="cuda").clamp_min(1e-6).item())
+
+    q_fi = (torch.randn_like(inputs.q, dtype=torch.bfloat16) / q_scale).to(torch.float8_e4m3fn)
+    max_num_blocks_fi = int(nblocks_fi.sum().item()) + inputs.num_batch + 4
+    k_cache_fi = (
+        torch.randn(
+            max_num_blocks_fi,
+            BLOCK_SIZE,
+            num_head_kv,
+            head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / k_scale
+    ).to(torch.float8_e4m3fn)
+    v_cache_fi = (
+        torch.randn(
+            max_num_blocks_fi,
+            BLOCK_SIZE,
+            num_head_kv,
+            head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / v_scale
+    ).to(torch.float8_e4m3fn)
+
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer,
+        "NHD",
+        use_cuda_graph=True,
+        paged_kv_indptr_buffer=kv_indptr,
+        paged_kv_indices_buffer=kv_indices,
+        paged_kv_last_page_len_buffer=kv_last_page_len,
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_head_q,
+        num_head_kv,
+        head_dim,
+        BLOCK_SIZE,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+    )
+
+    def call_fn():
+        wrapper.run(
+            q_fi,
+            (k_cache_fi, v_cache_fi),
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+
+    return call_fn
+
+
+def make_call_fn(
+    method: str,
+    inputs: Inputs,
+    args: argparse.Namespace,
+    task_map: torch.Tensor | None = None,
+) -> Callable[[], None]:
+    if method == "static":
+        return lambda: run_kernel(inputs)
+    if method == "dynamic":
+        if task_map is None:
+            task_map = make_task_map(
+                inputs.kv_lens, args.num_head_kv, DEFAULT_NUM_SEQ_Q, args.min_process_len
+            )
+
+        def call_fn():
+            if args.include_taskmap:
+                hpc.assign_attention_decode_task(
+                    inputs.kv_lens,
+                    task_map,
+                    args.num_head_kv,
+                    DEFAULT_NUM_SEQ_Q,
+                    True,
+                    min_process_len=args.min_process_len,
+                )
+            run_kernel(inputs, task_map)
+
+        return call_fn
+    if method == "flashattn":
+        return make_flashattn_fn(inputs, args.num_head_kv, args.head_dim)
+    if method == "flashinfer":
+        return make_flashinfer_fn(inputs, args.num_head_kv, args.num_head_q, args.head_dim)
+    raise ValueError(f"Unknown method: {method}")
 
 
 def bench_us(fn, warmup: int, iters: int, use_graph: bool) -> float:
@@ -334,41 +489,23 @@ def extract_nvtx_us(report_prefix: Path) -> list[float]:
 
 def run_nsys_worker(args: argparse.Namespace) -> None:
     case_name = args.cases[0]
-    quant_name = args.quant_types[0]
+    method = args.nsys_variant
     inputs = make_inputs(
         CASES[case_name],
-        quant_name,
         DEFAULT_NUM_SEQ_Q,
         args.num_head_kv,
         args.num_head_q,
         args.head_dim,
     )
-    task_map = None
-    if args.nsys_variant == "dynamic":
-        task_map = make_task_map(
-            inputs.kv_lens, args.num_head_kv, DEFAULT_NUM_SEQ_Q, args.min_process_len
-        )
-
-    def call_fn():
-        if args.nsys_variant == "dynamic" and args.include_taskmap:
-            hpc.assign_attention_decode_task(
-                inputs.kv_lens,
-                task_map,
-                args.num_head_kv,
-                DEFAULT_NUM_SEQ_Q,
-                True,
-                min_process_len=args.min_process_len,
-            )
-        run_kernel(inputs, quant_name, task_map)
-
+    call_fn = make_call_fn(method, inputs, args)
     run_method_c(call_fn, warmup=args.warmup, n_timed=args.iters + 2)
 
 
 def run_nsys_profile(
-    args: argparse.Namespace, case_name: str, quant_name: str, variant: str, out_dir: Path
+    args: argparse.Namespace, case_name: str, method: str, out_dir: Path
 ) -> tuple[float | None, int, str | None]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    report_prefix = out_dir / f"{case_name}_{quant_name}_{variant}"
+    report_prefix = out_dir / f"{case_name}_{method}"
     report_file = str(report_prefix) + ".nsys-rep"
     if os.path.exists(report_file):
         os.remove(report_file)
@@ -389,11 +526,9 @@ def run_nsys_profile(
         str(Path(__file__).resolve()),
         "--nsys-worker",
         "--nsys-variant",
-        variant,
+        method,
         "--cases",
         case_name,
-        "--quant-types",
-        quant_name,
         "--warmup",
         str(args.warmup),
         "--iters",
@@ -431,8 +566,50 @@ def run_nsys_profile(
     return float(median(samples)), len(samples), None
 
 
+def speedup_vs(baseline_us, dynamic_us) -> float | None:
+    """dynamic speedup over a baseline: baseline_us / dynamic_us (>1 means dynamic is faster)."""
+    if baseline_us and dynamic_us:
+        return baseline_us / dynamic_us
+    return None
+
+
+def build_result_row(
+    case_name: str,
+    batch: int,
+    max_kv: int,
+    results: dict,
+    *,
+    timing: str | None = None,
+    samples: dict | None = None,
+    error: str | None = None,
+) -> dict:
+    static_us = results.get("static")
+    dynamic_us = results.get("dynamic")
+    flashattn_us = results.get("flashattn")
+    flashinfer_us = results.get("flashinfer")
+    row = {
+        "case": case_name,
+        "quant_type": "qpertoken_perhead_kvpertensor",
+        "batch": batch,
+        "max_kv": max_kv,
+        "static_us": static_us,
+        "dynamic_us": dynamic_us,
+        "flashattn_us": flashattn_us,
+        "flashinfer_us": flashinfer_us,
+        "speedup_vs_static": speedup_vs(static_us, dynamic_us),
+        "speedup_vs_flashattn": speedup_vs(flashattn_us, dynamic_us),
+        "speedup_vs_flashinfer": speedup_vs(flashinfer_us, dynamic_us),
+    }
+    if timing is not None:
+        row["timing"] = timing
+    if samples is not None:
+        row.update(samples)
+    row["error"] = error
+    return row
+
+
 def run_nsys_driver(args: argparse.Namespace) -> list[dict]:
-    tag = args.tag or f"attention_decode_{int(time.time())}"
+    tag = args.tag or f"attention_decode_fp8_{int(time.time())}"
     out_dir = (
         Path(args.output_dir) / tag
         if args.output_dir
@@ -440,30 +617,32 @@ def run_nsys_driver(args: argparse.Namespace) -> list[dict]:
     )
     rows = []
     for case_name in args.cases:
-        for quant_name in args.quant_types:
-            static_us, static_n, static_err = run_nsys_profile(
-                args, case_name, quant_name, "static", out_dir
-            )
-            dynamic_us, dynamic_n, dynamic_err = run_nsys_profile(
-                args, case_name, quant_name, "dynamic", out_dir
-            )
-            row = {
-                "case": case_name,
-                "quant_type": quant_name,
-                "batch": len(CASES[case_name]),
-                "max_kv": max(CASES[case_name]),
-                "static_us": static_us,
-                "dynamic_us": dynamic_us,
-                "speedup": static_us / dynamic_us if static_us and dynamic_us else None,
-                "timing": "nsys_graph_nvtx_median",
-                "static_samples": static_n,
-                "dynamic_samples": dynamic_n,
-                "error": static_err or dynamic_err,
-            }
-            rows.append(row)
-            print_table(rows)
-            if row["error"]:
-                print(f"[warn] {case_name}/{quant_name}: {row['error']}", file=sys.stderr)
+        results = {}
+        errors = []
+        for method in args.methods:
+            us, n, err = run_nsys_profile(args, case_name, method, out_dir)
+            results[method] = us
+            results[f"{method}_samples"] = n
+            if err:
+                errors.append(f"{method}: {err}")
+        row = build_result_row(
+            case_name,
+            len(CASES[case_name]),
+            max(CASES[case_name]),
+            results,
+            timing="nsys_graph_nvtx_median",
+            samples={
+                "static_samples": results.get("static_samples", 0),
+                "dynamic_samples": results.get("dynamic_samples", 0),
+                "flashattn_samples": results.get("flashattn_samples", 0),
+                "flashinfer_samples": results.get("flashinfer_samples", 0),
+            },
+            error="; ".join(errors) if errors else None,
+        )
+        rows.append(row)
+        print_table(rows)
+        if row["error"]:
+            print(f"[warn] {case_name}: {row['error']}", file=sys.stderr)
     print(f"nsys reports: {out_dir}")
     return rows
 
@@ -475,21 +654,29 @@ def print_table(rows: list[dict]) -> None:
     def fmt_speedup(value) -> str:
         return f"{value:7.2f}x" if isinstance(value, (int, float)) else f"{'ERR':>8}"
 
+    width = 125
     print("")
-    print("=" * 112)
-    print("Attention Decode FP8 dynamic scheduling | latency in us (lower is better)")
-    print("-" * 112)
+    print("=" * width)
     print(
-        f"{'case':>18} | {'quant_type':>34} | {'batch':>5} | {'max_kv':>7} | {'static':>10} | {'dynamic':>10} | {'speedup':>8}"
+        "Attention Decode FP8 | HPC=qpertoken+kvpertensor, FA3/FI=qkvpertensor | "
+        "latency in us; x/* = baseline / dynamic"
     )
-    print("-" * 112)
+    print("-" * width)
+    print(
+        f"{'case':>18} | {'batch':>5} | {'max_kv':>7} | {'static':>10} | {'dynamic':>10} | "
+        f"{'flashattn':>10} | {'flashinfer':>10} | {'x/sta':>8} | {'x/fa':>8} | {'x/fi':>8}"
+    )
+    print("-" * width)
     for row in rows:
         print(
-            f"{row['case']:>18} | {row['quant_type']:>34} | {row['batch']:5d} | "
-            f"{row['max_kv']:7d} | {fmt_us(row['static_us'])} | {fmt_us(row['dynamic_us'])} | "
-            f"{fmt_speedup(row['speedup'])}"
+            f"{row['case']:>18} | {row['batch']:5d} | {row['max_kv']:7d} | "
+            f"{fmt_us(row.get('static_us'))} | {fmt_us(row.get('dynamic_us'))} | "
+            f"{fmt_us(row.get('flashattn_us'))} | {fmt_us(row.get('flashinfer_us'))} | "
+            f"{fmt_speedup(row.get('speedup_vs_static'))} | "
+            f"{fmt_speedup(row.get('speedup_vs_flashattn'))} | "
+            f"{fmt_speedup(row.get('speedup_vs_flashinfer'))}"
         )
-    print("=" * 112)
+    print("=" * width)
 
 
 def write_csv(path: str, rows: list[dict]) -> None:
@@ -511,15 +698,16 @@ def write_jsonl(path: str, rows: list[dict]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark Attention Decode FP8 static vs dynamic scheduling."
+        description=(
+            "Benchmark Attention Decode FP8: HPC static/dynamic "
+            "(qpertoken+kvpertensor) vs FA3/FlashInfer (qkvpertensor)."
+        )
     )
     parser.add_argument("--cases", nargs="+", default=list(CASES), choices=list(CASES))
-    parser.add_argument(
-        "--quant-types", nargs="+", default=list(QUANT_TYPES), choices=list(QUANT_TYPES)
-    )
+    parser.add_argument("--methods", nargs="+", default=list(METHODS), choices=list(METHODS))
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--min-process-len", type=int, default=512)
+    parser.add_argument("--min-process-len", type=int, default=64)
     parser.add_argument("--num-head-kv", type=int, default=DEFAULT_KV_HEADS)
     parser.add_argument("--num-head-q", type=int, default=DEFAULT_Q_HEADS)
     parser.add_argument("--head-dim", type=int, default=DEFAULT_HEAD_DIM)
@@ -554,7 +742,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-check", dest="check", action="store_false")
     parser.add_argument("--nsys-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
-        "--nsys-variant", choices=["static", "dynamic"], default="static", help=argparse.SUPPRESS
+        "--nsys-variant", choices=list(METHODS), default="static", help=argparse.SUPPRESS
     )
     parser.set_defaults(check=False)
     parser.set_defaults(graph=True)
@@ -574,50 +762,45 @@ def main() -> None:
 
     rows = []
     for case_name in args.cases:
-        for quant_name in args.quant_types:
-            inputs = make_inputs(
-                CASES[case_name],
-                quant_name,
-                DEFAULT_NUM_SEQ_Q,
-                args.num_head_kv,
-                args.num_head_q,
-                args.head_dim,
-            )
+        inputs = make_inputs(
+            CASES[case_name],
+            DEFAULT_NUM_SEQ_Q,
+            args.num_head_kv,
+            args.num_head_q,
+            args.head_dim,
+        )
+        task_map = None
+        if "dynamic" in args.methods or args.check:
             task_map = make_task_map(
                 inputs.kv_lens, args.num_head_kv, DEFAULT_NUM_SEQ_Q, args.min_process_len
             )
-            bench_fn = (
-                bench_us
-                if args.graph
-                else lambda fn, warmup, iters, _use_graph: bench_us_mean(fn, warmup, iters)
+
+        results = {}
+        for method in args.methods:
+            call_fn = make_call_fn(method, inputs, args, task_map=task_map)
+            try:
+                if args.graph:
+                    results[method] = bench_us(call_fn, args.warmup, args.iters, use_graph=True)
+                else:
+                    results[method] = bench_us_mean(call_fn, args.warmup, args.iters)
+            except Exception as e:
+                print(f"[warn] {case_name}/{method}: {e}", file=sys.stderr)
+                results[method] = None
+
+        if args.check:
+            static_out = run_kernel(inputs).clone()
+            dynamic_out = run_kernel(inputs, task_map)
+            if not torch.allclose(static_out, dynamic_out, atol=0.2, rtol=0.2):
+                raise AssertionError(f"{case_name}: dynamic output differs from static output")
+
+        rows.append(
+            build_result_row(
+                case_name,
+                inputs.num_batch,
+                inputs.max_seq_kv,
+                results,
             )
-            static_us = bench_fn(
-                lambda: run_kernel(inputs, quant_name), args.warmup, args.iters, args.graph
-            )
-            dynamic_us = bench_fn(
-                lambda: run_kernel(inputs, quant_name, task_map),
-                args.warmup,
-                args.iters,
-                args.graph,
-            )
-            if args.check:
-                static_out = run_kernel(inputs, quant_name).clone()
-                dynamic_out = run_kernel(inputs, quant_name, task_map)
-                if not torch.allclose(static_out, dynamic_out, atol=0.2, rtol=0.2):
-                    raise AssertionError(
-                        f"{case_name}/{quant_name}: dynamic output differs from static output"
-                    )
-            rows.append(
-                {
-                    "case": case_name,
-                    "quant_type": quant_name,
-                    "batch": inputs.num_batch,
-                    "max_kv": inputs.max_seq_kv,
-                    "static_us": static_us,
-                    "dynamic_us": dynamic_us,
-                    "speedup": static_us / dynamic_us if dynamic_us else None,
-                }
-            )
+        )
     print_table(rows)
     write_csv(args.csv, rows)
     write_jsonl(args.jsonl, rows)
