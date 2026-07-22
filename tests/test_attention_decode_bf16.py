@@ -1,22 +1,15 @@
-import os
 import sys
-from pathlib import Path
-
+import os
 import pytest
+from pathlib import Path
 
 sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
 
-import math
-
-import torch
-import torch.nn.functional as F
-
 import hpc
+import torch
+import math
+import torch.nn.functional as F
 from utils import allclose
-
-# Set random seed for reproducibility
-torch.manual_seed(41)
-torch.cuda.manual_seed(41)
 
 
 def ref_attn_with_paged_kvcache_func(
@@ -66,15 +59,7 @@ def ref_attn_with_paged_kvcache_func(
     return output.reshape(-1, num_head_q, head_dim)
 
 
-@pytest.mark.parametrize("num_batch", [1, 16, 200])
-@pytest.mark.parametrize("num_seq_q", [1, 2, 3])
-@pytest.mark.parametrize("max_seq_kv", [1024, 4096])
-@pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("kv_head_q_head", [(1, 4), (1, 8), (2, 16), (4, 32)])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("new_kv_included", [True, False])
-@pytest.mark.parametrize("splitk", [True, False])
-def test_attention_decode_bf16(
+def attention_decode_bf16_test_func(
     num_batch,
     num_seq_q,
     max_seq_kv,
@@ -82,10 +67,16 @@ def test_attention_decode_bf16(
     kv_head_q_head,
     head_dim,
     new_kv_included,
+    use_output,
     splitk,
+    use_dynamic_sched,
+    kvcache_shape,
 ):
+    torch.manual_seed(41)
+    torch.cuda.manual_seed(41)
 
     num_head_kv, num_head_q = kv_head_q_head
+
     num_dim_qk = head_dim
     num_dim_v = head_dim
     max_num_blocks = int(num_batch * max_seq_kv // block_size * 1.2)
@@ -100,15 +91,56 @@ def test_attention_decode_bf16(
         (num_batch * num_seq_q, num_head_kv, num_dim_v), dtype=torch.bfloat16, device="cuda"
     )
 
-    num_seq_kvcache = (
-        torch.randint(1, max_seq_kv, (num_batch,), dtype=torch.int32, device="cuda") * 0
-        + max_seq_kv
-    )
+    num_seq_kvcache = torch.randint(1, max_seq_kv, (num_batch,), dtype=torch.int32, device="cuda")
+
+    task_map = None
+    if use_dynamic_sched:
+        task_map_for_cpu = hpc.get_attention_decode_task_workspace(
+            num_batch, max_seq_kv + num_seq_q, num_head_kv, min_process_len=64
+        )
+        task_map_for_cuda = hpc.get_attention_decode_task_workspace(
+            num_batch, max_seq_kv + num_seq_q, num_head_kv, min_process_len=64
+        )
+
+        hpc.assign_attention_decode_task(
+            num_seq_kvcache.cpu() + num_seq_q,
+            task_map_for_cpu,
+            num_head_kv,
+            num_seq_q,
+            new_kv_included,
+            min_process_len=64,
+        )
+
+        hpc.assign_attention_decode_task(
+            num_seq_kvcache + num_seq_q,
+            task_map_for_cuda,
+            num_head_kv,
+            num_seq_q,
+            new_kv_included,
+            min_process_len=64,
+        )
+
+        num_total_ctas = task_map_for_cuda.view(torch.int32)[1]
+
+        sched_need_byte_size = (task_map_for_cpu.view(torch.int32)[0] * num_total_ctas + 1) * 48 + (
+            num_batch * num_head_kv * 4 + 47
+        ) // 48 * 48
+        assert torch.allclose(
+            task_map_for_cpu[:sched_need_byte_size], task_map_for_cuda[:sched_need_byte_size]
+        )
+
+        task_map = task_map_for_cuda
+        # hpc.print_attention_decode_task(task_map)
+
     nblocks = (num_seq_kvcache + num_seq_q + block_size - 1) // block_size
     total_blocks = sum(nblocks)
     kvcache = torch.randn(
         max_num_blocks, 2, block_size, num_head_kv, num_dim_qk, dtype=torch.bfloat16, device="cuda"
     )
+
+    if kvcache_shape == "HND":
+        kvcache = kvcache.permute(0, 1, 3, 2, 4).contiguous().permute(0, 1, 3, 2, 4)
+
     packed_block_ids = torch.randperm(max_num_blocks)[:total_blocks].to(torch.int32).cuda()
 
     max_num_block2 = max(nblocks)
@@ -135,15 +167,76 @@ def test_attention_decode_bf16(
         q, k, v, kvcache, block_ids, nblocks, seqlenq, cu_seqlenq, num_seq_kvcache
     )
 
-    my = hpc.attention_decode_bf16(
-        q,
-        kvcache[:, 0, :, :, :],
-        kvcache[:, 1, :, :, :],
-        block_ids,
-        num_seq_kvcache + num_seq_q if new_kv_included else num_seq_kvcache,
-        new_kv_included=new_kv_included,
-        splitk=splitk,
-        mtp=num_seq_q - 1,
-    )
+    if use_output:
+        my = torch.empty_like(q)
+        hpc.attention_decode_bf16(
+            q,
+            kvcache[:, 0, :, :, :],
+            kvcache[:, 1, :, :, :],
+            block_ids,
+            num_seq_kvcache + num_seq_q if new_kv_included else num_seq_kvcache,
+            mtp=num_seq_q - 1,
+            new_kv_included=new_kv_included,
+            splitk=splitk,
+            task_map=task_map,
+            output=my,
+        )
+    else:
+        num_seq_kvcache_input = num_seq_kvcache + num_seq_q if new_kv_included else num_seq_kvcache
+        my = hpc.attention_decode_bf16(
+            q,
+            kvcache[:, 0, :, :, :],
+            kvcache[:, 1, :, :, :],
+            block_ids,
+            num_seq_kvcache_input,
+            mtp=num_seq_q - 1,
+            new_kv_included=new_kv_included,
+            splitk=splitk,
+            task_map=task_map,
+        )
 
-    assert allclose(gt, my, atol=0.016)
+    print("\ngt\n")
+    print(gt[0, :, :])
+    print("\nmy\n")
+    print(my[0, :, :])
+
+    assert allclose(my, gt, atol=0.016)
+
+
+@pytest.mark.parametrize("num_batch", [1, 16, 200])
+@pytest.mark.parametrize("num_seq_q", [1, 2, 3])
+@pytest.mark.parametrize("max_seq_kv", [1024, 4096])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("kv_head_q_head", [(1, 8), (4, 32)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("new_kv_included", [True])
+@pytest.mark.parametrize("use_output", [False])
+@pytest.mark.parametrize("splitk", [True])
+@pytest.mark.parametrize("use_dynamic_sched", [False, True])
+@pytest.mark.parametrize("kvcache_shape", ["NHD", "HND"])
+def test_attn_bf16_sm90(
+    num_batch,
+    num_seq_q,
+    max_seq_kv,
+    block_size,
+    kv_head_q_head,
+    head_dim,
+    new_kv_included,
+    use_output,
+    splitk,
+    use_dynamic_sched,
+    kvcache_shape,
+):
+    attention_decode_bf16_test_func(
+        num_batch,
+        num_seq_q,
+        max_seq_kv,
+        block_size,
+        kv_head_q_head,
+        head_dim,
+        new_kv_included,
+        use_output,
+        splitk,
+        use_dynamic_sched,
+        kvcache_shape,
+    )
