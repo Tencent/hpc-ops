@@ -1,12 +1,12 @@
 // Copyright (C) 2026 Tencent.
-// Slimmed HIP port of utils.cuh for the norm operator on AMD gfx950 (wave64).
+// Slimmed HIP port of utils.cuh — shared device helpers for AMD gfx950 (wave64).
 // Kept verbatim from the original: vec_t / traits_vec_t / size / reshape /
 // to<> / load / store. Ported: rcpf_ftz / rsqrtf_ftz (PTX -> HIP intrinsics),
 // warp_reduce_sum_xor (wave32 -> wave64). Removed: cute/CUTLASS include and
 // attention helpers, multimem/atom/barrier PTX, unused fast-math.
 
-#ifndef SRC_AMD_NORMALIZATION_UTILS_HIP_CUH_
-#define SRC_AMD_NORMALIZATION_UTILS_HIP_CUH_
+#ifndef SRC_AMD_UTILS_UTILS_HIP_CUH_
+#define SRC_AMD_UTILS_UTILS_HIP_CUH_
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -218,6 +218,47 @@ __device__ __forceinline__ constexpr void store(void *ptr, const vec_t<T, N> &v)
   return;
 }
 
+// Streaming (non-temporal) store — an OPT-IN variant of store() for outputs that
+// are written once and never read back within the kernel. The nt/slc hint tells
+// the hardware to bypass the L2 write-allocate so a pure output stream does not
+// evict live inputs from L2; on bandwidth-bound streaming-write kernels this is
+// a net win. It is NOT safe for buffers that are read back in-kernel (in-place
+// accumulation, L2-reused scratch), which is why plain store() above keeps the
+// default temporal path — callers must request streaming explicitly.
+//
+// The 16-byte path stays a regular temporal dwordx4 store on purpose: measured
+// on the fp32 fused-RMSNorm MoE output (the dominant MoE traffic term) a nt hint
+// there REGRESSES because write-allocate helps that wide, fully-coalesced stream.
+template <typename T, int N>
+__device__ __forceinline__ constexpr void store_streaming(void *__restrict__ ptr,
+                                                          const vec_t<T, N> &v) {
+  using V = vec_t<T, N>;
+
+  constexpr int kBytes = sizeof(T) * N;
+
+  static_assert(kBytes == 1 || kBytes == 2 || kBytes == 4 || kBytes == 8 || kBytes == 16,
+                "not support for T x N");
+
+  if constexpr (kBytes == 1) {
+    using S = uint8_t;
+    __builtin_nontemporal_store(*reinterpret_cast<const S *>(&v), reinterpret_cast<S *>(ptr));
+  } else if constexpr (kBytes == 2) {
+    using S = uint16_t;
+    __builtin_nontemporal_store(*reinterpret_cast<const S *>(&v), reinterpret_cast<S *>(ptr));
+  } else if constexpr (kBytes == 4) {
+    using S = uint32_t;
+    __builtin_nontemporal_store(*reinterpret_cast<const S *>(&v), reinterpret_cast<S *>(ptr));
+  } else if constexpr (kBytes == 8) {
+    using S = uint64_t;
+    __builtin_nontemporal_store(*reinterpret_cast<const S *>(&v), reinterpret_cast<S *>(ptr));
+  } else if constexpr (kBytes == 16) {
+    using S = uint4;
+    *reinterpret_cast<S *>(ptr) = *reinterpret_cast<const S *>(&v);
+  }
+
+  return;
+}
+
 template <typename T, typename... Args>
 __device__ __forceinline__ constexpr void store(void *ptr, T val, Args... vals) {
   constexpr int N = sizeof...(Args);
@@ -257,4 +298,4 @@ __device__ __forceinline__ float warp_reduce_sum_xor(float x) {
 
 }  // namespace hpc
 
-#endif  // SRC_AMD_NORMALIZATION_UTILS_HIP_CUH_
+#endif  // SRC_AMD_UTILS_UTILS_HIP_CUH_

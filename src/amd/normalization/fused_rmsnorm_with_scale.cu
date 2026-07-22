@@ -4,7 +4,7 @@
 #include <iostream>
 
 #include "src/amd/normalization/fused_rmsnorm_with_scale.h"
-#include "src/amd/normalization/utils_hip.cuh"
+#include "src/amd/utils/utils_hip.cuh"
 
 namespace hpc {
 namespace normalization {
@@ -121,24 +121,25 @@ __global__ void fused_rmsnorm_with_scale(const __hip_bfloat16 *input_ptr,
 
         auto &split_input = reshape<2, kItemPer16B / 2>(reg_input[iter]);
         if constexpr (kIsMoe) {
-          store(&output_ptr_fp32[istore], split_input[0]);
-          store(&output_ptr_fp32[istore + kItemPer16B / 2], split_input[1]);
+          store_streaming(&output_ptr_fp32[istore], split_input[0]);
+          store_streaming(&output_ptr_fp32[istore + kItemPer16B / 2], split_input[1]);
 #pragma unroll
           for (int i = 0; i < kItemPer16B; i++) {
             reg_input[iter][i] *= inv_scale2;
           }
 
-          store(&output_ptr_fp8_scale2[istore], to<__hip_fp8x4_e4m3>(split_input[0]));
-          store(&output_ptr_fp8_scale2[istore + kItemPer16B / 2],
-                to<__hip_fp8x4_e4m3>(split_input[1]));
+          store_streaming(&output_ptr_fp8_scale2[istore], to<__hip_fp8x4_e4m3>(split_input[0]));
+          store_streaming(&output_ptr_fp8_scale2[istore + kItemPer16B / 2],
+                          to<__hip_fp8x4_e4m3>(split_input[1]));
 #pragma unroll
           for (int i = 0; i < kItemPer16B; i++) {
             reg_input[iter][i] *= inv_scale;
           }
         }
 
-        store(&output_ptr_fp8[istore], to<__hip_fp8x4_e4m3>(split_input[0]));
-        store(&output_ptr_fp8[istore + kItemPer16B / 2], to<__hip_fp8x4_e4m3>(split_input[1]));
+        store_streaming(&output_ptr_fp8[istore], to<__hip_fp8x4_e4m3>(split_input[0]));
+        store_streaming(&output_ptr_fp8[istore + kItemPer16B / 2],
+                        to<__hip_fp8x4_e4m3>(split_input[1]));
       }
     }
   }
