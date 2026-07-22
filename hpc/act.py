@@ -148,8 +148,6 @@ def scaled_fp8_quant_fake(input, scale=None, output=None):
         else torch.empty_like(input, dtype=torch.float8_e4m3fn, device=input.device)
     )
     scale_tensor = (
-        scale
-        if scale is not None
-        else torch.empty((1,), dtype=torch.float32, device=input.device)
+        scale if scale is not None else torch.empty((1,), dtype=torch.float32, device=input.device)
     )
     return output_tensor, scale_tensor

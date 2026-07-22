@@ -167,8 +167,9 @@ std::tuple<torch::Tensor, torch::Tensor> scaled_fp8_quant_entry(
                   input.scalar_type() == torch::kBFloat16,
               "input dtype must be float32, float16, or bfloat16");
 
-  auto output_tensor =
-      output.has_value() ? output.value() : torch::empty_like(input, input.options().dtype(torch::kFloat8_e4m3fn));
+  auto output_tensor = output.has_value()
+                           ? output.value()
+                           : torch::empty_like(input, input.options().dtype(torch::kFloat8_e4m3fn));
   TORCH_CHECK(output_tensor.device().is_cuda(), "output must be a CUDA tensor");
   TORCH_CHECK(output_tensor.is_contiguous(), "output must be contiguous");
   TORCH_CHECK(output_tensor.sizes() == input.sizes(), "output shape must match input shape");
