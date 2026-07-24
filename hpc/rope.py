@@ -234,6 +234,21 @@ def rope_norm_store_kv_fp8(
     )
 
 
+def qwen3_tts_rope(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> Tuple[Tensor, Tensor]:
+    """Qwen3-TTS NeoX RoPE fused op.
+
+    Args:
+        q: ``[B, num_q_heads, seq_len, head_dim]`` bfloat16 tensor.
+        k: ``[B, num_kv_heads, seq_len, head_dim]`` bfloat16 tensor.
+        cos: ``[B, seq_len, head_dim]`` bfloat16 tensor.
+        sin: ``[B, seq_len, head_dim]`` bfloat16 tensor.
+
+    Returns:
+        Tuple of contiguous rotated q/k tensors with the same shapes as inputs.
+    """
+    return torch.ops.hpc.qwen3_tts_rope(q, k, cos, sin)
+
+
 @torch.library.register_fake("hpc::rope_norm_store_kv")
 def rope_norm_store_kv_fake(
     key_cache,
@@ -325,3 +340,11 @@ def rope_norm_store_kv_fp8_fake(
         device=qkv.device,
     )
     return (out_q_fp8, q_scale, split_k_flag)
+
+
+@torch.library.register_fake("hpc::qwen3_tts_rope")
+def qwen3_tts_rope_fake(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor):
+    return (
+        torch.empty(q.shape, dtype=q.dtype, device=q.device),
+        torch.empty(k.shape, dtype=k.dtype, device=k.device),
+    )

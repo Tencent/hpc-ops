@@ -5,6 +5,7 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <limits>
 #include <optional>
 #include <tuple>
 
@@ -12,6 +13,21 @@
 
 namespace hpc {
 namespace rope {
+
+namespace {
+
+constexpr int64_t kQwen3TtsRopeHeadDim = 128;
+constexpr int64_t kQwen3TtsRowsPerBlockSmall = 4;
+constexpr int64_t kQwen3TtsRowsPerBlockLarge = 8;
+
+int64_t checked_mul(int64_t lhs, int64_t rhs, const char *name) {
+  TORCH_CHECK(lhs >= 0 && rhs >= 0, name, " must be non-negative");
+  TORCH_CHECK(rhs == 0 || lhs <= std::numeric_limits<int64_t>::max() / rhs, name,
+              " overflows int64_t");
+  return lhs * rhs;
+}
+
+}  // namespace
 
 torch::Tensor rope_norm_store_kv_entry(
     torch::Tensor &kcache, torch::Tensor &vcache, const torch::Tensor &qkv,
@@ -216,6 +232,61 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
   return std::make_tuple(out_q, q_scale, split_k_flag);
 }
 
+// qwen3_tts_rope: TTS NeoX RoPE. Kernel in
+// src/rope/qwen3_tts_rope.cu.
+std::tuple<torch::Tensor, torch::Tensor> qwen3_tts_rope_entry(const torch::Tensor &q,
+                                                              const torch::Tensor &k,
+                                                              const torch::Tensor &cos,
+                                                              const torch::Tensor &sin) {
+  TORCH_CHECK(q.dim() == 4 && k.dim() == 4, "q/k must be [B,H,S,D]");
+  TORCH_CHECK(cos.dim() == 3 && sin.dim() == 3, "cos/sin must be [B,S,D]");
+  TORCH_CHECK(q.scalar_type() == torch::kBFloat16 && k.scalar_type() == torch::kBFloat16,
+              "q/k must be bfloat16");
+  TORCH_CHECK(cos.scalar_type() == torch::kBFloat16 && sin.scalar_type() == torch::kBFloat16,
+              "cos/sin must be bfloat16");
+  TORCH_CHECK(q.size(0) == k.size(0) && q.size(2) == k.size(2) && q.size(3) == k.size(3),
+              "q/k shape mismatch");
+  TORCH_CHECK(cos.size(0) == q.size(0) && cos.size(1) == q.size(2) && cos.size(2) == q.size(3),
+              "cos shape mismatch");
+  TORCH_CHECK(sin.sizes() == cos.sizes(), "sin shape mismatch");
+  TORCH_CHECK(q.size(3) == kQwen3TtsRopeHeadDim, "qwen3_tts_rope only supports head_dim=128");
+  TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1, "q/k last dimension must be contiguous");
+  TORCH_CHECK(cos.stride(2) == 1 && sin.stride(2) == 1,
+              "cos/sin last dimension must be contiguous");
+
+  const int64_t total_q_rows =
+      checked_mul(checked_mul(q.size(0), q.size(1), "q B*H"), q.size(2), "q B*H*S");
+  const int64_t total_k_rows =
+      checked_mul(checked_mul(k.size(0), k.size(1), "k B*H"), k.size(2), "k B*H*S");
+  TORCH_CHECK(total_q_rows <= std::numeric_limits<int64_t>::max() - total_k_rows,
+              "qwen3_tts_rope total rows overflows int64_t");
+  const int64_t total_rows = total_q_rows + total_k_rows;
+  const int64_t rows_per_block =
+      q.size(0) <= 1 ? kQwen3TtsRowsPerBlockSmall : kQwen3TtsRowsPerBlockLarge;
+  const int64_t grid_x = (total_rows + rows_per_block - 1) / rows_per_block;
+  TORCH_CHECK(grid_x <= std::numeric_limits<uint32_t>::max(),
+              "qwen3_tts_rope grid.x overflows uint32_t");
+
+  torch::Tensor q_out = torch::empty(q.sizes(), q.options());
+  torch::Tensor k_out = torch::empty(k.sizes(), k.options());
+  if (total_rows == 0) {
+    return std::make_tuple(q_out, k_out);
+  }
+  Qwen3TtsRopeParams params{q.size(0),     q.size(2),    q.size(1),   k.size(1),     q.size(3),
+                            total_q_rows,  total_rows,   q.stride(0), q.stride(1),   q.stride(2),
+                            k.stride(0),   k.stride(1),  k.stride(2), cos.stride(0), cos.stride(1),
+                            sin.stride(0), sin.stride(1)};
+  auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+  qwen3_tts_rope_async(reinterpret_cast<__nv_bfloat16 *>(q_out.mutable_data_ptr()),
+                       reinterpret_cast<__nv_bfloat16 *>(k_out.mutable_data_ptr()),
+                       reinterpret_cast<const __nv_bfloat16 *>(q.const_data_ptr()),
+                       reinterpret_cast<const __nv_bfloat16 *>(k.const_data_ptr()),
+                       reinterpret_cast<const __nv_bfloat16 *>(cos.const_data_ptr()),
+                       reinterpret_cast<const __nv_bfloat16 *>(sin.const_data_ptr()), params,
+                       stream);
+  return std::make_tuple(q_out, k_out);
+}
+
 }  // namespace rope
 }  // namespace hpc
 
@@ -237,4 +308,6 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "Tensor? out_q=None, Tensor? out_k=None, Tensor? out_v=None, int qk_norm_policy=0) -> "
       "(Tensor, Tensor, Tensor)");
   m.impl("rope_norm_store_kv_fp8", torch::kCUDA, &hpc::rope::rope_norm_store_kv_fp8_entry);
+  m.def("qwen3_tts_rope(Tensor q, Tensor k, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
+  m.impl("qwen3_tts_rope", torch::kCUDA, &hpc::rope::qwen3_tts_rope_entry);
 }
