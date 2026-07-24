@@ -1,10 +1,13 @@
 # FusedMoE Benchmark
 
-Benchmark blockwise FP8 FusedMoE kernels across HPC-Ops and optional comparison backends.
+Benchmark FusedMoE kernels across HPC-Ops and optional comparison backends.
 
 ## Overview
 
-- Operator: SM90 blockwise FP8 FusedMoE
+- Operator: SM90 FusedMoE
+- Precision (`--dtype`):
+  - `fp8` (default): per-tensor FP8 path. Providers: `HPC-Ops`, `vLLM Triton`, `vLLM CUTLASS`, `SGLang`.
+  - `bf16`: bf16 path. Compared only against `SGLang` (Triton, unquantized). Providers restricted to `HPC-Ops` and `SGLang`.
 - Providers:
   - `HPC-Ops`
   - `vLLM Triton`
@@ -70,6 +73,20 @@ python3 benchmark/fused_moe/benchmark_fuse_moe.py \
   --gpu 0
 ```
 
+bf16 (HPC-Ops vs SGLang only):
+
+```bash
+python3 benchmark/fused_moe/benchmark_fuse_moe.py \
+  --dtype bf16 \
+  --tp 8 --ep 1 \
+  --csv fused_moe_bf16_tp8_ep1.csv \
+  --jsonl fused_moe_bf16_tp8_ep1.jsonl
+```
+
+With `--dtype bf16`, providers default to `hpcops sglang`. Passing any other
+provider (e.g. `vllm`) is rejected. The bf16 SGLang path runs the Triton
+FusedMoE kernels with unquantized bf16 weights and activations.
+
 Custom shape:
 
 ```bash
@@ -104,6 +121,7 @@ lists with `--tp-batches` and `--ep-batches`. Timing controls are exposed as
 - `model`: benchmark model shape.
 - `bs`: kernel-visible token count on the measured rank.
 - `backend`: provider key (`hpcops`, `vllm`, `vllm_cutlass`, `sglang`).
+- `dtype`: precision of the measured path (`fp8` or `bf16`).
 - `median_us`: median latency extracted from NVTX `step` ranges.
 - `mean_us`: mean latency of the same samples.
 - `n_samples`: number of timed samples.

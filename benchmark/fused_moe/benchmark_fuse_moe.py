@@ -54,6 +54,9 @@ ALL_BACKENDS = [
     "hpcops", "sglang", "vllm", "vllm_cutlass",
 ]
 
+# bf16 path only compares HPC-Ops against SGLang.
+BF16_BACKENDS = ["hpcops", "sglang"]
+
 DISPLAY = {
     "hpcops":       "HPC-Ops",
     "sglang":       "SGLang",
@@ -199,7 +202,7 @@ def build_env(backend: str, roots: Roots, gpu_id: int) -> dict:
 def dry_run(
     backend: str, roots: Roots, gpu_id: int,
     *, num_seq: int, hidden: int, intermediate_per_rank: int,
-    num_experts: int, topk: int, warmup: int, timeout: int,
+    num_experts: int, topk: int, warmup: int, timeout: int, dtype: str = "fp8",
 ) -> tuple[bool, str]:
     """Try a 1-step kernel call at minimal shape to confirm the backend
     actually works.  Returns (ok, message).
@@ -215,6 +218,7 @@ def dry_run(
         "--num-topk", str(topk),
         "--warmup", str(warmup),
         "--n-timed", "1",
+        "--dtype", dtype,
     ]
     env = build_env(backend, roots, gpu_id)
     try:
@@ -299,6 +303,7 @@ class CellResult:
     model: str
     bs: int
     backend: str
+    dtype: str
     tp: int
     ep: int
     n_expert_total: int
@@ -323,12 +328,13 @@ def profile_one(
     output_dir: Path, tag: str,
     models: dict[str, ModelSpec],
     *, warmup: int, iters: int, seed: int, nsys_attempts: int, nsys_timeout: int,
+    dtype: str = "fp8",
 ) -> CellResult:
     spec = models[model]
     E_total, topk, H, N_full = spec.experts, spec.topk, spec.hidden, spec.intermediate
     if E_total % ep != 0:
         return CellResult(
-            model=model, bs=bs, backend=backend, tp=tp, ep=ep,
+            model=model, bs=bs, backend=backend, dtype=dtype, tp=tp, ep=ep,
             n_expert_total=E_total, n_expert_local=0, topk=topk,
             hidden=H, intermediate_full=N_full, intermediate_per_rank=0,
             avg_per_group=0.0,
@@ -357,6 +363,7 @@ def profile_one(
         "--seed", str(seed),
         "--warmup", str(warmup),
         "--n-timed", str(iters),
+        "--dtype", dtype,
     ]
 
     attempts = run_nsys_profile(
@@ -366,7 +373,7 @@ def profile_one(
     )
     if attempts > nsys_attempts:
         return CellResult(
-            model=model, bs=bs, backend=backend, tp=tp, ep=ep,
+            model=model, bs=bs, backend=backend, dtype=dtype, tp=tp, ep=ep,
             n_expert_total=E_total, n_expert_local=E_local, topk=topk,
             hidden=H, intermediate_full=N_full, intermediate_per_rank=N_per_rank,
             avg_per_group=avg,
@@ -378,7 +385,7 @@ def profile_one(
     ns = extract_nvtx(rpath)
     if not ns:
         return CellResult(
-            model=model, bs=bs, backend=backend, tp=tp, ep=ep,
+            model=model, bs=bs, backend=backend, dtype=dtype, tp=tp, ep=ep,
             n_expert_total=E_total, n_expert_local=E_local, topk=topk,
             hidden=H, intermediate_full=N_full, intermediate_per_rank=N_per_rank,
             avg_per_group=avg,
@@ -397,7 +404,7 @@ def profile_one(
 
     arr = np.array(ns, dtype=np.float64) / 1000.0  # ns -> us
     return CellResult(
-        model=model, bs=bs, backend=backend, tp=tp, ep=ep,
+        model=model, bs=bs, backend=backend, dtype=dtype, tp=tp, ep=ep,
         n_expert_total=E_total, n_expert_local=E_local, topk=topk,
         hidden=H, intermediate_full=N_full, intermediate_per_rank=N_per_rank,
         avg_per_group=avg,
@@ -411,10 +418,10 @@ def profile_one(
     )
 
 
-def print_table(rows: list[dict]) -> None:
+def print_table(rows: list[dict], dtype: str = "fp8") -> None:
     print("")
     print("=" * 132)
-    print("FusedMoE FP8 latency | us per call (lower is better)")
+    print(f"FusedMoE {dtype.upper()} latency | us per call (lower is better)")
     print("-" * 132)
     print(
         f"{'model':>14} | {'mode':>9} | {'bs':>6} | {'backend':>12} | "
@@ -473,8 +480,11 @@ def main() -> int:
         metavar="NAME:E:TOPK:HIDDEN:INTERMEDIATE",
         help="Add or override a model shape, e.g. custom:128:8:4096:1536.",
     )
+    p.add_argument("--dtype", choices=["fp8", "bf16"], default="fp8",
+                   help="fp8: per-tensor FP8 path (all providers). "
+                        "bf16: bf16 path, compared only against SGLang.")
     p.add_argument("--providers", dest="backends", nargs="+",
-                   default=ALL_BACKENDS, choices=ALL_BACKENDS)
+                   default=None, choices=ALL_BACKENDS)
     p.add_argument("--backends", dest="backends", nargs="+",
                    choices=ALL_BACKENDS, help=argparse.SUPPRESS)
     p.add_argument("--timing", choices=["nsys"], default="nsys",
@@ -531,6 +541,19 @@ def main() -> int:
             f"unknown model(s): {', '.join(unknown_models)}. "
             "Use --model-shape NAME:E:TOPK:HIDDEN:INTERMEDIATE to add custom shapes."
         )
+
+    # Resolve providers; the bf16 path only supports HPC-Ops vs SGLang.
+    if args.dtype == "bf16":
+        if args.backends is None:
+            args.backends = list(BF16_BACKENDS)
+        else:
+            bad = [b for b in args.backends if b not in BF16_BACKENDS]
+            if bad:
+                p.error(
+                    f"--dtype bf16 only supports providers {BF16_BACKENDS}; got {bad}"
+                )
+    elif args.backends is None:
+        args.backends = list(ALL_BACKENDS)
     roots = resolve_roots(args)
     output_dir = Path(args.output_dir) if args.output_dir else SCRIPT_DIR / "log"
 
@@ -562,6 +585,7 @@ def main() -> int:
             topk=args.dry_run_topk,
             warmup=args.warmup,
             timeout=args.dry_run_timeout,
+            dtype=args.dtype,
         )
         if not ok:
             skipped[b] = f"dry_run failed: {msg}"
@@ -587,6 +611,7 @@ def main() -> int:
                         warmup=args.warmup, iters=args.iters, seed=args.seed,
                         nsys_attempts=args.nsys_attempts,
                         nsys_timeout=args.nsys_timeout,
+                        dtype=args.dtype,
                     )
                     row = asdict(res)
                     row["timing"] = "nsys_graph_nvtx_median"
@@ -595,7 +620,7 @@ def main() -> int:
                     lf.write(f"{model} bs={bs} {DISPLAY[b]} {med}\n")
                     lf.flush()
 
-    print_table(rows)
+    print_table(rows, args.dtype)
     write_csv(args.csv, rows)
     write_jsonl(args.jsonl, rows)
     print(f"nsys reports: {out_root}")
