@@ -28,11 +28,13 @@ Latency is reported in microseconds per operator call.
 ## FP8
 
 - Operator: SM90 Attention Decode FP8
-- Quantization modes:
-  - `qkpertoken_perhead_vperhead`
-  - `qpertoken_perhead_kvpertensor`
-- Comparison: static split-k vs dynamic task map
-- Default config: GQA `KV/Q heads=1/8`, `head_dim=128`, `block_size=64`
+- Comparison methods (`--methods`):
+  - `static`: HPC static split-k (`qpertoken_perhead` + `kvpertensor`)
+  - `dynamic`: HPC dynamic task map + split-k combine (same quant)
+  - `flashinfer`: FlashInfer paged decode FP8 (`qkvpertensor` scales, `block_size=64`)
+  - `flashattn`: FlashAttention-3 paged decode FP8 (`qkvpertensor` descales, `block_size=256`)
+- Default config: GQA `KV/Q heads=1/8`, `head_dim=128`, HPC `block_size=64`
+- CSV speedups: `speedup_vs_static`, `speedup_vs_flashattn`, `speedup_vs_flashinfer` (`baseline / dynamic`)
 
 Full sweep with the FusedMoE-aligned `nsys` timing path:
 
@@ -49,7 +51,7 @@ Fast smoke test with CUDA event timing:
 ```bash
 python3 benchmark/attention_decode/bench_attention_decode_fp8.py \
   --cases uniform_512 skewed_extreme \
-  --quant-types qpertoken_perhead_kvpertensor \
+  --methods static dynamic flashinfer flashattn \
   --warmup 1 \
   --iters 3
 ```
@@ -63,7 +65,7 @@ Enable correctness comparison between static and dynamic paths with `--check`.
   - `static`: HPC static split-k
   - `dynamic`: HPC dynamic task map
   - `flashinfer`: FlashInfer paged decode (`block_size=64`)
-  - `flashattn`: FlashAttention with KV cache (`block_size=256`)
+  - `flashattn`: FlashAttention-3 with KV cache (`block_size=256`)
 - Default config: GQA `KV/Q heads=1/8`, `head_dim=128`, HPC `block_size=64`
 - CSV speedups: `speedup_vs_static`, `speedup_vs_flashattn`, `speedup_vs_flashinfer` (`baseline / dynamic`)
 
