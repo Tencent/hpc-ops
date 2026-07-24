@@ -5,6 +5,8 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <cstdint>
+
 #include "src/gemm/gemm.h"
 
 namespace hpc {
@@ -22,8 +24,8 @@ static inline int normalized_m(int m, int n, int k) {
   constexpr int kRefN = 192;
   constexpr int kRefK = 4096;
   return static_cast<int>(
-      (static_cast<long long>(m) * n * kRefK + static_cast<long long>(kRefN) * k - 1) /
-      (static_cast<long long>(kRefN) * k));
+      (static_cast<int64_t>(m) * n * kRefK + static_cast<int64_t>(kRefN) * k - 1) /
+      (static_cast<int64_t>(kRefN) * k));
 }
 
 static inline int select_split_k_by_work(int norm_m) {
