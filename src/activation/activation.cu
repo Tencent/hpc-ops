@@ -4,12 +4,12 @@
 #include <cuda_fp16.h>
 #include <stdio.h>
 
+#include <type_traits>
+
 #include "cutlass/fast_math.h"
 #include "src/activation/activation.h"
 #include "src/utils/utils.cuh"
 #include "src/utils/utils.h"
-
-#include <type_traits>
 
 namespace hpc {
 namespace activation {
@@ -459,8 +459,7 @@ __device__ __forceinline__ float load_quant_value<float>(const float *ptr) {
 template <typename scalar_t>
 __global__ void scaled_fp8_quant_kernel(__nv_fp8_e4m3 *__restrict__ output,
                                         const scalar_t *__restrict__ input,
-                                        const float *__restrict__ scale,
-                                        int64_t numel) {
+                                        const float *__restrict__ scale, int64_t numel) {
   const float inv_scale = 1.0f / scale[0];
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
@@ -781,8 +780,7 @@ void masked_act_mul_and_blockwise_quant_async(__nv_fp8_e4m3 *output_ptr, float *
 
 template <typename scalar_t>
 void scaled_fp8_quant_async_impl(__nv_fp8_e4m3 *output_ptr, const scalar_t *input_ptr,
-                                 const float *scale_ptr, int64_t numel,
-                                 cudaStream_t stream) {
+                                 const float *scale_ptr, int64_t numel, cudaStream_t stream) {
   dim3 block(256);
   dim3 grid(std::min<int64_t>((numel + block.x - 1) / block.x, get_sm_count() * 8));
   kernels::scaled_fp8_quant_kernel<<<grid, block, 0, stream>>>(output_ptr, input_ptr, scale_ptr,

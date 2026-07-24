@@ -112,9 +112,9 @@ def fuse_allreduce_rmsnorm_low_latency(
         buffer_flags,
         world_size,
         rank,
-        True, # RMSNorm Fusion
+        True,  # RMSNorm Fusion
         launch_with_pdl,
-        True, # use two-Shot AllReduce
+        True,  # use two-Shot AllReduce
         output_x,
         residual_out,
         residual_in,
@@ -198,4 +198,3 @@ def empty_multimem(
     hdl = MulticastHandle(multicomm, size, dtype)
 
     return hdl.get_buffer(hdl.rank, size, dtype=dtype), hdl
-

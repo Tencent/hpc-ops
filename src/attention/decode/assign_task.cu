@@ -310,7 +310,7 @@ bool assign_attention_decode_task_async(int* task_map_ptr, const int* num_seq_kv
   auto launch = [&](auto tilen_tag) {
     constexpr int kTileN = decltype(tilen_tag)::value;
     int max_splitk = num_total_ctas;
-  
+
     kernels::assign_attention_decode_task_kernel<kMaxNumBatch, kTileN><<<grid, block, 0, stream>>>(
         task_map_ptr, num_seq_kvcache, num_batch, num_head_kv, num_seq_q, new_kv_included,
         min_process_len, num_total_ctas, max_splitk);

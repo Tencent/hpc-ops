@@ -3,6 +3,7 @@
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
+
 #include <algorithm>
 
 #include "src/allreduce/fuse_allreduce_rmsnorm_low_latency.h"
@@ -324,14 +325,14 @@ cudaError_t fuse_allreduce_rmsnorm_low_latency_async(AllReduceFusionParams const
       .numAttrs = 1,
   };
 
-#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE)                                                      \
-  do {                                                                                           \
-    cudaError_t _err = cudaLaunchKernelEx(                                                       \
+#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE)                                                       \
+  do {                                                                                            \
+    cudaError_t _err = cudaLaunchKernelEx(                                                        \
         &arConfig, &kernels::twoshotAllreduceKernel<WORLD_SIZE, T>, output, input, ucPtrs,        \
-        mcastPtr, numTokens, tokenDim, params.rank, params.bufferFlags, (!params.rmsNormFusion));\
-    if (_err != cudaSuccess) {                                                                   \
-      return _err;                                                                               \
-    }                                                                                            \
+        mcastPtr, numTokens, tokenDim, params.rank, params.bufferFlags, (!params.rmsNormFusion)); \
+    if (_err != cudaSuccess) {                                                                    \
+      return _err;                                                                                \
+    }                                                                                             \
   } while (0)
   T** ucPtrs = reinterpret_cast<T**>(params.bufferPtrsDev);
   T* mcastPtr = reinterpret_cast<T*>(params.multicastPtr);
@@ -391,22 +392,22 @@ cudaError_t fuse_allreduce_rmsnorm_low_latency_async(AllReduceFusionParams const
 
     size_t const smemSize = 3 * rnBlockSize * iters * sizeof(T);
 
-#define RUN_RMSNORM_KERNEL(LOADS_PER_THREAD)                                                      \
-  do {                                                                                            \
-    cudaError_t _err = cudaFuncSetAttribute(&kernels::rmsNormLamport<T, T, LOADS_PER_THREAD>,     \
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize,          \
-                                            smemSize);                                            \
-    if (_err != cudaSuccess) {                                                                    \
-      return _err;                                                                                \
-    }                                                                                             \
-    rnConfig.dynamicSmemBytes = smemSize;                                                         \
-    _err = cudaLaunchKernelEx(&rnConfig, &kernels::rmsNormLamport<T, T, LOADS_PER_THREAD>,        \
-                              residualOut, output, bufferInput, gamma,                            \
-                              static_cast<float>(params.epsilon), residualIn, numTokens,          \
-                              tokenDim, params.nRanks, params.bufferFlags);                       \
-    if (_err != cudaSuccess) {                                                                    \
-      return _err;                                                                                \
-    }                                                                                             \
+#define RUN_RMSNORM_KERNEL(LOADS_PER_THREAD)                                                       \
+  do {                                                                                             \
+    cudaError_t _err =                                                                             \
+        cudaFuncSetAttribute(&kernels::rmsNormLamport<T, T, LOADS_PER_THREAD>,                     \
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize);               \
+    if (_err != cudaSuccess) {                                                                     \
+      return _err;                                                                                 \
+    }                                                                                              \
+    rnConfig.dynamicSmemBytes = smemSize;                                                          \
+    _err = cudaLaunchKernelEx(&rnConfig, &kernels::rmsNormLamport<T, T, LOADS_PER_THREAD>,         \
+                              residualOut, output, bufferInput, gamma,                             \
+                              static_cast<float>(params.epsilon), residualIn, numTokens, tokenDim, \
+                              params.nRanks, params.bufferFlags);                                  \
+    if (_err != cudaSuccess) {                                                                     \
+      return _err;                                                                                 \
+    }                                                                                              \
   } while (0)
 
     T* residualOut = reinterpret_cast<T*>(params.residualOut);

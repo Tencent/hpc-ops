@@ -76,17 +76,16 @@ void fuse_allreduce_rmsnorm_high_throughput_entry(
 }
 
 void fuse_allreduce_rmsnorm_low_latency_entry(
-    const torch::Tensor &input_x,            // [num_tokens, token_dim]
-    const torch::Tensor &multicast_x,        // [num_tokens, token_dim] multimem_ptr tensor
-    const torch::Tensor &data_buffer_ptrs,   // [world_size] int64 pointers to remote buffers
-    torch::Tensor &multinode_x,              // local lamport buffer tensor
-    const torch::Tensor &buffer_flags,       // lamport flag buffer
-    int64_t world_size, int64_t rank, bool rmsnorm_fusion, bool launch_with_pdl,
-    bool use_two_shot,
-    torch::Tensor &output_x,                 // [num_tokens, token_dim]
-    torch::Tensor &residual_out,             // [num_tokens, token_dim]
-    const torch::Tensor &residual_in,        // [num_tokens, token_dim]
-    const torch::Tensor &weight_gamma,       // [token_dim]
+    const torch::Tensor &input_x,           // [num_tokens, token_dim]
+    const torch::Tensor &multicast_x,       // [num_tokens, token_dim] multimem_ptr tensor
+    const torch::Tensor &data_buffer_ptrs,  // [world_size] int64 pointers to remote buffers
+    torch::Tensor &multinode_x,             // local lamport buffer tensor
+    const torch::Tensor &buffer_flags,      // lamport flag buffer
+    int64_t world_size, int64_t rank, bool rmsnorm_fusion, bool launch_with_pdl, bool use_two_shot,
+    torch::Tensor &output_x,            // [num_tokens, token_dim]
+    torch::Tensor &residual_out,        // [num_tokens, token_dim]
+    const torch::Tensor &residual_in,   // [num_tokens, token_dim]
+    const torch::Tensor &weight_gamma,  // [token_dim]
     double rms_norm_eps) {
   auto stream = at::cuda::getCurrentCUDAStream(input_x.get_device());
 
@@ -116,17 +115,17 @@ void fuse_allreduce_rmsnorm_low_latency_entry(
               "weight_gamma tensor data type must be bfloat16");
   TORCH_CHECK(data_buffer_ptrs.scalar_type() == torch::kInt64,
               "data_buffer_ptrs tensor data type must be int64");
-  TORCH_CHECK(buffer_flags.scalar_type() == torch::kUInt32 ||
-                  buffer_flags.scalar_type() == torch::kInt32,
-              "buffer_flags tensor data type must be uint32/int32");
+  TORCH_CHECK(
+      buffer_flags.scalar_type() == torch::kUInt32 || buffer_flags.scalar_type() == torch::kInt32,
+      "buffer_flags tensor data type must be uint32/int32");
 
   // Shape & value checks
   TORCH_CHECK(input_x.dim() == 2, "input_x must be 2D [num_tokens, token_dim]");
   int64_t num_tokens = input_x.size(0);
   int64_t token_dim = input_x.size(1);
   using c_type = __nv_bfloat16;
-  TORCH_CHECK(token_dim % (sizeof(float4) / sizeof(c_type)) == 0,
-              "token_dim must be divisible by ", sizeof(float4) / sizeof(c_type));
+  TORCH_CHECK(token_dim % (sizeof(float4) / sizeof(c_type)) == 0, "token_dim must be divisible by ",
+              sizeof(float4) / sizeof(c_type));
   TORCH_CHECK(output_x.size(0) == num_tokens && output_x.size(1) == token_dim,
               "output_x shape mismatch: expected (", num_tokens, ", ", token_dim, ") but got (",
               output_x.size(0), ", ", output_x.size(1), ")");
@@ -167,10 +166,10 @@ void fuse_allreduce_rmsnorm_low_latency_entry(
   params.rank = static_cast<int>(rank);
   params.numTokens = static_cast<int>(num_tokens);
   params.tokenDim = static_cast<int>(token_dim);
-  params.bufferPtrsDev = reinterpret_cast<void**>(const_cast<void*>(data_buffer_ptrs_ptr));
+  params.bufferPtrsDev = reinterpret_cast<void **>(const_cast<void *>(data_buffer_ptrs_ptr));
   params.bufferPtrLocal = multinode_ptr;
-  params.multicastPtr = const_cast<void*>(multicast_ptr);
-  params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags_ptr);
+  params.multicastPtr = const_cast<void *>(multicast_ptr);
+  params.bufferFlags = reinterpret_cast<uint32_t *>(buffer_flags_ptr);
   params.rmsNormFusion = rmsnorm_fusion;
   params.launchWithPdl = launch_with_pdl;
 
@@ -187,8 +186,7 @@ void fuse_allreduce_rmsnorm_low_latency_entry(
 
   cudaError_t status = fuse_allreduce_rmsnorm_low_latency_async<c_type>(params);
   TORCH_CHECK(status == cudaSuccess,
-              "fuse_allreduce_rmsnorm_low_latency failed with error: ",
-              cudaGetErrorString(status));
+              "fuse_allreduce_rmsnorm_low_latency failed with error: ", cudaGetErrorString(status));
 }
 
 }  // namespace allreduce

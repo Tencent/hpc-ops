@@ -3,18 +3,18 @@
 #ifndef SRC_ALLREDUCE_FUSE_ALLREDUCE_RMSNORM_LOW_LATENCY_H_
 #define SRC_ALLREDUCE_FUSE_ALLREDUCE_RMSNORM_LOW_LATENCY_H_
 
-#include <cuda_runtime_api.h>
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
 
 #include <array>
-#include <iostream>
-#include <type_traits>
 #include <atomic>
 #include <cstdint>
+#include <iostream>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 namespace hpc {
@@ -254,9 +254,9 @@ struct __attribute__((aligned(32))) LamportFlags {
     int tid = cluster.thread_rank();
     cluster.sync();
     if (tid == 0) {
-    // red.async does not accept the .release qualifier (rejected by ptxas on
-    // sm_90a / CUDA 13). Use the plain release reduction instead, which is the
-    // intended global atomic-add-with-release semantics for the flag counter.
+      // red.async does not accept the .release qualifier (rejected by ptxas on
+      // sm_90a / CUDA 13). Use the plain release reduction instead, which is the
+      // intended global atomic-add-with-release semantics for the flag counter.
       asm volatile("red.release.global.gpu.add.u32 [%0], %1;" ::"l"(mFlagAccessPtr), "r"(1)
                    : "memory");
     }
@@ -465,7 +465,8 @@ inline __device__ T blockReduceSum(T val) {
 
 // A helper function to tune the grid configuration for fused oneshot and rmsnorm kernels
 // Return (block_size, cluster_size, loads_per_thread)
-// TODO(draken): I have modified this function. This function assumes the target is B200 (sm_100), which always supports CGA.
+// TODO(draken): I have modified this function. This function assumes the target is B200 (sm_100),
+// which always supports CGA.
 inline std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread) {
   // B200 always supports CGA, start with the preferred cluster size
   int clusterSize = 8;
