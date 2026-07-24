@@ -1,7 +1,7 @@
 // Copyright 2025 hpc-ops authors
 
-#ifndef SRC_ATTENTION_DECODE_SPLITK_ADAPTIVE_COMBINE_KERNELS_CUH_
-#define SRC_ATTENTION_DECODE_SPLITK_ADAPTIVE_COMBINE_KERNELS_CUH_
+#ifndef SRC_ATTENTION_DECODE_SPLITK_COMBINE_KERNELS_CUH_
+#define SRC_ATTENTION_DECODE_SPLITK_COMBINE_KERNELS_CUH_
 
 #include <cuda.h>
 #include <stdio.h>
@@ -138,7 +138,7 @@ __device__ __forceinline__ void store_row(const TiledCopy &tiled_copy_store, TYg
 }
 
 template <typename T, int kTileV, int kWarpCount, int kHeavyThresh>
-__global__ void attention_decode_dynamic_splitk_adaptive_combine_kernel(
+__global__ void attention_decode_dynamic_splitk_combine_kernel(
     T *y_ptr, const float *split_input_ptr, const float *lse_ptr, const int *task_map_ptr,
     int num_total_ctas, int num_batch, int num_seq_q, int num_head_q, int num_head_k,
     int pad_heads_per_group, int max_splitk, cutlass::FastDivmod heads_per_group_divider) {
@@ -326,4 +326,4 @@ __global__ void attention_decode_dynamic_splitk_adaptive_combine_kernel(
 }  // namespace attention
 }  // namespace hpc
 
-#endif  // SRC_ATTENTION_DECODE_SPLITK_ADAPTIVE_COMBINE_KERNELS_CUH_
+#endif  // SRC_ATTENTION_DECODE_SPLITK_COMBINE_KERNELS_CUH_

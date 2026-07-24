@@ -9,7 +9,7 @@
 #include "cute/tensor.hpp"
 #include "src/attention/decode/sm90/dynamic/smallm_bf16_dim128_dynamic_splitk_kernels.cuh"
 #include "src/attention/decode/smallm_dim128.h"
-#include "src/attention/decode/splitk_adaptive_combine_kernels.cuh"
+#include "src/attention/decode/splitk_combine_kernels.cuh"
 
 namespace hpc {
 namespace attention {
@@ -159,8 +159,8 @@ static void launch_smallm_bf16_dim128_dynamic_splitk_kernel(
       kCombineWarps * kHeavyThresh > max_splitk ? kCombineWarps * kHeavyThresh : max_splitk;
 
   auto combine_kernel =
-      kernels::attention_decode_dynamic_splitk_adaptive_combine_kernel<__nv_bfloat16, kTileV,
-                                                                       kCombineWarps, kHeavyThresh>;
+      kernels::attention_decode_dynamic_splitk_combine_kernel<__nv_bfloat16, kTileV, kCombineWarps,
+                                                              kHeavyThresh>;
 
   cudaLaunchConfig_t combine_config;
   memset(&combine_config, 0, sizeof(combine_config));
