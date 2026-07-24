@@ -23,6 +23,16 @@ def _discover_modules() -> Dict[str, ModuleType]:
             modules[module_name] = module
         except ImportError as e:
             print(f"WARNING: Failed to import {module_name}: {str(e)}", file=sys.stderr)
+        except RuntimeError as e:
+            # A partial build (e.g. the ROCm backend only compiles the ported
+            # operators) leaves some ops unregistered, so a module's
+            # register_fake for a missing op raises RuntimeError. Skip that
+            # module instead of aborting the whole package import.
+            print(
+                f"WARNING: Skipping {module_name}: operator not available in this build "
+                f"({str(e)})",
+                file=sys.stderr,
+            )
 
     return modules
 

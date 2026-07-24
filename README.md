@@ -184,14 +184,20 @@ softmax statistics to reduce vocabulary reads and fixed launch overhead.
 ## Quick Start
 
 ### Requirements
+
+For the NVIDIA CUDA build (full operator set):
 - NVIDIA SM90 architecture GPU
 - Python 3.8 or higher
 - Compilers with C++17 support
 - CUDA Toolkit: CUDA 12.8 or higher
 
+For the AMD ROCm build (currently the normalization operators only):
+- AMD gfx950 (MI350X) GPU
+- ROCm 7.2 or higher, with a matching ROCm build of PyTorch (`torch.version.hip` must be set)
+
 *You can set up the environment by installing the modules listed in requirements-dev.txt.*
 
-### Install from Source
+### Install from Source (NVIDIA CUDA)
 
 ```bash
 git clone https://github.com/Tencent/hpc-ops.git
@@ -200,6 +206,24 @@ cd hpc-ops
 # build packages
 make wheel
 python3 -m pip install dist/*.whl
+```
+
+### Install from Source (AMD ROCm)
+
+The ROCm backend is opt-in via `USE_ROCM=1` and builds only the ported operators
+under `src/amd/`. The target architecture defaults to `gfx950` and can be
+overridden with `PYTORCH_ROCM_ARCH`.
+
+```bash
+git clone https://github.com/Tencent/hpc-ops.git
+cd hpc-ops
+
+# build packages (defaults to gfx950; set PYTORCH_ROCM_ARCH to target another arch)
+USE_ROCM=1 make wheel
+
+# install WITHOUT dependency resolution so pip does not replace your ROCm
+# PyTorch with a CUDA build from PyPI
+python3 -m pip install --no-deps dist/*.whl
 ```
 
 ### Basic Usage
