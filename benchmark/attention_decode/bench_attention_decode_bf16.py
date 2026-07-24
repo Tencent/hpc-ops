@@ -1,6 +1,6 @@
 # Copyright (C) 2025 Tencent.
 
-"""Attention Decode FP8 benchmark for dynamic scheduling.
+"""Attention Decode BF16 benchmark for dynamic scheduling.
 
 
 Default workloads:
@@ -9,11 +9,7 @@ Default workloads:
     two_32k_30x4k
 
 Recommended command:
-    python3 benchmark/attention_decode/bench_attention_decode_fp8.py --csv attention_decode_fp8.csv
-
-Quantization:
-    - HPC static/dynamic: qpertoken_perhead + kvpertensor
-    - FlashAttention-3 / FlashInfer: qkvpertensor (scalar per-tensor scales)
+    python3 benchmark/attention_decode/bench_attention_decode_bf16.py --csv attention_decode_bf16.csv
 
 The benchmark compares HPC static split-k, HPC dynamic task map, FlashAttention-3,
 and FlashInfer. Latency is reported in microseconds per operator call.
@@ -48,10 +44,25 @@ DEFAULT_HEAD_DIM = 128
 DEFAULT_KV_HEADS = 1
 DEFAULT_Q_HEADS = 8
 
-# HPC path: Q per-token-per-head, K/V per-tensor.
-HPC_QUANT_TYPE = hpc.QuantType.QPERTOKEN_PERHEAD_KPERTENSOR_VPERTENSOR
-
 METHODS = ("static", "dynamic", "flashattn", "flashinfer")
+
+
+def _import_fa3_kvcache():
+    """Import FA3 flash_attn_with_kvcache."""
+    try:
+        from flash_attn_interface import flash_attn_with_kvcache
+
+        return flash_attn_with_kvcache
+    except Exception:
+        pass
+    try:
+        from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache
+
+        return flash_attn_with_kvcache
+    except Exception as e:
+        raise ImportError(
+            "FlashAttention-3 is required for --methods flashattn. "
+        ) from e
 
 
 CASES = {
@@ -74,30 +85,9 @@ class Inputs:
     v_cache: torch.Tensor
     block_ids: torch.Tensor
     kv_lens: torch.Tensor
-    q_scale: torch.Tensor
-    k_scale: torch.Tensor
-    v_scale: torch.Tensor
     output: torch.Tensor
     num_batch: int
     max_seq_kv: int
-
-
-def _import_fa3_kvcache():
-    """Import FA3 flash_attn_with_kvcache (supports FP8 + q/k/v_descale)."""
-    try:
-        from flash_attn_interface import flash_attn_with_kvcache
-
-        return flash_attn_with_kvcache
-    except Exception:
-        pass
-    try:
-        from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache
-
-        return flash_attn_with_kvcache
-    except Exception as e:
-        raise ImportError(
-            "FlashAttention-3 with FP8 is required for --methods flashattn. "
-        ) from e
 
 
 def build_block_ids(kv_lens: torch.Tensor, block_size: int, max_num_blocks: int) -> torch.Tensor:
@@ -139,7 +129,6 @@ def make_inputs(
     num_head_q: int,
     head_dim: int,
 ) -> Inputs:
-    """Build HPC inputs: Q per-token-per-head FP8, K/V per-tensor FP8."""
     torch.manual_seed(41)
     torch.cuda.manual_seed(41)
 
@@ -149,56 +138,31 @@ def make_inputs(
     nblocks = (kv_lens + BLOCK_SIZE - 1) // BLOCK_SIZE
     max_num_blocks = int(nblocks.sum().item() * 1.2) + num_batch + 8
 
-    q_bf16 = torch.randn(
+    q = torch.randn(
         (num_batch * num_seq_q, num_head_q, head_dim),
         dtype=torch.bfloat16,
         device="cuda",
     ) / math.sqrt(head_dim)
-    q_scale = q_bf16.float().abs().max(-1)[0].clamp_min(1e-6)
-    q = (q_bf16 / q_scale[:, :, None]).to(torch.float8_e4m3fn)
-
-    k_cache = (
-        torch.randn(
-            max_num_blocks, BLOCK_SIZE, num_head_kv, head_dim, dtype=torch.bfloat16, device="cuda"
-        )
-        / math.sqrt(head_dim)
-    ).to(torch.float8_e4m3fn)
+    k_cache = torch.randn(
+        max_num_blocks, BLOCK_SIZE, num_head_kv, head_dim, dtype=torch.bfloat16, device="cuda"
+    ) / math.sqrt(head_dim)
     v_cache = torch.randn(
         max_num_blocks, BLOCK_SIZE, num_head_kv, head_dim, dtype=torch.bfloat16, device="cuda"
-    ).to(torch.float8_e4m3fn)
-    k_scale = torch.rand((1,), dtype=torch.float32, device="cuda").clamp_min(1e-6)
-    v_scale = torch.rand((1,), dtype=torch.float32, device="cuda").clamp_min(1e-6)
-
-    block_ids = build_block_ids(kv_lens, BLOCK_SIZE, max_num_blocks)
-    output = torch.empty_like(q, dtype=torch.bfloat16)
-    return Inputs(
-        q,
-        k_cache,
-        v_cache,
-        block_ids,
-        kv_lens,
-        q_scale,
-        k_scale,
-        v_scale,
-        output,
-        num_batch,
-        max_seq_kv,
     )
+    block_ids = build_block_ids(kv_lens, BLOCK_SIZE, max_num_blocks)
+    output = torch.empty_like(q)
+    return Inputs(q, k_cache, v_cache, block_ids, kv_lens, output, num_batch, max_seq_kv)
 
 
 def run_kernel(inputs: Inputs, task_map: torch.Tensor | None = None) -> torch.Tensor:
-    return hpc.attention_decode_fp8(
+    return hpc.attention_decode_bf16(
         inputs.q,
         inputs.k_cache,
         inputs.v_cache,
         inputs.block_ids,
         inputs.kv_lens,
-        inputs.q_scale,
-        inputs.k_scale,
-        inputs.v_scale,
         mtp=DEFAULT_NUM_SEQ_Q - 1,
         new_kv_included=True,
-        quant_type=HPC_QUANT_TYPE,
         splitk=True,
         task_map=task_map,
         output=inputs.output,
@@ -206,61 +170,26 @@ def run_kernel(inputs: Inputs, task_map: torch.Tensor | None = None) -> torch.Te
 
 
 def make_flashattn_fn(inputs: Inputs, num_head_kv: int, head_dim: int) -> Callable[[], None]:
-    """FA3 FP8 decode with qkvpertensor scales."""
+    """FA3 BF16 decode with paged KV cache."""
     flash_attn_with_kvcache = _import_fa3_kvcache()
 
     nblocks_fa = (inputs.kv_lens + FA_BLOCK_SIZE - 1) // FA_BLOCK_SIZE
     max_num_blocks_fa = int(nblocks_fa.sum().item() * 1.2) + inputs.num_batch + 4
     max_pages = int(nblocks_fa.max().item())
-
-    # qkvpertensor: one scale for Q / K / V each.
-    q_scale = float(torch.rand((), device="cuda").clamp_min(1e-6).item())
-    k_scale = float(torch.rand((), device="cuda").clamp_min(1e-6).item())
-    v_scale = float(torch.rand((), device="cuda").clamp_min(1e-6).item())
-
-    q_fa = (torch.randn_like(inputs.q, dtype=torch.bfloat16) / q_scale).to(torch.float8_e4m3fn)
-    q_fa = q_fa.unsqueeze(1)  # (B*Sq, 1, Hq, D) for decode
-    k_cache_fa = (
-        torch.randn(
-            max_num_blocks_fa,
-            FA_BLOCK_SIZE,
-            num_head_kv,
-            head_dim,
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        / k_scale
-    ).to(torch.float8_e4m3fn)
-    v_cache_fa = (
-        torch.randn(
-            max_num_blocks_fa,
-            FA_BLOCK_SIZE,
-            num_head_kv,
-            head_dim,
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        / v_scale
-    ).to(torch.float8_e4m3fn)
-
+    k_cache_fa = torch.randn(
+        max_num_blocks_fa, FA_BLOCK_SIZE, num_head_kv, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    v_cache_fa = torch.randn(
+        max_num_blocks_fa, FA_BLOCK_SIZE, num_head_kv, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
     page_table = torch.zeros(inputs.num_batch, max_pages, dtype=torch.int32, device="cuda")
     offset = 0
     for i in range(inputs.num_batch):
         nb = int(nblocks_fa[i])
         page_table[i, :nb] = torch.arange(offset, offset + nb, dtype=torch.int32, device="cuda")
         offset += nb
+    q_fa = inputs.q.unsqueeze(1)
     cache_seqlens = inputs.kv_lens.to(torch.int32)
-
-    # FA3 descales are (batch, nheads_kv); broadcast tensor scales.
-    q_descale = torch.full(
-        (inputs.num_batch, num_head_kv), q_scale, dtype=torch.float32, device="cuda"
-    )
-    k_descale = torch.full(
-        (inputs.num_batch, num_head_kv), k_scale, dtype=torch.float32, device="cuda"
-    )
-    v_descale = torch.full(
-        (inputs.num_batch, num_head_kv), v_scale, dtype=torch.float32, device="cuda"
-    )
 
     def call_fn():
         flash_attn_with_kvcache(
@@ -269,9 +198,6 @@ def make_flashattn_fn(inputs: Inputs, num_head_kv: int, head_dim: int) -> Callab
             v_cache=v_cache_fa,
             cache_seqlens=cache_seqlens,
             page_table=page_table,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
             causal=True,
         )
 
@@ -281,7 +207,6 @@ def make_flashattn_fn(inputs: Inputs, num_head_kv: int, head_dim: int) -> Callab
 def make_flashinfer_fn(
     inputs: Inputs, num_head_kv: int, num_head_q: int, head_dim: int
 ) -> Callable[[], None]:
-    """FlashInfer FP8 decode with qkvpertensor (scalar) scales."""
     import flashinfer
 
     nblocks_fi = (inputs.kv_lens + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -291,40 +216,9 @@ def make_flashinfer_fn(
     offset = 0
     for i in range(inputs.num_batch):
         nb = int(nblocks_fi[i])
-        kv_indices[offset : offset + nb] = torch.arange(
-            offset, offset + nb, dtype=torch.int32, device="cuda"
-        )
+        kv_indices[offset : offset + nb] = inputs.block_ids[i, :nb]
         offset += nb
     kv_last_page_len = ((inputs.kv_lens - 1) % BLOCK_SIZE + 1).to(torch.int32)
-
-    q_scale = float(torch.rand((), device="cuda").clamp_min(1e-6).item())
-    k_scale = float(torch.rand((), device="cuda").clamp_min(1e-6).item())
-    v_scale = float(torch.rand((), device="cuda").clamp_min(1e-6).item())
-
-    q_fi = (torch.randn_like(inputs.q, dtype=torch.bfloat16) / q_scale).to(torch.float8_e4m3fn)
-    max_num_blocks_fi = int(nblocks_fi.sum().item()) + inputs.num_batch + 4
-    k_cache_fi = (
-        torch.randn(
-            max_num_blocks_fi,
-            BLOCK_SIZE,
-            num_head_kv,
-            head_dim,
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        / k_scale
-    ).to(torch.float8_e4m3fn)
-    v_cache_fi = (
-        torch.randn(
-            max_num_blocks_fi,
-            BLOCK_SIZE,
-            num_head_kv,
-            head_dim,
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        / v_scale
-    ).to(torch.float8_e4m3fn)
 
     workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda")
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
@@ -343,18 +237,12 @@ def make_flashinfer_fn(
         num_head_kv,
         head_dim,
         BLOCK_SIZE,
-        q_data_type=torch.float8_e4m3fn,
-        kv_data_type=torch.float8_e4m3fn,
+        data_type=torch.bfloat16,
+        q_data_type=torch.bfloat16,
     )
 
     def call_fn():
-        wrapper.run(
-            q_fi,
-            (k_cache_fi, v_cache_fi),
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
+        wrapper.run(inputs.q, (inputs.k_cache, inputs.v_cache))
 
     return call_fn
 
@@ -589,7 +477,6 @@ def build_result_row(
     flashinfer_us = results.get("flashinfer")
     row = {
         "case": case_name,
-        "quant_type": "qpertoken_perhead_kvpertensor",
         "batch": batch,
         "max_kv": max_kv,
         "static_us": static_us,
@@ -609,7 +496,7 @@ def build_result_row(
 
 
 def run_nsys_driver(args: argparse.Namespace) -> list[dict]:
-    tag = args.tag or f"attention_decode_fp8_{int(time.time())}"
+    tag = args.tag or f"attention_decode_bf16_{int(time.time())}"
     out_dir = (
         Path(args.output_dir) / tag
         if args.output_dir
@@ -658,8 +545,7 @@ def print_table(rows: list[dict]) -> None:
     print("")
     print("=" * width)
     print(
-        "Attention Decode FP8 | HPC=qpertoken+kvpertensor, FA3/FI=qkvpertensor | "
-        "latency in us; x/* = baseline / dynamic"
+        "Attention Decode BF16 | HPC vs FA3/FlashInfer | latency in us; x/* = baseline / dynamic"
     )
     print("-" * width)
     print(
@@ -698,10 +584,7 @@ def write_jsonl(path: str, rows: list[dict]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Benchmark Attention Decode FP8: HPC static/dynamic "
-            "(qpertoken+kvpertensor) vs FA3/FlashInfer (qkvpertensor)."
-        )
+        description="Benchmark Attention Decode BF16: HPC static/dynamic vs FlashAttention-3/FlashInfer."
     )
     parser.add_argument("--cases", nargs="+", default=list(CASES), choices=list(CASES))
     parser.add_argument("--methods", nargs="+", default=list(METHODS), choices=list(METHODS))
@@ -775,9 +658,11 @@ def main() -> None:
                 inputs.kv_lens, args.num_head_kv, DEFAULT_NUM_SEQ_Q, args.min_process_len
             )
 
+        # Disable include_taskmap for event timing of prebuilt task_map unless requested.
+        method_args = args
         results = {}
         for method in args.methods:
-            call_fn = make_call_fn(method, inputs, args, task_map=task_map)
+            call_fn = make_call_fn(method, inputs, method_args, task_map=task_map)
             try:
                 if args.graph:
                     results[method] = bench_us(call_fn, args.warmup, args.iters, use_graph=True)

@@ -347,6 +347,7 @@ def attention_decode_bf16(
     mtp: int = 0,
     new_kv_included: bool = False,
     splitk: bool = True,
+    task_map: Tensor = None,
     split_flag: Tensor = None,
     output: Tensor = None,
 ) -> Tensor:
@@ -382,6 +383,9 @@ def attention_decode_bf16(
         splitk: use the split k implemention or not.
             Shape: scalar
             Dtype: bool
+        task_map: pre scheduled task map, it can be allocated by 'get_attention_decode_task_workspace' and assign by 'assign_attention_decode_task'.
+            Shape: [num_task_map_bytes]
+            Dtype: int8
         output: Output tensor for store output value inplace.
             Shape: [num_batch * num_seq_q, num_head_q, num_dim_qk]
             Dtype: bfloat16
@@ -407,6 +411,7 @@ def attention_decode_bf16(
         mtp,
         new_kv_included,
         splitk,
+        task_map,
         split_flag,
         output,
     )
@@ -609,6 +614,8 @@ def assign_attention_decode_task(
             num_seq_kvcache, num_head_kv, mtp, new_kv_included, min_process_len, None
         )
         task_map[:8].copy_(task_map_host.reshape(-1)[:8], non_blocking=True)
+        # int32[5] / byte[20:24]: max_num_chunks for adaptive combine.
+        task_map[20:24].copy_(task_map_host.reshape(-1)[20:24], non_blocking=True)
         task_map[48 : task_map_host.numel()].copy_(
             task_map_host.reshape(-1)[48:], non_blocking=True
         )
@@ -746,7 +753,17 @@ def attention_with_kvcache_blocksparse_prefill_fp8_fake(
 
 @torch.library.register_fake("hpc::attention_decode_bf16")
 def attention_decode_bf16_fake(
-    q, kcache, vcache, block_ids, num_seq_kvcache, new_kv_included, splitk, output
+    q,
+    kcache,
+    vcache,
+    block_ids,
+    num_seq_kvcache,
+    mtp,
+    new_kv_included,
+    splitk,
+    task_map=None,
+    split_flag=None,
+    output=None,
 ):
     return torch.empty_like(q)
 

@@ -178,20 +178,25 @@ static void launch_smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_splitk_
                      heads_per_group, pad_heads_per_group, num_kvcache_blocks, num_seq_max_blocks,
                      qscale_pad_stride, one_over_dk_log2e, max_splitk);
 
-  // ---- combine kernel: LSE-weighted reduction across chunks ----
-  constexpr int kCombineWarps = 4;
-  dim3 combine_grid(num_head_q / kCombineWarps, num_seq_q, num_batch);
-  dim3 combine_block(kCombineWarps * 32);
-  cutlass::FastDivmod hpg_divider(heads_per_group);
+  // ---- adaptive combine: LSE-weighted reduction across chunks ----
+  cutlass::FastDivmod heads_per_group_divmod(heads_per_group);
+  constexpr int kCombineWarps = 8;
+  constexpr int kHeavyThresh = 3 * kCombineWarps;
+  // heavy phase splits each head dimension into (kTileV / 32) dim-tiles
+  const int num_slots = (kTileV / 32) * num_head_q * num_seq_q * num_batch;
+  int combine_grid = num_total_ctas < num_slots ? num_total_ctas : num_slots;
+  int weight_pool_size =
+      kCombineWarps * kHeavyThresh > max_splitk ? kCombineWarps * kHeavyThresh : max_splitk;
 
   auto combine_kernel =
-      kernels::attention_decode_dynamic_splitk_combine_kernel<__nv_bfloat16, kCombineWarps>;
+      kernels::attention_decode_dynamic_splitk_combine_kernel<__nv_bfloat16, kTileV, kCombineWarps,
+                                                              kHeavyThresh>;
 
   cudaLaunchConfig_t combine_config;
   memset(&combine_config, 0, sizeof(combine_config));
-  combine_config.gridDim = combine_grid;
-  combine_config.blockDim = combine_block;
-  combine_config.dynamicSmemBytes = sizeof(float) * kCombineWarps * max_splitk;
+  combine_config.gridDim = dim3(combine_grid, 1, 1);
+  combine_config.blockDim = dim3(kCombineWarps * 32);
+  combine_config.dynamicSmemBytes = sizeof(float) * weight_pool_size;
   cudaLaunchAttribute combine_attrs[1];
   combine_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   combine_attrs[0].val.programmaticStreamSerializationAllowed = 1;
@@ -202,8 +207,8 @@ static void launch_smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_splitk_
   cudaLaunchKernelEx(&combine_config, combine_kernel, reinterpret_cast<__nv_bfloat16 *>(y_ptr),
                      reinterpret_cast<const float *>(splitk_out_ptr),
                      reinterpret_cast<const float *>(lse_ptr), task_map_ptr, num_total_ctas,
-                     num_batch, num_seq_q, num_head_q, num_head_k, pad_heads_per_group, num_dim_v,
-                     max_splitk, hpg_divider);
+                     num_batch, num_seq_q, num_head_q, num_head_k, pad_heads_per_group, max_splitk,
+                     heads_per_group_divmod);
 }
 
 bool smallm_fp8_qkpertoken_perhead_vperhead_dim128_dynamic_async(

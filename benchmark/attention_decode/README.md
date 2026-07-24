@@ -1,21 +1,10 @@
-# Attention Decode FP8 Benchmark
+# Attention Decode Benchmark
 
-This directory contains the benchmark entry used to reproduce the dynamic scheduling results for Attention Decode FP8.
-
-## Figure Mapping
-
-- Operator: SM90 Attention Decode FP8
-- Quantization modes:
-  - `qkpertoken_perhead_vperhead`
-  - `qpertoken_perhead_kvpertensor`
-- Comparison: static split-k vs dynamic task map
-- Timing unit: microseconds per operator call
-- Timing modes:
-  - `--timing event`: quick CUDA event timing around CUDA Graph replay.
-  - `--timing nsys`: release-style timing aligned with FusedMoE, using `nsys`, NVTX `step`, CUDA Graph replay, and median latency.
-- Default config: GQA `KV/Q heads=1/8`, `head_dim=128`, `block_size=64`
+This directory contains the benchmark entries used to reproduce the dynamic scheduling results for Attention Decode FP8 and BF16.
 
 ## Scenario Names
+
+Shared by FP8 and BF16:
 
 - `uniform_512`: `64x512`
 - `uniform_4096`: `64x4K`
@@ -27,7 +16,25 @@ This directory contains the benchmark entry used to reproduce the dynamic schedu
 
 `AxB` means `A` decode requests with KV length `B`; `AxB+CxD` means mixed KV lengths in the same batch.
 
-## Reproduction Commands
+## Timing Modes
+
+Both benches support:
+
+- `--timing event`: quick CUDA event timing around CUDA Graph replay.
+- `--timing nsys`: release-style timing aligned with FusedMoE, using `nsys`, NVTX `step`, CUDA Graph replay, and median latency.
+
+Latency is reported in microseconds per operator call.
+
+## FP8
+
+- Operator: SM90 Attention Decode FP8
+- Comparison methods (`--methods`):
+  - `static`: HPC static split-k (`qpertoken_perhead` + `kvpertensor`)
+  - `dynamic`: HPC dynamic task map + split-k combine (same quant)
+  - `flashinfer`: FlashInfer paged decode FP8 (`qkvpertensor` scales, `block_size=64`)
+  - `flashattn`: FlashAttention-3 paged decode FP8 (`qkvpertensor` descales, `block_size=256`)
+- Default config: GQA `KV/Q heads=1/8`, `head_dim=128`, HPC `block_size=64`
+- CSV speedups: `speedup_vs_static`, `speedup_vs_flashattn`, `speedup_vs_flashinfer` (`baseline / dynamic`)
 
 Full sweep with the FusedMoE-aligned `nsys` timing path:
 
@@ -44,7 +51,40 @@ Fast smoke test with CUDA event timing:
 ```bash
 python3 benchmark/attention_decode/bench_attention_decode_fp8.py \
   --cases uniform_512 skewed_extreme \
-  --quant-types qpertoken_perhead_kvpertensor \
+  --methods static dynamic flashinfer flashattn \
+  --warmup 1 \
+  --iters 3
+```
+
+Enable correctness comparison between static and dynamic paths with `--check`.
+
+## BF16
+
+- Operator: SM90 Attention Decode BF16
+- Comparison methods (`--methods`):
+  - `static`: HPC static split-k
+  - `dynamic`: HPC dynamic task map
+  - `flashinfer`: FlashInfer paged decode (`block_size=64`)
+  - `flashattn`: FlashAttention-3 with KV cache (`block_size=256`)
+- Default config: GQA `KV/Q heads=1/8`, `head_dim=128`, HPC `block_size=64`
+- CSV speedups: `speedup_vs_static`, `speedup_vs_flashattn`, `speedup_vs_flashinfer` (`baseline / dynamic`)
+
+Full sweep with the FusedMoE-aligned `nsys` timing path:
+
+```bash
+python3 benchmark/attention_decode/bench_attention_decode_bf16.py \
+  --timing nsys \
+  --output-dir attention_decode_nsys \
+  --csv attention_decode_bf16.csv \
+  --jsonl attention_decode_bf16.jsonl
+```
+
+Fast smoke test with CUDA event timing:
+
+```bash
+python3 benchmark/attention_decode/bench_attention_decode_bf16.py \
+  --cases uniform_512 skewed_extreme \
+  --methods static dynamic flashinfer flashattn \
   --warmup 1 \
   --iters 3
 ```
