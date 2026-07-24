@@ -448,7 +448,6 @@ cudaError_t fuse_allreduce_rmsnorm_low_latency_async(AllReduceFusionParams const
       }  // switch (rnLoadsPerThread)
     }  // if (rnUseCGA)
 #undef RUN_RMSNORM_KERNEL
-
   }  // if (params.rmsNormFusion)
   return cudaSuccess;
 }

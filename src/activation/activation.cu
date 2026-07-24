@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <stdio.h>
 
+#include <algorithm>
 #include <type_traits>
 
 #include "cutlass/fast_math.h"
