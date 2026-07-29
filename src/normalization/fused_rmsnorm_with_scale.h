@@ -8,8 +8,6 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
-#include <torch/all.h>
-#include <torch/library.h>
 
 #include <tuple>
 

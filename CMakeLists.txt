@@ -98,7 +98,6 @@ target_compile_options(
   _C PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:
     -Werror=all-warnings
-    --diag-suppress=3189
     -lineinfo
     --expt-relaxed-constexpr
     -std=c++20
