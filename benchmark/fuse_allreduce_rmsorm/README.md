@@ -29,7 +29,7 @@ Run from the repository root:
 
 ```bash
 cd benchmark/fuse_allreduce_rmsorm/
-python3 bench_allreduce_rmsnorm.py \
+python3 benchmark_fuse_allreduce_rmsnorm.py \
   --hidden 7168 \
   --tokens 8 32 128 512 4096 8192 16384 32768 \
   --fi-backend mnnvl \
