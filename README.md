@@ -6,7 +6,7 @@
   <p>
     <img alt="CUDA" src="https://img.shields.io/badge/CUDA-12.8%2B-76B900">
     <img alt="GPU" src="https://img.shields.io/badge/GPU-H20%20%7C%20SM90-76B900">
-    <img alt="Python" src="https://img.shields.io/badge/Python-3.8%2B-3776AB">
+    <img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-3776AB">
     <img alt="License" src="https://img.shields.io/badge/License-MIT-blue">
   </p>
 </div>
@@ -185,7 +185,8 @@ softmax statistics to reduce vocabulary reads and fixed launch overhead.
 
 ### Requirements
 - NVIDIA SM90 architecture GPU
-- Python 3.8 or higher
+- Python 3.9 or higher
+- PyTorch installed in the build environment
 - Compilers with C++17 support
 - CUDA Toolkit: CUDA 12.8 or higher
 
@@ -201,6 +202,21 @@ cd hpc-ops
 make wheel
 python3 -m pip install dist/*.whl
 ```
+
+The source build uses the Python executable that runs `setup.py`, queries
+PyTorch include/library paths from that same environment, and matches PyTorch's
+`_GLIBCXX_USE_CXX11_ABI` setting by default. Set `CMAKE_BUILD_PARALLEL_LEVEL`,
+`MAX_JOBS`, or `SLURM_CPUS_PER_TASK` to control parallel compilation. Extra
+CMake options can be passed with `HPC_OPS_CMAKE_ARGS`, for example:
+
+```bash
+MAX_JOBS=8 HPC_OPS_CMAKE_ARGS="-DHPC_OPS_CUDA_ARCHITECTURES=90a" make wheel
+```
+
+If compilation fails inside files under `torch/include`, first verify that the
+active PyTorch wheel, CUDA toolkit, and host compiler are supported together.
+For example, failures in `ATen/core/List_inl.h` usually indicate a PyTorch
+header/toolchain compatibility issue rather than an hpc-ops kernel error.
 
 ### Basic Usage
 
