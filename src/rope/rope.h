@@ -59,10 +59,10 @@ struct MultimodalRopeParams {
   bool is_neox;
 };
 
-void multimodal_rope_async(__nv_bfloat16 *q_out, __nv_bfloat16 *k_out,
-                           const __nv_bfloat16 *q, const __nv_bfloat16 *k,
-                           const float *cos_sin_cache, const int64_t *positions,
-                           const MultimodalRopeParams &params, cudaStream_t stream);
+void multimodal_rope_async(__nv_bfloat16 *q_out, __nv_bfloat16 *k_out, const __nv_bfloat16 *q,
+                           const __nv_bfloat16 *k, const float *cos_sin_cache,
+                           const int64_t *positions, const MultimodalRopeParams &params,
+                           cudaStream_t stream);
 
 }  // namespace rope
 }  // namespace hpc

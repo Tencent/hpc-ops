@@ -2,7 +2,6 @@
 
 #include <ATen/MemoryOverlap.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime_api.h>
 #include <torch/all.h>
 #include <torch/library.h>
@@ -228,14 +227,12 @@ std::tuple<torch::Tensor, torch::Tensor> multimodal_rope_impl(
   TORCH_CHECK(q.device() == k.device() && q.device() == cos_sin_cache.device() &&
                   q.device() == positions.device(),
               "q/k/cos_sin_cache/positions must be on the same CUDA device");
-  c10::cuda::CUDAGuard device_guard(q.device());
   TORCH_CHECK(q.dim() == 4 && k.dim() == 4, "q/k must be [B,H,S,D]");
   TORCH_CHECK(cos_sin_cache.dim() == 2, "cos_sin_cache must be [max_position, head_dim]");
   TORCH_CHECK(positions.dim() == 2, "positions must be [B, S]");
   TORCH_CHECK(q.scalar_type() == torch::kBFloat16 && k.scalar_type() == torch::kBFloat16,
               "q/k must be bfloat16");
-  TORCH_CHECK(cos_sin_cache.scalar_type() == torch::kFloat,
-              "cos_sin_cache must be float32");
+  TORCH_CHECK(cos_sin_cache.scalar_type() == torch::kFloat, "cos_sin_cache must be float32");
   TORCH_CHECK(positions.scalar_type() == torch::kInt64, "positions must be int64");
   TORCH_CHECK(q.size(0) == k.size(0) && q.size(2) == k.size(2) && q.size(3) == k.size(3),
               "q/k shape mismatch");
@@ -256,10 +253,8 @@ std::tuple<torch::Tensor, torch::Tensor> multimodal_rope_impl(
   TORCH_CHECK(neox_profile || interleaved_profile,
               "multimodal_rope supports NeoX D128/D512 Hq/Hkv 16/8, 28/4, 32/8, "
               "64/4, 64/8 and interleaved D64 Hq/Hkv 32/1, 64/1");
-  TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1,
-              "q/k last dimension must be contiguous");
-  TORCH_CHECK(cos_sin_cache.stride(1) == 1,
-              "cos_sin_cache last dimension must be contiguous");
+  TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1, "q/k last dimension must be contiguous");
+  TORCH_CHECK(cos_sin_cache.stride(1) == 1, "cos_sin_cache last dimension must be contiguous");
   at::assert_no_internal_overlap(q);
   at::assert_no_internal_overlap(k);
   for (int64_t dim = 0; dim < q.dim(); ++dim) {
@@ -340,16 +335,17 @@ std::tuple<torch::Tensor, torch::Tensor> multimodal_rope_impl(
                         reinterpret_cast<const float *>(cos_sin_cache.const_data_ptr()),
                         positions.const_data_ptr<int64_t>(), params, stream);
   const cudaError_t launch_error = cudaGetLastError();
-  TORCH_CHECK(launch_error == cudaSuccess, "multimodal_rope kernel launch failed: ",
-              cudaGetErrorString(launch_error));
+  TORCH_CHECK(launch_error == cudaSuccess,
+              "multimodal_rope kernel launch failed: ", cudaGetErrorString(launch_error));
   return std::make_tuple(q_out, k_out);
 }
 
-std::tuple<torch::Tensor, torch::Tensor> multimodal_rope_entry(
-    const torch::Tensor &q, const torch::Tensor &k, const torch::Tensor &cos_sin_cache,
-    const torch::Tensor &positions, bool is_neox) {
-  return multimodal_rope_impl(q, k, cos_sin_cache, positions, is_neox, std::nullopt,
-                              std::nullopt);
+std::tuple<torch::Tensor, torch::Tensor> multimodal_rope_entry(const torch::Tensor &q,
+                                                               const torch::Tensor &k,
+                                                               const torch::Tensor &cos_sin_cache,
+                                                               const torch::Tensor &positions,
+                                                               bool is_neox) {
+  return multimodal_rope_impl(q, k, cos_sin_cache, positions, is_neox, std::nullopt, std::nullopt);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> multimodal_rope_out_entry(
@@ -382,7 +378,8 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 
   m.def(
       "multimodal_rope(Tensor q, Tensor k, Tensor cos_sin_cache, Tensor positions, "
-      "bool is_neox=True) -> (Tensor, Tensor)");
+      "bool is_neox=True) "
+      "-> (Tensor, Tensor)");
   m.impl("multimodal_rope", torch::kCUDA, &hpc::rope::multimodal_rope_entry);
   m.def(
       "multimodal_rope.out(Tensor q, Tensor k, Tensor cos_sin_cache, Tensor positions, "

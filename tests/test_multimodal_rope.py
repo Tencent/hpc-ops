@@ -398,6 +398,12 @@ def _time_graph(graph: torch.cuda.CUDAGraph) -> float:
     return statistics.median(samples)
 
 
+def _capture_and_time(first_call, second_call) -> tuple[float, float]:
+    first_graph = _capture_graph(first_call)
+    second_graph = _capture_graph(second_call)
+    return _time_graph(first_graph), _time_graph(second_graph)
+
+
 def _verify_benchmark_outputs(
     case: RopeCase,
     q: torch.Tensor,
@@ -480,15 +486,9 @@ def _benchmark_case(case: RopeCase, flashinfer_rope, reverse: bool) -> dict:
         k_flat_out,
     )
     if reverse:
-        flashinfer_graph = _capture_graph(flashinfer_call)
-        hpc_graph = _capture_graph(hpc_call)
-        flashinfer_us = _time_graph(flashinfer_graph)
-        hpc_us = _time_graph(hpc_graph)
+        flashinfer_us, hpc_us = _capture_and_time(flashinfer_call, hpc_call)
     else:
-        hpc_graph = _capture_graph(hpc_call)
-        flashinfer_graph = _capture_graph(flashinfer_call)
-        hpc_us = _time_graph(hpc_graph)
-        flashinfer_us = _time_graph(flashinfer_graph)
+        hpc_us, flashinfer_us = _capture_and_time(hpc_call, flashinfer_call)
     return {
         "case": case,
         "hpc_us": hpc_us,
