@@ -28,7 +28,11 @@ class CMakeBuild(build_ext):
         os.makedirs(build_lib_dir, exist_ok=True)
         os.makedirs(build_temp_dir, exist_ok=True)
 
-        cmake_args = [f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={build_lib_dir}", *ext.version_macros]
+        cmake_args = [
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={build_lib_dir}",
+            f"-DPython3_EXECUTABLE={sys.executable}",
+            *ext.version_macros,
+        ]
 
         subprocess.check_call(["cmake", ext.sourcedir] + cmake_args, cwd=build_temp_dir)
         subprocess.check_call(
