@@ -32,6 +32,7 @@ class BenchSpec:
     tp: int = 1
     ep: int = 1
     seed: int = 0
+    dtype: str = "fp8"          # "fp8" (per-tensor) or "bf16"
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +60,7 @@ class Backend(ABC):
 # ---------------------------------------------------------------------------
 DTYPE_FP8 = torch.float8_e4m3fn
 DTYPE_HALF = torch.half
+DTYPE_BF16 = torch.bfloat16
 
 
 def scaled_fp8_quant_local(x: torch.Tensor, scale: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -130,6 +132,30 @@ def build_fp8_weights(
     return w1_fp8, w2_fp8, w1_scale, w2_scale
 
 
+def build_bf16_weights(
+    num_expert_local: int,
+    intermediate_per_rank: int,
+    hidden: int,
+    *,
+    seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build w1 (gate+up fused along N) and w2 (down) as unquantized bf16.
+
+    Layout matches build_fp8_weights (and HPC-Ops / sglang convention):
+        w1: [E, 2N, K]  (bf16)
+        w2: [E, K,  N]  (bf16)
+    """
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    E, N, K = num_expert_local, intermediate_per_rank, hidden
+    w1 = torch.randn(
+        (E, 2 * N, K), dtype=torch.float, device="cuda", generator=g,
+    ).to(DTYPE_BF16)
+    w2 = torch.randn(
+        (E, K, N), dtype=torch.float, device="cuda", generator=g,
+    ).to(DTYPE_BF16)
+    return w1, w2
+
+
 def build_routing(
     num_seq: int,
     num_expert_total: int,
@@ -162,12 +188,12 @@ def build_routing(
 
 
 def build_activation(
-    num_seq: int, hidden: int, *, seed: int = 0,
+    num_seq: int, hidden: int, *, seed: int = 0, dtype: torch.dtype = DTYPE_HALF,
 ) -> torch.Tensor:
-    """Build a half activation tensor."""
+    """Build an activation tensor (half by default, bf16 for the bf16 path)."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     return torch.randn(
-        (num_seq, hidden), dtype=DTYPE_HALF, device="cuda", generator=g,
+        (num_seq, hidden), dtype=dtype, device="cuda", generator=g,
     ) / 10
 
 
@@ -227,6 +253,7 @@ def spec_to_argv(spec: BenchSpec) -> list[str]:
         "--tp", str(spec.tp),
         "--ep", str(spec.ep),
         "--seed", str(spec.seed),
+        "--dtype", spec.dtype,
     ]
 
 
@@ -242,4 +269,5 @@ def spec_from_args(args) -> BenchSpec:
         tp=args.tp,
         ep=args.ep,
         seed=args.seed,
+        dtype=getattr(args, "dtype", "fp8"),
     )

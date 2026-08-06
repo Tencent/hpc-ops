@@ -29,6 +29,7 @@ def main() -> None:
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--ep", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--dtype", choices=["fp8", "bf16"], default="fp8")
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument(
         "--n-timed", type=int, default=52,

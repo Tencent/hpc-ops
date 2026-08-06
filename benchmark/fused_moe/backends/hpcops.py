@@ -9,8 +9,8 @@ import torch
 
 from . import register
 from .base import (
-    A_SCALE_VALUE, Backend, BenchSpec, build_a_scale, build_activation,
-    build_fp8_weights, build_routing,
+    A_SCALE_VALUE, Backend, BenchSpec, DTYPE_BF16, build_a_scale, build_activation,
+    build_bf16_weights, build_fp8_weights, build_routing,
 )
 
 
@@ -23,6 +23,35 @@ class HpcBackend(Backend):
     def setup(self, spec: BenchSpec) -> Callable[[], None]:
         import hpc
 
+        if spec.dtype == "bf16":
+            return self._setup_bf16(spec, hpc)
+        return self._setup_fp8(spec, hpc)
+
+    def _setup_bf16(self, spec: BenchSpec, hpc) -> Callable[[], None]:
+        E = spec.num_expert_local
+        N = spec.intermediate_per_rank
+        K = spec.hidden
+
+        x_bf16 = build_activation(spec.num_seq, K, seed=spec.seed, dtype=DTYPE_BF16)
+        w1_bf16, w2_bf16 = build_bf16_weights(E, N, K, seed=spec.seed + 1)
+        topk_ids, topk_w = build_routing(
+            spec.num_seq, spec.num_expert_total, spec.num_topk, seed=spec.seed + 2,
+        )
+
+        rank_ep = 0
+        num_expert_total = spec.num_expert_total
+
+        def call_fn():
+            hpc.fuse_moe_bf16(
+                x_bf16, w1_bf16, w2_bf16,
+                topk_ids, topk_w,
+                rank_ep, num_expert_total,
+            )
+
+        self._tensors = (x_bf16, w1_bf16, w2_bf16, topk_ids, topk_w)
+        return call_fn
+
+    def _setup_fp8(self, spec: BenchSpec, hpc) -> Callable[[], None]:
         E = spec.num_expert_local
         N = spec.intermediate_per_rank
         K = spec.hidden

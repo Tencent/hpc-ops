@@ -891,6 +891,348 @@ __global__ void __launch_bounds__(384, 1)
   }
 }
 
+template <typename Config, typename TmaA, typename TmaB, typename TmaD, int kTaskLoopPolicy,
+          bool kUsePDL = false>
+__global__ void __launch_bounds__(384, 1)
+    group_gemm_bf16_kernel(const __grid_constant__ TmaB tma_b, cute::TmaDescriptor *td_xy,
+                                    int *seqlens_ptr, int *tiles_ptr,
+                                    int *cu_tiles_ptr, int4 *task_map_ptr, int num_group, int m,
+                                    int n, int k, cutlass::FastDivmod flat_divider) {
+  using namespace cute;  // NOLINT
+
+  using Tin = typename Config::Tin;
+  using Tout = typename Config::Tout;
+  using TiledMma = typename Config::TiledMma;
+  using SLayoutA = typename Config::SLayoutX;
+  using SLayoutB = typename Config::SLayoutW;
+  using SLayoutCT = typename Config::SLayoutY;
+
+  constexpr int kTileM = Config::kTileM;
+  constexpr int kTileN = Config::kTileN;
+  constexpr int kTileK = Config::kTileK;
+  constexpr int kStage = Config::kStage;
+
+  int idx = threadIdx.x;
+
+  int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
+  int ilane = idx % 32;
+  int elected = cute::elect_one_sync();
+  bool is_leader_in_block = (iwarp == 0) && elected;
+  bool is_leader_in_warpgroup = ((iwarp % 4) == 0) && elected;
+
+  __shared__ uint64_t writable[kStage];
+  __shared__ uint64_t readable[kStage];
+
+  extern __shared__ uint8_t shm_data[] alignas(128);
+  auto *shm_a = reinterpret_cast<Tin *>(shm_data);
+  auto *shm_b = shm_a + cosize(SLayoutA{});
+  auto *shm_c = reinterpret_cast<Tout *>(shm_b + cosize(SLayoutB{}));
+
+  using Ttask = std::conditional_t<kTaskLoopPolicy == 0, int4, int>;
+  Ttask *shm_tiles = reinterpret_cast<Ttask *>(shm_c + cosize(SLayoutCT{}));
+
+  TmaA tma_a;
+  TmaD tma_d;
+
+  if constexpr (kUsePDL) {
+    cudaGridDependencySynchronize();
+  }
+
+  int num_total_warps = blockDim.x / 32;
+  for (int i = iwarp; i < num_group * 2; i += num_total_warps) {
+    tma_descriptor_fence_acquire(td_xy + i);
+  }
+
+  auto sA = make_tensor(make_smem_ptr(shm_a), SLayoutA{});
+  auto sB = make_tensor(make_smem_ptr(shm_b), SLayoutB{});
+
+  auto gA = tma_a.get_tma_tensor(make_shape(m, k));
+  auto gB = tma_b.get_tma_tensor(make_shape(n, k, num_group));
+  auto gC =
+      make_tensor(make_gmem_ptr(static_cast<Tout *>(nullptr)),
+                  make_shape(Int<kTileN>{}, Int<kTileM>{}), make_stride(Int<kTileM>{}, Int<1>{}));
+
+  auto btma_a = tma_a.get_slice(0);
+  auto btma_b = tma_b.get_slice(0);
+
+  auto tAg = btma_a.partition_S(gA);  // (TMA, TMA_M, TMA_K)
+  auto tAs = btma_a.partition_D(sA);  // (TMA, _1, _1, kStage)
+
+  auto tBg = btma_b.partition_S(gB);  // (TMA, TMA_N, TMA_K, num_group)
+  auto tBs = btma_b.partition_D(sB);  // (TMA, _1, _1, kStage)
+
+  int num_tile_n = size<1>(tBg);
+
+  if (is_leader_in_block) {
+#pragma unroll
+    for (int i = 0; i < kStage; ++i) {
+      initialize_barrier(readable[i], 1);
+      initialize_barrier(writable[i], size(TiledMma{}) / 128);
+    }
+  }
+
+  // we can also use the following code to initialize the barrier
+  /*
+  if (idx < kStage) {
+    readable[idx] = 0x7ffff800001ffffe;  // initialize_barrier(1);
+    writable[idx] = 0x7ffff000001ffffc;  // initialize_barrier(2);
+  }
+   */
+
+  int total_m = cu_tiles_ptr[num_group];
+  if (total_m <= 0) {
+    return;
+  }
+
+  if constexpr (kTaskLoopPolicy == 0) {
+    // Persistent task map: each block walks the flat tile array with a stride
+    // of gridDim.x and stages its tasks into shm_tiles (one int4 per wave).
+    int warp_count = blockDim.x / 32;
+    int iwarp_block = blockIdx.x + gridDim.x * iwarp;
+    int actual_tiles = total_m * num_tile_n + gridDim.x;
+    int iwave = 0;
+    while (iwarp_block < actual_tiles) {
+      int4 task = task_map_ptr[iwarp_block];
+      if (ilane == 0) {
+        shm_tiles[iwave * warp_count + iwarp] = task;
+      }
+      if (task.z < 0) {
+        break;
+      }
+      iwarp_block += gridDim.x * warp_count;
+      iwave++;
+    }
+  } else if constexpr (kTaskLoopPolicy == 1) {
+    for (int i = idx; i < num_group; i += blockDim.x) {
+      shm_tiles[i] = tiles_ptr[i];
+    }
+  } else {
+    for (int i = idx; i < (num_group + 1); i += blockDim.x) {
+      shm_tiles[i] = cu_tiles_ptr[i];
+    }
+  }
+
+  // sync to avoid ahead thread use(wait) readable when it is not initizlized yet
+  __syncthreads();
+
+  constexpr int kNumThreads = size(TiledMma{});
+  // load warpgroup
+  if (idx >= kNumThreads) {
+    cutlass::arch::warpgroup_reg_dealloc<24>();
+    idx -= kNumThreads;
+    constexpr int kTransactionBytes = sizeof(Tin) * (kTileM + kTileN) * kTileK;
+    // sizeof(Tin) * cosize(SLayoutA{}(_, _, 0)) + sizeof(Tin) * cosize(SLayoutB{}(_, _, 0));
+
+    int iwarp = __shfl_sync(0xFFFFFFFF, idx / 32, 0);
+    int is_leader_in_load = ((iwarp == 0) && elected);
+
+    if (is_leader_in_load) {
+      int phase = 1;  // start with ok
+      int ismem_write = __shfl_sync(0xFFFFFFFF, 0, 0);
+      int iblock = blockIdx.x;
+      int ntile_k = size<2>(tAg);
+
+      int igroup = 0;
+      int sum_tile_m = 0;
+      int itile_m, itile_n;
+      int iwave = 0;
+      while (true) {
+        if constexpr (kTaskLoopPolicy == 0) {
+          int4 task = shm_tiles[iwave];
+          itile_m = task.x;
+          itile_n = task.y;
+          igroup = task.z;
+          if (igroup < 0) {
+            break;
+          }
+          iwave++;
+        } else if constexpr (kTaskLoopPolicy == 1) {
+          get_next_tile_horizon(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, sum_tile_m,
+                                flat_divider);
+          if (igroup < 0) {
+            break;
+          }
+        } else {
+          get_next_tile_vert(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, total_m);
+          if (itile_n >= num_tile_n) {
+            break;
+          }
+        }
+
+        iblock += gridDim.x;
+
+        auto *td_x = td_xy + igroup * 2;
+
+#pragma unroll 1
+        for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
+          // load a, b
+          wait_barrier(writable[ismem_write], phase);
+
+          cute::copy(tma_a.with(td_x, readable[ismem_write]), tAg(_, itile_m, itile_k),
+                     tAs(_, 0, 0, ismem_write));
+
+          cute::copy(tma_b.with(readable[ismem_write]), tBg(_, itile_n, itile_k, igroup),
+                     tBs(_, 0, 0, ismem_write));
+
+          set_barrier_transaction_bytes(readable[ismem_write], kTransactionBytes);
+
+          ++ismem_write;
+          if (ismem_write == kStage) {
+            ismem_write = 0;
+            phase ^= 1;
+          }
+        }  // ntile_todo
+      }  // while
+    }  // if idx == 0
+
+  } else {
+    // math warpgroup
+    cutlass::arch::warpgroup_reg_alloc<168>();
+
+    int idx_in_warpgroup = idx % 128;
+    int iwarpgroup = idx / 128;
+    int iwarp_in_warpgroup = idx_in_warpgroup / 32;
+    int elected_idx_in_warpgroup = ((iwarp_in_warpgroup == 0) && elected);
+
+    TiledMma tiled_mma;
+
+    auto thr_mma = tiled_mma.get_slice(idx);
+    auto tBs4r = thr_mma.partition_A(sB);
+    auto tAs4r = thr_mma.partition_B(sA);
+
+    auto tBr = thr_mma.make_fragment_A(tBs4r);  // (MMA, MMA_N, MMA_K, kStage)
+    auto tAr = thr_mma.make_fragment_B(tAs4r);  // (MMA, MMA_M, MMA_K, kStage)
+
+    auto tCr = thr_mma.partition_fragment_C(gC);
+
+    int ismem_read = 0;
+    int phase = 0;
+
+    int iblock = blockIdx.x;
+    int igroup = 0;
+    int sum_tile_m = 0;
+    int itile_m, itile_n;
+    int iwave = 0;
+    while (true) {
+      if constexpr (kTaskLoopPolicy == 0) {
+        int4 task = shm_tiles[iwave];
+        itile_m = task.x;
+        itile_n = task.y;
+        igroup = task.z;
+        if (igroup < 0) {
+          break;
+        }
+        iwave++;
+      } else if constexpr (kTaskLoopPolicy == 1) {
+        get_next_tile_horizon(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, sum_tile_m,
+                              flat_divider);
+        if (igroup < 0) {
+          break;
+        }
+      } else {
+        get_next_tile_vert(shm_tiles, iblock, num_group, igroup, itile_m, itile_n, total_m);
+        if (itile_n >= num_tile_n) {
+          break;
+        }
+      }
+
+      iblock += gridDim.x;
+
+      int ntile_k = size<2>(tAg);
+      tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
+
+      // Pipelined K-loop: keep 1 WGMMA batch in flight (wait<1> instead of
+      // wait<0> per iter). The writable barrier of stage k is released only
+      // after wait<1> in iter k+1, so the MMA of iter k+1 can overlap with
+      // the producer's reload of stage k. The accumulator tCr only needs to
+      // be fenced once before the first WGMMA and once after the last drain.
+      int prev_ismem_read = 0;
+      warpgroup_fence_operand(tCr);
+#pragma unroll 1
+      for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
+        wait_barrier(readable[ismem_read], phase);
+
+        // mma
+        warpgroup_arrive();
+#pragma unroll
+        for (int ik = 0; ik < size<2>(tAr); ++ik) {
+          cute::gemm(tiled_mma, tBr(_, _, ik, ismem_read), tAr(_, _, ik, ismem_read), tCr(_, _, _));
+          tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+        }
+        warpgroup_commit_batch();
+
+        if (itile_k >= 1) {
+          // Previous batch is now done; release the stage it consumed so
+          // the producer can refill it while the current batch is still
+          // in flight.
+          warpgroup_wait<1>();
+          if (elected_idx_in_warpgroup) {
+            arrive_barrier(writable[prev_ismem_read]);
+          }
+        }
+
+        prev_ismem_read = ismem_read;
+        ++ismem_read;
+        if (ismem_read == kStage) {
+          phase ^= 1;
+          ismem_read = 0;
+        }
+      }
+
+      // Drain the last in-flight batch and release its stage.
+      warpgroup_wait<0>();
+      warpgroup_fence_operand(tCr);
+      if (elected_idx_in_warpgroup) {
+        arrive_barrier(writable[prev_ismem_read]);
+      }
+
+      // float32 -> bfloat16
+      auto tCrh = make_tensor_like<cute::bfloat16_t>(tCr);
+
+#pragma unroll
+      for (int i = 0; i < size(tCr); ++i) {
+        tCrh(i) = (Tout)(tCr(i));
+      }
+
+      // Epilogue
+      auto sCT =
+          make_tensor(make_smem_ptr(reinterpret_cast<Tout *>(shm_c)), SLayoutCT{});  // (M, N)
+      using STSM_ATOM =
+          std::conditional_t<kTileM == 8, cute::SM90_U16x4_STSM_T, cute::SM90_U16x8_STSM_T>;
+      using R2SCopyAtomC = Copy_Atom<STSM_ATOM, Tout>;
+      auto tiled_copy_c = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);
+      auto thr_copy_c = tiled_copy_c.get_slice(idx);
+
+      auto tCr4s = thr_copy_c.retile_S(tCrh);
+      auto tCs4r = thr_copy_c.partition_D(sCT);
+
+      tma_store_wait<0>();
+      syncwarpgroup(iwarpgroup);
+
+      cute::copy(tiled_copy_c, tCr4s, tCs4r);
+      syncwarpgroup(iwarpgroup);
+      cute::tma_store_fence();
+
+      if (is_leader_in_warpgroup) {
+        auto gD = tma_d.get_tma_tensor(make_shape(n, m));
+        auto btma_d = tma_d.get_slice(0);
+
+        auto tDs = btma_d.partition_S(sCT);  // (TMA, _2, _1)
+        auto tDg = btma_d.partition_D(gD);   // (TMA, TMA_M, TMA_N)
+
+        auto *td_y = td_xy + igroup * 2 + 1;
+        cute::copy(tma_d.with(td_y), tDs(_, iwarpgroup, Int<0>{}),
+                   tDg(_, itile_n * 2 + iwarpgroup, itile_m));
+        tma_store_arrive();
+      }
+    }
+  }
+
+  if constexpr (kUsePDL) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+}
+
 }  // namespace kernels
 
 }  // namespace group_gemm

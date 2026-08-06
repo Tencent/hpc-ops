@@ -165,6 +165,75 @@ struct GroupGEMMBlockWiseFp8Config {
   auto get_shm_size() { return shm_size; }
 };
 
+template <int kTileM>
+static constexpr auto mma_selector_bf16() {
+  constexpr auto MajorA = GMMA::Major::K;
+  constexpr auto MajorB = GMMA::Major::K;
+  if constexpr (kTileM == 8) {
+    return cute::SM90_64x8x16_F32BF16BF16_SS<MajorA, MajorB>{};
+  } else if constexpr (kTileM == 16) {
+    return cute::SM90_64x16x16_F32BF16BF16_SS<MajorA, MajorB>{};
+  } else if constexpr (kTileM == 32) {
+    return cute::SM90_64x32x16_F32BF16BF16_SS<MajorA, MajorB>{};
+  } else if constexpr (kTileM == 48) {
+    return cute::SM90_64x48x16_F32BF16BF16_SS<MajorA, MajorB>{};
+  } else if constexpr (kTileM == 64) {
+    return cute::SM90_64x64x16_F32BF16BF16_SS<MajorA, MajorB>{};
+  } else if constexpr (kTileM == 96) {
+    return cute::SM90_64x96x16_F32BF16BF16_SS<MajorA, MajorB>{};
+  } else if constexpr (kTileM == 128) {
+    return cute::SM90_64x128x16_F32BF16BF16_SS<MajorA, MajorB>{};
+  } else {
+    return cute::SM90_64x64x16_F32BF16BF16_SS<MajorA, MajorB>{};
+  }
+}
+
+template <typename Tin_, typename Tout_, int kTileM_, int kTileN_, int kTileK_, int kStage_,
+          int kWarpgroupM_ = 2, int kWarpgroupN_ = 1, int kSwizzleX = 128, int kSwizzleW = 128,
+          int kSwizzleY = 128>
+struct GroupGEMMBF16Config {
+  using Tin = Tin_;
+  using Tout = Tout_;
+
+  static constexpr int kTileM = kTileM_;
+  static constexpr int kTileN = kTileN_;
+  static constexpr int kTileK = kTileK_;
+  static constexpr int kStage = kStage_;
+  static constexpr int kWarpgroupM = kWarpgroupM_;
+  static constexpr int kWarpgroupN = kWarpgroupN_;
+
+  using SLayoutXAtom = decltype(slayout_selector<kSwizzleX, Tin>());
+  using SLayoutWAtom = decltype(slayout_selector<kSwizzleW, Tin>());
+  using SLayoutYAtom = decltype(slayout_selector<kSwizzleY, Tout, false>());
+
+  using SLayoutX = decltype(tile_to_shape(SLayoutXAtom{},
+                                          make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{})));
+  using SLayoutW = decltype(tile_to_shape(SLayoutWAtom{},
+                                          make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{})));
+  using SLayoutY =
+      decltype(tile_to_shape(SLayoutYAtom{}, make_shape(Int<kTileN>{}, Int<kTileM>{})));
+  using CopyBoxY = decltype(tile_to_shape(SLayoutYAtom{},
+                                          make_shape(Int<kTileN / kWarpgroupM>{}, Int<kTileM>{})));
+
+  template <typename TX, typename TW, typename TY>
+  auto get_tma(TX x, TW w, TY y) {
+    auto tma_x = make_tma_copy(SM90_TMA_LOAD{}, x, take<0, 2>(SLayoutX{}));
+    auto tma_w = make_tma_copy(SM90_TMA_LOAD{}, w, take<0, 2>(SLayoutW{}));
+    auto tma_y = make_tma_copy(SM90_TMA_STORE{}, y, CopyBoxY{});
+    return std::make_tuple(tma_x, tma_w, tma_y);
+  }
+
+  using WarpgroupLayout =
+      decltype(make_layout(make_shape(Int<kWarpgroupM>{}, Int<kWarpgroupN>{}, Int<1>{})));
+  using TiledMma = decltype(make_tiled_mma(mma_selector_bf16<kTileM>(), WarpgroupLayout{}));
+
+  static constexpr int shm_xw = (cosize(SLayoutX{}) + cosize(SLayoutW{})) * sizeof(Tin);
+  static constexpr int shm_y = cosize(SLayoutY{}) * sizeof(Tout);
+  static constexpr int shm_size = shm_xw + shm_y;
+
+  auto get_shm_size() { return shm_size; }
+};
+
 }  // namespace group_gemm
 }  // namespace hpc
 
