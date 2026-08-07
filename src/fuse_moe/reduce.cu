@@ -38,7 +38,8 @@ __global__ void reduce_kernel(T *y_ptr, const T *x_ptr, const int *topk_pos_ptr,
   }
 #pragma unroll 1
   for (int i = idx; i < num_topk; i += blockDim.x) {
-    pos_shm[i] = topk_pos_ptr[irow * num_topk + i];
+    pos_shm[i] = topk_pos_ptr ? topk_pos_ptr[irow * num_topk + i]
+                              : irow * num_topk + i;
     scale_shm[i] = topk_scale_ptr[irow * num_topk + i];
   }
   __syncthreads();

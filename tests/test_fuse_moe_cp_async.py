@@ -144,7 +144,7 @@ def naive_fuse_moe_pertensor_fp8(
 
 
 # hunyuan-v3 TP=8 EP=1 shape: E=192, topk=8, H=4096, I=192 (= 1536/8)
-@pytest.mark.parametrize("num_seq", [128])
+@pytest.mark.parametrize("num_seq", [1, 2, 3, 4, 8, 128])
 @pytest.mark.parametrize("num_topk", [8])
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("intermediate_size", [192])
