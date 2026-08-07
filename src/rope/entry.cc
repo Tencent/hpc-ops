@@ -1,10 +1,13 @@
 // Copyright (C) 2026 Tencent.
 
+#include <ATen/MemoryOverlap.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime_api.h>
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <cstdint>
 #include <optional>
 #include <tuple>
 
@@ -216,6 +219,145 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rope_norm_store_kv_fp8_e
   return std::make_tuple(out_q, q_scale, split_k_flag);
 }
 
+std::tuple<torch::Tensor, torch::Tensor> multimodal_rope_impl(
+    const torch::Tensor &q, const torch::Tensor &k, const torch::Tensor &cos_sin_cache,
+    const torch::Tensor &positions, bool is_neox, std::optional<torch::Tensor> q_out_opt,
+    std::optional<torch::Tensor> k_out_opt) {
+  TORCH_CHECK(q.is_cuda() && k.is_cuda() && cos_sin_cache.is_cuda() && positions.is_cuda(),
+              "q/k/cos_sin_cache/positions must be CUDA tensors");
+  TORCH_CHECK(q.device() == k.device() && q.device() == cos_sin_cache.device() &&
+                  q.device() == positions.device(),
+              "q/k/cos_sin_cache/positions must be on the same CUDA device");
+  c10::cuda::CUDAGuard device_guard(q.device());
+  TORCH_CHECK(q.dim() == 4 && k.dim() == 4, "q/k must be [B,H,S,D]");
+  TORCH_CHECK(cos_sin_cache.dim() == 2, "cos_sin_cache must be [max_position, head_dim]");
+  TORCH_CHECK(positions.dim() == 2, "positions must be [B, S]");
+  TORCH_CHECK(q.scalar_type() == torch::kBFloat16 && k.scalar_type() == torch::kBFloat16,
+              "q/k must be bfloat16");
+  TORCH_CHECK(cos_sin_cache.scalar_type() == torch::kFloat,
+              "cos_sin_cache must be float32");
+  TORCH_CHECK(positions.scalar_type() == torch::kInt64, "positions must be int64");
+  TORCH_CHECK(q.size(0) == k.size(0) && q.size(2) == k.size(2) && q.size(3) == k.size(3),
+              "q/k shape mismatch");
+  TORCH_CHECK(cos_sin_cache.size(1) == q.size(3),
+              "cos_sin_cache last dimension must equal head_dim (first half cos, second half "
+              "sin; not duplicated/expanded per batch or sequence)");
+  TORCH_CHECK(positions.size(0) == q.size(0) && positions.size(1) == q.size(2),
+              "positions shape mismatch, expected [B, S]");
+  const int64_t q_heads = q.size(1);
+  const int64_t kv_heads = k.size(1);
+  const int64_t head_dim = q.size(3);
+  const bool neox_profile =
+      is_neox && (head_dim == 128 || head_dim == 512) &&
+      ((q_heads == 16 && kv_heads == 8) || (q_heads == 28 && kv_heads == 4) ||
+       (q_heads == 32 && kv_heads == 8) || (q_heads == 64 && (kv_heads == 4 || kv_heads == 8)));
+  const bool interleaved_profile =
+      !is_neox && head_dim == 64 && (q_heads == 32 || q_heads == 64) && kv_heads == 1;
+  TORCH_CHECK(neox_profile || interleaved_profile,
+              "multimodal_rope supports NeoX D128/D512 Hq/Hkv 16/8, 28/4, 32/8, "
+              "64/4, 64/8 and interleaved D64 Hq/Hkv 32/1, 64/1");
+  TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1,
+              "q/k last dimension must be contiguous");
+  TORCH_CHECK(cos_sin_cache.stride(1) == 1,
+              "cos_sin_cache last dimension must be contiguous");
+  at::assert_no_internal_overlap(q);
+  at::assert_no_internal_overlap(k);
+  for (int64_t dim = 0; dim < q.dim(); ++dim) {
+    TORCH_CHECK(q.size(dim) <= 1 || q.stride(dim) > 0,
+                "q must have positive strides for non-singleton dimensions");
+    TORCH_CHECK(k.size(dim) <= 1 || k.stride(dim) > 0,
+                "k must have positive strides for non-singleton dimensions");
+  }
+
+  auto prepare_output = [](const std::optional<torch::Tensor> &output_opt,
+                           const torch::Tensor &input, const char *name) {
+    if (!output_opt.has_value()) {
+      return torch::empty_strided(input.sizes(), input.strides(), input.options());
+    }
+    torch::Tensor output = output_opt.value();
+    TORCH_CHECK(output.is_cuda(), name, " must be a CUDA tensor");
+    TORCH_CHECK(output.device() == input.device(), name, " must be on the input device");
+    TORCH_CHECK(output.scalar_type() == input.scalar_type(), name, " must match input dtype");
+    TORCH_CHECK(output.sizes() == input.sizes(), name, " must match input shape");
+    TORCH_CHECK(output.stride(3) == 1, name, " last dimension must be contiguous");
+    at::assert_no_internal_overlap(output);
+    for (int64_t dim = 0; dim < output.dim(); ++dim) {
+      TORCH_CHECK(output.size(dim) <= 1 || output.stride(dim) > 0, name,
+                  " must have positive strides for non-singleton dimensions");
+    }
+    return output;
+  };
+  torch::Tensor q_out = prepare_output(q_out_opt, q, "q_out");
+  torch::Tensor k_out = prepare_output(k_out_opt, k, "k_out");
+  const std::uintptr_t tensor_alignment = is_neox ? 4 : 16;
+  const int64_t stride_alignment = is_neox ? 2 : 8;
+  TORCH_CHECK(
+      reinterpret_cast<std::uintptr_t>(q.const_data_ptr()) % tensor_alignment == 0 &&
+          reinterpret_cast<std::uintptr_t>(k.const_data_ptr()) % tensor_alignment == 0 &&
+          reinterpret_cast<std::uintptr_t>(q_out.const_data_ptr()) % tensor_alignment == 0 &&
+          reinterpret_cast<std::uintptr_t>(k_out.const_data_ptr()) % tensor_alignment == 0 &&
+          reinterpret_cast<std::uintptr_t>(cos_sin_cache.const_data_ptr()) % 16 == 0,
+      "multimodal_rope inputs and outputs do not satisfy vector alignment");
+  TORCH_CHECK(
+      q.stride(0) % stride_alignment == 0 && q.stride(1) % stride_alignment == 0 &&
+          q.stride(2) % stride_alignment == 0 && k.stride(0) % stride_alignment == 0 &&
+          k.stride(1) % stride_alignment == 0 && k.stride(2) % stride_alignment == 0 &&
+          q_out.stride(0) % stride_alignment == 0 && q_out.stride(1) % stride_alignment == 0 &&
+          q_out.stride(2) % stride_alignment == 0 && k_out.stride(0) % stride_alignment == 0 &&
+          k_out.stride(1) % stride_alignment == 0 && k_out.stride(2) % stride_alignment == 0 &&
+          cos_sin_cache.stride(0) % 4 == 0,
+      "multimodal_rope inputs and outputs do not satisfy vector stride alignment");
+  if (q_out_opt.has_value()) {
+    at::assert_no_overlap(q_out, q);
+    at::assert_no_overlap(q_out, k);
+    at::assert_no_overlap(q_out, cos_sin_cache);
+    at::assert_no_overlap(q_out, positions);
+  }
+  if (k_out_opt.has_value()) {
+    at::assert_no_overlap(k_out, q);
+    at::assert_no_overlap(k_out, k);
+    at::assert_no_overlap(k_out, cos_sin_cache);
+    at::assert_no_overlap(k_out, positions);
+  }
+  if (q_out_opt.has_value() && k_out_opt.has_value()) {
+    at::assert_no_overlap(q_out, k_out);
+  }
+  if (q.size(0) == 0 || q.size(2) == 0) {
+    return std::make_tuple(q_out, k_out);
+  }
+  MultimodalRopeParams params{q.size(0),           q.size(2),           q.size(1),
+                              k.size(1),           q.size(3),           q.stride(0),
+                              q.stride(1),         q.stride(2),         k.stride(0),
+                              k.stride(1),         k.stride(2),         q_out.stride(0),
+                              q_out.stride(1),     q_out.stride(2),     k_out.stride(0),
+                              k_out.stride(1),     k_out.stride(2),     cos_sin_cache.stride(0),
+                              positions.stride(0), positions.stride(1), is_neox};
+  auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+  multimodal_rope_async(reinterpret_cast<__nv_bfloat16 *>(q_out.mutable_data_ptr()),
+                        reinterpret_cast<__nv_bfloat16 *>(k_out.mutable_data_ptr()),
+                        reinterpret_cast<const __nv_bfloat16 *>(q.const_data_ptr()),
+                        reinterpret_cast<const __nv_bfloat16 *>(k.const_data_ptr()),
+                        reinterpret_cast<const float *>(cos_sin_cache.const_data_ptr()),
+                        positions.const_data_ptr<int64_t>(), params, stream);
+  const cudaError_t launch_error = cudaGetLastError();
+  TORCH_CHECK(launch_error == cudaSuccess, "multimodal_rope kernel launch failed: ",
+              cudaGetErrorString(launch_error));
+  return std::make_tuple(q_out, k_out);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> multimodal_rope_entry(
+    const torch::Tensor &q, const torch::Tensor &k, const torch::Tensor &cos_sin_cache,
+    const torch::Tensor &positions, bool is_neox) {
+  return multimodal_rope_impl(q, k, cos_sin_cache, positions, is_neox, std::nullopt,
+                              std::nullopt);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> multimodal_rope_out_entry(
+    const torch::Tensor &q, const torch::Tensor &k, const torch::Tensor &cos_sin_cache,
+    const torch::Tensor &positions, bool is_neox, torch::Tensor q_out, torch::Tensor k_out) {
+  return multimodal_rope_impl(q, k, cos_sin_cache, positions, is_neox, q_out, k_out);
+}
+
 }  // namespace rope
 }  // namespace hpc
 
@@ -237,4 +379,13 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "Tensor? out_q=None, Tensor? out_k=None, Tensor? out_v=None, int qk_norm_policy=0) -> "
       "(Tensor, Tensor, Tensor)");
   m.impl("rope_norm_store_kv_fp8", torch::kCUDA, &hpc::rope::rope_norm_store_kv_fp8_entry);
+
+  m.def(
+      "multimodal_rope(Tensor q, Tensor k, Tensor cos_sin_cache, Tensor positions, "
+      "bool is_neox=True) -> (Tensor, Tensor)");
+  m.impl("multimodal_rope", torch::kCUDA, &hpc::rope::multimodal_rope_entry);
+  m.def(
+      "multimodal_rope.out(Tensor q, Tensor k, Tensor cos_sin_cache, Tensor positions, "
+      "bool is_neox=True, *, Tensor(a!) out_q, Tensor(b!) out_k) -> (Tensor(a!), Tensor(b!))");
+  m.impl("multimodal_rope.out", torch::kCUDA, &hpc::rope::multimodal_rope_out_entry);
 }
