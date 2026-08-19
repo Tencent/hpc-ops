@@ -44,7 +44,7 @@ count_and_gather_entry(const torch::Tensor &x, const torch::Tensor &topk_ids,
   torch::Tensor tiles = torch::empty({num_expert}, options.dtype(torch::kInt32));
   torch::Tensor cu_tiles = torch::empty({num_expert + 1}, options.dtype(torch::kInt32));
   torch::Tensor gate_up_tmas = torch::empty({num_expert * 2, 128}, options.dtype(torch::kInt8));
-  torch::Tensor dowm_tmas = torch::empty({num_expert * 2, 128}, options.dtype(torch::kInt8));
+  torch::Tensor down_tmas = torch::empty({num_expert * 2, 128}, options.dtype(torch::kInt8));
 
   const auto *x_ptr = x.const_data_ptr();
   const auto *topk_ids_ptr = topk_ids.const_data_ptr();
@@ -59,16 +59,16 @@ count_and_gather_entry(const torch::Tensor &x, const torch::Tensor &topk_ids,
   auto *tiles_ptr = tiles.mutable_data_ptr();
   auto *cu_tiles_ptr = cu_tiles.mutable_data_ptr();
   auto *gate_up_tmas_ptr = gate_up_tmas.mutable_data_ptr();
-  auto *dowm_tmas_ptr = dowm_tmas.mutable_data_ptr();
+  auto *down_tmas_ptr = down_tmas.mutable_data_ptr();
 
   count_and_gather_async(gate_up_input_ptr, gate_up_output_ptr, down_input_ptr, down_output_ptr,
                          x_ptr, topk_ids_ptr, topk_pos_ptr, seqlens_ptr, cu_seqlens_ptr,
-                         gate_up_tmas_ptr, dowm_tmas_ptr, tiles_ptr, cu_tiles_ptr, nullptr, nullptr,
+                         gate_up_tmas_ptr, down_tmas_ptr, tiles_ptr, cu_tiles_ptr, nullptr, nullptr,
                          num_seq, hidden_size, intermediate_size, num_topk, num_expert, rank_ep,
                          num_seq_per_group_avg, stream);
 
   return std::make_tuple(gate_up_input, gate_up_output, topk_pos, seqlens, cu_seqlens, tiles,
-                         cu_tiles, gate_up_tmas, dowm_tmas);
+                         cu_tiles, gate_up_tmas, down_tmas);
 }
 
 torch::Tensor reduce_entry(const torch::Tensor &x, const torch::Tensor &topk_pos,
