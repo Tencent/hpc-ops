@@ -89,4 +89,35 @@ python3 benchmark/attention_decode/bench_attention_decode_bf16.py \
   --iters 3
 ```
 
-Enable correctness comparison between static and dynamic paths with `--check`.
+Qwen3.5-9B BF16 decode (`KV/Q heads=4/16`, `head_dim=256`):
+
+```bash
+python3 benchmark/attention_decode/bench_attention_decode_bf16.py \
+  --num-head-kv 4 \
+  --num-head-q 16 \
+  --head-dim 256 \
+  --methods static dynamic flashinfer flashattn \
+  --flashinfer-use-tensor-cores \
+  --warmup 10 \
+  --iters 100 \
+  --check \
+  --csv attention_decode_bf16_dim256.csv \
+  --jsonl attention_decode_bf16_dim256.jsonl
+```
+
+The BF16 benchmark uses `block_size=64` for HPC and FlashInfer. FlashAttention-3 uses
+`block_size=256`, its minimum paged-KV block size. Cache allocation, page-table construction,
+FlashInfer planning, and CUDA Graph capture are outside the timed region.
+
+The Qwen3.5 command enables FlashInfer's tensor-core GQA path. FA3 uses its split-K heuristic and
+automatic GQA packing by default; `--flashattn-num-splits` and `--flashattn-pack-gqa` expose both
+knobs for provider tuning. CSV/JSONL rows record these provider settings.
+
+Dynamic timing uses a prebuilt task map by default and therefore measures kernel execution and
+split-K combine. Pass `--include-taskmap` to include `assign_attention_decode_task` in the timed
+region. CSV/JSONL rows record this boundary, the GPU and provider versions, head configuration,
+page sizes, warmup count, iteration count, and all nine scenario names.
+
+For BF16, `--check` compares dynamic and each requested external provider with static using the
+same logical Q/K/V data (`atol=0.016`, `rtol=1e-5`). The FlashAttention-3 cache is repacked to its
+larger page size before timing.

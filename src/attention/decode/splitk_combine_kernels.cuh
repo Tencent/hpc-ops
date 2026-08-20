@@ -175,7 +175,9 @@ __global__ void attention_decode_dynamic_splitk_combine_kernel(
   // ---- Phase 1: light slots. One warp per slot. ----
   {
     constexpr int kDimPerThread = 4;  // 4 * fp32 -> 128-bit load
-    static_assert(kTileV == 32 * kDimPerThread, "light phase covers full kTileV per warp");
+    constexpr int kDimPerWarp = 32 * kDimPerThread;
+    static_assert(kTileV % kDimPerWarp == 0, "kTileV must be divisible by light dim-tile");
+    constexpr int kDimTiles = kTileV / kDimPerWarp;
 
     using TiledCopyLoad = decltype(make_tiled_copy(
         Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, float>{}, Layout<Shape<_32, _1>>{},
@@ -190,15 +192,16 @@ __global__ void attention_decode_dynamic_splitk_combine_kernel(
     auto thr_copy_load = tiled_copy_load.get_slice(ilane);
     auto thr_copy_store = tiled_copy_store.get_slice(ilane);
 
-    const int num_slots = num_head_q * num_seq_q * num_batch;
-    auto slot_shape = make_shape(num_head_q, num_seq_q, num_batch);
+    const int num_slots = kDimTiles * num_head_q * num_seq_q * num_batch;
+    auto slot_shape = make_shape(Int<kDimTiles>{}, num_head_q, num_seq_q, num_batch);
 
     for (int islot = blockIdx.x * kWarpCount + iwarp; islot < num_slots;
          islot += gridDim.x * kWarpCount) {
       auto crd = idx2crd(islot, slot_shape);
-      const int ihead_q = get<0>(crd);
-      const int iseq = get<1>(crd);
-      const int ibatch = get<2>(crd);
+      const int idimtile = get<0>(crd);
+      const int ihead_q = get<1>(crd);
+      const int iseq = get<2>(crd);
+      const int ibatch = get<3>(crd);
 
       int ihead_kv, ihead;
       heads_per_group_divider(ihead_kv, ihead, ihead_q);
@@ -208,9 +211,12 @@ __global__ void attention_decode_dynamic_splitk_combine_kernel(
         continue;
       }
 
-      Tensor gS = mS(_, ihead_q, iseq, _, ibatch);
+      Tensor gS =
+          make_tensor(mS(_, ihead_q, iseq, _, ibatch).data() + idimtile * kDimPerWarp,
+                      make_shape(Int<kDimPerWarp>{}, num_chunks), make_stride(_1{}, stride<3>(mS)));
       Tensor gL = mL(ihead, iseq, ihead_kv, _, ibatch);
-      Tensor gY = mY(_, ihead_q, iseq, ibatch);
+      Tensor gY = make_tensor(mY(_, ihead_q, iseq, ibatch).data() + idimtile * kDimPerWarp,
+                              make_shape(Int<kDimPerWarp>{}));
 
       Tensor tSg = thr_copy_load.partition_S(gS);
       Tensor tYg = thr_copy_store.partition_D(gY);

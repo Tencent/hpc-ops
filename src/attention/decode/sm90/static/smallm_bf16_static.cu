@@ -7,8 +7,8 @@
 #include <iostream>
 
 #include "cute/tensor.hpp"
-#include "src/attention/decode/sm90/static/smallm_bf16_dim128_static_splitk_kernels.cuh"
-#include "src/attention/decode/smallm_dim128.h"
+#include "src/attention/decode/sm90/static/smallm_bf16_static_splitk_kernels.cuh"
+#include "src/attention/decode/smallm_bf16.h"
 
 namespace hpc {
 namespace attention {
@@ -27,8 +27,8 @@ static constexpr auto mma_selector_bf16() {
 }
 
 template <int kTileM, int kTileN, int kTileK, int kTileV, int kBlockSize, int kSplitK,
-          int kSplitMinLen>
-void launch_smallm_bf16_dim128_static_splitk_kernel(
+          int kSplitMinLen, int kStage>
+void launch_smallm_bf16_static_splitk_kernel(
     void *y_ptr, void *lse_ptr, void *splitk_out_ptr, const void *q_ptr, void *kcache_ptr,
     void *vcache_ptr, const int *block_ids_ptr, const int *num_seq_kvcache_ptr, int *split_flag_ptr,
     bool new_kv_included, int num_batch, int num_seq_q, int num_head_q, int num_head_k,
@@ -37,7 +37,6 @@ void launch_smallm_bf16_dim128_static_splitk_kernel(
     int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
     int64_t vcache_token_stride, int64_t vcache_head_stride, cudaStream_t stream) {
   using namespace cute;  // NOLINT
-  constexpr int kStage = 2;
   constexpr int kHeadsPerGroup = 8;
 
   using Tin = cute::bfloat16_t;
@@ -145,23 +144,23 @@ void launch_smallm_bf16_dim128_static_splitk_kernel(
       num_kvcache_blocks, num_seq_max_blocks, one_over_dk_log2e);
 }
 
-bool smallm_bf16_dim128_static_async(
-    void *y_ptr, void *lse_ptr, void *splitk_out_ptr, const void *q_ptr, void *kcache_ptr,
-    void *vcache_ptr, const int *block_ids_ptr, const int *num_seq_kvcache_ptr, int *split_flag_ptr,
-    bool new_kv_included, int splitk, int num_batch, int num_seq_q, int num_head_q, int num_head_k,
-    int num_head_v, int num_dim_qk, int num_dim_v, int num_kvcache_blocks, int block_size,
-    int num_seq_max_blocks, int ldY, int ldQ, int64_t kcache_block_stride,
-    int64_t kcache_token_stride, int64_t kcache_head_stride, int64_t vcache_block_stride,
-    int64_t vcache_token_stride, int64_t vcache_head_stride, cudaStream_t stream) {
+bool smallm_bf16_static_async(void *y_ptr, void *lse_ptr, void *splitk_out_ptr, const void *q_ptr,
+                              void *kcache_ptr, void *vcache_ptr, const int *block_ids_ptr,
+                              const int *num_seq_kvcache_ptr, int *split_flag_ptr,
+                              bool new_kv_included, int splitk, int num_batch, int num_seq_q,
+                              int num_head_q, int num_head_k, int num_head_v, int num_dim_qk,
+                              int num_dim_v, int num_kvcache_blocks, int block_size,
+                              int num_seq_max_blocks, int ldY, int ldQ, int64_t kcache_block_stride,
+                              int64_t kcache_token_stride, int64_t kcache_head_stride,
+                              int64_t vcache_block_stride, int64_t vcache_token_stride,
+                              int64_t vcache_head_stride, cudaStream_t stream) {
   using namespace cute;  // NOLINT
 
   constexpr int kTileN = 64;
-  constexpr int kTileK = 128;
-  constexpr int kTileV = 128;
 
-  if (num_dim_qk != kTileK || num_dim_v != kTileV || (block_size != 32 && block_size != 64) ||
-      (splitk != 1 && splitk != 4 && splitk != 16)) {
-    std::cout << "launch launch_attention_decode_bf16_dim128_smallm failed with "
+  if (num_dim_qk != num_dim_v || (num_dim_qk != 128 && num_dim_qk != 256) ||
+      (block_size != 32 && block_size != 64) || (splitk != 1 && splitk != 4 && splitk != 16)) {
+    std::cout << "launch smallm_bf16_static_async failed with "
               << "  num_dim_qk: " << num_dim_qk << ", num_dim_v: " << num_dim_v
               << ", block_size:" << block_size << std::endl;
     return false;
@@ -169,13 +168,16 @@ bool smallm_bf16_dim128_static_async(
 
   int heads_per_group = num_head_q / num_head_k;
 
-  auto launch = [&](auto splitk_tag, auto min_len_tag, auto tilem_tag, auto block_size_tag) {
+  auto launch = [&](auto splitk_tag, auto min_len_tag, auto tilem_tag, auto block_size_tag,
+                    auto head_dim_tag, auto stage_tag) {
     constexpr int kSplitK = decltype(splitk_tag)::value;
     constexpr int kSplitMinLen = decltype(min_len_tag)::value;
     constexpr int kTileM = decltype(tilem_tag)::value;
     constexpr int kBlockSize = decltype(block_size_tag)::value;
-    launch_smallm_bf16_dim128_static_splitk_kernel<kTileM, kTileN, kTileK, kTileV, kBlockSize,
-                                                   kSplitK, kSplitMinLen>(
+    constexpr int kHeadDim = decltype(head_dim_tag)::value;
+    constexpr int kStage = decltype(stage_tag)::value;
+    launch_smallm_bf16_static_splitk_kernel<kTileM, kTileN, kHeadDim, kHeadDim, kBlockSize, kSplitK,
+                                            kSplitMinLen, kStage>(
         y_ptr, lse_ptr, splitk_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
         num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, num_batch, num_seq_q, num_head_q,
         num_head_k, num_head_v, heads_per_group, num_dim_qk, num_dim_v, num_kvcache_blocks,
@@ -183,11 +185,23 @@ bool smallm_bf16_dim128_static_async(
         kcache_head_stride, vcache_block_stride, vcache_token_stride, vcache_head_stride, stream);
   };
 
+  auto dispatch_head_dim = [&](auto splitk_tag, auto min_len_tag, auto tilem_tag,
+                               auto block_size_tag) {
+    if (num_dim_qk == 128) {
+      launch(splitk_tag, min_len_tag, tilem_tag, block_size_tag, std::integral_constant<int, 128>{},
+             std::integral_constant<int, 2>{});
+    } else {
+      // Keep the staged K/V shared-memory footprint equal to the dim-128 path.
+      launch(splitk_tag, min_len_tag, tilem_tag, block_size_tag, std::integral_constant<int, 256>{},
+             std::integral_constant<int, 1>{});
+    }
+  };
+
   auto dispatch_block_size = [&](auto splitk_tag, auto min_len_tag, auto tilem_tag) {
     if (block_size == 32) {
-      launch(splitk_tag, min_len_tag, tilem_tag, std::integral_constant<int, 32>{});
+      dispatch_head_dim(splitk_tag, min_len_tag, tilem_tag, std::integral_constant<int, 32>{});
     } else if (block_size == 64) {
-      launch(splitk_tag, min_len_tag, tilem_tag, std::integral_constant<int, 64>{});
+      dispatch_head_dim(splitk_tag, min_len_tag, tilem_tag, std::integral_constant<int, 64>{});
     }
   };
 

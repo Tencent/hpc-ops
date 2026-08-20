@@ -435,8 +435,6 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   int num_head_q = q.size(1);
   int num_dim_qk = q.size(2);
 
-  TORCH_CHECK((num_dim_qk == 128), "we only support head dim 128.");
-
   int num_kvcache_blocks = kcache.size(0);
   int block_size = kcache.size(1);
 
@@ -446,9 +444,19 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   int num_head_k = kcache.size(2);
   int num_head_v = vcache.size(2);
   int num_dim_v = vcache.size(3);
+  TORCH_CHECK(num_dim_qk == num_dim_v && (num_dim_qk == 128 || num_dim_qk == 256),
+              "attention_decode_bf16: expected matching head dimensions of 128 or 256, got "
+              "dim_qk=",
+              num_dim_qk, " dim_v=", num_dim_v);
+  TORCH_CHECK(kcache.size(3) == num_dim_qk,
+              "attention_decode_bf16: kcache head dimension must match q");
+  TORCH_CHECK(num_head_k == num_head_v,
+              "attention_decode_bf16: kcache and vcache must have the same number of heads");
 
   int num_seq_max_blocks = block_ids.size(1);
 
+  TORCH_CHECK(num_head_q % num_head_k == 0,
+              "attention_decode_bf16: num_head_q must be divisible by num_head_k");
   int heads_per_group = num_head_q / num_head_k;
   TORCH_CHECK(heads_per_group == 4 || heads_per_group == 8,
               "we only support num_head_q / num_head_k == 4 or 8.");
@@ -463,6 +471,13 @@ torch::Tensor attention_decode_bf16_entry(const torch::Tensor &q, torch::Tensor 
   torch::Tensor y;
   if (output.has_value()) {
     y = output.value();
+    TORCH_CHECK(y.device().is_cuda(), "output tensor must be cuda");
+    TORCH_CHECK(y.get_device() == q.get_device(), "output tensor must be on the same device as q");
+    TORCH_CHECK(y.scalar_type() == torch::kBFloat16, "output dtype must be bfloat16");
+    TORCH_CHECK(y.is_contiguous(), "output tensor must be contiguous");
+    TORCH_CHECK(y.dim() == 3 && y.size(0) == num_batch * num_seq_q && y.size(1) == num_head_q &&
+                    y.size(2) == num_dim_v,
+                "output must have shape [num_batch * num_seq_q, num_head_q, num_dim_v]");
   } else {
     y = torch::empty({num_batch * num_seq_q, num_head_q, num_dim_v}, options);
   }

@@ -365,6 +365,13 @@ __device__ __forceinline__ void online_softmax(TensorA& tAttr_nm, TensorM& gMax,
       vec_t<float, 4> warp_max2 = *reinterpret_cast<vec_t<float, 4>*>(&warp_max[4]);
       store(smem_max + iwarp * kTileM + ilane * 8, warp_max1);
       store(smem_max + iwarp * kTileM + ilane * 8 + 4, warp_max2);
+    } else if constexpr (kM == 10) {
+      vec_t<float, 4> warp_max1 = *reinterpret_cast<vec_t<float, 4>*>(&warp_max[0]);
+      vec_t<float, 4> warp_max2 = *reinterpret_cast<vec_t<float, 4>*>(&warp_max[4]);
+      vec_t<float, 2> warp_max3 = *reinterpret_cast<vec_t<float, 2>*>(&warp_max[8]);
+      store(smem_max + iwarp * kTileM + ilane * 8, warp_max1);
+      store(smem_max + iwarp * kTileM + ilane * 8 + 4, warp_max2);
+      store(smem_max + iwarp * kTileM + ilane * 2 + 32, warp_max3);
     }
   }
 
@@ -388,6 +395,14 @@ __device__ __forceinline__ void online_softmax(TensorA& tAttr_nm, TensorM& gMax,
 
         reduce_max1 = load<float, 4>(smem_max + i * kTileM + ilane * 8);
         reduce_max2 = load<float, 4>(smem_max + i * kTileM + ilane * 8 + 4);
+      } else if constexpr (kM == 10) {
+        vec_t<float, 4>& reduce_max1 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_max[0]);
+        vec_t<float, 4>& reduce_max2 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_max[4]);
+        vec_t<float, 2>& reduce_max3 = *reinterpret_cast<vec_t<float, 2>*>(&reduce_max[8]);
+
+        reduce_max1 = load<float, 4>(smem_max + i * kTileM + ilane * 8);
+        reduce_max2 = load<float, 4>(smem_max + i * kTileM + ilane * 8 + 4);
+        reduce_max3 = load<float, 2>(smem_max + i * kTileM + ilane * 2 + 32);
       }
 #pragma unroll
       for (int im = 0; im < kM; ++im) {
@@ -547,6 +562,13 @@ __device__ __forceinline__ void final_online_softmax(TensorY& tYr_nm, TensorS& g
       vec_t<float, 4> warp_sum2 = *reinterpret_cast<vec_t<float, 4>*>(&warp_sum[4]);
       store(smem_sum + iwarp * kTileM + ilane * 8, warp_sum1);
       store(smem_sum + iwarp * kTileM + ilane * 8 + 4, warp_sum2);
+    } else if constexpr (kM == 10) {
+      vec_t<float, 4> warp_sum1 = *reinterpret_cast<vec_t<float, 4>*>(&warp_sum[0]);
+      vec_t<float, 4> warp_sum2 = *reinterpret_cast<vec_t<float, 4>*>(&warp_sum[4]);
+      vec_t<float, 2> warp_sum3 = *reinterpret_cast<vec_t<float, 2>*>(&warp_sum[8]);
+      store(smem_sum + iwarp * kTileM + ilane * 8, warp_sum1);
+      store(smem_sum + iwarp * kTileM + ilane * 8 + 4, warp_sum2);
+      store(smem_sum + iwarp * kTileM + ilane * 2 + 32, warp_sum3);
     }
   }
 
@@ -574,6 +596,14 @@ __device__ __forceinline__ void final_online_softmax(TensorY& tYr_nm, TensorS& g
 
         reduce_sum1 = load<float, 4>(smem_sum + i * kTileM + ilane * 8);
         reduce_sum2 = load<float, 4>(smem_sum + i * kTileM + ilane * 8 + 4);
+      } else if constexpr (kM == 10) {
+        vec_t<float, 4>& reduce_sum1 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_sum[0]);
+        vec_t<float, 4>& reduce_sum2 = *reinterpret_cast<vec_t<float, 4>*>(&reduce_sum[4]);
+        vec_t<float, 2>& reduce_sum3 = *reinterpret_cast<vec_t<float, 2>*>(&reduce_sum[8]);
+
+        reduce_sum1 = load<float, 4>(smem_sum + i * kTileM + ilane * 8);
+        reduce_sum2 = load<float, 4>(smem_sum + i * kTileM + ilane * 8 + 4);
+        reduce_sum3 = load<float, 2>(smem_sum + i * kTileM + ilane * 2 + 32);
       }
 #pragma unroll
       for (int im = 0; im < kM; ++im) {
@@ -668,7 +698,9 @@ __device__ __forceinline__ void splitk_reduce(CuteT* y_ptr, float* lse_ptr, floa
                                               const int& ibatch, const int& iwarp,
                                               const int& ilane) {
   constexpr int kItemsPerThread = 4;
-  int icol = ilane * kItemsPerThread;
+  constexpr int kItemsPerWarp = 32 * kItemsPerThread;
+  static_assert(kTileV % kItemsPerWarp == 0, "kTileV must be divisible by warp output tile");
+  constexpr int kDimTiles = kTileV / kItemsPerWarp;
 
   vec_t<float, kSplitK> lse;
   vec_t<float, kItemsPerThread> output;
@@ -676,9 +708,9 @@ __device__ __forceinline__ void splitk_reduce(CuteT* y_ptr, float* lse_ptr, floa
   auto* lse_batch = lse_ptr + ibatch * kSplitK * num_head_k * lse_heads_per_group * num_seq_q +
                     ihead_kv * lse_heads_per_group * num_seq_q;
   auto* split_input = split_y_ptr + ibatch * kSplitK * num_head_q * num_seq_q * kTileV +
-                      ihead_kv * heads_per_group * kTileV + icol;
+                      ihead_kv * heads_per_group * kTileV;
   auto* out_row = reinterpret_cast<Tout*>(y_ptr) + ibatch * num_head_q * num_seq_q * kTileV +
-                  ihead_kv * heads_per_group * kTileV + icol;
+                  ihead_kv * heads_per_group * kTileV;
 
   for (int iseqq = 0; iseqq < num_seq_q; iseqq++) {
     auto* lse_seq = lse_batch + iseqq * lse_heads_per_group;
@@ -688,10 +720,6 @@ __device__ __forceinline__ void splitk_reduce(CuteT* y_ptr, float* lse_ptr, floa
       auto* lse_head = lse_seq + iqhead;
       auto* split_input_head = split_input_seq + iqhead * kTileV;
       auto* out_row_head = out_row_seq + iqhead * kTileV;
-#pragma unroll
-      for (int i = 0; i < kItemsPerThread; i++) {
-        output[i] = 0.f;
-      }
 
       float max_lse = 0.f;
       float sum_lse = 0.f;
@@ -714,18 +742,27 @@ __device__ __forceinline__ void splitk_reduce(CuteT* y_ptr, float* lse_ptr, floa
       sum_lse = log2f_ftz(sum_lse) + max_lse;
 
 #pragma unroll
-      for (int i = 0; i < kSplitK; i++) {
-        if (i < num_chunks) {
-          auto y =
-              load<float, kItemsPerThread>(split_input_head + i * num_head_q * num_seq_q * kTileV);
-          float scale = exp2f_ftz(lse[i] - sum_lse);
+      for (int idimtile = 0; idimtile < kDimTiles; ++idimtile) {
+        const int icol = idimtile * kItemsPerWarp + ilane * kItemsPerThread;
 #pragma unroll
-          for (int j = 0; j < kItemsPerThread; j++) {
-            output[j] += scale * y[j];
+        for (int i = 0; i < kItemsPerThread; i++) {
+          output[i] = 0.f;
+        }
+
+#pragma unroll
+        for (int i = 0; i < kSplitK; i++) {
+          if (i < num_chunks) {
+            auto y = load<float, kItemsPerThread>(split_input_head +
+                                                  i * num_head_q * num_seq_q * kTileV + icol);
+            float scale = exp2f_ftz(lse[i] - sum_lse);
+#pragma unroll
+            for (int j = 0; j < kItemsPerThread; j++) {
+              output[j] += scale * y[j];
+            }
           }
         }
+        store(out_row_head + icol, to<Tout>(output));
       }
-      store(out_row_head, to<Tout>(output));
     }
   }
 }

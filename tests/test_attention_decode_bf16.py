@@ -195,11 +195,6 @@ def attention_decode_bf16_test_func(
             task_map=task_map,
         )
 
-    print("\ngt\n")
-    print(gt[0, :, :])
-    print("\nmy\n")
-    print(my[0, :, :])
-
     assert allclose(my, gt, atol=0.016)
 
 
@@ -239,4 +234,84 @@ def test_attn_bf16_sm90(
         splitk,
         use_dynamic_sched,
         kvcache_shape,
+    )
+
+
+@pytest.mark.parametrize("num_batch", [1, 16])
+@pytest.mark.parametrize("num_seq_q", [1, 2, 3])
+@pytest.mark.parametrize("max_seq_kv", [1024, 4096])
+@pytest.mark.parametrize("use_dynamic_sched", [False, True])
+@pytest.mark.parametrize("kvcache_shape", ["NHD", "HND"])
+def test_attn_bf16_dim256_sm90(
+    num_batch,
+    num_seq_q,
+    max_seq_kv,
+    use_dynamic_sched,
+    kvcache_shape,
+):
+    attention_decode_bf16_test_func(
+        num_batch=num_batch,
+        num_seq_q=num_seq_q,
+        max_seq_kv=max_seq_kv,
+        block_size=64,
+        kv_head_q_head=(4, 16),
+        head_dim=256,
+        new_kv_included=True,
+        use_output=False,
+        splitk=True,
+        use_dynamic_sched=use_dynamic_sched,
+        kvcache_shape=kvcache_shape,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "num_batch",
+        "num_seq_q",
+        "max_seq_kv",
+        "block_size",
+        "kv_head_q_head",
+        "head_dim",
+        "use_output",
+        "splitk",
+        "use_dynamic_sched",
+        "kvcache_shape",
+    ),
+    [
+        pytest.param(1, 1, 1024, 32, (4, 16), 256, True, False, False, "NHD", id="static-nosplit"),
+        pytest.param(16, 3, 4096, 32, (2, 16), 256, True, True, False, "HND", id="static-gqa8"),
+        pytest.param(1, 1, 1024, 16, (4, 16), 256, True, True, True, "NHD", id="dynamic-block16"),
+        pytest.param(4, 4, 1024, 32, (4, 16), 256, True, True, True, "HND", id="dynamic-mtp3"),
+        pytest.param(
+            4, 5, 1024, 64, (2, 16), 256, False, True, True, "NHD", id="dynamic-mtp4-gqa8"
+        ),
+        pytest.param(
+            4, 5, 1024, 64, (2, 16), 128, False, True, True, "NHD", id="dynamic-mtp4-dim128"
+        ),
+    ],
+)
+def test_attn_bf16_additional_paths_sm90(
+    num_batch,
+    num_seq_q,
+    max_seq_kv,
+    block_size,
+    kv_head_q_head,
+    head_dim,
+    use_output,
+    splitk,
+    use_dynamic_sched,
+    kvcache_shape,
+):
+    attention_decode_bf16_test_func(
+        num_batch=num_batch,
+        num_seq_q=num_seq_q,
+        max_seq_kv=max_seq_kv,
+        block_size=block_size,
+        kv_head_q_head=kv_head_q_head,
+        head_dim=head_dim,
+        new_kv_included=True,
+        use_output=use_output,
+        splitk=splitk,
+        use_dynamic_sched=use_dynamic_sched,
+        kvcache_shape=kvcache_shape,
     )

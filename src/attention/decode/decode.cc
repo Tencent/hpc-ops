@@ -6,6 +6,7 @@
 
 #include <algorithm>
 
+#include "src/attention/decode/smallm_bf16.h"
 #include "src/attention/decode/smallm_dim128.h"
 
 namespace hpc {
@@ -20,16 +21,16 @@ bool attention_decode_bf16_async(
     int64_t kcache_block_stride, int64_t kcache_token_stride, int64_t kcache_head_stride,
     int64_t vcache_block_stride, int64_t vcache_token_stride, int64_t vcache_head_stride,
     cudaStream_t stream) {
-  if (num_dim_qk == 128) {
+  if (num_dim_qk == num_dim_v && (num_dim_qk == 128 || num_dim_qk == 256)) {
     if (task_map_ptr) {
-      return smallm_bf16_dim128_dynamic_async(
+      return smallm_bf16_dynamic_async(
           y_ptr, lse_ptr, split_out_ptr, task_map_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
           splitk, num_batch, num_seq_q, num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v,
           num_kvcache_blocks, block_size, num_seq_max_blocks, ldQ, kcache_block_stride,
           kcache_token_stride, kcache_head_stride, vcache_block_stride, vcache_token_stride,
           vcache_head_stride, stream);
     } else {
-      return smallm_bf16_dim128_static_async(
+      return smallm_bf16_static_async(
           y_ptr, lse_ptr, split_out_ptr, q_ptr, kcache_ptr, vcache_ptr, block_ids_ptr,
           num_seq_kvcache_ptr, split_flag_ptr, new_kv_included, splitk, num_batch, num_seq_q,
           num_head_q, num_head_k, num_head_v, num_dim_qk, num_dim_v, num_kvcache_blocks, block_size,

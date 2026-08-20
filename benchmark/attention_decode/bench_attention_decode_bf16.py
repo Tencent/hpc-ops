@@ -11,13 +11,19 @@ Default workloads:
 Recommended command:
     python3 benchmark/attention_decode/bench_attention_decode_bf16.py --csv attention_decode_bf16.csv
 
+Qwen3.5-9B decode shape:
+    python3 benchmark/attention_decode/bench_attention_decode_bf16.py \
+        --num-head-kv 4 --num-head-q 16 --head-dim 256
+
 The benchmark compares HPC static split-k, HPC dynamic task map, FlashAttention-3,
-and FlashInfer. Latency is reported in microseconds per operator call.
+and FlashInfer. Latency is reported in microseconds per operator call. Provider setup
+and task-map construction are outside the timed region unless --include-taskmap is set.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import importlib.metadata
 import json
 import math
 import os
@@ -45,6 +51,8 @@ DEFAULT_KV_HEADS = 1
 DEFAULT_Q_HEADS = 8
 
 METHODS = ("static", "dynamic", "flashattn", "flashinfer")
+CHECK_ATOL = 0.016
+CHECK_RTOL = 1e-5
 
 
 def _import_fa3_kvcache():
@@ -60,9 +68,7 @@ def _import_fa3_kvcache():
 
         return flash_attn_with_kvcache
     except Exception as e:
-        raise ImportError(
-            "FlashAttention-3 is required for --methods flashattn. "
-        ) from e
+        raise ImportError("FlashAttention-3 is required for --methods flashattn. ") from e
 
 
 CASES = {
@@ -169,44 +175,65 @@ def run_kernel(inputs: Inputs, task_map: torch.Tensor | None = None) -> torch.Te
     )
 
 
-def make_flashattn_fn(inputs: Inputs, num_head_kv: int, head_dim: int) -> Callable[[], None]:
+def make_flashattn_fn(
+    inputs: Inputs,
+    num_head_kv: int,
+    head_dim: int,
+    num_splits: int = 0,
+    pack_gqa: bool | None = None,
+) -> Callable[[], torch.Tensor]:
     """FA3 BF16 decode with paged KV cache."""
     flash_attn_with_kvcache = _import_fa3_kvcache()
 
     nblocks_fa = (inputs.kv_lens + FA_BLOCK_SIZE - 1) // FA_BLOCK_SIZE
     max_num_blocks_fa = int(nblocks_fa.sum().item() * 1.2) + inputs.num_batch + 4
     max_pages = int(nblocks_fa.max().item())
-    k_cache_fa = torch.randn(
+    k_cache_fa = torch.empty(
         max_num_blocks_fa, FA_BLOCK_SIZE, num_head_kv, head_dim, dtype=torch.bfloat16, device="cuda"
     )
-    v_cache_fa = torch.randn(
+    v_cache_fa = torch.empty(
         max_num_blocks_fa, FA_BLOCK_SIZE, num_head_kv, head_dim, dtype=torch.bfloat16, device="cuda"
     )
     page_table = torch.zeros(inputs.num_batch, max_pages, dtype=torch.int32, device="cuda")
     offset = 0
     for i in range(inputs.num_batch):
         nb = int(nblocks_fa[i])
+        seq_len = int(inputs.kv_lens[i])
+        source_blocks = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+        source_ids = inputs.block_ids[i, :source_blocks]
+        source_k = inputs.k_cache[source_ids].reshape(-1, num_head_kv, head_dim)[:seq_len]
+        source_v = inputs.v_cache[source_ids].reshape(-1, num_head_kv, head_dim)[:seq_len]
+        target_k = k_cache_fa[offset : offset + nb].reshape(-1, num_head_kv, head_dim)
+        target_v = v_cache_fa[offset : offset + nb].reshape(-1, num_head_kv, head_dim)
+        target_k[:seq_len].copy_(source_k)
+        target_v[:seq_len].copy_(source_v)
         page_table[i, :nb] = torch.arange(offset, offset + nb, dtype=torch.int32, device="cuda")
         offset += nb
     q_fa = inputs.q.unsqueeze(1)
     cache_seqlens = inputs.kv_lens.to(torch.int32)
 
     def call_fn():
-        flash_attn_with_kvcache(
+        return flash_attn_with_kvcache(
             q=q_fa,
             k_cache=k_cache_fa,
             v_cache=v_cache_fa,
             cache_seqlens=cache_seqlens,
             page_table=page_table,
             causal=True,
-        )
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+        ).squeeze(1)
 
     return call_fn
 
 
 def make_flashinfer_fn(
-    inputs: Inputs, num_head_kv: int, num_head_q: int, head_dim: int
-) -> Callable[[], None]:
+    inputs: Inputs,
+    num_head_kv: int,
+    num_head_q: int,
+    head_dim: int,
+    use_tensor_cores: bool = False,
+) -> Callable[[], torch.Tensor]:
     import flashinfer
 
     nblocks_fi = (inputs.kv_lens + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -228,6 +255,7 @@ def make_flashinfer_fn(
         paged_kv_indptr_buffer=kv_indptr,
         paged_kv_indices_buffer=kv_indices,
         paged_kv_last_page_len_buffer=kv_last_page_len,
+        use_tensor_cores=use_tensor_cores,
     )
     wrapper.plan(
         kv_indptr,
@@ -242,7 +270,7 @@ def make_flashinfer_fn(
     )
 
     def call_fn():
-        wrapper.run(inputs.q, (inputs.k_cache, inputs.v_cache))
+        return wrapper.run(inputs.q, (inputs.k_cache, inputs.v_cache))
 
     return call_fn
 
@@ -252,7 +280,7 @@ def make_call_fn(
     inputs: Inputs,
     args: argparse.Namespace,
     task_map: torch.Tensor | None = None,
-) -> Callable[[], None]:
+) -> Callable[[], torch.Tensor]:
     if method == "static":
         return lambda: run_kernel(inputs)
     if method == "dynamic":
@@ -275,9 +303,22 @@ def make_call_fn(
 
         return call_fn
     if method == "flashattn":
-        return make_flashattn_fn(inputs, args.num_head_kv, args.head_dim)
+        pack_gqa = {"auto": None, "true": True, "false": False}[args.flashattn_pack_gqa]
+        return make_flashattn_fn(
+            inputs,
+            args.num_head_kv,
+            args.head_dim,
+            num_splits=args.flashattn_num_splits,
+            pack_gqa=pack_gqa,
+        )
     if method == "flashinfer":
-        return make_flashinfer_fn(inputs, args.num_head_kv, args.num_head_q, args.head_dim)
+        return make_flashinfer_fn(
+            inputs,
+            args.num_head_kv,
+            args.num_head_q,
+            args.head_dim,
+            use_tensor_cores=args.flashinfer_use_tensor_cores,
+        )
     raise ValueError(f"Unknown method: {method}")
 
 
@@ -461,6 +502,37 @@ def speedup_vs(baseline_us, dynamic_us) -> float | None:
     return None
 
 
+def package_version(*names: str) -> str:
+    for name in names:
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return "unknown"
+
+
+def benchmark_metadata(args: argparse.Namespace) -> dict:
+    return {
+        "gpu": torch.cuda.get_device_name(),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "flashattn_version": package_version("flash-attn", "flash_attn_3"),
+        "flashinfer_version": package_version("flashinfer-python", "flashinfer"),
+        "flashattn_num_splits": args.flashattn_num_splits,
+        "flashattn_pack_gqa": args.flashattn_pack_gqa,
+        "flashinfer_use_tensor_cores": args.flashinfer_use_tensor_cores,
+        "num_head_q": args.num_head_q,
+        "num_head_kv": args.num_head_kv,
+        "head_dim": args.head_dim,
+        "hpc_block_size": BLOCK_SIZE,
+        "flashattn_block_size": FA_BLOCK_SIZE,
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "cuda_graph": args.graph,
+        "dynamic_timing": "taskmap_and_kernel" if args.include_taskmap else "prebuilt_taskmap",
+    }
+
+
 def build_result_row(
     case_name: str,
     batch: int,
@@ -469,6 +541,7 @@ def build_result_row(
     *,
     timing: str | None = None,
     samples: dict | None = None,
+    metadata: dict | None = None,
     error: str | None = None,
 ) -> dict:
     static_us = results.get("static")
@@ -479,6 +552,7 @@ def build_result_row(
         "case": case_name,
         "batch": batch,
         "max_kv": max_kv,
+        "methods": ",".join(method for method in METHODS if method in results),
         "static_us": static_us,
         "dynamic_us": dynamic_us,
         "flashattn_us": flashattn_us,
@@ -491,6 +565,8 @@ def build_result_row(
         row["timing"] = timing
     if samples is not None:
         row.update(samples)
+    if metadata is not None:
+        row.update(metadata)
     row["error"] = error
     return row
 
@@ -524,6 +600,7 @@ def run_nsys_driver(args: argparse.Namespace) -> list[dict]:
                 "flashattn_samples": results.get("flashattn_samples", 0),
                 "flashinfer_samples": results.get("flashinfer_samples", 0),
             },
+            metadata=benchmark_metadata(args),
             error="; ".join(errors) if errors else None,
         )
         rows.append(row)
@@ -535,18 +612,20 @@ def run_nsys_driver(args: argparse.Namespace) -> list[dict]:
 
 
 def print_table(rows: list[dict]) -> None:
-    def fmt_us(value) -> str:
+    def fmt_us(value, method: str, attempted: set[str]) -> str:
+        if method not in attempted:
+            return f"{'N/A':>10}"
         return f"{value:10.2f}" if isinstance(value, (int, float)) else f"{'ERR':>10}"
 
-    def fmt_speedup(value) -> str:
+    def fmt_speedup(value, required: tuple[str, ...], attempted: set[str]) -> str:
+        if not set(required).issubset(attempted):
+            return f"{'N/A':>8}"
         return f"{value:7.2f}x" if isinstance(value, (int, float)) else f"{'ERR':>8}"
 
     width = 125
     print("")
     print("=" * width)
-    print(
-        "Attention Decode BF16 | HPC vs FA3/FlashInfer | latency in us; x/* = baseline / dynamic"
-    )
+    print("Attention Decode BF16 | HPC vs FA3/FlashInfer | latency in us; x/* = baseline / dynamic")
     print("-" * width)
     print(
         f"{'case':>18} | {'batch':>5} | {'max_kv':>7} | {'static':>10} | {'dynamic':>10} | "
@@ -554,13 +633,16 @@ def print_table(rows: list[dict]) -> None:
     )
     print("-" * width)
     for row in rows:
+        attempted = set(row["methods"].split(","))
         print(
             f"{row['case']:>18} | {row['batch']:5d} | {row['max_kv']:7d} | "
-            f"{fmt_us(row.get('static_us'))} | {fmt_us(row.get('dynamic_us'))} | "
-            f"{fmt_us(row.get('flashattn_us'))} | {fmt_us(row.get('flashinfer_us'))} | "
-            f"{fmt_speedup(row.get('speedup_vs_static'))} | "
-            f"{fmt_speedup(row.get('speedup_vs_flashattn'))} | "
-            f"{fmt_speedup(row.get('speedup_vs_flashinfer'))}"
+            f"{fmt_us(row.get('static_us'), 'static', attempted)} | "
+            f"{fmt_us(row.get('dynamic_us'), 'dynamic', attempted)} | "
+            f"{fmt_us(row.get('flashattn_us'), 'flashattn', attempted)} | "
+            f"{fmt_us(row.get('flashinfer_us'), 'flashinfer', attempted)} | "
+            f"{fmt_speedup(row.get('speedup_vs_static'), ('static', 'dynamic'), attempted)} | "
+            f"{fmt_speedup(row.get('speedup_vs_flashattn'), ('flashattn', 'dynamic'), attempted)} | "
+            f"{fmt_speedup(row.get('speedup_vs_flashinfer'), ('flashinfer', 'dynamic'), attempted)}"
         )
     print("=" * width)
 
@@ -582,6 +664,32 @@ def write_jsonl(path: str, rows: list[dict]) -> None:
             f.write(json.dumps(row) + "\n")
 
 
+def check_outputs(
+    inputs: Inputs,
+    task_map: torch.Tensor,
+    methods: list[str],
+    call_fns: dict[str, Callable[[], torch.Tensor]],
+) -> None:
+    expected = run_kernel(inputs).clone()
+    outputs = {"dynamic": run_kernel(inputs, task_map).clone()}
+    for method in ("flashattn", "flashinfer"):
+        if method not in methods:
+            continue
+        if method not in call_fns:
+            raise RuntimeError(f"cannot check {method}: benchmark setup failed")
+        outputs[method] = call_fns[method]().clone()
+
+    torch.cuda.synchronize()
+    for method, actual in outputs.items():
+        torch.testing.assert_close(
+            actual,
+            expected,
+            atol=CHECK_ATOL,
+            rtol=CHECK_RTOL,
+            msg=lambda message, method=method: f"{method} output differs from static output: {message}",
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark Attention Decode BF16: HPC static/dynamic vs FlashAttention-3/FlashInfer."
@@ -591,6 +699,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--min-process-len", type=int, default=64)
+    parser.add_argument(
+        "--flashattn-num-splits",
+        type=int,
+        default=0,
+        help="FA3 split-K count; 0 uses the provider heuristic.",
+    )
+    parser.add_argument(
+        "--flashattn-pack-gqa",
+        choices=("auto", "true", "false"),
+        default="auto",
+        help="FA3 GQA packing policy.",
+    )
+    parser.add_argument(
+        "--flashinfer-use-tensor-cores",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use FlashInfer's tensor-core GQA decode path.",
+    )
     parser.add_argument("--num-head-kv", type=int, default=DEFAULT_KV_HEADS)
     parser.add_argument("--num-head-q", type=int, default=DEFAULT_Q_HEADS)
     parser.add_argument("--head-dim", type=int, default=DEFAULT_HEAD_DIM)
@@ -620,7 +746,7 @@ def parse_args() -> argparse.Namespace:
         "--check",
         dest="check",
         action="store_true",
-        help="Compare dynamic output with static output.",
+        help="Compare dynamic and requested external-provider outputs with static output.",
     )
     parser.add_argument("--no-check", dest="check", action="store_false")
     parser.add_argument("--nsys-worker", action="store_true", help=argparse.SUPPRESS)
@@ -661,9 +787,12 @@ def main() -> None:
         # Disable include_taskmap for event timing of prebuilt task_map unless requested.
         method_args = args
         results = {}
+        call_fns = {}
+        errors = []
         for method in args.methods:
-            call_fn = make_call_fn(method, inputs, method_args, task_map=task_map)
             try:
+                call_fn = make_call_fn(method, inputs, method_args, task_map=task_map)
+                call_fns[method] = call_fn
                 if args.graph:
                     results[method] = bench_us(call_fn, args.warmup, args.iters, use_graph=True)
                 else:
@@ -671,12 +800,10 @@ def main() -> None:
             except Exception as e:
                 print(f"[warn] {case_name}/{method}: {e}", file=sys.stderr)
                 results[method] = None
+                errors.append(f"{method}: {e}")
 
         if args.check:
-            static_out = run_kernel(inputs).clone()
-            dynamic_out = run_kernel(inputs, task_map)
-            if not torch.allclose(static_out, dynamic_out, atol=0.2, rtol=0.2):
-                raise AssertionError(f"{case_name}: dynamic output differs from static output")
+            check_outputs(inputs, task_map, args.methods, call_fns)
 
         rows.append(
             build_result_row(
@@ -684,6 +811,8 @@ def main() -> None:
                 inputs.num_batch,
                 inputs.max_seq_kv,
                 results,
+                metadata=benchmark_metadata(args),
+                error="; ".join(errors) if errors else None,
             )
         )
     print_table(rows)
