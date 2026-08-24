@@ -788,6 +788,47 @@ SMEMV:
 ---------------------
 */
 // clang-format on
+//
+// Build the tiled copy that loads the FP8 V tile from shared memory into
+// registers in the transposed, V0/V1-interleaved layout that the
+// SM75_U16x8_LDSM_T (LDSM.1matrix) copy atom consumes. This answers the
+// "what are thr_layout / val_layout" question from issue #44.
+//
+// The copy tile is (kTileN=64, kTileV=32). V in shared memory is laid out as
+// (64, 32) contiguous (column-major over the 64-wide N, then 32 rows of V). The
+// 128 threads are arranged as (32, 4) by `thr_layout`:
+//
+//   thr_layout = (32, 4, 1, 1) : (4, 1, 0, 0)
+//     -> thread_id = i*4 + j, so consecutive threads stride by 4 along N.
+//        The 32-thread "row" dimension covers N in 4 strided passes; the 4
+//        threads are the 4 warps, each owning a (16, 8) sub-tile of N.
+//
+// Each thread carries 16 values arranged as (2, 2, 1, 4) by `val_layout`:
+//
+//   val_layout = (2, 2, 1, 4) : (1, 2, 4, 4)
+//     -> smem offset of a value = a*1 + b*2 + d*4  (the 1-sized middle axis is
+//        a no-op). With a in {0,1}, b in {0,1}, d in {0,1,2,3} each thread
+//        owns 2*2*4 = 16 entries spanning 8 columns (d) at 2 row-positions (a)
+//        and 2 "banks" (b).
+//
+// make_tiled_copy() combines the two via raked_product, computing
+//   layout_mn = raked_product(thr_layout, val_layout)   // (M,N) <- (thr,val)
+//   layout_tv = right_inverse(layout_mn)              // (thr,val) <- (M,N)
+// i.e. it maps the (M, N) shared-memory coordinates to (thread_id, value_id)
+// so that cute::copy can route each (64, 32) element to the right thread and
+// the right register slot. The LDSM.1matrix instruction then interprets each
+// thread's 16 values as the 8x16 fragment layout shown as "T0 in Reg" above.
+//
+// Net result: this is a correctness-critical, hand-tuned copy -- the strides are
+// not arbitrary. Changing thr_layout/val_layout without re-deriving the
+// raked_product will silently produce a wrong V transpose and corrupt output.
+//
+// (The V0 V1 V0 V1 ... look-ahead in the diagram comes not from val_layout's
+//  strides but from the strided thread traversal: the 4 threads per (16,8) N
+//  block are the 4 warps, and the 2 threads per warp contribute to adjacent
+//  column-pairs split across the two 8-column register halves of the LDSM
+//  fragment. Adjacent column-pairs therefore live in different register halves,
+//  which is what the look-ahead reflects.)
 template <typename T>
 __device__ __forceinline__ auto make_tiled_copy_V_interleave_trans() {
   using namespace cute;  // NOLINT
