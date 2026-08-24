@@ -11,6 +11,7 @@
 #include "cute/tensor.hpp"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/arch/reg_reconfig.h"
+#include "src/group_gemm/config.h"
 #include "src/utils/tma.cuh"
 #include "src/utils/utils.cuh"
 
@@ -240,11 +241,13 @@ __global__ void __launch_bounds__(384, 1)
   int elected = cute::elect_one_sync();
   bool is_leader_in_warpgroup = ((iwarp % 4) == 0) && elected;
 
-  __shared__ uint64_t writable[kStage];
-  __shared__ uint64_t readable[kStage];
+  // Shared memory is a single 128-byte-aligned dynamic struct. The pipeline
+  // barriers live inside it (not as separate static arrays) so the TMA buffers
+  // A/B/Y are guaranteed 128-byte aligned regardless of how the compiler packs
+  // any preceding static shared memory. See issue #42.
+  extern __shared__ typename Config::SharedStorage storage[];
 
-  extern __shared__ uint8_t shm_data[] alignas(128);
-  auto *shm_a = reinterpret_cast<Tin *>(shm_data);
+  auto *shm_a = reinterpret_cast<Tin *>(storage[0].A);
   auto *shm_b = shm_a + cosize(SLayoutA{});
   auto *shm_c = reinterpret_cast<Tout *>(shm_b + cosize(SLayoutB{}));
 
@@ -564,11 +567,13 @@ __global__ void __launch_bounds__(384, 1)
   int elected = cute::elect_one_sync();
   bool is_leader_in_warpgroup = ((iwarp % 4) == 0) && elected;
 
-  __shared__ uint64_t writable[kStage];
-  __shared__ uint64_t readable[kStage];
+  // Shared memory is a single 128-byte-aligned dynamic struct. The pipeline
+  // barriers live inside it (not as separate static arrays) so the TMA buffers
+  // A/B/Y and the scale buffers AS/BS are guaranteed 128-byte aligned regardless
+  // of how the compiler packs any preceding static shared memory. See issue #42.
+  extern __shared__ typename Config::SharedStorage storage[];
 
-  extern __shared__ uint8_t shm_data[] alignas(128);
-  auto *shm_a = reinterpret_cast<Tin *>(shm_data);
+  auto *shm_a = reinterpret_cast<Tin *>(storage[0].A);
   auto *shm_b = shm_a + cosize(SLayoutA{});
   auto *shm_c = reinterpret_cast<Tout *>(shm_b + cosize(SLayoutB{}));
   auto *shm_as = reinterpret_cast<float *>(shm_c + cosize(SLayoutCT{}));

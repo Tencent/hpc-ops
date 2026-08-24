@@ -103,7 +103,23 @@ struct GroupGEMMFp8Config {
   static constexpr int shm_y = cosize(SLayoutY{}) * sizeof(Tout);
   static constexpr int shm_size = shm_xw + shm_y;
 
-  auto get_shm_size() { return shm_size; }
+  auto get_shm_size() { return sizeof(SharedStorage); }
+
+  // All shared memory lives in one dynamically allocated, 128-byte-aligned struct.
+  // The pipeline barriers used to be separate `__shared__ uint64_t writable/readable`
+  // arrays placed *before* the dynamic region; the compiler chose that static
+  // offset, so the dynamic base was only 8-aligned and the TMA buffers below lost
+  // the 128-byte alignment the TMA loads require (issue #42, SM120 Blackwell).
+  // Moving the barriers *into* the dynamic struct pins the dynamic base to
+  // 128 bytes (the base is aligned to the strictest member alignment), so the
+  // `alignas(128)` buffers are always 128-byte aligned regardless of static packing.
+  struct SharedStorage {
+    alignas(128) uint64_t writable[kStage];
+    alignas(128) uint64_t readable[kStage];
+    alignas(128) uint8_t A[cosize(SLayoutX{}) * sizeof(Tin)];
+    alignas(128) uint8_t B[cosize(SLayoutW{}) * sizeof(Tin)];
+    alignas(128) uint8_t Y[cosize(SLayoutY{}) * sizeof(Tout)];
+  };
 };
 
 template <typename Tin_, typename Tout_, typename TS_, int kTileM_, int kTileN_, int kTileK_,
@@ -162,7 +178,25 @@ struct GroupGEMMBlockWiseFp8Config {
   static constexpr int shm_xws = (cosize(SLayoutXS{}) + cosize(SLayoutWS{})) * sizeof(TS);
   static constexpr int shm_size = shm_xw + shm_y + shm_xws;
 
-  auto get_shm_size() { return shm_size; }
+  auto get_shm_size() { return sizeof(SharedStorage); }
+
+  // All shared memory lives in one dynamically allocated, 128-byte-aligned struct.
+  // The pipeline barriers used to be separate `__shared__ uint64_t writable/readable`
+  // arrays placed *before* the dynamic region; the compiler chose that static
+  // offset, so the dynamic base was only 8-aligned and the TMA buffers below lost
+  // the 128-byte alignment the TMA loads require (issue #42, SM120 Blackwell).
+  // Moving the barriers *into* the dynamic struct pins the dynamic base to
+  // 128 bytes (the base is aligned to the strictest member alignment), so the
+  // `alignas(128)` buffers are always 128-byte aligned regardless of static packing.
+  struct SharedStorage {
+    alignas(128) uint64_t writable[kStage];
+    alignas(128) uint64_t readable[kStage];
+    alignas(128) uint8_t A[cosize(SLayoutX{}) * sizeof(Tin)];
+    alignas(128) uint8_t B[cosize(SLayoutW{}) * sizeof(Tin)];
+    alignas(128) uint8_t Y[cosize(SLayoutY{}) * sizeof(Tout)];
+    alignas(128) uint8_t AS[cosize(SLayoutXS{}) * sizeof(TS)];
+    alignas(128) uint8_t BS[cosize(SLayoutWS{}) * sizeof(TS)];
+  };
 };
 
 }  // namespace group_gemm
