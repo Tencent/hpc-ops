@@ -279,12 +279,12 @@ __device__ __forceinline__ void get_group_id(int irow, const int *cu_num_tokens_
   igroup = right;
 }
 
-template <bool kUsePDL = false>
+template <bool kUsePDL = false, bool kUseSwiGLULimit = false>
 __global__ void act_mul_and_blockwise_quant_fusemoe_kernel(
     const __nv_bfloat16 *gate_up_output_ptr, __nv_fp8_e4m3 *output_ptr, float *output_scale_ptr,
     const int *cu_num_tokens_per_group_ptr, const int *cu_tiles_ptr, const int num_row,
     const int num_row_padded_size, const int num_col, const int num_group, const int ktile_m,
-    cutlass::FastDivmod block1D22D) {
+    const float swiglu_limit, cutlass::FastDivmod block1D22D) {
   int iblockx;
   int iblocky;
 
@@ -316,7 +316,13 @@ __global__ void act_mul_and_blockwise_quant_fusemoe_kernel(
     vec_t<float, 8> out;
 #pragma unroll
     for (int i = 0; i < size(out); ++i) {
-      out[i] = silu(gate[i]) * up[i];
+      if constexpr (kUseSwiGLULimit) {
+        const float gate_value = fminf(gate[i], swiglu_limit);
+        const float up_value = fminf(fmaxf(up[i], -swiglu_limit), swiglu_limit);
+        out[i] = silu(gate_value) * up_value;
+      } else {
+        out[i] = silu(gate[i]) * up[i];
+      }
     }
 
     float thread_max = 0.f;
@@ -693,7 +699,7 @@ void act_mul_and_blockwise_quant_async(void *output_ptr, void *output_scale_ptr,
                                        const void *cu_tiles_ptr, const int num_row,
                                        const int num_row_padded_size, const int num_col,
                                        const int num_group, const int num_tokens_per_group_avg,
-                                       bool use_pdl, cudaStream_t stream) {
+                                       float swiglu_limit, bool use_pdl, cudaStream_t stream) {
   using Tin = __nv_bfloat16;
   using Tout = __nv_fp8_e4m3;
   int intermediate_size = num_col / 2;
@@ -740,18 +746,29 @@ void act_mul_and_blockwise_quant_async(void *output_ptr, void *output_scale_ptr,
     config.attrs = attribute;
     config.numAttrs = 1;
 
-    auto kernel = kernels::act_mul_and_blockwise_quant_fusemoe_kernel<kUsePDL>;
+    auto kernel = swiglu_limit > 0.0f
+                      ? kernels::act_mul_and_blockwise_quant_fusemoe_kernel<kUsePDL, true>
+                      : kernels::act_mul_and_blockwise_quant_fusemoe_kernel<kUsePDL, false>;
 
     cudaLaunchKernelEx(&config, kernel, (Tin *)input_ptr, (Tout *)output_ptr,
                        (float *)output_scale_ptr, (int *)cu_num_tokens_per_group_ptr,
                        (int *)cu_tiles_ptr, num_row, num_row_padded_size, intermediate_size,
-                       num_group, ktile_m, block1D22D);
+                       num_group, ktile_m, swiglu_limit, block1D22D);
   } else {
     constexpr bool kUsePDL = false;
-    kernels::act_mul_and_blockwise_quant_fusemoe_kernel<kUsePDL><<<grid, block, 0, stream>>>(
-        (Tin *)input_ptr, (Tout *)output_ptr, (float *)output_scale_ptr,
-        (int *)cu_num_tokens_per_group_ptr, (int *)cu_tiles_ptr, num_row, num_row_padded_size,
-        intermediate_size, num_group, ktile_m, block1D22D);
+    if (swiglu_limit > 0.0f) {
+      kernels::act_mul_and_blockwise_quant_fusemoe_kernel<kUsePDL, true>
+          <<<grid, block, 0, stream>>>(
+              (Tin *)input_ptr, (Tout *)output_ptr, (float *)output_scale_ptr,
+              (int *)cu_num_tokens_per_group_ptr, (int *)cu_tiles_ptr, num_row, num_row_padded_size,
+              intermediate_size, num_group, ktile_m, swiglu_limit, block1D22D);
+    } else {
+      kernels::act_mul_and_blockwise_quant_fusemoe_kernel<kUsePDL, false>
+          <<<grid, block, 0, stream>>>(
+              (Tin *)input_ptr, (Tout *)output_ptr, (float *)output_scale_ptr,
+              (int *)cu_num_tokens_per_group_ptr, (int *)cu_tiles_ptr, num_row, num_row_padded_size,
+              intermediate_size, num_group, ktile_m, swiglu_limit, block1D22D);
+    }
   }
 }
 

@@ -124,3 +124,35 @@ Default model shapes:
 | `qwen3-235b` | 128 | 8 | 4096 | 1536 |
 | `hunyuan-v3` | 192 | 8 | 4096 | 1536 |
 | `deepseek-v3` | 256 | 8 | 7168 | 2048 |
+
+## Peer-indexed SGLang serving reproduction
+
+The peer-indexed W13 serving path is integrated by the SGLang test branch
+[`taoyuanyuan/sglang:feature/hpc-ops-peer-indexed-input-v1`](https://github.com/taoyuanyuan/sglang/tree/feature/hpc-ops-peer-indexed-input-v1).
+Build this HPC-Ops checkout in place, then provide the GLM-5.2-FP8 checkpoint and
+SGLang checkout paths:
+
+```bash
+python3 setup.py build_ext --inplace
+export MODEL_PATH=/path/to/GLM-5.2-FP8
+export SGLANG_ROOT=/path/to/sglang
+```
+
+Start one backend on an 8x Hopper NVLink node. `MODE` accepts `deepep`,
+`megamoe`, or `hpc`:
+
+```bash
+MODE=hpc benchmark/fused_moe/run_peer_indexed_sglang_server.sh
+```
+
+In another shell, run the fixed 8K-input/1K-output B8/B32 workload. The script
+performs exact-shape warmup, flushes the prompt cache, runs three measured
+repetitions, and validates every forced output token:
+
+```bash
+MODE=hpc benchmark/fused_moe/benchmark_peer_indexed_sglang.sh
+```
+
+Use the same `MODEL_PATH`, `SGLANG_ROOT`, `PYTHON_BIN`, `PORT`, and GPU node for
+every backend. Results are written under `peer-indexed-serving-results` by
+default; set `OUTPUT_ROOT` to override it.

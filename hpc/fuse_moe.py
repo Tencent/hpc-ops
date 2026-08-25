@@ -211,6 +211,8 @@ def fuse_moe_blockwise_fp8(
     rank_ep: int,
     num_expert_total: int,
     shared_output: Tensor = None,
+    output: Tensor = None,
+    swiglu_limit: float = 0.0,
 ) -> Tensor:
     """Run blockwise FP8 FusedMoE."""
     return torch.ops.hpc.fuse_moe_blockwise_fp8(
@@ -225,7 +227,8 @@ def fuse_moe_blockwise_fp8(
         shared_output,
         rank_ep,
         num_expert_total,
-        None,
+        output,
+        swiglu_limit,
     )
 
 
@@ -242,6 +245,7 @@ def fuse_moe_blockwise(
     num_expert_total: int,
     shared_output: Tensor = None,
     output: Tensor = None,
+    swiglu_limit: float = 0.0,
 ) -> Tensor:
     """Run blockwise FP8 FusedMoE."""
     return torch.ops.hpc.fuse_moe_blockwise(
@@ -257,7 +261,144 @@ def fuse_moe_blockwise(
         rank_ep,
         num_expert_total,
         output,
+        swiglu_limit,
     )
+
+
+def prepare_indexed_input(
+    source: Tensor,
+    topk_ids: Tensor,
+    topk_weights: Tensor,
+    activation: Tensor,
+    activation_scale: Tensor,
+    output_ids: Tensor,
+    output_weights: Tensor,
+) -> None:
+    """Quantize one EP owner's BF16 rows and prepare routing metadata."""
+    torch.ops.hpc.prepare_indexed_input(
+        source,
+        topk_ids,
+        topk_weights,
+        activation,
+        activation_scale,
+        output_ids,
+        output_weights,
+    )
+
+
+def fuse_moe_blockwise_indexed(
+    x: Tensor,
+    x_scale: Tensor,
+    input_ptrs: Tensor,
+    input_scale_ptrs: Tensor,
+    source_rows: Tensor,
+    gate_up_weight: Tensor,
+    gate_up_weight_scale: Tensor,
+    down_weight: Tensor,
+    down_weight_scale: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    rank_ep: int,
+    num_expert_total: int,
+    swiglu_limit: float = 0.0,
+) -> Tensor:
+    """Run blockwise MoE with W13 reading indexed CUDA-addressable peer rows."""
+    return torch.ops.hpc.fuse_moe_blockwise_indexed(
+        x,
+        x_scale,
+        input_ptrs,
+        input_scale_ptrs,
+        source_rows,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids,
+        topk_scale,
+        rank_ep,
+        num_expert_total,
+        swiglu_limit,
+    )
+
+
+def fuse_moe_blockwise_indexed_pull(
+    x: Tensor,
+    x_scale: Tensor,
+    input_ptrs: Tensor,
+    input_scale_ptrs: Tensor,
+    source_rows: Tensor,
+    gate_up_weight: Tensor,
+    gate_up_weight_scale: Tensor,
+    down_weight: Tensor,
+    down_weight_scale: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    rank_ep: int,
+    num_expert_total: int,
+    swiglu_limit: float = 0.0,
+) -> Tensor:
+    """Pull indexed peer rows before running native blockwise grouped GEMM."""
+    return torch.ops.hpc.fuse_moe_blockwise_indexed_pull(
+        x,
+        x_scale,
+        input_ptrs,
+        input_scale_ptrs,
+        source_rows,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids,
+        topk_scale,
+        rank_ep,
+        num_expert_total,
+        swiglu_limit,
+    )
+
+
+def scatter_indexed_output(
+    rows: Tensor,
+    output_ptrs: Tensor,
+    destination_rows: Tensor,
+    owner_capacity: int,
+    producer_slot: int,
+    producer_slots: int,
+) -> None:
+    """Scatter BF16 expert partials directly into EP owner slots."""
+    torch.ops.hpc.scatter_indexed_output(
+        rows,
+        output_ptrs,
+        destination_rows,
+        owner_capacity,
+        producer_slot,
+        producer_slots,
+    )
+
+
+def fuse_moe_ep_publish(
+    signal_ptrs: Tensor,
+    rank: int,
+    world_size: int,
+    generation: Tensor,
+    signal_words: int,
+) -> None:
+    """Release this rank's prepared FusedMoE input or output to every peer."""
+    torch.ops.hpc.fuse_moe_ep_publish(
+        signal_ptrs,
+        rank,
+        world_size,
+        generation,
+        signal_words,
+    )
+
+
+def fuse_moe_ep_wait(
+    local_signal: Tensor,
+    world_size: int,
+    generation: Tensor,
+) -> None:
+    """Acquire the requested FusedMoE generation from every peer."""
+    torch.ops.hpc.fuse_moe_ep_wait(local_signal, world_size, generation)
 
 
 @torch.library.register_fake("hpc::count_and_gather")
@@ -343,6 +484,7 @@ def fuse_moe_blockwise_fake(
     rank_ep: int,
     num_expert_total: int,
     output,
+    swiglu_limit: float = 0.0,
 ):
     return (
         output
@@ -365,9 +507,95 @@ def fuse_moe_blockwise_fp8_fake(
     rank_ep: int,
     num_expert_total: int,
     output,
+    swiglu_limit: float = 0.0,
 ):
     return (
         output
         if output is not None
         else torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
     )
+
+
+@torch.library.register_fake("hpc::scatter_indexed_output")
+def scatter_indexed_output_fake(
+    rows: Tensor,
+    output_ptrs: Tensor,
+    destination_rows: Tensor,
+    owner_capacity: int,
+    producer_slot: int,
+    producer_slots: int,
+):
+    return None
+
+
+@torch.library.register_fake("hpc::prepare_indexed_input")
+def prepare_indexed_input_fake(
+    source: Tensor,
+    topk_ids: Tensor,
+    topk_weights: Tensor,
+    activation: Tensor,
+    activation_scale: Tensor,
+    output_ids: Tensor,
+    output_weights: Tensor,
+):
+    return None
+
+
+@torch.library.register_fake("hpc::fuse_moe_ep_publish")
+def fuse_moe_ep_publish_fake(
+    signal_ptrs: Tensor,
+    rank: int,
+    world_size: int,
+    generation: Tensor,
+    signal_words: int,
+):
+    return None
+
+
+@torch.library.register_fake("hpc::fuse_moe_ep_wait")
+def fuse_moe_ep_wait_fake(
+    local_signal: Tensor,
+    world_size: int,
+    generation: Tensor,
+):
+    return None
+
+
+@torch.library.register_fake("hpc::fuse_moe_blockwise_indexed")
+def fuse_moe_blockwise_indexed_fake(
+    x: Tensor,
+    x_scale: Tensor,
+    input_ptrs: Tensor,
+    input_scale_ptrs: Tensor,
+    source_rows: Tensor,
+    gate_up_weight: Tensor,
+    gate_up_weight_scale: Tensor,
+    down_weight: Tensor,
+    down_weight_scale: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    rank_ep: int,
+    num_expert_total: int,
+    swiglu_limit: float = 0.0,
+):
+    return x.new_empty((topk_ids.shape[0], x.shape[1]), dtype=torch.bfloat16)
+
+
+@torch.library.register_fake("hpc::fuse_moe_blockwise_indexed_pull")
+def fuse_moe_blockwise_indexed_pull_fake(
+    x: Tensor,
+    x_scale: Tensor,
+    input_ptrs: Tensor,
+    input_scale_ptrs: Tensor,
+    source_rows: Tensor,
+    gate_up_weight: Tensor,
+    gate_up_weight_scale: Tensor,
+    down_weight: Tensor,
+    down_weight_scale: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    rank_ep: int,
+    num_expert_total: int,
+    swiglu_limit: float = 0.0,
+):
+    return x.new_empty((topk_ids.shape[0], x.shape[1]), dtype=torch.bfloat16)

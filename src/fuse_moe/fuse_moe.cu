@@ -6,7 +6,10 @@
 #include <algorithm>
 
 #include "cute/tensor.hpp"
+#include "src/fuse_moe/cp_async/fuse_moe_cp_async.h"
 #include "src/fuse_moe/fuse_moe.h"
+#include "src/group_gemm/cp_async/group_gemm.h"
+#include "src/utils/utils.h"
 
 namespace hpc {
 namespace fuse_moe {
@@ -71,7 +74,7 @@ void fuse_moe_blockwise_async(
     int num_gateup_waves, int num_down_waves, int num_tokens, int num_padded_tokens,
     int hidden_size, int intermediate_size, int num_topk, int num_expert_total,
     int num_expert_local, int gate_up_weight_scale_lastdim_pad4, int down_weight_scale_lastdim_pad4,
-    int rank_ep, cudaStream_t stream) {
+    int rank_ep, float swiglu_limit, cudaStream_t stream) {
   int total_num_tokens = num_tokens * num_topk;
   int num_tokens_per_group_avg = total_num_tokens / num_expert_total;
 
@@ -101,7 +104,7 @@ void fuse_moe_blockwise_async(
   activation::act_mul_and_blockwise_quant_async(
       down_input_ptr, down_input_scale_ptr, gate_up_output_ptr, cu_num_tokens_per_group_ptr,
       cu_tiles_ptr, total_num_tokens, num_padded_tokens, intermediate_size, num_expert_local,
-      num_tokens_per_group_avg, use_pdl, stream);
+      num_tokens_per_group_avg, swiglu_limit, use_pdl, stream);
 
   // 3. call down linear
   group_gemm::group_gemm_blockwise_fp8_async(
@@ -115,5 +118,117 @@ void fuse_moe_blockwise_async(
                total_num_tokens, num_tokens, hidden_size, num_topk, use_pdl, stream);
 }
 
+void fuse_moe_blockwise_indexed_direct_async(
+    void *output_ptr, const void *input_ptrs_dev, const void *input_scale_ptrs_dev,
+    int rows_per_shard, int num_input_ptrs, const void *source_rows_ptr, int64_t input_row_stride,
+    int64_t input_scale_row_stride, void *row_indices_ptr, void *gate_up_output_ptr,
+    const void *gate_up_weight_ptr, const void *gate_up_weight_scale_ptr, void *down_input_ptr,
+    void *down_input_scale_ptr, void *down_output_ptr, const void *down_weight_ptr,
+    const void *down_weight_scale_ptr, void *down_tmas_ptr, const void *topk_ids_ptr,
+    const void *topk_scale_ptr, void *topk_pos_ptr, void *num_tokens_per_group_ptr,
+    void *cu_num_tokens_per_group_ptr, void *tiles_ptr, void *cu_tiles_ptr,
+    void *gateup_task_map_ptr, int num_gateup_waves, int num_tokens, int num_padded_tokens,
+    int hidden_size, int intermediate_size, int num_topk, int num_expert_total,
+    int num_expert_local, int gate_up_weight_scale_lastdim_pad4, int down_weight_scale_lastdim_pad4,
+    int rank_ep, float swiglu_limit, cudaStream_t stream) {
+  const int total_num_tokens = num_tokens * num_topk;
+  const int num_tokens_per_group_avg = total_num_tokens / num_expert_total;
+  constexpr int kGemmTileN = 128;
+  const int gate_up_num_tile_n = (intermediate_size + kGemmTileN - 1) / kGemmTileN;
+  const int gateup_task_map_len = num_gateup_waves * get_sm_count();
+
+  fuse_moe_cp_async::count_and_build_indices_async(
+      topk_ids_ptr, row_indices_ptr, source_rows_ptr, topk_pos_ptr, num_tokens_per_group_ptr,
+      cu_num_tokens_per_group_ptr, tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr,
+      /*down_task_map_ptr=*/nullptr, gate_up_num_tile_n, /*down_num_tile_n=*/0, gateup_task_map_len,
+      /*down_task_map_len=*/0, num_tokens, num_topk, num_expert_local, rank_ep,
+      num_tokens_per_group_avg, stream);
+
+  group_gemm_cp_async::group_gemm_blockwise_fp8_scatter_async(
+      gate_up_output_ptr, input_ptrs_dev, input_scale_ptrs_dev, rows_per_shard, num_input_ptrs,
+      gate_up_weight_ptr, gate_up_weight_scale_ptr, row_indices_ptr, input_row_stride,
+      input_scale_row_stride, gate_up_weight_scale_lastdim_pad4, num_tokens_per_group_ptr,
+      cu_num_tokens_per_group_ptr, tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr,
+      gateup_task_map_len, total_num_tokens, intermediate_size, hidden_size, num_expert_local,
+      num_tokens_per_group_avg,
+      /*use_pdl=*/true, stream);
+
+  activation::act_mul_and_blockwise_quant_async(
+      down_input_ptr, down_input_scale_ptr, gate_up_output_ptr, cu_num_tokens_per_group_ptr,
+      cu_tiles_ptr, total_num_tokens, num_padded_tokens, intermediate_size, num_expert_local,
+      num_tokens_per_group_avg, swiglu_limit, /*use_pdl=*/true, stream);
+
+  group_gemm::group_gemm_blockwise_fp8_async(
+      down_output_ptr, down_input_ptr, down_weight_ptr, num_tokens_per_group_ptr,
+      cu_num_tokens_per_group_ptr, down_input_scale_ptr, down_weight_scale_ptr, down_tmas_ptr,
+      tiles_ptr, cu_tiles_ptr, /*task_map_ptr=*/nullptr, /*num_waves=*/0, num_expert_local,
+      total_num_tokens, hidden_size, intermediate_size / 2, num_padded_tokens,
+      down_weight_scale_lastdim_pad4, num_tokens_per_group_avg,
+      /*update_tma=*/true, /*use_pdl=*/true, stream);
+
+  reduce_async(output_ptr, down_output_ptr, topk_pos_ptr, topk_scale_ptr,
+               /*shared_output_ptr=*/nullptr, total_num_tokens, num_tokens, hidden_size, num_topk,
+               /*use_pdl=*/true, stream);
+}
+
+void fuse_moe_blockwise_indexed_pull_async(
+    void *output_ptr, const void *input_ptrs_dev, const void *input_scale_ptrs_dev,
+    int rows_per_shard, int num_input_ptrs, const void *source_rows_ptr, int64_t input_row_stride,
+    int64_t input_scale_row_stride, void *row_indices_ptr, void *gate_up_input_ptr,
+    void *gate_up_input_scale_ptr, void *gate_up_output_ptr, const void *gate_up_weight_ptr,
+    const void *gate_up_weight_scale_ptr, void *gate_up_tmas_ptr, void *down_input_ptr,
+    void *down_input_scale_ptr, void *down_output_ptr, const void *down_weight_ptr,
+    const void *down_weight_scale_ptr, void *down_tmas_ptr, const void *topk_ids_ptr,
+    const void *topk_scale_ptr, void *topk_pos_ptr, void *num_tokens_per_group_ptr,
+    void *cu_num_tokens_per_group_ptr, void *tiles_ptr, void *cu_tiles_ptr,
+    void *gateup_task_map_ptr, int num_gateup_waves, int num_tokens, int num_padded_tokens,
+    int aligned_size, int hidden_size, int intermediate_size, int num_topk, int num_expert_total,
+    int num_expert_local, int gate_up_weight_scale_lastdim_pad4, int down_weight_scale_lastdim_pad4,
+    int rank_ep, float swiglu_limit, cudaStream_t stream) {
+  const int total_num_tokens = num_tokens * num_topk;
+  const int num_tokens_per_group_avg = total_num_tokens / num_expert_total;
+  constexpr int kGemmTileN = 128;
+  const int gate_up_num_tile_n = (intermediate_size + kGemmTileN - 1) / kGemmTileN;
+  const int gateup_task_map_len = num_gateup_waves * get_sm_count();
+
+  fuse_moe_cp_async::count_and_build_indices_async(
+      topk_ids_ptr, row_indices_ptr, source_rows_ptr, topk_pos_ptr, num_tokens_per_group_ptr,
+      cu_num_tokens_per_group_ptr, tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr,
+      /*down_task_map_ptr=*/nullptr, gate_up_num_tile_n, /*down_num_tile_n=*/0, gateup_task_map_len,
+      /*down_task_map_len=*/0, num_tokens, num_topk, num_expert_local, rank_ep,
+      num_tokens_per_group_avg, stream);
+
+  const int scale_groups = hidden_size / 128;
+  pull_indexed_rows_async(input_ptrs_dev, input_scale_ptrs_dev, rows_per_shard, num_input_ptrs,
+                          input_row_stride, input_scale_row_stride, row_indices_ptr,
+                          cu_num_tokens_per_group_ptr, cu_tiles_ptr, gate_up_input_ptr,
+                          gate_up_input_scale_ptr, total_num_tokens, hidden_size, scale_groups,
+                          num_padded_tokens, num_expert_local, aligned_size, stream);
+
+  group_gemm::group_gemm_blockwise_fp8_async(
+      gate_up_output_ptr, gate_up_input_ptr, gate_up_weight_ptr, num_tokens_per_group_ptr,
+      cu_num_tokens_per_group_ptr, gate_up_input_scale_ptr, gate_up_weight_scale_ptr,
+      gate_up_tmas_ptr, tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr, num_gateup_waves,
+      num_expert_local, total_num_tokens, intermediate_size, hidden_size, num_padded_tokens,
+      gate_up_weight_scale_lastdim_pad4, num_tokens_per_group_avg,
+      /*update_tma=*/true, /*use_pdl=*/true, stream);
+
+  activation::act_mul_and_blockwise_quant_async(
+      down_input_ptr, down_input_scale_ptr, gate_up_output_ptr, cu_num_tokens_per_group_ptr,
+      cu_tiles_ptr, total_num_tokens, num_padded_tokens, intermediate_size, num_expert_local,
+      num_tokens_per_group_avg, swiglu_limit, /*use_pdl=*/true, stream);
+
+  group_gemm::group_gemm_blockwise_fp8_async(
+      down_output_ptr, down_input_ptr, down_weight_ptr, num_tokens_per_group_ptr,
+      cu_num_tokens_per_group_ptr, down_input_scale_ptr, down_weight_scale_ptr, down_tmas_ptr,
+      tiles_ptr, cu_tiles_ptr, /*task_map_ptr=*/nullptr, /*num_waves=*/0, num_expert_local,
+      total_num_tokens, hidden_size, intermediate_size / 2, num_padded_tokens,
+      down_weight_scale_lastdim_pad4, num_tokens_per_group_avg, /*update_tma=*/true,
+      /*use_pdl=*/true, stream);
+
+  reduce_async(output_ptr, down_output_ptr, topk_pos_ptr, topk_scale_ptr,
+               /*shared_output_ptr=*/nullptr, total_num_tokens, num_tokens, hidden_size, num_topk,
+               /*use_pdl=*/true, stream);
+}
 }  // namespace fuse_moe
 }  // namespace hpc

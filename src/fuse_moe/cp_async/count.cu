@@ -109,15 +109,13 @@ __global__ void count_cuseq_kernel(int *seqlens_ptr, int *cu_seqlens_ptr, int *t
 
 // Build row_indices, topk_pos, and optional per-GEMM task maps.
 template <bool kUsePDL = false>
-__global__ void build_indices_kernel(const int *topk_ids_ptr, int *row_indices_ptr,
-                                     int *topk_pos_ptr, int *seqlens_ptr,  // used as counters
-                                     const int *cu_seqlens_ptr, const int *cu_tiles_ptr,
-                                     const int *tiles_ptr, int4 *gateup_task_map,
-                                     int4 *down_task_map, int gate_up_num_tile_n,
-                                     int down_num_tile_n, int gateup_task_map_len,
-                                     int down_task_map_len, int total_num_topk, int num_topk,
-                                     int num_expert, int num_topk_blocks, int start_expert,
-                                     int end_expert) {
+__global__ void build_indices_kernel(
+    const int *topk_ids_ptr, int *row_indices_ptr, const int *source_rows_ptr, int *topk_pos_ptr,
+    int *seqlens_ptr,  // used as counters
+    const int *cu_seqlens_ptr, const int *cu_tiles_ptr, const int *tiles_ptr, int4 *gateup_task_map,
+    int4 *down_task_map, int gate_up_num_tile_n, int down_num_tile_n, int gateup_task_map_len,
+    int down_task_map_len, int total_num_topk, int num_topk, int num_expert, int num_topk_blocks,
+    int start_expert, int end_expert) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
   if constexpr (kUsePDL) {
     cudaGridDependencySynchronize();
@@ -156,7 +154,7 @@ __global__ void build_indices_kernel(const int *topk_ids_ptr, int *row_indices_p
 
     if (my_local_expert >= 0) {
       int pos = cu_seqlens_ptr[my_local_expert] + counter_shm[my_local_expert] + my_local_pos;
-      row_indices_ptr[pos] = my_token_idx;
+      row_indices_ptr[pos] = source_rows_ptr ? source_rows_ptr[my_token_idx] : my_token_idx;
       topk_pos_ptr[my_token_idx * num_topk + my_topk_j] = pos;
     }
   } else {
@@ -233,13 +231,11 @@ __global__ void build_indices_kernel(const int *topk_ids_ptr, int *row_indices_p
 // task_map pointers are accepted for signature symmetry but ignored; task_map
 // build is performed by `build_two_task_maps_kernel` instead.
 template <int kThreadPerBlock, int kGroupPerThread, int kTileM, bool kUsePDL = false>
-__global__ void count_and_build_kernel(const int *topk_ids_ptr, int *row_indices_ptr,
-                                       int *topk_pos_ptr, int *seqlens_ptr, int *cu_seqlens_ptr,
-                                       int *tiles_ptr, int *cu_tiles_ptr, int4 *gateup_task_map,
-                                       int4 *down_task_map, int gate_up_num_tile_n,
-                                       int down_num_tile_n, int num_seq, int num_topk,
-                                       int total_num_topk, int num_expert, int start_expert,
-                                       int end_expert) {
+__global__ void count_and_build_kernel(
+    const int *topk_ids_ptr, int *row_indices_ptr, const int *source_rows_ptr, int *topk_pos_ptr,
+    int *seqlens_ptr, int *cu_seqlens_ptr, int *tiles_ptr, int *cu_tiles_ptr, int4 *gateup_task_map,
+    int4 *down_task_map, int gate_up_num_tile_n, int down_num_tile_n, int num_seq, int num_topk,
+    int total_num_topk, int num_expert, int start_expert, int end_expert) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
   // Phase 1: count tokens per expert in shared memory
@@ -316,7 +312,7 @@ __global__ void count_and_build_kernel(const int *topk_ids_ptr, int *row_indices
       int pos = cu_seqlens_ptr[local_expert] + slot;
       int token_idx = i / num_topk;
       int topk_j = i % num_topk;
-      row_indices_ptr[pos] = token_idx;
+      row_indices_ptr[pos] = source_rows_ptr ? source_rows_ptr[token_idx] : token_idx;
       topk_pos_ptr[token_idx * num_topk + topk_j] = pos;
     }
   }
@@ -356,12 +352,13 @@ static cudaLaunchConfig_t make_pdl_config(dim3 grid, dim3 block, size_t smem, cu
 // Template dispatcher: selects kTileM based on average tokens per expert
 // ---------------------------------------------------------------------------
 template <int kTileM, bool kUsePDL>
-void launch_count_and_build(const int *topk_ids_ptr, int *row_indices_ptr, int *topk_pos_ptr,
-                            int *seqlens_ptr, int *cu_seqlens_ptr, int *tiles_ptr,
-                            int *cu_tiles_ptr, int4 *gateup_task_map, int4 *down_task_map,
-                            int gate_up_num_tile_n, int down_num_tile_n, int gateup_task_map_len,
-                            int down_task_map_len, int num_seq, int num_topk, int num_expert,
-                            int start_expert, int end_expert, cudaStream_t stream) {
+void launch_count_and_build(const int *topk_ids_ptr, int *row_indices_ptr,
+                            const int *source_rows_ptr, int *topk_pos_ptr, int *seqlens_ptr,
+                            int *cu_seqlens_ptr, int *tiles_ptr, int *cu_tiles_ptr,
+                            int4 *gateup_task_map, int4 *down_task_map, int gate_up_num_tile_n,
+                            int down_num_tile_n, int gateup_task_map_len, int down_task_map_len,
+                            int num_seq, int num_topk, int num_expert, int start_expert,
+                            int end_expert, cudaStream_t stream) {
   constexpr int kThreadPerBlock = 256;
   constexpr int kGroupPerThread = 2;
   int total_num_topk = num_seq * num_topk;
@@ -378,8 +375,8 @@ void launch_count_and_build(const int *topk_ids_ptr, int *row_indices_ptr, int *
     auto cfg = make_pdl_config(grid, block, num_expert * sizeof(int), stream, attr);
     auto kernel =
         kernels::count_and_build_kernel<kThreadPerBlock, kGroupPerThread, kTileM, kUsePDL>;
-    cudaLaunchKernelEx(&cfg, kernel, topk_ids_ptr, row_indices_ptr, topk_pos_ptr, seqlens_ptr,
-                       cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr,
+    cudaLaunchKernelEx(&cfg, kernel, topk_ids_ptr, row_indices_ptr, source_rows_ptr, topk_pos_ptr,
+                       seqlens_ptr, cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr,
                        /*gateup_task_map=*/nullptr, /*down_task_map=*/nullptr, gate_up_num_tile_n,
                        down_num_tile_n, num_seq, num_topk, total_num_topk, num_expert, start_expert,
                        end_expert);
@@ -438,8 +435,8 @@ void launch_count_and_build(const int *topk_ids_ptr, int *row_indices_ptr, int *
       dim3 grid(num_topk_blocks + task_map_blocks);
       auto cfg = make_pdl_config(grid, block, num_expert * sizeof(int), stream, attr);
       auto kernel = kernels::build_indices_kernel<kUsePDL>;
-      cudaLaunchKernelEx(&cfg, kernel, topk_ids_ptr, row_indices_ptr, topk_pos_ptr, seqlens_ptr,
-                         (const int *)cu_seqlens_ptr, (const int *)cu_tiles_ptr,
+      cudaLaunchKernelEx(&cfg, kernel, topk_ids_ptr, row_indices_ptr, source_rows_ptr, topk_pos_ptr,
+                         seqlens_ptr, (const int *)cu_seqlens_ptr, (const int *)cu_tiles_ptr,
                          (const int *)tiles_ptr, gateup_task_map, down_task_map, gate_up_num_tile_n,
                          down_num_tile_n, gateup_task_map_len, down_task_map_len, total_num_topk,
                          num_topk, num_expert, num_topk_blocks, start_expert, end_expert);
@@ -451,8 +448,9 @@ void launch_count_and_build(const int *topk_ids_ptr, int *row_indices_ptr, int *
 // Public API
 // ---------------------------------------------------------------------------
 void count_and_build_indices_async(const void *topk_ids_ptr, void *row_indices_ptr,
-                                   void *topk_pos_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
-                                   void *tiles_ptr, void *cu_tiles_ptr, void *gateup_task_map_ptr,
+                                   const void *source_rows_ptr, void *topk_pos_ptr,
+                                   void *seqlens_ptr, void *cu_seqlens_ptr, void *tiles_ptr,
+                                   void *cu_tiles_ptr, void *gateup_task_map_ptr,
                                    void *down_task_map_ptr, int gate_up_num_tile_n,
                                    int down_num_tile_n, int gateup_task_map_len,
                                    int down_task_map_len, int num_seq, int num_topk, int num_expert,
@@ -469,66 +467,75 @@ void count_and_build_indices_async(const void *topk_ids_ptr, void *row_indices_p
   if (num_seq_per_group_avg <= 8) {
     constexpr int kTileM = 8;
     launch_count_and_build<kTileM, kUsePDL>(
-        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
-        (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, gate_up_tm, down_tm,
-        gate_up_num_tile_n, down_num_tile_n, gateup_task_map_len, down_task_map_len, num_seq,
-        num_topk, num_expert, start_expert, end_expert, stream);
+        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (const int *)source_rows_ptr,
+        (int *)topk_pos_ptr, (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (int *)tiles_ptr,
+        (int *)cu_tiles_ptr, gate_up_tm, down_tm, gate_up_num_tile_n, down_num_tile_n,
+        gateup_task_map_len, down_task_map_len, num_seq, num_topk, num_expert, start_expert,
+        end_expert, stream);
   } else if (num_seq_per_group_avg <= 16) {
     constexpr int kTileM = 16;
     launch_count_and_build<kTileM, kUsePDL>(
-        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
-        (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, gate_up_tm, down_tm,
-        gate_up_num_tile_n, down_num_tile_n, gateup_task_map_len, down_task_map_len, num_seq,
-        num_topk, num_expert, start_expert, end_expert, stream);
+        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (const int *)source_rows_ptr,
+        (int *)topk_pos_ptr, (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (int *)tiles_ptr,
+        (int *)cu_tiles_ptr, gate_up_tm, down_tm, gate_up_num_tile_n, down_num_tile_n,
+        gateup_task_map_len, down_task_map_len, num_seq, num_topk, num_expert, start_expert,
+        end_expert, stream);
   } else if (num_seq_per_group_avg <= 32) {
     constexpr int kTileM = 32;
     launch_count_and_build<kTileM, kUsePDL>(
-        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
-        (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, gate_up_tm, down_tm,
-        gate_up_num_tile_n, down_num_tile_n, gateup_task_map_len, down_task_map_len, num_seq,
-        num_topk, num_expert, start_expert, end_expert, stream);
+        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (const int *)source_rows_ptr,
+        (int *)topk_pos_ptr, (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (int *)tiles_ptr,
+        (int *)cu_tiles_ptr, gate_up_tm, down_tm, gate_up_num_tile_n, down_num_tile_n,
+        gateup_task_map_len, down_task_map_len, num_seq, num_topk, num_expert, start_expert,
+        end_expert, stream);
   } else if (num_seq_per_group_avg <= 48) {
     constexpr int kTileM = 48;
     launch_count_and_build<kTileM, kUsePDL>(
-        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
-        (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, gate_up_tm, down_tm,
-        gate_up_num_tile_n, down_num_tile_n, gateup_task_map_len, down_task_map_len, num_seq,
-        num_topk, num_expert, start_expert, end_expert, stream);
+        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (const int *)source_rows_ptr,
+        (int *)topk_pos_ptr, (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (int *)tiles_ptr,
+        (int *)cu_tiles_ptr, gate_up_tm, down_tm, gate_up_num_tile_n, down_num_tile_n,
+        gateup_task_map_len, down_task_map_len, num_seq, num_topk, num_expert, start_expert,
+        end_expert, stream);
   } else if (num_seq_per_group_avg <= 64) {
     constexpr int kTileM = 64;
     launch_count_and_build<kTileM, kUsePDL>(
-        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
-        (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, gate_up_tm, down_tm,
-        gate_up_num_tile_n, down_num_tile_n, gateup_task_map_len, down_task_map_len, num_seq,
-        num_topk, num_expert, start_expert, end_expert, stream);
+        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (const int *)source_rows_ptr,
+        (int *)topk_pos_ptr, (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (int *)tiles_ptr,
+        (int *)cu_tiles_ptr, gate_up_tm, down_tm, gate_up_num_tile_n, down_num_tile_n,
+        gateup_task_map_len, down_task_map_len, num_seq, num_topk, num_expert, start_expert,
+        end_expert, stream);
   } else if (num_seq_per_group_avg <= 96) {
     constexpr int kTileM = 48;
     launch_count_and_build<kTileM, kUsePDL>(
-        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
-        (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, gate_up_tm, down_tm,
-        gate_up_num_tile_n, down_num_tile_n, gateup_task_map_len, down_task_map_len, num_seq,
-        num_topk, num_expert, start_expert, end_expert, stream);
+        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (const int *)source_rows_ptr,
+        (int *)topk_pos_ptr, (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (int *)tiles_ptr,
+        (int *)cu_tiles_ptr, gate_up_tm, down_tm, gate_up_num_tile_n, down_num_tile_n,
+        gateup_task_map_len, down_task_map_len, num_seq, num_topk, num_expert, start_expert,
+        end_expert, stream);
   } else if (num_seq_per_group_avg <= 128) {
     constexpr int kTileM = 64;
     launch_count_and_build<kTileM, kUsePDL>(
-        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
-        (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, gate_up_tm, down_tm,
-        gate_up_num_tile_n, down_num_tile_n, gateup_task_map_len, down_task_map_len, num_seq,
-        num_topk, num_expert, start_expert, end_expert, stream);
+        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (const int *)source_rows_ptr,
+        (int *)topk_pos_ptr, (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (int *)tiles_ptr,
+        (int *)cu_tiles_ptr, gate_up_tm, down_tm, gate_up_num_tile_n, down_num_tile_n,
+        gateup_task_map_len, down_task_map_len, num_seq, num_topk, num_expert, start_expert,
+        end_expert, stream);
   } else if (num_seq_per_group_avg <= 144) {
     constexpr int kTileM = 48;
     launch_count_and_build<kTileM, kUsePDL>(
-        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
-        (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, gate_up_tm, down_tm,
-        gate_up_num_tile_n, down_num_tile_n, gateup_task_map_len, down_task_map_len, num_seq,
-        num_topk, num_expert, start_expert, end_expert, stream);
+        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (const int *)source_rows_ptr,
+        (int *)topk_pos_ptr, (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (int *)tiles_ptr,
+        (int *)cu_tiles_ptr, gate_up_tm, down_tm, gate_up_num_tile_n, down_num_tile_n,
+        gateup_task_map_len, down_task_map_len, num_seq, num_topk, num_expert, start_expert,
+        end_expert, stream);
   } else {
     constexpr int kTileM = 64;
     launch_count_and_build<kTileM, kUsePDL>(
-        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (int *)topk_pos_ptr, (int *)seqlens_ptr,
-        (int *)cu_seqlens_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, gate_up_tm, down_tm,
-        gate_up_num_tile_n, down_num_tile_n, gateup_task_map_len, down_task_map_len, num_seq,
-        num_topk, num_expert, start_expert, end_expert, stream);
+        (const int *)topk_ids_ptr, (int *)row_indices_ptr, (const int *)source_rows_ptr,
+        (int *)topk_pos_ptr, (int *)seqlens_ptr, (int *)cu_seqlens_ptr, (int *)tiles_ptr,
+        (int *)cu_tiles_ptr, gate_up_tm, down_tm, gate_up_num_tile_n, down_num_tile_n,
+        gateup_task_map_len, down_task_map_len, num_seq, num_topk, num_expert, start_expert,
+        end_expert, stream);
   }
 }
 

@@ -31,7 +31,7 @@ void act_mul_and_blockwise_quant_async(void *output_ptr, void *output_scale_ptr,
                                        const void *cu_tiles_ptr, const int num_row,
                                        const int num_row_padded_size, const int num_col,
                                        const int num_group, const int num_tokens_per_group_avg,
-                                       bool use_pdl, cudaStream_t stream);
+                                       float swiglu_limit, bool use_pdl, cudaStream_t stream);
 
 void act_mul_and_blockwise_quant_async(void *output_ptr, void *output_scale_ptr,
                                        const void *input_ptr, const int num_row, const int num_col,

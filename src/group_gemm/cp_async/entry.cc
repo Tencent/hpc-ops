@@ -108,6 +108,9 @@ torch::Tensor group_gemm_fp8_scatter_entry(
 
   auto options = x.options();
   auto y = torch::empty({total_tokens, n}, options.dtype(torch::kBFloat16));
+  if (total_tokens == 0) {
+    return y;
+  }
 
   auto *y_ptr = y.mutable_data_ptr();
   const auto *x_ptr = x.const_data_ptr();
