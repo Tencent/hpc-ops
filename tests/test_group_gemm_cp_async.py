@@ -103,3 +103,33 @@ def test_correctness(shape, scatter, use_task_map):
         )
 
     assert allclose(gt.to(torch.float32), actual_output.to(torch.float32), rtol=0.08, atol=1)
+
+
+def test_scatter_accepts_zero_rows():
+    num_group = 4
+    n = 128
+    k = 128
+    x = torch.empty((0, k), dtype=DTYPE_IN, device="cuda")
+    weight = torch.randn((num_group, n, k), dtype=torch.float, device="cuda").to(DTYPE_IN)
+    scale = torch.ones(num_group, dtype=torch.float32, device="cuda")
+    row_indices = torch.empty(0, dtype=torch.int32, device="cuda")
+    seqlens = torch.zeros(num_group, dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.zeros(num_group + 1, dtype=torch.int32, device="cuda")
+    tiles = torch.zeros(num_group, dtype=torch.int32, device="cuda")
+    cu_tiles = torch.zeros(num_group + 1, dtype=torch.int32, device="cuda")
+
+    output = torch.ops.hpc.group_gemm_fp8_scatter_cp_async(
+        x,
+        weight,
+        scale,
+        row_indices,
+        seqlens,
+        cu_seqlens,
+        tiles,
+        cu_tiles,
+        False,
+    )
+    torch.cuda.synchronize()
+
+    assert output.shape == (0, n)
+    assert output.dtype == torch.bfloat16

@@ -35,7 +35,8 @@ void fuse_moe_cp_async(void *output_ptr, const void *input_ptr, void *gate_up_ou
 
   // When task_map pointers are non-null, this call also fills both task_maps
   // and writes sentinel -1 into their unused tail slots.
-  count_and_build_indices_async(topk_ids_ptr, row_indices_ptr, topk_pos_ptr, seqlens_ptr,
+  count_and_build_indices_async(topk_ids_ptr, row_indices_ptr,
+                                /*source_rows_ptr=*/nullptr, topk_pos_ptr, seqlens_ptr,
                                 cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr,
                                 down_task_map_ptr, gate_up_num_tile_n, down_num_tile_n,
                                 gateup_task_map_len, down_task_map_len, num_seq, num_topk,

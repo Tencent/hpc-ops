@@ -5,6 +5,8 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <cmath>
+#include <limits>
 #include <tuple>
 
 #include "src/fuse_moe/cp_async/fuse_moe_cp_async.h"
@@ -442,23 +444,26 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   }
 }
 
-torch::Tensor fuse_moe_blockwise_entry(
+torch::Tensor fuse_moe_blockwise_impl(
     const torch::Tensor &x, const torch::Tensor &x_scale, const torch::Tensor &gate_up_weight,
     const torch::Tensor &gate_up_weight_scale, const torch::Tensor &down_weight,
     const torch::Tensor &down_weight_scale, const torch::Tensor &topk_ids,
     const torch::Tensor &topk_scale, std::optional<torch::Tensor> shared_output, int64_t rank_ep,
-    int64_t num_expert_total, std::optional<torch::Tensor> output) {
-  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
+    int64_t num_expert_total, std::optional<torch::Tensor> output,
+    std::optional<torch::Tensor> input_ptrs, std::optional<torch::Tensor> input_scale_ptrs,
+    std::optional<torch::Tensor> source_rows, bool indexed_pull, double swiglu_limit) {
+  const bool indexed = input_ptrs.has_value();
 
   TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn &&
                   gate_up_weight.dtype() == torch::kFloat8_e4m3fn &&
                   down_weight.dtype() == torch::kFloat8_e4m3fn,
               "x, gate_up_weight and down_weight dtype must be fp8_e4m3");
   TORCH_CHECK(topk_ids.dtype() == torch::kInt32, "topk_ids dtype must be int32");
+  TORCH_CHECK(x_scale.dtype() == torch::kFloat32, "x_scale dtype must be float32");
   TORCH_CHECK(gate_up_weight_scale.dtype() == torch::kFloat32 &&
                   down_weight_scale.dtype() == torch::kFloat32 &&
                   topk_scale.dtype() == torch::kFloat32,
-              "gate_up_scale, down_scale, act_and_mul_scale and topk_scale dtype must be float32");
+              "gate_up_scale, down_scale and topk_scale dtype must be float32");
   TORCH_CHECK(x.device().is_cuda(), "x tensor must be cuda");
   TORCH_CHECK(x_scale.device().is_cuda(), "x_scale tensor must be cuda");
   TORCH_CHECK(gate_up_weight.device().is_cuda(), "gate_up_weight tensor must be cuda");
@@ -467,9 +472,30 @@ torch::Tensor fuse_moe_blockwise_entry(
   TORCH_CHECK(down_weight_scale.device().is_cuda(), "down_weight_scale tensor must be cuda");
   TORCH_CHECK(topk_ids.device().is_cuda(), "topk_ids tensor must be cuda");
   TORCH_CHECK(topk_scale.device().is_cuda(), "topk_scale tensor must be cuda");
+  TORCH_CHECK(std::isfinite(swiglu_limit) && swiglu_limit >= 0.0,
+              "swiglu_limit must be finite and non-negative");
 
-  TORCH_CHECK(x.is_contiguous(), "x tensor must be contiguous");
-  TORCH_CHECK(x_scale.is_contiguous(), "x_scale tensor must be contiguous");
+  TORCH_CHECK(x.dim() == 2, "x must be two-dimensional");
+  TORCH_CHECK(x_scale.dim() == 2, "x_scale must be two-dimensional");
+  TORCH_CHECK(gate_up_weight.dim() == 3, "gate_up_weight must be three-dimensional");
+  TORCH_CHECK(gate_up_weight_scale.dim() == 3,
+              "gate_up_weight_scale must be three-dimensional");
+  TORCH_CHECK(down_weight.dim() == 3, "down_weight must be three-dimensional");
+  TORCH_CHECK(down_weight_scale.dim() == 3,
+              "down_weight_scale must be three-dimensional");
+  TORCH_CHECK(topk_ids.dim() == 2 && topk_scale.dim() == 2,
+              "topk_ids and topk_scale must be two-dimensional");
+
+  const int device = x.get_device();
+  for (const torch::Tensor *tensor : {&x_scale, &gate_up_weight, &gate_up_weight_scale,
+                                      &down_weight, &down_weight_scale, &topk_ids, &topk_scale}) {
+    TORCH_CHECK(tensor->get_device() == device,
+                "FusedMoE input tensors must use the same CUDA device");
+  }
+
+  TORCH_CHECK(indexed ? x.stride(1) == 1 : x.is_contiguous(), "x rows must be contiguous");
+  TORCH_CHECK(indexed ? x_scale.stride(1) == 1 : x_scale.is_contiguous(),
+              "x_scale rows must be contiguous");
   TORCH_CHECK(gate_up_weight.is_contiguous(), "gate_up_weight tensor must be contiguous");
   TORCH_CHECK(gate_up_weight_scale.is_contiguous(),
               "gate_up_weight_scale tensor must be contiguous");
@@ -478,15 +504,58 @@ torch::Tensor fuse_moe_blockwise_entry(
   TORCH_CHECK(topk_ids.is_contiguous(), "topk_ids tensor must be contiguous");
   TORCH_CHECK(topk_scale.is_contiguous(), "topk_scale tensor must be contiguous");
 
-  TORCH_CHECK(x.size(0) == topk_ids.size(0), "x and topk_ids must share the same num_tokens");
+  if (indexed) {
+    TORCH_CHECK(source_rows.has_value(), "source_rows is required for indexed W13 input");
+    TORCH_CHECK(input_scale_ptrs.has_value(), "input_scale_ptrs is required for indexed W13 input");
+    const auto rows = source_rows.value();
+    const auto peer_inputs = input_ptrs.value();
+    const auto peer_scales = input_scale_ptrs.value();
+    TORCH_CHECK(rows.device().is_cuda(), "source_rows tensor must be cuda");
+    TORCH_CHECK(rows.dtype() == torch::kInt32, "source_rows dtype must be int32");
+    TORCH_CHECK(rows.is_contiguous(), "source_rows tensor must be contiguous");
+    TORCH_CHECK(rows.dim() == 1 && rows.size(0) == topk_ids.size(0),
+                "source_rows must contain one physical row per logical token");
+    TORCH_CHECK(peer_inputs.device().is_cuda() && peer_scales.device().is_cuda(),
+                "peer pointer tables must be CUDA tensors");
+    TORCH_CHECK(rows.get_device() == device && peer_inputs.get_device() == device &&
+                    peer_scales.get_device() == device,
+                "indexed metadata must use the same CUDA device as x");
+    TORCH_CHECK(peer_inputs.dtype() == torch::kInt64 && peer_scales.dtype() == torch::kInt64,
+                "peer pointer tables must be int64 tensors");
+    TORCH_CHECK(peer_inputs.dim() == 1 && peer_inputs.is_contiguous(),
+                "input_ptrs must be a contiguous vector");
+    TORCH_CHECK(peer_scales.dim() == 1 && peer_scales.is_contiguous(),
+                "input_scale_ptrs must be a contiguous vector");
+    TORCH_CHECK(peer_inputs.numel() == peer_scales.numel() && peer_inputs.numel() > 0,
+                "peer pointer table sizes must match and be non-empty");
+    TORCH_CHECK(topk_ids.size(0) == 0 || x.size(0) > 0,
+                "indexed input capacity must be positive for non-empty input");
+    TORCH_CHECK(x.size(0) <= std::numeric_limits<int>::max() / peer_inputs.numel(),
+                "indexed input capacity exceeds int32 rank-major row encoding");
+    TORCH_CHECK(!shared_output.has_value(), "shared_output is not supported by indexed W13 input");
+  } else {
+    TORCH_CHECK(x.size(0) == topk_ids.size(0), "x and topk_ids must share the same num_tokens");
+  }
   TORCH_CHECK(topk_ids.size(0) == topk_scale.size(0),
               "topk_ids and topk_scale must share the same num_tokens");
   TORCH_CHECK(topk_ids.size(1) == topk_scale.size(1),
               "topk_ids and topk_scale must share the same num_topk");
   TORCH_CHECK(x.size(1) == gate_up_weight.size(2), "x and weight must share the same k");
+  TORCH_CHECK(x.size(1) > 0 && x.size(1) % 128 == 0,
+              "hidden size must be a positive multiple of 128");
+  TORCH_CHECK(gate_up_weight.size(1) > 0 && gate_up_weight.size(1) % 128 == 0,
+              "gate_up output size must be a positive multiple of 128");
+  TORCH_CHECK(down_weight.size(1) == x.size(1), "down_weight output size must match hidden size");
+  TORCH_CHECK(down_weight.size(2) > 0 && down_weight.size(2) % 128 == 0,
+              "down_weight input size must be a positive multiple of 128");
+  TORCH_CHECK(gate_up_weight.size(1) == down_weight.size(2) * 2,
+              "gate_up output size must be twice down_weight input size");
   TORCH_CHECK(gate_up_weight.size(0) == down_weight.size(0),
               "gate_up_weight and down_weight must share the same num_expert");
-  TORCH_CHECK(x_scale.size(0) == x.size(0), "x_scale and x must share the same nun_tokens");
+  TORCH_CHECK(x_scale.size(0) == x.size(0), "x_scale and x must share the same num_rows");
+  TORCH_CHECK(gate_up_weight_scale.size(0) == gate_up_weight.size(0) &&
+                  down_weight_scale.size(0) == down_weight.size(0),
+              "weight scales must match their expert dimensions");
   TORCH_CHECK(x_scale.size(1) == x.size(1) / 128, "x_scale must be per 128 blockwise quant");
   TORCH_CHECK(gate_up_weight_scale.size(1) == gate_up_weight.size(1) / 128,
               "gate_up_weight must be per 128 blockwise quant");
@@ -510,17 +579,41 @@ torch::Tensor fuse_moe_blockwise_entry(
     shared_output_ptr = shared_output_tensor.const_data_ptr();
   }
 
-  int num_tokens = x.size(0);
+  TORCH_CHECK(topk_ids.size(1) == 0 ||
+                  topk_ids.size(0) <= std::numeric_limits<int>::max() / topk_ids.size(1),
+              "route count exceeds int32 capacity");
+  int num_tokens = topk_ids.size(0);
   int hidden_size = x.size(1);
   int num_experts = gate_up_weight.size(0);
   int intermediate_size = gate_up_weight.size(1);
   int num_topk = topk_ids.size(1);
+  int num_input_ptrs = indexed ? input_ptrs.value().numel() : 0;
+  TORCH_CHECK(num_expert_total > 0, "num_expert_total must be positive");
+  TORCH_CHECK(num_expert_total <= std::numeric_limits<int>::max(),
+              "num_expert_total exceeds int32 capacity");
+  TORCH_CHECK(num_experts > 0 && num_expert_total % num_experts == 0,
+              "local experts must be a non-empty divisor of num_expert_total");
+  TORCH_CHECK(num_experts <= 512, "num_expert_local must be <= 512, got ", num_experts);
+  TORCH_CHECK(!indexed || (rank_ep >= 0 && rank_ep < num_expert_total / num_experts),
+              "rank_ep is outside the expert-parallel domain");
+  TORCH_CHECK(num_topk > 0 && num_topk <= 128, "num_topk must be in [1, 128]");
   int num_tokens_per_group_avg = num_tokens * num_topk / num_expert_total;
   int aligned_size = 0;
   int gate_up_weight_scale_lastdim_pad4 = gate_up_weight_scale.size(-1);
   int down_weight_scale_lastdim_pad4 = down_weight_scale.size(-1);
 
-  TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
+  if (num_tokens == 0) {
+    if (output.has_value()) {
+      TORCH_CHECK(output.value().size(0) == 0 && output.value().size(1) == hidden_size,
+                  "output shape must be [num_tokens, hidden_size]");
+      TORCH_CHECK(output.value().dtype() == torch::kBFloat16, "output dtype must be bfloat16");
+      TORCH_CHECK(output.value().device().is_cuda(), "output must be cuda tensor");
+      TORCH_CHECK(output.value().get_device() == device && output.value().is_contiguous(),
+                  "output must be contiguous and use the same CUDA device as x");
+      return output.value();
+    }
+    return torch::empty({0, hidden_size}, x.options().dtype(torch::kBFloat16));
+  }
 
   if (num_tokens_per_group_avg <= 8) {
     aligned_size = 8;
@@ -541,9 +634,13 @@ torch::Tensor fuse_moe_blockwise_entry(
   } else {
     aligned_size = 64;
   }
-  int num_padded_tokens =
-      (num_tokens * num_topk + num_expert_total * aligned_size + aligned_size - 1) / aligned_size *
-      aligned_size;
+  const int64_t padded_route_count =
+      (static_cast<int64_t>(num_tokens) * num_topk +
+       static_cast<int64_t>(num_expert_total) * aligned_size + aligned_size - 1) /
+      aligned_size * aligned_size;
+  TORCH_CHECK(padded_route_count <= std::numeric_limits<int>::max(),
+              "padded route count exceeds int32 capacity");
+  int num_padded_tokens = static_cast<int>(padded_route_count);
 
   auto options = x.options();
   torch::Tensor y;
@@ -553,18 +650,25 @@ torch::Tensor fuse_moe_blockwise_entry(
                 "output shape must be [num_tokens, hidden_size]");
     TORCH_CHECK(output.value().dtype() == torch::kBFloat16, "output dtype must be bfloat16");
     TORCH_CHECK(output.value().device().is_cuda(), "output must be cuda tensor");
+    TORCH_CHECK(output.value().get_device() == device && output.value().is_contiguous(),
+                "output must be contiguous and use the same CUDA device as x");
     y_ptr = output.value().mutable_data_ptr();
   } else {
     y = torch::empty({num_tokens, hidden_size}, options.dtype(torch::kBFloat16));
     y_ptr = y.mutable_data_ptr();
   }
-  torch::Tensor gate_up_input =
-      torch::empty({num_tokens * num_topk, hidden_size}, options.dtype(torch::kFloat8_e4m3fn));
-  torch::Tensor gate_up_input_scale =
-      torch::empty({x_scale.size(1), num_padded_tokens}, options.dtype(torch::kFloat32));
+  torch::Tensor gate_up_input;
+  torch::Tensor gate_up_input_scale;
+  torch::Tensor gate_up_tmas;
+  if (!indexed || indexed_pull) {
+    gate_up_input =
+        torch::empty({num_tokens * num_topk, hidden_size}, options.dtype(torch::kFloat8_e4m3fn));
+    gate_up_input_scale =
+        torch::empty({x_scale.size(1), num_padded_tokens}, options.dtype(torch::kFloat32));
+    gate_up_tmas = torch::empty({num_experts * 2, 128}, options.dtype(torch::kInt8));
+  }
   torch::Tensor gate_up_output =
       torch::empty({num_tokens * num_topk, intermediate_size}, options.dtype(torch::kBFloat16));
-  torch::Tensor gate_up_tmas = torch::empty({num_experts * 2, 128}, options.dtype(torch::kInt8));
   torch::Tensor down_input = torch::empty({num_tokens * num_topk, intermediate_size / 2},
                                           options.dtype(torch::kFloat8_e4m3fn));
   torch::Tensor down_input_scale = torch::empty({intermediate_size / 2 / 128, num_padded_tokens},
@@ -573,6 +677,10 @@ torch::Tensor fuse_moe_blockwise_entry(
       torch::empty({num_tokens * num_topk, hidden_size}, options.dtype(torch::kBFloat16));
   torch::Tensor down_tmas = torch::empty({num_experts * 2, 128}, options.dtype(torch::kInt8));
   torch::Tensor topk_pos = torch::empty({num_tokens, num_topk}, options.dtype(torch::kInt32));
+  torch::Tensor row_indices;
+  if (indexed) {
+    row_indices = torch::empty({num_tokens * num_topk}, options.dtype(torch::kInt32));
+  }
   torch::Tensor num_tokens_per_group = torch::zeros({num_experts}, options.dtype(torch::kInt32));
   torch::Tensor cu_num_tokens_per_group =
       torch::empty({num_experts + 1}, options.dtype(torch::kInt32));
@@ -581,8 +689,10 @@ torch::Tensor fuse_moe_blockwise_entry(
 
   int num_sm = get_sm_count();
   constexpr int kTileN = 128;
+  constexpr int kIndexedGateUpTileN = 128;
+  const int gate_up_tile_n = indexed ? kIndexedGateUpTileN : kTileN;
   int num_gateup_tiles = ((num_tokens + aligned_size - 1) / aligned_size) *
-                         ((intermediate_size + kTileN - 1) / kTileN) * num_experts;
+                         ((intermediate_size + gate_up_tile_n - 1) / gate_up_tile_n) * num_experts;
   int num_down_tiles = ((num_tokens + aligned_size - 1) / aligned_size) *
                        ((hidden_size + kTileN - 1) / kTileN) * num_experts;
   int num_gateup_waves = (num_gateup_tiles + num_sm - 1) / num_sm + 1;
@@ -595,47 +705,117 @@ torch::Tensor fuse_moe_blockwise_entry(
   if (num_tokens_per_group_avg <= 8) {
     gateup_task_map = torch::empty({num_gateup_waves, num_sm, 4}, options.dtype(torch::kInt32));
     gateup_task_map_ptr = gateup_task_map.mutable_data_ptr();
-    down_task_map = torch::empty({num_down_waves, num_sm, 4}, options.dtype(torch::kInt32));
-    down_task_map_ptr = down_task_map.mutable_data_ptr();
+    if (!indexed) {
+      down_task_map = torch::empty({num_down_waves, num_sm, 4}, options.dtype(torch::kInt32));
+      down_task_map_ptr = down_task_map.mutable_data_ptr();
+    }
   }
 
   const auto *x_ptr = x.const_data_ptr();
   const auto *x_scale_ptr = x_scale.const_data_ptr();
+  const auto *source_rows_ptr = indexed ? source_rows.value().const_data_ptr() : nullptr;
   const auto *topk_ids_ptr = topk_ids.const_data_ptr();
   const auto *topk_scale_ptr = topk_scale.const_data_ptr();
   const auto *gate_up_weight_ptr = gate_up_weight.const_data_ptr();
   const auto *gate_up_weight_scale_ptr = gate_up_weight_scale.const_data_ptr();
   const auto *down_weight_ptr = down_weight.const_data_ptr();
   const auto *down_weight_scale_ptr = down_weight_scale.const_data_ptr();
+  auto stream = at::cuda::getCurrentCUDAStream(device);
 
   auto *topk_pos_ptr = topk_pos.mutable_data_ptr();
+  auto *row_indices_ptr = indexed ? row_indices.mutable_data_ptr() : nullptr;
   auto *num_tokens_per_group_ptr = num_tokens_per_group.mutable_data_ptr();
   auto *cu_num_tokens_per_group_ptr = cu_num_tokens_per_group.mutable_data_ptr();
   auto *tiles_ptr = tiles.mutable_data_ptr();
   auto *cu_tiles_ptr = cu_tiles.mutable_data_ptr();
-  auto *gate_up_input_ptr = gate_up_input.mutable_data_ptr();
-  auto *gate_up_input_scale_ptr = gate_up_input_scale.mutable_data_ptr();
+  auto *gate_up_input_ptr = (!indexed || indexed_pull) ? gate_up_input.mutable_data_ptr() : nullptr;
+  auto *gate_up_input_scale_ptr =
+      (!indexed || indexed_pull) ? gate_up_input_scale.mutable_data_ptr() : nullptr;
   auto *gate_up_output_ptr = gate_up_output.mutable_data_ptr();
-  auto *gate_up_tmas_ptr = gate_up_tmas.mutable_data_ptr();
+  auto *gate_up_tmas_ptr = (!indexed || indexed_pull) ? gate_up_tmas.mutable_data_ptr() : nullptr;
   auto *down_input_ptr = down_input.mutable_data_ptr();
   auto *down_input_scale_ptr = down_input_scale.mutable_data_ptr();
   auto *down_output_ptr = down_output.mutable_data_ptr();
   auto *down_tmas_ptr = down_tmas.mutable_data_ptr();
 
-  fuse_moe_blockwise_async(
-      y_ptr, x_ptr, x_scale_ptr, gate_up_input_ptr, gate_up_input_scale_ptr, gate_up_output_ptr,
-      gate_up_weight_ptr, gate_up_weight_scale_ptr, gate_up_tmas_ptr, down_input_ptr,
-      down_input_scale_ptr, down_output_ptr, down_weight_ptr, down_weight_scale_ptr, down_tmas_ptr,
-      topk_ids_ptr, topk_scale_ptr, topk_pos_ptr, num_tokens_per_group_ptr,
-      cu_num_tokens_per_group_ptr, tiles_ptr, cu_tiles_ptr, shared_output_ptr, gateup_task_map_ptr,
-      down_task_map_ptr, num_gateup_waves, num_down_waves, num_tokens, num_padded_tokens,
-      hidden_size, intermediate_size, num_topk, num_expert_total, num_experts,
-      gate_up_weight_scale_lastdim_pad4, down_weight_scale_lastdim_pad4, rank_ep, stream);
+  if (indexed_pull) {
+    fuse_moe_blockwise_indexed_pull_async(
+        y_ptr, input_ptrs.value().const_data_ptr(), input_scale_ptrs.value().const_data_ptr(),
+        x.size(0), num_input_ptrs, source_rows_ptr, x.stride(0), x_scale.stride(0), row_indices_ptr,
+        gate_up_input_ptr, gate_up_input_scale_ptr, gate_up_output_ptr, gate_up_weight_ptr,
+        gate_up_weight_scale_ptr, gate_up_tmas_ptr, down_input_ptr, down_input_scale_ptr,
+        down_output_ptr, down_weight_ptr, down_weight_scale_ptr, down_tmas_ptr, topk_ids_ptr,
+        topk_scale_ptr, topk_pos_ptr, num_tokens_per_group_ptr, cu_num_tokens_per_group_ptr,
+        tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr, num_gateup_waves, num_tokens,
+        num_padded_tokens, aligned_size, hidden_size, intermediate_size, num_topk, num_expert_total,
+        num_experts, gate_up_weight_scale_lastdim_pad4, down_weight_scale_lastdim_pad4, rank_ep,
+        static_cast<float>(swiglu_limit), stream);
+  } else if (indexed) {
+    fuse_moe_blockwise_indexed_direct_async(
+        y_ptr, input_ptrs.value().const_data_ptr(), input_scale_ptrs.value().const_data_ptr(),
+        x.size(0), num_input_ptrs, source_rows_ptr, x.stride(0), x_scale.stride(0), row_indices_ptr,
+        gate_up_output_ptr, gate_up_weight_ptr, gate_up_weight_scale_ptr, down_input_ptr,
+        down_input_scale_ptr, down_output_ptr, down_weight_ptr, down_weight_scale_ptr,
+        down_tmas_ptr, topk_ids_ptr, topk_scale_ptr, topk_pos_ptr, num_tokens_per_group_ptr,
+        cu_num_tokens_per_group_ptr, tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr, num_gateup_waves,
+        num_tokens, num_padded_tokens, hidden_size, intermediate_size, num_topk, num_expert_total,
+        num_experts, gate_up_weight_scale_lastdim_pad4, down_weight_scale_lastdim_pad4, rank_ep,
+        static_cast<float>(swiglu_limit), stream);
+  } else {
+    fuse_moe_blockwise_async(
+        y_ptr, x_ptr, x_scale_ptr, gate_up_input_ptr, gate_up_input_scale_ptr, gate_up_output_ptr,
+        gate_up_weight_ptr, gate_up_weight_scale_ptr, gate_up_tmas_ptr, down_input_ptr,
+        down_input_scale_ptr, down_output_ptr, down_weight_ptr, down_weight_scale_ptr,
+        down_tmas_ptr, topk_ids_ptr, topk_scale_ptr, topk_pos_ptr, num_tokens_per_group_ptr,
+        cu_num_tokens_per_group_ptr, tiles_ptr, cu_tiles_ptr, shared_output_ptr,
+        gateup_task_map_ptr, down_task_map_ptr, num_gateup_waves, num_down_waves, num_tokens,
+        num_padded_tokens, hidden_size, intermediate_size, num_topk, num_expert_total, num_experts,
+        gate_up_weight_scale_lastdim_pad4, down_weight_scale_lastdim_pad4, rank_ep,
+        static_cast<float>(swiglu_limit), stream);
+  }
   if (output.has_value()) {
     return output.value();
   } else {
     return y;
   }
+}
+
+torch::Tensor fuse_moe_blockwise_entry(
+    const torch::Tensor &x, const torch::Tensor &x_scale, const torch::Tensor &gate_up_weight,
+    const torch::Tensor &gate_up_weight_scale, const torch::Tensor &down_weight,
+    const torch::Tensor &down_weight_scale, const torch::Tensor &topk_ids,
+    const torch::Tensor &topk_scale, std::optional<torch::Tensor> shared_output, int64_t rank_ep,
+    int64_t num_expert_total, std::optional<torch::Tensor> output, double swiglu_limit) {
+  return fuse_moe_blockwise_impl(x, x_scale, gate_up_weight, gate_up_weight_scale, down_weight,
+                                 down_weight_scale, topk_ids, topk_scale, shared_output, rank_ep,
+                                 num_expert_total, output, std::nullopt, std::nullopt, std::nullopt,
+                                 false, swiglu_limit);
+}
+
+torch::Tensor fuse_moe_blockwise_indexed_entry(
+    const torch::Tensor &x, const torch::Tensor &x_scale, const torch::Tensor &input_ptrs,
+    const torch::Tensor &input_scale_ptrs, const torch::Tensor &source_rows,
+    const torch::Tensor &gate_up_weight, const torch::Tensor &gate_up_weight_scale,
+    const torch::Tensor &down_weight, const torch::Tensor &down_weight_scale,
+    const torch::Tensor &topk_ids, const torch::Tensor &topk_scale, int64_t rank_ep,
+    int64_t num_expert_total, double swiglu_limit) {
+  return fuse_moe_blockwise_impl(x, x_scale, gate_up_weight, gate_up_weight_scale, down_weight,
+                                 down_weight_scale, topk_ids, topk_scale, std::nullopt, rank_ep,
+                                 num_expert_total, std::nullopt, input_ptrs, input_scale_ptrs,
+                                 source_rows, false, swiglu_limit);
+}
+
+torch::Tensor fuse_moe_blockwise_indexed_pull_entry(
+    const torch::Tensor &x, const torch::Tensor &x_scale, const torch::Tensor &input_ptrs,
+    const torch::Tensor &input_scale_ptrs, const torch::Tensor &source_rows,
+    const torch::Tensor &gate_up_weight, const torch::Tensor &gate_up_weight_scale,
+    const torch::Tensor &down_weight, const torch::Tensor &down_weight_scale,
+    const torch::Tensor &topk_ids, const torch::Tensor &topk_scale, int64_t rank_ep,
+    int64_t num_expert_total, double swiglu_limit) {
+  return fuse_moe_blockwise_impl(x, x_scale, gate_up_weight, gate_up_weight_scale, down_weight,
+                                 down_weight_scale, topk_ids, topk_scale, std::nullopt, rank_ep,
+                                 num_expert_total, std::nullopt, input_ptrs, input_scale_ptrs,
+                                 source_rows, true, swiglu_limit);
 }
 
 }  // namespace fuse_moe
@@ -672,13 +852,31 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "gate_up_weight_scale, "
       "Tensor down_weight, Tensor down_weight_scale, Tensor topk_ids, Tensor topk_scale, Tensor ? "
       "shared_output, "
-      "int rank_ep, int num_expert_total, Tensor ? output) -> (Tensor)");
+      "int rank_ep, int num_expert_total, Tensor ? output, float swiglu_limit=0.0) -> (Tensor)");
   m.impl("fuse_moe_blockwise", torch::kCUDA, &hpc::fuse_moe::fuse_moe_blockwise_entry);
+
+  m.def(
+      "fuse_moe_blockwise_indexed(Tensor x, Tensor x_scale, Tensor input_ptrs, Tensor "
+      "input_scale_ptrs, Tensor source_rows, Tensor "
+      "gate_up_weight, Tensor gate_up_weight_scale, Tensor down_weight, Tensor "
+      "down_weight_scale, Tensor topk_ids, Tensor topk_scale, int rank_ep, int num_expert_total, "
+      "float swiglu_limit=0.0) "
+      "-> (Tensor)");
+  m.impl("fuse_moe_blockwise_indexed", torch::kCUDA,
+         &hpc::fuse_moe::fuse_moe_blockwise_indexed_entry);
+
+  m.def(
+      "fuse_moe_blockwise_indexed_pull(Tensor x, Tensor x_scale, Tensor input_ptrs, Tensor "
+      "input_scale_ptrs, Tensor source_rows, Tensor gate_up_weight, Tensor gate_up_weight_scale, "
+      "Tensor down_weight, Tensor down_weight_scale, Tensor topk_ids, Tensor topk_scale, int "
+      "rank_ep, int num_expert_total, float swiglu_limit=0.0) -> Tensor");
+  m.impl("fuse_moe_blockwise_indexed_pull", torch::kCUDA,
+         &hpc::fuse_moe::fuse_moe_blockwise_indexed_pull_entry);
 
   m.def(
       "fuse_moe_blockwise_fp8(Tensor x, Tensor x_scale, Tensor gate_up_weight, Tensor "
       "gate_up_weight_scale, Tensor down_weight, Tensor down_weight_scale, Tensor topk_ids, "
       "Tensor topk_scale, Tensor ? shared_output, int rank_ep, int num_expert_total, Tensor ? "
-      "output) -> (Tensor)");
+      "output, float swiglu_limit=0.0) -> (Tensor)");
   m.impl("fuse_moe_blockwise_fp8", torch::kCUDA, &hpc::fuse_moe::fuse_moe_blockwise_entry);
 }
