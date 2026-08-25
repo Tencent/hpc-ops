@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Tencent.
+
 import torch
 from typing import Tuple, Any, Optional, Sequence
 from itertools import accumulate

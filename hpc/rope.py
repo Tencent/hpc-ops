@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Tencent.
+
 from typing import Optional, Tuple
 
 import torch

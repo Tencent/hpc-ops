@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Tencent.
+
 """Benchmark fused AllReduce + Residual + RMSNorm on a single 8-GPU node.
 
 Compares four implementations of ``RMSNorm(AllReduce(x) + residual, weight)``:

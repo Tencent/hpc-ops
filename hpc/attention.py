@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Tencent.
+
 from enum import Enum
 from typing import Optional
 

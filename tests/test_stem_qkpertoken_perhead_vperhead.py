@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Tencent.
+
 """CI correctness tests for dim128 Stem with Q/K per-token and V per-head scales.
 
 Exercises `QuantType.QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD`:

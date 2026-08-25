@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Tencent.
+
 import os
 import sys
 from pathlib import Path

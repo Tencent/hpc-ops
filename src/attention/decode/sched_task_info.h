@@ -1,4 +1,4 @@
-// Copyright 2025 hpc-ops authors
+// Copyright (C) 2026 Tencent.
 
 #ifndef SRC_ATTENTION_DECODE_SCHED_TASK_INFO_H_
 #define SRC_ATTENTION_DECODE_SCHED_TASK_INFO_H_

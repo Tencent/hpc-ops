@@ -1,4 +1,4 @@
-// Copyright 2025 hpc-ops authors
+// Copyright (C) 2026 Tencent.
 
 #ifndef SRC_GEMM_GEMM_H_
 #define SRC_GEMM_GEMM_H_
