@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Tencent.
+
 import torch
 
 # Single-node NVLink multicast communicator, registered as a torch C++ class

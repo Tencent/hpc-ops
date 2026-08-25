@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Tencent.
+
 import torch
 from torch import Tensor
 from typing import Union, Tuple, Optional

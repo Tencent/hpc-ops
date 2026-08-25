@@ -1,4 +1,4 @@
-// Copyright 2025 hpc-ops authors
+// Copyright (C) 2026 Tencent.
 
 #ifndef SRC_COMMUNICATOR_MULTICAST_COMMUNICATOR_H_
 #define SRC_COMMUNICATOR_MULTICAST_COMMUNICATOR_H_

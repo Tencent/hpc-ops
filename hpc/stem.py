@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Tencent.
+
 """Stem sparse attention operators.
 
 This module provides CUDA-accelerated operators for the Stem sparse attention

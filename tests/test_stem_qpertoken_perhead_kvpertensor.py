@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Tencent.
+
 """CI correctness tests for dim128 Stem with Q per-token and KV per-tensor scales.
 
 Lightweight smoke tests covering:

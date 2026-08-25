@@ -1,4 +1,4 @@
-# Copyright (C) 2025 Tencent.
+# Copyright (C) 2026 Tencent.
 
 """Attention Decode BF16 benchmark for dynamic scheduling.
 
