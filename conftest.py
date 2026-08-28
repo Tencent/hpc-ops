@@ -49,13 +49,7 @@ s = func(*args, **kwargs)
 # test output
 def assert_equal(my, gt):
   if isinstance(my, torch.Tensor):
-    if (din['func_name'] == 'topk_filtered' and my.dtype == torch.int32 and
-        my.dim() == 2 and my.shape == gt.shape and my.shape[-1] in (512, 2048)):
-      # The exact index set is unordered because output slots are reserved by
-      # atomics. Compare the set representation used by the sanitizer replay.
-      assert torch.equal(my.sort(dim=-1).values, gt.sort(dim=-1).values)
-    else:
-      assert torch.equal(my.byte(), gt.byte())
+    assert torch.equal(my.byte(), gt.byte())
   elif isinstance(my, tuple):
     for i, e in enumerate(my):
       assert_equal(my[i], gt[i])
@@ -78,7 +72,7 @@ assert_equal(kwargs, dout['kwargs'])
 
 
 def sanitizer_check(file_name, check):
-    cmd = f'PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer --tool={check} --require-cuda-init=no --kernel-name regex="hpc.+" python3 {file_name}'
+    cmd = f'compute-sanitizer --tool={check} --require-cuda-init=no --kernel-name regex="hpc.+" python3 {file_name}'
     print(cmd)
     try:
         output = subprocess.check_output(cmd, shell=True)

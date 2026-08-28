@@ -8,18 +8,10 @@ sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/li
 import hpc
 import torch
 
-# The kernel collects top-k indices via atomicAdd, so the output order differs
-# between runs while the index set stays identical. conftest's sanitizer hook
-# re-runs every call, which would make this exhaustive module prohibitively
-# expensive. A focused split-and-spill sanitizer case lives in the companion
-# test_topk_filtered_sanitizer.py module.
-pytestmark = [
-    pytest.mark.skipif(bool(os.getenv("SANITIZER_CHECK")), reason="skip sanitizer"),
-    pytest.mark.skipif(
-        torch.cuda.get_device_capability() not in ((9, 0), (10, 3)),
-        reason="Top-K is implemented for sm90 and sm103",
-    ),
-]
+pytestmark = pytest.mark.skipif(
+    bool(os.getenv("SANITIZER_CHECK")),
+    reason="unordered Top-K output is not byte-stable under sanitizer replay",
+)
 
 TOP_K = 2048
 SPLIT_TEST_N = 270336
