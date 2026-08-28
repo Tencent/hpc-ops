@@ -72,7 +72,7 @@ assert_equal(kwargs, dout['kwargs'])
 
 
 def sanitizer_check(file_name, check):
-    cmd = f'compute-sanitizer --tool={check} --require-cuda-init=no --kernel-name regex="hpc.+" python3 {file_name}'
+    cmd = f'PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer --tool={check} --require-cuda-init=no --kernel-name regex="hpc.+" python3 {file_name}'
     print(cmd)
     try:
         output = subprocess.check_output(cmd, shell=True)
