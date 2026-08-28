@@ -10,7 +10,7 @@ CSRC_FILES=$(CC_FILES) $(CU_FILES) $(CUH_FILES) $(H_FILES)
 # Architectures the build supports. The same list is in CMakeLists.txt and
 # setup.py; adding one also needs an HPC_ARCH_EVAL_<arch> block in
 # src/utils/utils.h.
-KNOWN_ARCHS=90 100 103 120
+KNOWN_ARCHS=90 100 103
 ALL_ARCHS=$(shell echo $(KNOWN_ARCHS) | tr ' ' ,)
 
 # Target architectures. Each gets its own module; a build for several of them

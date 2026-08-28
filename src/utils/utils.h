@@ -59,12 +59,6 @@ int get_sm_arch();
 #define HPC_ARCH_EVAL_103(expr) HPC_ARCH_UNEVAL(expr)
 #endif
 
-#if HPC_TARGET_ARCH == 120
-#define HPC_ARCH_EVAL_120(expr) HPC_ARCH_EVAL_LIVE(120, expr)
-#else
-#define HPC_ARCH_EVAL_120(expr) HPC_ARCH_UNEVAL(expr)
-#endif
-
 #define HPC_ARCH_CAT(a, b) HPC_ARCH_CAT_(a, b)
 #define HPC_ARCH_CAT_(a, b) a##b
 

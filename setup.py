@@ -11,7 +11,7 @@ from setuptools.command.build_ext import build_ext
 # Architectures the build supports. The same list is in the Makefile and
 # CMakeLists.txt; adding one also needs an HPC_ARCH_EVAL_<arch> block in
 # src/utils/utils.h.
-KNOWN_ARCHS = [90, 100, 103, 120]
+KNOWN_ARCHS = [90, 100, 103]
 
 
 class CMakeExtension(Extension):
