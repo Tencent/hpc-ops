@@ -4,7 +4,7 @@ from torch import Tensor
 import torch
 
 
-def topk_filtered(
+def topk(
     logits: Tensor,
     ke: Tensor,
     output: Tensor,
@@ -31,10 +31,10 @@ def topk_filtered(
             where ``0 <= M_live <= M_cap``.
         top_k: Supported values are 512 and 2048.
         counters: Optional zero-filled CUDA uint8 persistent-state buffer sized
-            by ``topk_filtered_workspace_size(M_cap, N)[0]``. It is left
+            by ``topk_workspace_size(M_cap, N)[0]``. It is left
             zero-filled after every call and can be reused directly.
         workspace: Optional CUDA uint8 scratch buffer sized by
-            ``topk_filtered_workspace_size(M_cap, N)[1]``. Its incoming
+            ``topk_workspace_size(M_cap, N)[1]``. Its incoming
             contents are ignored. A minimum-sized buffer remains exact but
             disables the KV-split fast path.
 
@@ -46,21 +46,21 @@ def topk_filtered(
     )
 
 
-def topk_filtered_workspace_size(num_rows: int, max_kv_len: int) -> Tuple[int, int]:
+def topk_workspace_size(num_rows: int, max_kv_len: int) -> Tuple[int, int]:
     """Return recommended ``(counters_bytes, workspace_bytes)`` for a shape."""
     return torch.ops.hpc.topk_filtered_workspace_size(num_rows, max_kv_len)
 
 
-def topk_filtered_min_workspace_size(max_kv_len: int) -> int:
+def topk_min_workspace_size(max_kv_len: int) -> int:
     """Return minimum scratch bytes that preserve exact execution."""
     return torch.ops.hpc.topk_filtered_min_workspace_size(max_kv_len)
 
 
-def topk_filtered_peak_workspace_size(max_kv_len: int) -> int:
+def topk_peak_workspace_size(max_kv_len: int) -> int:
     """Return peak scratch bytes over every row capacity at a fixed width."""
     return torch.ops.hpc.topk_filtered_peak_workspace_size(max_kv_len)
 
 
 @torch.library.register_fake("hpc::topk_filtered")
-def topk_filtered_fake(logits, ke, output, top_k, num_valid_rows, counters, workspace):
+def _topk_fake(logits, ke, output, top_k, num_valid_rows, counters, workspace):
     return output

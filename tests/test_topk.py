@@ -25,7 +25,7 @@ def test_fake_tensor():
         ke = torch.full((4,), 8192, dtype=torch.int32, device="cuda")
         output = torch.empty((4, TOP_K), dtype=torch.int32, device="cuda")
         num_valid_rows = torch.full((1,), 4, dtype=torch.int32, device="cuda")
-        result = hpc.topk_filtered(logits, ke, output, num_valid_rows, TOP_K)
+        result = hpc.topk(logits, ke, output, num_valid_rows, TOP_K)
 
     assert result is output
 
@@ -106,7 +106,7 @@ def _validate(logits, indices, ke, top_k=TOP_K):
 def _alloc_scratch(logits, ke):
     # counters must be zeroed; workspace needs no initialization, so it is filled
     # with garbage here to keep proving that.
-    cnt_bytes, ws_bytes = hpc.topk_filtered_workspace_size(ke.numel(), logits.shape[1])
+    cnt_bytes, ws_bytes = hpc.topk_workspace_size(ke.numel(), logits.shape[1])
     cnt = torch.zeros(cnt_bytes, dtype=torch.uint8, device="cuda")
     ws = torch.full((ws_bytes,), 0xA5, dtype=torch.uint8, device="cuda")
     return cnt, ws
@@ -127,7 +127,7 @@ def _run(seq_lens, n=None, dirty_pad=False, extra_rows=0, top_k=TOP_K):
     # Kernel does not initialize the output buffer by design; pre-fill it so
     # compute-sanitizer initcheck does not flag reads of untouched slots.
     out = torch.full((m_valid, top_k), -1, dtype=torch.int32, device="cuda")
-    hpc.topk_filtered(logits, ke, out, num_valid, top_k)
+    hpc.topk(logits, ke, out, num_valid, top_k)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu(), top_k=top_k)
 
@@ -220,7 +220,7 @@ def test_num_valid_rows_partial():
     out = torch.full((m_valid, TOP_K), -1, dtype=torch.int32, device="cuda")
     nvr = 3
     num_valid = torch.tensor([nvr], dtype=torch.int32, device="cuda")
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K)
+    hpc.topk(logits, ke, out, num_valid, TOP_K)
     torch.cuda.synchronize()
     _validate(logits[:nvr], out[:nvr], ke.cpu()[:nvr])
     assert (out[nvr:] == -1).all(), "rows beyond num_valid_rows must be untouched"
@@ -232,15 +232,15 @@ def test_workspace_size_query():
     seq_lens = [40000, 65536]
     logits = torch.randn(len(seq_lens), n, dtype=torch.float32, device="cuda")
     ke = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
-    cnt_bytes, ws_bytes = hpc.topk_filtered_workspace_size(ke.numel(), logits.shape[1])
+    cnt_bytes, ws_bytes = hpc.topk_workspace_size(ke.numel(), logits.shape[1])
     assert cnt_bytes > 0 and cnt_bytes % 4 == 0
     assert ws_bytes > 0 and ws_bytes % 4 == 0
-    assert ws_bytes >= hpc.topk_filtered_min_workspace_size(logits.shape[1])
+    assert ws_bytes >= hpc.topk_min_workspace_size(logits.shape[1])
     cnt = torch.zeros(cnt_bytes, dtype=torch.uint8, device="cuda")
     ws = torch.empty(ws_bytes, dtype=torch.uint8, device="cuda")
     out = torch.full((len(seq_lens), TOP_K), -1, dtype=torch.int32, device="cuda")
     num_valid = torch.tensor([len(seq_lens)], dtype=torch.int32, device="cuda")
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, counters=cnt, workspace=ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, counters=cnt, workspace=ws)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -251,11 +251,11 @@ def test_peak_workspace_size_bounds_every_row_count():
     # including the interior maximum the KV-split path produces, which is why a
     # row-count ceiling is not a safe substitute.
     for n in (4096, 65536, 131072, 262144, 393216):
-        peak = hpc.topk_filtered_peak_workspace_size(n)
-        assert peak >= hpc.topk_filtered_min_workspace_size(n)
+        peak = hpc.topk_peak_workspace_size(n)
+        assert peak >= hpc.topk_min_workspace_size(n)
         worst_rows, worst = 0, 0
         for num_rows in range(1, 4096):
-            ws_bytes = hpc.topk_filtered_workspace_size(num_rows, n)[1]
+            ws_bytes = hpc.topk_workspace_size(num_rows, n)[1]
             assert ws_bytes <= peak, f"n={n} num_rows={num_rows} exceeds the peak"
             if ws_bytes > worst:
                 worst_rows, worst = num_rows, ws_bytes
@@ -273,19 +273,17 @@ def test_peak_workspace_size_serves_every_split_schedule():
     cases = [(m, splits) for m, splits in split_cases]
     cases.append((193, None))
 
-    peak = hpc.topk_filtered_peak_workspace_size(n)
+    peak = hpc.topk_peak_workspace_size(n)
     ws = torch.full((peak,), 0xA5, dtype=torch.uint8, device="cuda")
     max_m = max(m for m, _ in cases)
-    cnt = torch.zeros(
-        hpc.topk_filtered_workspace_size(max_m, n)[0], dtype=torch.uint8, device="cuda"
-    )
+    cnt = torch.zeros(hpc.topk_workspace_size(max_m, n)[0], dtype=torch.uint8, device="cuda")
     base = -torch.arange(n, dtype=torch.float32, device="cuda") / n
 
     for m, splits in cases:
-        required = hpc.topk_filtered_workspace_size(m, n)[1]
+        required = hpc.topk_workspace_size(m, n)[1]
         assert required <= peak
         if splits is None:
-            assert required == hpc.topk_filtered_min_workspace_size(n)
+            assert required == hpc.topk_min_workspace_size(n)
         else:
             assert required == _expected_split_workspace_bytes(m, n, splits)
 
@@ -294,7 +292,7 @@ def test_peak_workspace_size_serves_every_split_schedule():
         ke = torch.full((m,), n, dtype=torch.int32, device="cuda")
         out = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
         num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
-        hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+        hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
         torch.cuda.synchronize()
 
         _assert_known_upper_tail(out, n, m - 1)
@@ -304,9 +302,9 @@ def test_peak_workspace_size_serves_every_split_schedule():
 def test_bounded_row_local_workspace_does_not_grow_with_rows():
     n = 65536
     grid = _persistent_grid()
-    reference = hpc.topk_filtered_workspace_size(grid, n)[1]
+    reference = hpc.topk_workspace_size(grid, n)[1]
     for m in (grid + 1, max(grid + 2, 512), 1024, 4096):
-        assert hpc.topk_filtered_workspace_size(m, n)[1] == reference
+        assert hpc.topk_workspace_size(m, n)[1] == reference
 
 
 def test_zero_valid_rows():
@@ -318,15 +316,13 @@ def test_zero_valid_rows():
     out = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
     cnt, ws = _alloc_scratch(logits, ke)
 
-    hpc.topk_filtered(
-        logits, ke, out, torch.zeros(1, dtype=torch.int32, device="cuda"), TOP_K, cnt, ws
-    )
+    hpc.topk(logits, ke, out, torch.zeros(1, dtype=torch.int32, device="cuda"), TOP_K, cnt, ws)
     torch.cuda.synchronize()
     assert (out == -1).all(), "no row is valid, so output must be untouched"
 
     # The same buffers, with no memset in between, must still give exact results.
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -351,7 +347,7 @@ def test_counters_are_self_cleaning(m, n):
 
     for _ in range(3):
         out = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
-        hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+        hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
         torch.cuda.synchronize()
         # Every counter, including the per-row arrive counters, comes back zeroed.
         assert not cnt.any(), "counters must come back zeroed"
@@ -374,7 +370,7 @@ def test_row_local_static_first_wave_repeated(m, n, nvr):
     cnt, ws = _alloc_scratch(logits, ke)
 
     for _ in range(3):
-        hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+        hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
         torch.cuda.synchronize()
         assert not cnt.any(), "static-first-wave launch left queue state dirty"
         _validate(logits[:nvr], out[:nvr], ke.cpu()[:nvr])
@@ -395,11 +391,11 @@ def test_persistent_queue_hardware_boundary_cuda_graph():
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, ws = _alloc_scratch(logits, ke)
 
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+        hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
 
     for nvr in (0, 1, grid - 1, grid, grid + 1):
         out.fill_(-1)
@@ -424,7 +420,7 @@ def test_padded_output_stride():
     num_valid = torch.tensor([m_valid], dtype=torch.int32, device="cuda")
     # Same as _run: initialize the padded output buffer to avoid initcheck reports.
     out = torch.full((m_valid, TOP_K + 64), -1, dtype=torch.int32, device="cuda")
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K)
+    hpc.topk(logits, ke, out, num_valid, TOP_K)
     torch.cuda.synchronize()
     _validate(logits, out[:, :TOP_K], ke.cpu())
 
@@ -452,7 +448,7 @@ def test_sampled_exact_adversarial_fallback():
     ke = torch.tensor([n], dtype=torch.int32, device="cuda")
     out = torch.full((1, TOP_K), -1, dtype=torch.int32, device="cuda")
     num_valid = torch.tensor([1], dtype=torch.int32, device="cuda")
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K)
+    hpc.topk(logits, ke, out, num_valid, TOP_K)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -464,7 +460,7 @@ def test_exact_auto_dispatch(m):
     ke = torch.full((m,), n, dtype=torch.int32, device="cuda")
     out = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K)
+    hpc.topk(logits, ke, out, num_valid, TOP_K)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -477,11 +473,11 @@ def test_exact_auto_cuda_graph_replay():
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, workspace = _alloc_scratch(logits, ke)
 
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, workspace)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, workspace)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, workspace)
+        hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, workspace)
     for _ in range(3):
         graph.replay()
     torch.cuda.synchronize()
@@ -531,7 +527,7 @@ def test_short_exact_dispatch_boundaries(m, n):
     ke = torch.full((m,), n, dtype=torch.int32, device="cuda")
     out = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K)
+    hpc.topk(logits, ke, out, num_valid, TOP_K)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -546,7 +542,7 @@ def test_short_exact_special_values_and_ties():
     ke = torch.tensor([n - i * 137 for i in range(m)], dtype=torch.int32, device="cuda")
     out = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K)
+    hpc.topk(logits, ke, out, num_valid, TOP_K)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -569,7 +565,7 @@ def test_row_local_candidate_resolver_boundaries(candidate_count):
     out = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
 
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K)
+    hpc.topk(logits, ke, out, num_valid, TOP_K)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -597,11 +593,11 @@ def test_short_exact_cuda_graph_replay(m, n):
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, workspace = _alloc_scratch(logits, ke)
 
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, workspace)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, workspace)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, workspace)
+        hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, workspace)
     for _ in range(3):
         graph.replay()
     torch.cuda.synchronize()
@@ -619,11 +615,11 @@ def test_short_exact_cuda_graph_mutable_valid_rows(n):
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, workspace = _alloc_scratch(logits, ke)
 
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, workspace)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, workspace)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, workspace)
+        hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, workspace)
 
     boundaries = (1, 2 * _sm_count(), 2 * _sm_count() + 1, grid - 1, grid, grid + 1, 0)
     for nvr in dict.fromkeys(v for v in boundaries if 0 <= v <= m):
@@ -647,11 +643,11 @@ def test_row_local_cuda_graph_mutable_lengths():
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, workspace = _alloc_scratch(logits, ke)
 
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, workspace)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, workspace)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, workspace)
+        hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, workspace)
 
     patterns = (
         (TOP_K, 8192, 16384, 16385, n),
@@ -693,7 +689,7 @@ def test_kv_split_uniform_rows(m, n):
     out = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, ws = _alloc_scratch(logits, ke)
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -710,7 +706,7 @@ def test_kv_split_row_owned_spill_across_grid_boundary():
     if m > 192:
         pytest.skip("KV-split task grid cannot exceed the persistent pool on this GPU")
     n = SPLIT_TEST_N
-    _, recommended = hpc.topk_filtered_workspace_size(m, n)
+    _, recommended = hpc.topk_workspace_size(m, n)
     assert recommended == _expected_split_workspace_bytes(m, n, 2)
     assert 2 * m > grid
 
@@ -723,7 +719,7 @@ def test_kv_split_row_owned_spill_across_grid_boundary():
     cnt, ws = _alloc_scratch(logits, ke)
 
     for _ in range(5):
-        hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+        hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
 
     expected = torch.arange(TOP_K, dtype=torch.int32, device="cuda").expand(m - 1, -1)
@@ -749,7 +745,7 @@ def test_kv_split_ragged_rows():
     out = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, ws = _alloc_scratch(logits, ke)
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -767,7 +763,7 @@ def test_kv_split_dirty_padding_excluded():
     out = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, ws = _alloc_scratch(logits, ke)
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -786,7 +782,7 @@ def test_kv_split_forces_fallback():
     out = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, ws = _alloc_scratch(logits, ke)
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -803,14 +799,14 @@ def test_kv_split_matches_single_cta():
 
     out_split = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
     cnt, ws_split = _alloc_scratch(logits, ke)
-    hpc.topk_filtered(logits, ke, out_split, num_valid, TOP_K, cnt, ws_split)
+    hpc.topk(logits, ke, out_split, num_valid, TOP_K, cnt, ws_split)
 
     out_single = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
     ws_single = torch.empty(
-        hpc.topk_filtered_min_workspace_size(logits.shape[1]), dtype=torch.uint8, device="cuda"
+        hpc.topk_min_workspace_size(logits.shape[1]), dtype=torch.uint8, device="cuda"
     )
     assert ws_single.numel() < ws_split.numel(), "split workspace should be the larger one"
-    hpc.topk_filtered(logits, ke, out_single, num_valid, TOP_K, cnt, ws_single)
+    hpc.topk(logits, ke, out_single, num_valid, TOP_K, cnt, ws_single)
     torch.cuda.synchronize()
 
     for r in range(m):
@@ -825,7 +821,7 @@ def test_kv_split_num_valid_rows_partial():
     out = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
     num_valid = torch.tensor([nvr], dtype=torch.int32, device="cuda")
     cnt, ws = _alloc_scratch(logits, ke)
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     _validate(logits[:nvr], out[:nvr], ke.cpu()[:nvr])
     assert (out[nvr:] == -1).all(), "rows beyond num_valid_rows must be untouched"
@@ -842,11 +838,11 @@ def test_kv_split_cuda_graph_replay():
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, ws = _alloc_scratch(logits, ke)
 
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+        hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     for nvr in (0, 1, m - 1, m):
         out.fill_(-1)
         num_valid.fill_(nvr)
@@ -868,8 +864,8 @@ def test_kv_split_cuda_graph_replay():
     ],
 )
 def test_kv_split_dispatch_workspace_boundaries(m, n, uses_split):
-    _, recommended = hpc.topk_filtered_workspace_size(m, n)
-    minimum = hpc.topk_filtered_min_workspace_size(n)
+    _, recommended = hpc.topk_workspace_size(m, n)
+    minimum = hpc.topk_min_workspace_size(n)
     assert (recommended > minimum) == uses_split
 
 
@@ -902,7 +898,7 @@ def test_cluster_uniform_rows(m, n):
     out = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, ws = _alloc_scratch(logits, ke)
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -921,7 +917,7 @@ def test_cluster_local_candidate_overflow_fallback():
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, ws = _alloc_scratch(logits, ke)
 
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -939,7 +935,7 @@ def test_cluster8_exact_candidate_overflow():
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, ws = _alloc_scratch(logits, ke)
 
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -958,7 +954,7 @@ def test_cluster8_unaligned_candidate_overflow(padding):
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, ws = _alloc_scratch(logits, ke)
 
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -972,7 +968,7 @@ def test_cluster_num_valid_rows_partial():
     num_valid = torch.tensor([nvr], dtype=torch.int32, device="cuda")
     cnt, ws = _alloc_scratch(logits, ke)
 
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     _validate(logits[:nvr], out[:nvr], ke.cpu()[:nvr])
     assert (out[nvr:] == -1).all(), "rows beyond num_valid_rows must be untouched"
@@ -991,7 +987,7 @@ def test_cluster_dispatch_boundary_repeated_launches(m):
     cnt, ws = _alloc_scratch(logits, ke)
 
     for _ in range(3):
-        hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+        hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     _validate(logits, out, ke.cpu())
 
@@ -1005,11 +1001,11 @@ def test_cluster_cuda_graph_replay(m, n):
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
     cnt, ws = _alloc_scratch(logits, ke)
 
-    hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        hpc.topk_filtered(logits, ke, out, num_valid, TOP_K, cnt, ws)
+        hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
     for _ in range(3):
         graph.replay()
     torch.cuda.synchronize()
