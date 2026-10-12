@@ -9,6 +9,26 @@ import torch
 
 _pkg_dir = Path(__file__).parent
 
+# Architectures that have no C++ operator module. They get only the operators
+# written in Python, the CuTe DSL fused MoE that compiles itself on first use,
+# so `import hpc` must not ask for a `_C_sm<arch>` module there.
+_PYTHON_ONLY_ARCHS = (120,)
+
+# The CuTe DSL fused MoE and what callers need around it: weight preparation,
+# an availability check and startup compilation. All that `import hpc` offers on
+# those architectures, and also offered everywhere else. Resolved on first
+# access, so hpc.cute stays off the import path until then.
+_CUTE_EXPORTS = (
+    "fuse_moe_blockwise_fp8_dsl",
+    "fuse_moe_blockwise_w4a8_mxfp4_mxfp8_dsl",
+    "prepare_fp8_mx_mma_weights",
+    "pack_mxfp_weight_scale_sm120",
+    "dsl_available",
+    "BlockwiseShape",
+    "blockwise_warmup_units",
+    "fp8_blockwise_warmup_units",
+)
+
 
 def _nvml_arch():
     """SM architecture of the first device torch would see, or None if NVML cannot say.
@@ -61,7 +81,8 @@ def _load_module() -> int:
     A package carries one `_C_sm<arch>.abi3.so` per architecture it was built
     for. The match is exact: architecture-specific cubins are not forward
     compatible, so another module cannot stand in. HPC_SM_ARCH overrides the
-    detection, for a build machine with no matching GPU.
+    detection, for a build machine with no matching GPU. Architectures in
+    _PYTHON_ONLY_ARCHS load nothing.
     """
     override = os.getenv("HPC_SM_ARCH", "").strip()
     if override:
@@ -79,6 +100,9 @@ def _load_module() -> int:
             )
         major, minor = torch.cuda.get_device_capability()
         arch = major * 10 + minor
+
+    if arch in _PYTHON_ONLY_ARCHS:
+        return arch
 
     modules = _pkg_dir.glob("_C_sm*.abi3.so")
     built = sorted(int(p.name.removeprefix("_C_sm").removesuffix(".abi3.so")) for p in modules)
@@ -128,10 +152,34 @@ def _export_functions(modules: Dict[str, ModuleType]):
 
 __all__ = []
 
-_export_functions(_discover_modules())
+if __loaded_arch__ in _PYTHON_ONLY_ARCHS:
+    # The top-level modules register fake kernels for C++ operators that were
+    # never loaded, so none of them can be imported here.
+    from .version import version as __version__
 
-__version__ = torch.ops.hpc.version()
-__built_json__ = torch.ops.hpc.built_json()
+    __built_json__ = None
+
+else:
+    _export_functions(_discover_modules())
+
+    __version__ = torch.ops.hpc.version()
+    __built_json__ = torch.ops.hpc.built_json()
+
+__all__.extend(name for name in _CUTE_EXPORTS if name not in __all__)
+
+
+def __getattr__(name):
+    if name in _CUTE_EXPORTS:
+        from .cute import fuse_moe as _cute_fuse_moe
+
+        return getattr(_cute_fuse_moe, name)
+    if __loaded_arch__ in _PYTHON_ONLY_ARCHS:
+        raise AttributeError(
+            f"module 'hpc' has no attribute {name!r}; on sm{__loaded_arch__} hpc only "
+            f"provides {', '.join(_CUTE_EXPORTS)}"
+        )
+    raise AttributeError(f"module 'hpc' has no attribute {name!r}")
+
 
 __doc__ = """
 High Performance Computing Operators Library
