@@ -15,6 +15,80 @@ namespace hpc {
 namespace iHC {
 namespace kernels {
 
+// The projection/sqrsum accumulation for one block's rows.
+//
+// kActiveRows is a compile-time trip count, which is the point of factoring
+// this out. Written inline with a runtime bound -- `for (r = 0; r <
+// num_valid_rows; ++r)` -- the compiler cannot unroll the row loop or hoist the
+// next iteration's weight loads above the current one's FFMAs, so the whole W
+// tile (vec_t<float, 8> reg_w[2 * hc], 64 registers) stays live across it and
+// every load sits on the critical path. Measured on an H20 at n=2048 /
+// hidden 6144 / rows=4, that cost 77% of all stall cycles on long-scoreboard
+// (8.32 of 10.76) while L1/L2/DRAM/SM throughput all sat between 22 and 53
+// percent and the FFMA count already matched the operator's arithmetic exactly
+// -- the kernel was purely waiting on loads.
+//
+// With the trip count fixed the compiler software-pipelines the K loop: the
+// stall drops to 3.26 cycles, registers at the same configuration fall from 128
+// to 118, and the kernel runs 1.13x faster at that shape. Callers get more by
+// also raising kRowsPerBlock, which is the only lever on weight traffic (a
+// block reads all of W once however many rows it owns).
+//
+// The caller passes kRowsPerBlock for a full tile and 1 for the partial tile at
+// the end of the grid, so the tail stays exact without instantiating every
+// possible row count.
+template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kRowsPerBlock,
+          int kThreadsPerBlock, int kProjRows, int kActiveRows>
+__device__ __forceinline__ void ihc_pre_accumulate(const __nv_bfloat16* x_ptr, const float* w_ptr,
+                                                   int row_base,
+                                                   float (&acc_dot)[kRowsPerBlock][kProjRows],
+                                                   float (&acc_sqsum)[kRowsPerBlock],
+                                                   int row_offset) {
+  constexpr int kHCDim = kHCMult * kHiddenDim;
+  constexpr int kSpan = kThreadsPerBlock * kElementsPerThread;
+  constexpr int kSteps = kHCDim / kSpan;
+  constexpr int kHalf = kElementsPerThread / 2;
+
+  static_assert(kHCDim % kSpan == 0, "the block's span must divide hc_mult * hidden_dim");
+
+  // One flat pass over hc_mult * hidden_dim. The original nested the head and
+  // chunk loops, but `i * kHiddenDim + icol` is contiguous across them anyway.
+  for (int step = 0; step < kSteps; ++step) {
+    const int iflat = step * kSpan + threadIdx.x * kElementsPerThread;
+
+    vec_t<float, kElementsPerThread> reg_w[kProjRows];
+#pragma unroll
+    for (int c = 0; c < kProjRows; ++c) {
+      const float* w_row_ptr = w_ptr + static_cast<int64_t>(c) * kHCDim + iflat;
+      *reinterpret_cast<vec_t<float, kHalf>*>(&reg_w[c][0]) = load<float, kHalf>(w_row_ptr);
+      *reinterpret_cast<vec_t<float, kHalf>*>(&reg_w[c][kHalf]) =
+          load<float, kHalf>(w_row_ptr + kHalf);
+    }
+
+#pragma unroll
+    for (int rr = 0; rr < kActiveRows; ++rr) {
+      const int r = row_offset + rr;
+      auto reg_x = to<float>(load<__nv_bfloat16, kElementsPerThread>(
+          x_ptr + static_cast<int64_t>(row_base + r) * kHCDim + iflat));
+      const auto* x2 = reinterpret_cast<const float2*>(&reg_x[0]);
+#pragma unroll
+      for (int j = 0; j < kElementsPerThread / 2; ++j) {
+        acc_sqsum[r] += x2[j].x * x2[j].x;
+        acc_sqsum[r] += x2[j].y * x2[j].y;
+      }
+#pragma unroll
+      for (int c = 0; c < kProjRows; ++c) {
+        const auto* w2 = reinterpret_cast<const float2*>(&reg_w[c][0]);
+#pragma unroll
+        for (int j = 0; j < kElementsPerThread / 2; ++j) {
+          acc_dot[r][c] += x2[j].x * w2[j].x;
+          acc_dot[r][c] += x2[j].y * w2[j].y;
+        }
+      }
+    }
+  }
+}
+
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kRowsPerBlock,
           int kThreadsPerBlock, bool kHasPost, bool kUsePDL = false, bool kFuseRmsNorm = false,
           bool kCastBfloatForNorm = false>
@@ -61,41 +135,16 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     }
   }
 
-#pragma unroll
-  for (int i = 0; i < kHCMult; ++i) {
-#pragma unroll
-    for (int ch = 0; ch < kChunks; ++ch) {
-      const int icol = (ch * kThreadsPerBlock + threadIdx.x) * kElementsPerThread;
-      const int iflat = i * kHiddenDim + icol;
-      constexpr int kHalf = kElementsPerThread / 2;
-      vec_t<float, kElementsPerThread> reg_w[kProjRows];
-#pragma unroll
-      for (int c = 0; c < kProjRows; ++c) {
-        const float* w_row_ptr = w_ptr + c * kHCDim + iflat;
-        *reinterpret_cast<vec_t<float, kHalf>*>(&reg_w[c][0]) = load<float, kHalf>(w_row_ptr);
-        *reinterpret_cast<vec_t<float, kHalf>*>(&reg_w[c][kHalf]) =
-            load<float, kHalf>(w_row_ptr + kHalf);
-      }
-
-      for (int r = 0; r < num_valid_rows; ++r) {
-        auto reg_x = to<float>(
-            load<__nv_bfloat16, kElementsPerThread>(x_ptr + (row_base + r) * kHCDim + iflat));
-        const auto* x2 = reinterpret_cast<const float2*>(&reg_x[0]);
-#pragma unroll
-        for (int j = 0; j < kElementsPerThread / 2; ++j) {
-          acc_sqsum[r] += x2[j].x * x2[j].x;
-          acc_sqsum[r] += x2[j].y * x2[j].y;
-        }
-#pragma unroll
-        for (int c = 0; c < kProjRows; ++c) {
-          const auto* w2 = reinterpret_cast<const float2*>(&reg_w[c][0]);
-#pragma unroll
-          for (int j = 0; j < kElementsPerThread / 2; ++j) {
-            acc_dot[r][c] += x2[j].x * w2[j].x;
-            acc_dot[r][c] += x2[j].y * w2[j].y;
-          }
-        }
-      }
+  // Full tiles take the specialized trip count; only the last block of the grid
+  // falls back to one row at a time. See ihc_pre_accumulate() for why the
+  // compile-time bound matters.
+  if (num_valid_rows == kRowsPerBlock) {
+    ihc_pre_accumulate<kHCMult, kHiddenDim, kElementsPerThread, kRowsPerBlock, kThreadsPerBlock,
+                       kProjRows, kRowsPerBlock>(x_ptr, w_ptr, row_base, acc_dot, acc_sqsum, 0);
+  } else {
+    for (int r = 0; r < num_valid_rows; ++r) {
+      ihc_pre_accumulate<kHCMult, kHiddenDim, kElementsPerThread, kRowsPerBlock, kThreadsPerBlock,
+                         kProjRows, 1>(x_ptr, w_ptr, row_base, acc_dot, acc_sqsum, r);
     }
   }
 
@@ -711,22 +760,140 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 namespace {
 
 constexpr int kElementsPerThread = 8;
-constexpr int kPreRowsPerBlock = 1;
 constexpr int kPostThreadsPerBlock = 128;
 
-template <int kHiddenDim, bool kHasPost, bool kFuseRmsNorm, bool kCastBfloatForNorm>
-void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
-                     const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
-                     const float* hc_base_ptr, int num_batch, float norm_eps, float hc_eps,
-                     float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
-                     cudaStream_t stream, bool use_pdl) {
-  constexpr int kThreads = 256;
-  const int num_block = (num_batch + kPreRowsPerBlock - 1) / kPreRowsPerBlock;
+// Rows per block for the pre/head kernel, by token count. The kernel loads x
+// once per K-chunk and reuses it across all 2*hc projection rows, so giving a
+// block several rows amortizes the weight traffic -- but the accumulators
+// (acc_dot[kRowsPerBlock][kProjRows] plus acc_sqsum) are per-thread registers,
+// so the win reverses once they spill.
+//
+// Measured on H20, hidden 6144, bf16, CUDA Graph (us per call):
+//
+//     tokens   rows=1   rows=2   rows=4   rows=8   rows=16
+//         64    13.49    13.34    22.30    47.01    105.01
+//        128    17.61    13.57    23.54    46.10    106.56
+//        256    33.84    20.71    23.45    45.67    107.06
+//        320    47.88    31.67    29.12    45.76    107.29
+//       1024   114.43    81.88    69.50   131.05    163.71
+//      16384  1640.36  1077.84   950.21  2217.04   1684.79
+//
+// Those figures predate the compile-time row loop in ihc_pre_accumulate(), and
+// the spill they describe has moved: rows=8 is now 218 registers at 256 threads
+// rather than spilling, and is competitive. They are kept because they are the
+// only measurements covering architectures other than sm90, which is also why
+// this table is the conservative default -- see pre_config() below for the
+// re-measured sm90 one.
+//
+// Small counts stay on rows=1 only because sm90 routes them to the K-split
+// path instead; see src/iHC/sm90/.
+constexpr int pre_rows_per_block(int num_batch) {
+  if (num_batch < 64) {
+    return 1;
+  }
+  if (num_batch < 320) {
+    return 2;
+  }
+  return 4;
+}
+
+// Rows and block size together, re-measured on the pipelined kernel.
+//
+// The row count interacts with the block size -- 192 threads wins at several
+// token counts and is not reachable by tuning rows alone -- so the two are
+// chosen as a pair. Both tables below are H20 measurements and apply to sm90
+// only; other architectures keep pre_rows_per_block() at 256 threads, since
+// transcribing a tuning table measured on different hardware is exactly the
+// mistake that produced the stale numbers above.
+//
+// Only a block size whose span (threads * kElementsPerThread) divides
+// hc_mult * hidden_dim is legal. At hidden 6144 that admits 128/192/256/384/512
+// threads; at hidden 4096 only 128/256/512, which is why the two tables differ
+// rather than one being derived from the other.
+//
+// Measured on H20 under CUDA Graph, best of repeated rounds, against the best
+// of rows=1/2/4 at 256 threads (us per call):
+//
+//   hidden 6144            hidden 4096
+//   tokens  base   this    tokens  base   this
+//      256  20.7   18.2      256  16.1   13.3   (rows 2, 256 thr)
+//      512  30.9   26.1      512  20.6   17.8
+//     1024  69.7   56.4     1024  40.2   35.7
+//     2048 140.3  112.0     2048  94.3   69.9
+//     8192 490.4  409.4     8192 328.3  245.0
+//    32768 1886.4 1657.1   32768 1243.1 1008.3
+struct PreConfig {
+  int rows;
+  int threads;
+};
+
+constexpr PreConfig pre_config(int num_batch, int hidden_dim) {
+  if (hidden_dim == 6144) {
+    // Under 192 tokens the grid is too small for a wide block to pay: at 128
+    // tokens rows=4/384 threads measured 17.59us against 13.84us for
+    // rows=2/256, which also matches what the shared table already picked
+    // there. From 192 up the wide block wins (17.87 vs 19.85 at 192, 18.24 vs
+    // 19.90 at 256).
+    if (num_batch < 192) {
+      return {2, 256};
+    }
+    if (num_batch < 320) {
+      return {4, 384};
+    }
+    if (num_batch < 512) {
+      return {6, 256};
+    }
+    if (num_batch < 768) {
+      return {4, 256};
+    }
+    // A notch around 1024 tokens from wave quantization against 78 SMs:
+    // rows=6 gives 171 blocks (2.2 waves, the last barely occupied) where
+    // rows=8 gives 128. Measured at n=1024, rows=6 85.3us against rows=8
+    // 56.4us; the neighbours do not share it (768: 38.6 vs 50.7, 1280: 75.1
+    // vs 93.7), so the exception is bounded instead of moving the threshold.
+    if (num_batch >= 896 && num_batch < 1152) {
+      return {8, 192};
+    }
+    if (num_batch < 12288) {
+      return {6, 192};
+    }
+    return {8, 128};
+  }
+  // hidden 4096.
+  if (num_batch < 384) {
+    return {2, 256};
+  }
+  if (num_batch < 768) {
+    return {4, 256};
+  }
+  // The same notch as above: rows=6 measured 43.5us at n=1024 against 35.7us
+  // for rows=8, while 768 and 1280 both prefer rows=6 (24.5 vs 31.4, 40.3 vs
+  // 44.8).
+  if (num_batch >= 896 && num_batch < 1152) {
+    return {8, 128};
+  }
+  if (num_batch < 12288) {
+    return {6, 128};
+  }
+  // Past ~12k tokens the narrow blocks lose to 256 threads: at 16384, rows=4
+  // at 256 threads measured 496us against 524us (rows=6/128) and 520us
+  // (rows=8/128).
+  return {4, 256};
+}
+
+template <int kHiddenDim, int kRowsPerBlock, bool kHasPost, bool kFuseRmsNorm,
+          bool kCastBfloatForNorm, int kThreads = 256>
+void launch_pre_head_rows(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
+                          const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
+                          const float* hc_base_ptr, int num_batch, float norm_eps, float hc_eps,
+                          float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
+                          cudaStream_t stream, bool use_pdl) {
+  const int num_block = (num_batch + kRowsPerBlock - 1) / kRowsPerBlock;
   auto launch = [&](auto pdl_tag) {
     constexpr bool kUsePDL = decltype(pdl_tag)::value;
     auto kernel = kernels::fuse_ihc_pre_or_head_kernel<4, kHiddenDim, kElementsPerThread,
-                                                       kPreRowsPerBlock, kThreads, kHasPost,
-                                                       kUsePDL, kFuseRmsNorm, kCastBfloatForNorm>;
+                                                       kRowsPerBlock, kThreads, kHasPost, kUsePDL,
+                                                       kFuseRmsNorm, kCastBfloatForNorm>;
     cudaLaunchConfig_t config{};
     config.gridDim = dim3(num_block);
     config.blockDim = dim3(kThreads);
@@ -748,6 +915,88 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
   } else {
     launch(std::false_type{});
   }
+}
+
+// Picks the launch shape and forwards.
+//
+// On sm90 the (rows, threads) pair comes from pre_config(), which was measured
+// on the pipelined kernel; elsewhere only the row count varies and the block
+// stays at 256 threads, per pre_rows_per_block(). Both paths run the same
+// kernel -- the arch split is over tuning constants, not code.
+template <int kHiddenDim, bool kHasPost, bool kFuseRmsNorm, bool kCastBfloatForNorm>
+void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
+                     const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
+                     const float* hc_base_ptr, int num_batch, float norm_eps, float hc_eps,
+                     float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
+                     cudaStream_t stream, bool use_pdl) {
+#define HPC_IHC_LAUNCH_PRE(rows, threads)                                                      \
+  launch_pre_head_rows<kHiddenDim, rows, kHasPost, kFuseRmsNorm, kCastBfloatForNorm, threads>( \
+      output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,     \
+      norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl)
+
+#if HPC_TARGET_ARCH == 90
+  const PreConfig cfg = pre_config(num_batch, kHiddenDim);
+  // Only the pairs pre_config() can return are instantiated. A block size is
+  // legal only if threads * kElementsPerThread divides hc_mult * hidden_dim,
+  // which is why the two hidden sizes list different pairs.
+  if constexpr (kHiddenDim == 6144) {
+    if (cfg.rows == 4 && cfg.threads == 384) {
+      HPC_IHC_LAUNCH_PRE(4, 384);
+      return;
+    }
+    if (cfg.rows == 6 && cfg.threads == 256) {
+      HPC_IHC_LAUNCH_PRE(6, 256);
+      return;
+    }
+    if (cfg.rows == 4 && cfg.threads == 256) {
+      HPC_IHC_LAUNCH_PRE(4, 256);
+      return;
+    }
+    if (cfg.rows == 8 && cfg.threads == 192) {
+      HPC_IHC_LAUNCH_PRE(8, 192);
+      return;
+    }
+    if (cfg.rows == 6 && cfg.threads == 192) {
+      HPC_IHC_LAUNCH_PRE(6, 192);
+      return;
+    }
+    if (cfg.rows == 8 && cfg.threads == 128) {
+      HPC_IHC_LAUNCH_PRE(8, 128);
+      return;
+    }
+  } else if constexpr (kHiddenDim == 4096) {
+    if (cfg.rows == 2 && cfg.threads == 256) {
+      HPC_IHC_LAUNCH_PRE(2, 256);
+      return;
+    }
+    if (cfg.rows == 4 && cfg.threads == 256) {
+      HPC_IHC_LAUNCH_PRE(4, 256);
+      return;
+    }
+    if (cfg.rows == 8 && cfg.threads == 128) {
+      HPC_IHC_LAUNCH_PRE(8, 128);
+      return;
+    }
+    if (cfg.rows == 6 && cfg.threads == 128) {
+      HPC_IHC_LAUNCH_PRE(6, 128);
+      return;
+    }
+  }
+  // Any shape pre_config() does not cover falls through to the table below.
+#endif
+
+  switch (pre_rows_per_block(num_batch)) {
+    case 1:
+      HPC_IHC_LAUNCH_PRE(1, 256);
+      break;
+    case 2:
+      HPC_IHC_LAUNCH_PRE(2, 256);
+      break;
+    default:
+      HPC_IHC_LAUNCH_PRE(4, 256);
+      break;
+  }
+#undef HPC_IHC_LAUNCH_PRE
 }
 
 template <int kHiddenDim, bool kFuseRmsNorm, bool kCastBfloatForNorm>

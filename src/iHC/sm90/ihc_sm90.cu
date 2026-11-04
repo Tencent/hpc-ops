@@ -50,10 +50,35 @@ constexpr int kElementsPerThread = 8;
 //        255            32.8       32.77
 //        256            33.6       33.60   (parity; declined from here)
 //
-// The two converge around 128-256 because by then the row grid fills the device
-// too. 256 is where the shared kernel is reliably no worse, and it coincides
-// with the Triton implementation's own _DECODE_N_THRESHOLD.
-constexpr int kDecodeTokenThreshold = 256;
+// Hands over to the shared kernel's rows=2 instantiation (see
+// pre_rows_per_block() in iHC.cu, measured alongside this). End-to-end at
+// hidden 6144 under CUDA Graph, us per call:
+//
+//     tokens   k-split   rows=2
+//         32      6.77    ~12.9
+//         64     10.52     13.04
+//         96     13.77     13.25
+//        128     18.55     13.36
+//
+// They cross between 64 and 96, so this path keeps everything below 96. Under
+// 64 the row grid cannot fill the device at any row count.
+//
+// Re-measured after the row-per-block kernel gained a compile-time row loop
+// (see ihc_pre_accumulate() in src/iHC/iHC.cu) and a (rows, threads) tuning
+// table. That made the row path faster everywhere, but the crossover barely
+// moved: at 96 and 128 tokens it is still behind, because 128 tokens is only
+// 16-32 blocks against 78 SMs however the rows are chosen. End-to-end under
+// CUDA Graph at hidden 6144 (us per call):
+//
+//     tokens   k-split   row path (retuned)
+//         96     13.28                17.65
+//        128     13.21                17.77
+//        256     20.51                18.42
+//        512     30.68                26.35
+//
+// So the threshold stays where measurement puts it rather than being lowered to
+// hand the new path more shapes.
+constexpr int kDecodeTokenThreshold = 96;
 
 // BLOCK_K by token count: tiny batches need K cut finely to expose enough
 // blocks, larger ones prefer fewer and wider chunks because the per-block
