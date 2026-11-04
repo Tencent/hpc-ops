@@ -1,30 +1,26 @@
 // Copyright 2026 Tencent
 
-// sm90 decode-shaped iHC pre: a K-split translation of the FlagGems-vllm Triton
-// kernels (flaggems_vllm/ops/ihc/ihc_pre.py).
+// Split-K fuse_ihc_pre, for batches with too few tokens to fill the device.
+// Ported from the FlagGems-vllm Triton kernels (flaggems_vllm/ops/ihc/ihc_pre.py).
 //
-// Why a second path exists on sm90. The shared fuse_ihc_pre_or_head_kernel uses
-// kPreRowsPerBlock = 1, so its grid is exactly num_batch. On an H20 (78 SMs)
-// that leaves 77 SMs idle at one token, and its latency is flat at ~12-13us from
-// 1 to 64 tokens -- measured 0.36x of the Triton baseline at a single token.
-// Splitting K instead of rows exposes num_batch * num_splits blocks, which fills
-// the machine at decode sizes; above the crossover the row-per-block kernel wins
-// again and this path is not used.
+// The shared fuse_ihc_pre_or_head_kernel gives each block one row, so its grid
+// is num_batch: on H20 one token leaves 77 of 78 SMs idle, flat at ~12-13us to
+// 64 tokens. Splitting K exposes num_batch * num_splits blocks instead.
 //
-// Two kernels, like the Triton original:
-//   stage1  one block per (token, K-chunk): fp32 sqrsum + the 2*hc projection
-//           rows for its chunk, written to its own partial slot (no atomics).
-//   stage2  reduces the slots for one token, forms the gates, and emits the
-//           pre-gated channel sum. Folding the slot reduction in here keeps the
-//           op at two launches; a separate reduction kernel would add a third,
-//           which is ~4.5us and a large fraction of the total at these sizes.
+// The token count is the whole criterion -- decode is the common source of such
+// a batch but neither necessary nor sufficient, so nothing here tests the phase.
 //
-// fp32 accumulation throughout, no tensor cores: K is hc_mult * hidden_dim
-// (24576 at hidden 6144), and a bf16/tf32 dot would blow the 2e-5 tolerance the
-// post gates are held to.
+// At the operator root because it runs on every KNOWN_ARCHS: fp32 FFMA, warp
+// shuffles and PDL, no wgmma/TMA/cluster. Only ihc_splitk.cu's tables are arch-specific.
+//
+// stage1 one block per (token, K-chunk) -> its own partial slot, no atomics.
+// stage2 reduces the slots, forms the gates, emits the pre-gated channel sum.
+//
+// fp32 throughout, no tensor cores: K is 24576 at hidden 6144, and a bf16/tf32
+// dot would blow the 2e-5 tolerance the post gates are held to.
 
-#ifndef SRC_IHC_SM90_IHC_DECODE_CUH_
-#define SRC_IHC_SM90_IHC_DECODE_CUH_
+#ifndef SRC_IHC_IHC_SPLITK_CUH_
+#define SRC_IHC_IHC_SPLITK_CUH_
 
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
@@ -33,7 +29,7 @@
 
 namespace hpc {
 namespace iHC {
-namespace sm90 {
+namespace splitk {
 
 // Partial slot layout per (token, split): [sqrsum, mix[0 .. 2*hc-1]].
 template <int kHCMult>
@@ -41,18 +37,15 @@ struct PartialSlot {
   static constexpr int kStride = 1 + 2 * kHCMult;
 };
 
-// stage1: one block owns one (token, K-chunk). Threads stride over the chunk,
-// each accumulating into fp32 registers; a warp reduction then a small shared
-// reduction combine them, and lane 0 of warp 0 writes the slot.
+// stage1: one block owns one (token, K-chunk), reduced through warp shuffles
+// then shared memory.
 //
-// kElementsPerThread is 8 bf16 (16B) for x. The weight rows are fp32, so the
-// same element count is two 16B loads per row -- the loop reads x once and
-// reuses it across all 2*hc rows, which is the point: the baseline Triton
-// kernel's L1TEX bottleneck was re-reading x once per projection row.
+// The loop reads x once into registers and reuses it across all 2*hc weight
+// rows: the baseline Triton kernel's L1TEX bottleneck was re-reading x per row.
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, int kBlockK,
           bool kUsePDL = false>
 __global__ void __launch_bounds__(kThreadsPerBlock)
-    ihc_pre_stage1_decode_kernel(float* partial_ptr, const __nv_bfloat16* x_ptr, const float* w_ptr,
+    ihc_pre_stage1_splitk_kernel(float* partial_ptr, const __nv_bfloat16* x_ptr, const float* w_ptr,
                                  int num_batch) {
   constexpr int kProjRows = 2 * kHCMult;
   constexpr int kHCDim = kHCMult * kHiddenDim;
@@ -158,30 +151,41 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 }
 
-// stage2: one block per (token, hidden-slice). Reduces that token's partial
-// slots, forms the pre/post gates, and writes the pre-gated channel sum for its
-// slice.
+// stage2: one block per (token, hidden-slice). Reduces that token's slots,
+// forms the gates, writes the pre-gated channel sum. Only slice 0 stores post.
 //
-// The hidden dim must be split across blocks, not walked by one block: at a
-// single token the channel sum alone is 4 * hidden bf16 reads, and giving it to
-// one block reproduces exactly the occupancy problem this path exists to avoid
-// (measured 4.9us for one block vs 1.7us across six). The slot reduction and
-// the gate math are repeated per slice -- a few dozen flops against a
-// kHiddenDim-sized streaming load, which is the same trade the Triton
-// implementation makes. Only slice 0 stores the post gates.
+// Slicing the hidden dim beats walking it in one block (4.9us vs 1.7us across
+// six): one block would reproduce the occupancy problem this path exists to
+// avoid. The gate math is redone per slice -- a few dozen flops against a
+// kHiddenDim streaming load.
+//
+// kFuseRmsNorm gives that up: sum(y^2) spans the row, and both alternatives
+// cost more than the slicing saves (a third kernel ~4.5us; cross-block atomics
+// plus a grid barrier worse still). So a folded launch runs one wide block per
+// token, keeping two launches and a block-local reduction. The static_assert
+// below enforces the pairing; the host picks the thread count to match.
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, int kNumSplits,
-          bool kUsePDL = false>
+          bool kUsePDL = false, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false>
 __global__ void __launch_bounds__(kThreadsPerBlock)
-    ihc_pre_stage2_decode_kernel(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
+    ihc_pre_stage2_splitk_kernel(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                                  const __nv_bfloat16* x_ptr, const float* partial_ptr,
                                  const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch,
-                                 float norm_eps, float hc_eps, float magnitude) {
+                                 float norm_eps, float hc_eps, float magnitude,
+                                 const __nv_bfloat16* rms_weight_ptr = nullptr,
+                                 float rms_eps = 0.f) {
   constexpr int kProjRows = 2 * kHCMult;
   constexpr int kHCDim = kHCMult * kHiddenDim;
   constexpr int kStride = PartialSlot<kHCMult>::kStride;
   // One block covers kBlockD contiguous hidden elements.
   constexpr int kBlockD = kThreadsPerBlock * kElementsPerThread;
   constexpr float kInvHCDim = 1.0f / kHCDim;
+  constexpr float kInvHiddenDim = 1.0f / kHiddenDim;
+  constexpr int kWarpSize = 32;
+  constexpr int kWarpsPerBlock = kThreadsPerBlock / kWarpSize;
+
+  static_assert(!kFuseRmsNorm || kBlockD == kHiddenDim,
+                "the RMSNorm fold needs the whole row in one block, so a folded launch must "
+                "size the block as kHiddenDim / kElementsPerThread");
 
   static_assert(kHiddenDim % kBlockD == 0,
                 "kThreadsPerBlock * kElementsPerThread must divide kHiddenDim");
@@ -195,9 +199,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     return;
   }
 
-  // Reduce this token's slots. Each of the first kProjRows+1 threads owns one
-  // column of the slot array and walks the splits; the result goes to shared so
-  // every thread can read the gates.
+  // Each of the first kProjRows+1 threads owns one slot column and walks the
+  // splits; the result goes to shared so every thread can read the gates.
   __shared__ float smem_reduced[kProjRows + 1];
   __shared__ float smem_H_pre[kHCMult];
 
@@ -252,15 +255,54 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     }
   }
 
-  store<__nv_bfloat16, kElementsPerThread>(y_row + icol, to<__nv_bfloat16>(acc));
+  if constexpr (!kFuseRmsNorm) {
+    store<__nv_bfloat16, kElementsPerThread>(y_row + icol, to<__nv_bfloat16>(acc));
+  } else {
+    // y never reaches HBM unnormalized: it stays in acc while the row's sqsum
+    // is reduced block-locally (kBlockD == kHiddenDim), then goes out scaled.
+    //
+    // kCastBfloatForNorm rounds y to bf16 before squaring, matching what the
+    // unfused path would read back from HBM; without it the norm is more
+    // accurate but not bit-identical. The caller picks.
+    float y_sqsum = 0.f;
+    if constexpr (kCastBfloatForNorm) {
+      auto acc_bf = to<__nv_bfloat16>(acc);
+      acc = to<float>(acc_bf);
+    }
+#pragma unroll
+    for (int j = 0; j < kElementsPerThread; ++j) {
+      y_sqsum += acc[j] * acc[j];
+    }
+
+    __shared__ float smem_sqsum[kWarpsPerBlock];
+    const float warp_sum = warp_reduce_sum_xor(y_sqsum);
+    if (threadIdx.x % kWarpSize == 0) {
+      smem_sqsum[threadIdx.x / kWarpSize] = warp_sum;
+    }
+    __syncthreads();
+
+    float total = 0.f;
+#pragma unroll
+    for (int w = 0; w < kWarpsPerBlock; ++w) {
+      total += smem_sqsum[w];
+    }
+    const float y_scale = rsqrtf_ftz(total * kInvHiddenDim + rms_eps);
+
+    const auto reg_g = to<float>(load<__nv_bfloat16, kElementsPerThread>(rms_weight_ptr + icol));
+#pragma unroll
+    for (int j = 0; j < kElementsPerThread; ++j) {
+      acc[j] = acc[j] * y_scale * reg_g[j];
+    }
+    store<__nv_bfloat16, kElementsPerThread>(y_row + icol, to<__nv_bfloat16>(acc));
+  }
 
   if constexpr (kUsePDL) {
     cudaTriggerProgrammaticLaunchCompletion();
   }
 }
 
-}  // namespace sm90
+}  // namespace splitk
 }  // namespace iHC
 }  // namespace hpc
 
-#endif  // SRC_IHC_SM90_IHC_DECODE_CUH_
+#endif  // SRC_IHC_IHC_SPLITK_CUH_

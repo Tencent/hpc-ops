@@ -38,26 +38,31 @@ void fuse_ihc_head_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr, 
                          float rms_eps = 0.f, bool cast_bfloat_for_norm = false,
                          bool use_pdl = true);
 
-// sm90 only: a K-split pre path for decode-shaped batches. The shared
-// row-per-block kernel above has a grid of exactly num_batch, which cannot fill
-// an sm90 device at small token counts (latency-flat ~12-13us from 1 to 64
-// tokens on H20); splitting K instead exposes enough blocks to scale down.
-// ihc_pre_decode_supported() reports whether this path claims a given shape --
-// it declines at and above the measured crossover, where the shared kernel wins.
-namespace sm90 {
+// A split-K pre path for batches with too few tokens to fill the device, where
+// fuse_ihc_pre_async's grid of num_batch leaves most SMs idle. The selector is
+// the token count against an SM-count-scaled threshold, not the inference
+// phase -- a short prefill or a speculative-decode verify step qualifies on the
+// same terms as a decode step.
+//
+// The kernels are portable across KNOWN_ARCHS but the crossover is not, so the
+// threshold is derived per device; ihc_pre_splitk_supported() answers for the
+// module it was built into, so the caller needs no #if of its own.
+namespace splitk {
 
-bool ihc_pre_decode_supported(int num_batch, int hc_mult, int hidden_dim);
+bool ihc_pre_splitk_supported(int num_batch, int hc_mult, int hidden_dim, bool fuse_rms_norm);
 
-size_t ihc_pre_decode_scratch_floats(int num_batch, int hc_mult, int hidden_dim);
+size_t ihc_pre_splitk_scratch_floats(int num_batch, int hc_mult, int hidden_dim,
+                                     bool fuse_rms_norm);
 
-void fuse_ihc_pre_decode_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
+void fuse_ihc_pre_splitk_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                                const __nv_bfloat16* x_ptr, const float* w_ptr,
                                const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch,
                                int hc_mult, int hidden_dim, float norm_eps, float hc_eps,
                                float magnitude, float* scratch_ptr, cudaStream_t stream,
-                               bool use_pdl = true);
+                               bool use_pdl = true, const __nv_bfloat16* rms_weight_ptr = nullptr,
+                               float rms_eps = 0.f, bool cast_bfloat_for_norm = false);
 
-}  // namespace sm90
+}  // namespace splitk
 
 }  // namespace iHC
 }  // namespace hpc

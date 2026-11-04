@@ -17,26 +17,16 @@ namespace kernels {
 
 // The projection/sqrsum accumulation for one block's rows.
 //
-// kActiveRows is a compile-time trip count, which is the point of factoring
-// this out. Written inline with a runtime bound -- `for (r = 0; r <
-// num_valid_rows; ++r)` -- the compiler cannot unroll the row loop or hoist the
-// next iteration's weight loads above the current one's FFMAs, so the whole W
-// tile (vec_t<float, 8> reg_w[2 * hc], 64 registers) stays live across it and
-// every load sits on the critical path. Measured on an H20 at n=2048 /
-// hidden 6144 / rows=4, that cost 77% of all stall cycles on long-scoreboard
-// (8.32 of 10.76) while L1/L2/DRAM/SM throughput all sat between 22 and 53
-// percent and the FFMA count already matched the operator's arithmetic exactly
-// -- the kernel was purely waiting on loads.
+// kActiveRows being a compile-time trip count is the point of factoring this
+// out: under a runtime bound the compiler can neither unroll the row loop nor
+// hoist the next weight loads above the current FFMAs, so the whole W tile (64
+// registers) stays live with every load on the critical path. On H20 at n=2048
+// / hidden 6144 / rows=4 that put 77% of stall cycles on long-scoreboard (8.32
+// of 10.76) at 22-53% throughput -- waiting on loads, not short of bandwidth.
+// Fixing the count drops the stall to 3.26 and runs 1.13x faster.
 //
-// With the trip count fixed the compiler software-pipelines the K loop: the
-// stall drops to 3.26 cycles, registers at the same configuration fall from 128
-// to 118, and the kernel runs 1.13x faster at that shape. Callers get more by
-// also raising kRowsPerBlock, which is the only lever on weight traffic (a
-// block reads all of W once however many rows it owns).
-//
-// The caller passes kRowsPerBlock for a full tile and 1 for the partial tile at
-// the end of the grid, so the tail stays exact without instantiating every
-// possible row count.
+// The caller passes kRowsPerBlock for a full tile and 1 for the grid's partial
+// tail, so the tail stays exact without instantiating every row count.
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kRowsPerBlock,
           int kThreadsPerBlock, int kProjRows, int kActiveRows>
 __device__ __forceinline__ void ihc_pre_accumulate(const __nv_bfloat16* x_ptr, const float* w_ptr,
@@ -762,33 +752,22 @@ namespace {
 constexpr int kElementsPerThread = 8;
 constexpr int kPostThreadsPerBlock = 128;
 
-// Rows per block for the pre/head kernel, by token count. The kernel loads x
-// once per K-chunk and reuses it across all 2*hc projection rows, so giving a
-// block several rows amortizes the weight traffic -- but the accumulators
-// (acc_dot[kRowsPerBlock][kProjRows] plus acc_sqsum) are per-thread registers,
-// so the win reverses once they spill.
+// Rows per block for the pre kernel (kHasPost = true). A block reads all of W
+// once whatever its row count, so more rows amortize the weight traffic until
+// the accumulators leave registers. sm90 has its own table in pre_config().
 //
-// Measured on H20, hidden 6144, bf16, CUDA Graph (us per call):
+// The first boundary depends on the RMSNorm fold: on B200 an unfolded request
+// below ~176 tokens goes to the split-K path (src/iHC/ihc_splitk.cu) and never
+// reaches here, while a folded one does, its second pass over y already
+// filling a block at one row. B200, hidden 6144, 256 threads (us per call):
 //
-//     tokens   rows=1   rows=2   rows=4   rows=8   rows=16
-//         64    13.49    13.34    22.30    47.01    105.01
-//        128    17.61    13.57    23.54    46.10    106.56
-//        256    33.84    20.71    23.45    45.67    107.06
-//        320    47.88    31.67    29.12    45.76    107.29
-//       1024   114.43    81.88    69.50   131.05    163.71
-//      16384  1640.36  1077.84   950.21  2217.04   1684.79
-//
-// Those figures predate the compile-time row loop in ihc_pre_accumulate(), and
-// the spill they describe has moved: rows=8 is now 218 registers at 256 threads
-// rather than spilling, and is competitive. They are kept because they are the
-// only measurements covering architectures other than sm90, which is also why
-// this table is the conservative default -- see pre_config() below for the
-// re-measured sm90 one.
-//
-// Small counts stay on rows=1 only because sm90 routes them to the K-split
-// path instead; see src/iHC/sm90/.
-constexpr int pre_rows_per_block(int num_batch) {
-  if (num_batch < 64) {
+//     tokens   plain r=1   plain r=2   folded r=1   folded r=2
+//         64       17.80       13.72        12.60        15.25
+//        128       18.40       13.85        13.00        15.25
+//        192       18.75       14.03        17.83        15.45
+//        320       24.59       19.13        25.31        20.16
+constexpr int pre_rows_per_block(int num_batch, bool fuse_rms_norm) {
+  if (num_batch < (fuse_rms_norm ? 192 : 64)) {
     return 1;
   }
   if (num_batch < 320) {
@@ -797,31 +776,52 @@ constexpr int pre_rows_per_block(int num_batch) {
   return 4;
 }
 
-// Rows and block size together, re-measured on the pipelined kernel.
+// Rows per block for the head kernel (kHasPost = false). Head needs its own
+// table: kHasPost halves kProjRows, so there is less work per row to pay for a
+// wider tile, and its register use is not a subset of pre's -- two pairs the
+// pre tables pick spill here (sm100 and sm_90a alike), <4096, rows=4, 256thr>
+// by 2640B and <6144, rows=4, 384thr> by 1336B.
 //
-// The row count interacts with the block size -- 192 threads wins at several
-// token counts and is not reachable by tuning rows alone -- so the two are
-// chosen as a pair. Both tables below are H20 measurements and apply to sm90
-// only; other architectures keep pre_rows_per_block() at 256 threads, since
-// transcribing a tuning table measured on different hardware is exactly the
-// mistake that produced the stale numbers above.
+// B200, each pair instantiated directly, 256 threads, us per call (* = choice):
 //
-// Only a block size whose span (threads * kElementsPerThread) divides
-// hc_mult * hidden_dim is legal. At hidden 6144 that admits 128/192/256/384/512
-// threads; at hidden 4096 only 128/256/512, which is why the two tables differ
-// rather than one being derived from the other.
+//   hidden 6144                      hidden 4096
+//   tokens   rows=1  rows=2  rows=4  tokens   rows=1  rows=2   rows=4
+//      128    8.88*  10.94       -      320    10.43   9.39*    27.98 spill
+//      320   14.13   12.17*  13.06     1024    25.49  15.54*    45.77 spill
+//     1024   37.55   21.58   17.00*   16384   347.88 209.20*  1887.76 spill
+//    16384  933.59  519.26* 513.53
 //
-// Measured on H20 under CUDA Graph, best of repeated rounds, against the best
-// of rows=1/2/4 at 256 threads (us per call):
+// At 4096 the spilling pair also loses to non-spilling rows=4 at 128 threads
+// (13.10 vs 9.49 at 512 tokens), so capping at rows=2 is the tuning answer and
+// not just spill avoidance. At 6144 rows=4 takes over from 1024 tokens; the
+// 16384 cell is near parity and left on rows=2.
+constexpr int head_rows_per_block(int num_batch, int hidden_dim) {
+  if (num_batch < 320) {
+    return 1;
+  }
+  if (hidden_dim == 6144 && num_batch >= 1024) {
+    return 4;
+  }
+  return 2;
+}
+
+// Rows and block size as a pair, for sm90's pre path. The two interact (192
+// threads wins at several token counts and rows alone cannot reach it), and
+// only a block whose span divides hc_mult * hidden_dim is legal -- 128/192/256/384
+// at hidden 6144 but only 128/256 at 4096, which is why the tables differ.
+//
+// H20, against the best of rows=1/2/4 at 256 threads (us/call):
 //
 //   hidden 6144            hidden 4096
 //   tokens  base   this    tokens  base   this
-//      256  20.7   18.2      256  16.1   13.3   (rows 2, 256 thr)
 //      512  30.9   26.1      512  20.6   17.8
-//     1024  69.7   56.4     1024  40.2   35.7
 //     2048 140.3  112.0     2048  94.3   69.9
-//     8192 490.4  409.4     8192 328.3  245.0
 //    32768 1886.4 1657.1   32768 1243.1 1008.3
+//
+// Gated on the arch it was measured for: the only caller sits in
+// launch_pre_head()'s HPC_TARGET_ARCH == 90 branch, so an ungated definition is
+// unreferenced elsewhere, which -Werror=all-warnings rejects (#177-D).
+#if HPC_TARGET_ARCH == 90
 struct PreConfig {
   int rows;
   int threads;
@@ -880,6 +880,7 @@ constexpr PreConfig pre_config(int num_batch, int hidden_dim) {
   // (rows=8/128).
   return {4, 256};
 }
+#endif  // HPC_TARGET_ARCH == 90
 
 template <int kHiddenDim, int kRowsPerBlock, bool kHasPost, bool kFuseRmsNorm,
           bool kCastBfloatForNorm, int kThreads = 256>
@@ -917,12 +918,9 @@ void launch_pre_head_rows(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
   }
 }
 
-// Picks the launch shape and forwards.
-//
-// On sm90 the (rows, threads) pair comes from pre_config(), which was measured
-// on the pipelined kernel; elsewhere only the row count varies and the block
-// stays at 256 threads, per pre_rows_per_block(). Both paths run the same
-// kernel -- the arch split is over tuning constants, not code.
+// Picks the launch shape and forwards. sm90 takes the (rows, threads) pair from
+// pre_config(); elsewhere only the row count varies at 256 threads, per
+// pre_rows_per_block(). Same kernel either way -- the split is over constants.
 template <int kHiddenDim, bool kHasPost, bool kFuseRmsNorm, bool kCastBfloatForNorm>
 void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                      const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
@@ -934,67 +932,104 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
       output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,     \
       norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl)
 
+  // Head skips pre_config(): two of its pairs spill in the head instantiation,
+  // per -Xptxas=-v under sm_90a (a compile-time fact, not an sm100 extrapolation):
+  //
+  //     instantiation            pre              head
+  //     <4096, rows=4, 256thr>   128 regs, 0B     255 regs, 156B spill
+  //     <6144, rows=4, 384thr>   152 regs, 0B     168 regs, 524B spill
+  //
+  // pre_config() returns both inside windows head reaches (4096 at 384..768
+  // tokens, 6144 at 192..320). The sm90 spill's runtime cost is unmeasured and
+  // a tenth the sm100 one, so head falls through to head_rows_per_block()
+  // rather than get an sm90 table invented for it.
 #if HPC_TARGET_ARCH == 90
-  const PreConfig cfg = pre_config(num_batch, kHiddenDim);
-  // Only the pairs pre_config() can return are instantiated. A block size is
-  // legal only if threads * kElementsPerThread divides hc_mult * hidden_dim,
-  // which is why the two hidden sizes list different pairs.
-  if constexpr (kHiddenDim == 6144) {
-    if (cfg.rows == 4 && cfg.threads == 384) {
-      HPC_IHC_LAUNCH_PRE(4, 384);
-      return;
+  if constexpr (kHasPost) {
+    const PreConfig cfg = pre_config(num_batch, kHiddenDim);
+    // Only the pairs pre_config() can return are instantiated. A block size is
+    // legal only if threads * kElementsPerThread divides hc_mult * hidden_dim,
+    // which is why the two hidden sizes list different pairs.
+    if constexpr (kHiddenDim == 6144) {
+      if (cfg.rows == 4 && cfg.threads == 384) {
+        HPC_IHC_LAUNCH_PRE(4, 384);
+        return;
+      }
+      if (cfg.rows == 6 && cfg.threads == 256) {
+        HPC_IHC_LAUNCH_PRE(6, 256);
+        return;
+      }
+      if (cfg.rows == 4 && cfg.threads == 256) {
+        HPC_IHC_LAUNCH_PRE(4, 256);
+        return;
+      }
+      if (cfg.rows == 8 && cfg.threads == 192) {
+        HPC_IHC_LAUNCH_PRE(8, 192);
+        return;
+      }
+      if (cfg.rows == 6 && cfg.threads == 192) {
+        HPC_IHC_LAUNCH_PRE(6, 192);
+        return;
+      }
+      if (cfg.rows == 8 && cfg.threads == 128) {
+        HPC_IHC_LAUNCH_PRE(8, 128);
+        return;
+      }
+    } else if constexpr (kHiddenDim == 4096) {
+      if (cfg.rows == 2 && cfg.threads == 256) {
+        HPC_IHC_LAUNCH_PRE(2, 256);
+        return;
+      }
+      if (cfg.rows == 4 && cfg.threads == 256) {
+        HPC_IHC_LAUNCH_PRE(4, 256);
+        return;
+      }
+      if (cfg.rows == 8 && cfg.threads == 128) {
+        HPC_IHC_LAUNCH_PRE(8, 128);
+        return;
+      }
+      if (cfg.rows == 6 && cfg.threads == 128) {
+        HPC_IHC_LAUNCH_PRE(6, 128);
+        return;
+      }
     }
-    if (cfg.rows == 6 && cfg.threads == 256) {
-      HPC_IHC_LAUNCH_PRE(6, 256);
-      return;
-    }
-    if (cfg.rows == 4 && cfg.threads == 256) {
-      HPC_IHC_LAUNCH_PRE(4, 256);
-      return;
-    }
-    if (cfg.rows == 8 && cfg.threads == 192) {
-      HPC_IHC_LAUNCH_PRE(8, 192);
-      return;
-    }
-    if (cfg.rows == 6 && cfg.threads == 192) {
-      HPC_IHC_LAUNCH_PRE(6, 192);
-      return;
-    }
-    if (cfg.rows == 8 && cfg.threads == 128) {
-      HPC_IHC_LAUNCH_PRE(8, 128);
-      return;
-    }
-  } else if constexpr (kHiddenDim == 4096) {
-    if (cfg.rows == 2 && cfg.threads == 256) {
-      HPC_IHC_LAUNCH_PRE(2, 256);
-      return;
-    }
-    if (cfg.rows == 4 && cfg.threads == 256) {
-      HPC_IHC_LAUNCH_PRE(4, 256);
-      return;
-    }
-    if (cfg.rows == 8 && cfg.threads == 128) {
-      HPC_IHC_LAUNCH_PRE(8, 128);
-      return;
-    }
-    if (cfg.rows == 6 && cfg.threads == 128) {
-      HPC_IHC_LAUNCH_PRE(6, 128);
-      return;
-    }
+    // Any shape pre_config() does not cover falls through to the table below.
   }
-  // Any shape pre_config() does not cover falls through to the table below.
 #endif
 
-  switch (pre_rows_per_block(num_batch)) {
-    case 1:
-      HPC_IHC_LAUNCH_PRE(1, 256);
-      break;
-    case 2:
-      HPC_IHC_LAUNCH_PRE(2, 256);
-      break;
-    default:
-      HPC_IHC_LAUNCH_PRE(4, 256);
-      break;
+  // One table per gate group; see head_rows_per_block() for why they differ.
+  // The rows=4 arm is `if constexpr`-guarded rather than left as unreachable
+  // runtime code because a template arm no call reaches is still compiled: the
+  // spilling <4096, rows=4, kHasPost=false> instantiation would otherwise stay
+  // in the module and in the -Xptxas=-v output, hiding the next real spill.
+  if constexpr (kHasPost) {
+    switch (pre_rows_per_block(num_batch, kFuseRmsNorm)) {
+      case 1:
+        HPC_IHC_LAUNCH_PRE(1, 256);
+        break;
+      case 2:
+        HPC_IHC_LAUNCH_PRE(2, 256);
+        break;
+      default:
+        HPC_IHC_LAUNCH_PRE(4, 256);
+        break;
+    }
+  } else {
+    switch (head_rows_per_block(num_batch, kHiddenDim)) {
+      case 1:
+        HPC_IHC_LAUNCH_PRE(1, 256);
+        break;
+      case 2:
+        HPC_IHC_LAUNCH_PRE(2, 256);
+        break;
+      default:
+        // head_rows_per_block() returns 4 only at hidden 6144, where the pair
+        // does not spill; at hidden 4096 it caps at 2, so this arm is not
+        // instantiated there.
+        if constexpr (kHiddenDim == 6144) {
+          HPC_IHC_LAUNCH_PRE(4, 256);
+        }
+        break;
+    }
   }
 #undef HPC_IHC_LAUNCH_PRE
 }
