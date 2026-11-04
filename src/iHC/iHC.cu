@@ -927,10 +927,14 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                      const float* hc_base_ptr, int num_batch, float norm_eps, float hc_eps,
                      float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
                      cudaStream_t stream, bool use_pdl) {
-#define HPC_IHC_LAUNCH_PRE(rows, threads)                                                      \
-  launch_pre_head_rows<kHiddenDim, rows, kHasPost, kFuseRmsNorm, kCastBfloatForNorm, threads>( \
-      output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,     \
-      norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl)
+  // Tag-dispatched: <rows, threads> as integral_constant pairs rather than a
+  // macro, so the launch keeps its types and the arms stay greppable.
+  auto launch = [&](auto rows_tag, auto threads_tag) {
+    launch_pre_head_rows<kHiddenDim, decltype(rows_tag)::value, kHasPost, kFuseRmsNorm,
+                         kCastBfloatForNorm, decltype(threads_tag)::value>(
+        output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+        norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
+  };
 
   // Head skips pre_config(): two of its pairs spill in the head instantiation,
   // per -Xptxas=-v under sm_90a (a compile-time fact, not an sm100 extrapolation):
@@ -951,44 +955,44 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
     // which is why the two hidden sizes list different pairs.
     if constexpr (kHiddenDim == 6144) {
       if (cfg.rows == 4 && cfg.threads == 384) {
-        HPC_IHC_LAUNCH_PRE(4, 384);
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 384>{});
         return;
       }
       if (cfg.rows == 6 && cfg.threads == 256) {
-        HPC_IHC_LAUNCH_PRE(6, 256);
+        launch(std::integral_constant<int, 6>{}, std::integral_constant<int, 256>{});
         return;
       }
       if (cfg.rows == 4 && cfg.threads == 256) {
-        HPC_IHC_LAUNCH_PRE(4, 256);
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
         return;
       }
       if (cfg.rows == 8 && cfg.threads == 192) {
-        HPC_IHC_LAUNCH_PRE(8, 192);
+        launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 192>{});
         return;
       }
       if (cfg.rows == 6 && cfg.threads == 192) {
-        HPC_IHC_LAUNCH_PRE(6, 192);
+        launch(std::integral_constant<int, 6>{}, std::integral_constant<int, 192>{});
         return;
       }
       if (cfg.rows == 8 && cfg.threads == 128) {
-        HPC_IHC_LAUNCH_PRE(8, 128);
+        launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 128>{});
         return;
       }
     } else if constexpr (kHiddenDim == 4096) {
       if (cfg.rows == 2 && cfg.threads == 256) {
-        HPC_IHC_LAUNCH_PRE(2, 256);
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 256>{});
         return;
       }
       if (cfg.rows == 4 && cfg.threads == 256) {
-        HPC_IHC_LAUNCH_PRE(4, 256);
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
         return;
       }
       if (cfg.rows == 8 && cfg.threads == 128) {
-        HPC_IHC_LAUNCH_PRE(8, 128);
+        launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 128>{});
         return;
       }
       if (cfg.rows == 6 && cfg.threads == 128) {
-        HPC_IHC_LAUNCH_PRE(6, 128);
+        launch(std::integral_constant<int, 6>{}, std::integral_constant<int, 128>{});
         return;
       }
     }
@@ -1004,34 +1008,33 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
   if constexpr (kHasPost) {
     switch (pre_rows_per_block(num_batch, kFuseRmsNorm)) {
       case 1:
-        HPC_IHC_LAUNCH_PRE(1, 256);
+        launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 256>{});
         break;
       case 2:
-        HPC_IHC_LAUNCH_PRE(2, 256);
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 256>{});
         break;
       default:
-        HPC_IHC_LAUNCH_PRE(4, 256);
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
         break;
     }
   } else {
     switch (head_rows_per_block(num_batch, kHiddenDim)) {
       case 1:
-        HPC_IHC_LAUNCH_PRE(1, 256);
+        launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 256>{});
         break;
       case 2:
-        HPC_IHC_LAUNCH_PRE(2, 256);
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 256>{});
         break;
       default:
         // head_rows_per_block() returns 4 only at hidden 6144, where the pair
         // does not spill; at hidden 4096 it caps at 2, so this arm is not
         // instantiated there.
         if constexpr (kHiddenDim == 6144) {
-          HPC_IHC_LAUNCH_PRE(4, 256);
+          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
         }
         break;
     }
   }
-#undef HPC_IHC_LAUNCH_PRE
 }
 
 template <int kHiddenDim, bool kFuseRmsNorm, bool kCastBfloatForNorm>
@@ -1163,48 +1166,43 @@ void launch_post(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
 
 }  // namespace
 
-void fuse_ihc_pre_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
+bool fuse_ihc_pre_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                         const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
                         const float* hc_base_ptr, int num_batch, int hc_mult, int hidden_dim,
                         float norm_eps, float hc_eps, float magnitude, cudaStream_t stream,
                         const __nv_bfloat16* rms_weight_ptr, float rms_eps,
                         bool cast_bfloat_for_norm, bool use_pdl) {
   if (hc_mult != 4) {
-    return;
+    return false;
   }
-  const bool fuse_norm = rms_weight_ptr != nullptr;
+  auto by_hidden = [&](auto hidden_tag) {
+    constexpr int kHidden = decltype(hidden_tag)::value;
+    if (rms_weight_ptr == nullptr) {
+      launch_pre_head<kHidden, true, false, false>(
+          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+          norm_eps, hc_eps, magnitude, nullptr, 0.f, stream, use_pdl);
+    } else if (cast_bfloat_for_norm) {
+      launch_pre_head<kHidden, true, true, true>(
+          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
+    } else {
+      launch_pre_head<kHidden, true, true, false>(
+          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
+    }
+  };
+
   if (hidden_dim == 6144) {
-    if (!fuse_norm) {
-      launch_pre_head<6144, true, false, false>(output_y_ptr, output_H_post_ptr, x_ptr, w_ptr,
-                                                hc_scale_ptr, hc_base_ptr, num_batch, norm_eps,
-                                                hc_eps, magnitude, nullptr, 0.f, stream, use_pdl);
-    } else if (cast_bfloat_for_norm) {
-      launch_pre_head<6144, true, true, true>(
-          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
-    } else {
-      launch_pre_head<6144, true, true, false>(
-          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
-    }
+    by_hidden(std::integral_constant<int, 6144>{});
   } else if (hidden_dim == 4096) {
-    if (!fuse_norm) {
-      launch_pre_head<4096, true, false, false>(output_y_ptr, output_H_post_ptr, x_ptr, w_ptr,
-                                                hc_scale_ptr, hc_base_ptr, num_batch, norm_eps,
-                                                hc_eps, magnitude, nullptr, 0.f, stream, use_pdl);
-    } else if (cast_bfloat_for_norm) {
-      launch_pre_head<4096, true, true, true>(
-          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
-    } else {
-      launch_pre_head<4096, true, true, false>(
-          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
-    }
+    by_hidden(std::integral_constant<int, 4096>{});
+  } else {
+    return false;
   }
+  return true;
 }
 
-void fuse_ihc_post_pre_async(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr,
+bool fuse_ihc_post_pre_async(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr,
                              const __nv_bfloat16* xa_ptr, const __nv_bfloat16* residual_ptr,
                              const float* H_post_in_ptr, const float* w_ptr,
                              const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch,
@@ -1213,45 +1211,36 @@ void fuse_ihc_post_pre_async(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* 
                              const __nv_bfloat16* rms_weight_ptr, float rms_eps,
                              bool cast_bfloat_for_norm, bool use_pdl) {
   if (hc_mult != 4) {
-    return;
+    return false;
   }
-  const bool fuse_norm = rms_weight_ptr != nullptr;
+  auto by_hidden = [&](auto hidden_tag) {
+    constexpr int kHidden = decltype(hidden_tag)::value;
+    if (rms_weight_ptr == nullptr) {
+      launch_post_pre<kHidden, false, false>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
+                                             H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                             num_batch, norm_eps, hc_eps, magnitude, nullptr, 0.f,
+                                             scratch_ptr, stream, use_pdl);
+    } else if (cast_bfloat_for_norm) {
+      launch_post_pre<kHidden, true, true>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
+                                           H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                           num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr,
+                                           rms_eps, scratch_ptr, stream, use_pdl);
+    } else {
+      launch_post_pre<kHidden, true, false>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
+                                            H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                            num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr,
+                                            rms_eps, scratch_ptr, stream, use_pdl);
+    }
+  };
 
   if (hidden_dim == 6144) {
-    if (!fuse_norm) {
-      launch_post_pre<6144, false, false>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
-                                          H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
-                                          num_batch, norm_eps, hc_eps, magnitude, nullptr, 0.f,
-                                          scratch_ptr, stream, use_pdl);
-    } else if (cast_bfloat_for_norm) {
-      launch_post_pre<6144, true, true>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
-                                        H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-                                        norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps,
-                                        scratch_ptr, stream, use_pdl);
-    } else {
-      launch_post_pre<6144, true, false>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
-                                         H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-                                         norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps,
-                                         scratch_ptr, stream, use_pdl);
-    }
+    by_hidden(std::integral_constant<int, 6144>{});
   } else if (hidden_dim == 4096) {
-    if (!fuse_norm) {
-      launch_post_pre<4096, false, false>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
-                                          H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
-                                          num_batch, norm_eps, hc_eps, magnitude, nullptr, 0.f,
-                                          scratch_ptr, stream, use_pdl);
-    } else if (cast_bfloat_for_norm) {
-      launch_post_pre<4096, true, true>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
-                                        H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-                                        norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps,
-                                        scratch_ptr, stream, use_pdl);
-    } else {
-      launch_post_pre<4096, true, false>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
-                                         H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-                                         norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps,
-                                         scratch_ptr, stream, use_pdl);
-    }
+    by_hidden(std::integral_constant<int, 4096>{});
+  } else {
+    return false;
   }
+  return true;
 }
 
 size_t ihc_post_pre_scratch_floats(int num_batch, int hc_mult, int hidden_dim) {
@@ -1267,57 +1256,55 @@ size_t ihc_post_pre_scratch_floats(int num_batch, int hc_mult, int hidden_dim) {
   return static_cast<size_t>(num_batch) * chunks * (proj_rows + 1);
 }
 
-void fuse_ihc_post_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
+bool fuse_ihc_post_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
                          const __nv_bfloat16* residual_ptr, const float* H_post_ptr, int num_batch,
                          int hc_mult, int hidden_dim, cudaStream_t stream, bool use_pdl) {
   if (hc_mult != 4) {
-    return;
+    return false;
   }
   if (hidden_dim == 6144) {
     launch_post<6144>(output_ptr, x_ptr, residual_ptr, H_post_ptr, num_batch, stream, use_pdl);
   } else if (hidden_dim == 4096) {
     launch_post<4096>(output_ptr, x_ptr, residual_ptr, H_post_ptr, num_batch, stream, use_pdl);
+  } else {
+    return false;
   }
+  return true;
 }
 
-void fuse_ihc_head_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr, const float* w_ptr,
+bool fuse_ihc_head_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr, const float* w_ptr,
                          const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch,
                          int hc_mult, int hidden_dim, float norm_eps, float hc_eps,
                          cudaStream_t stream, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
                          bool cast_bfloat_for_norm, bool use_pdl) {
   if (hc_mult != 4) {
-    return;
+    return false;
   }
-  const bool fuse_norm = rms_weight_ptr != nullptr;
+  auto by_hidden = [&](auto hidden_tag) {
+    constexpr int kHidden = decltype(hidden_tag)::value;
+    if (rms_weight_ptr == nullptr) {
+      launch_pre_head<kHidden, false, false, false>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
+                                                    hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
+                                                    nullptr, 0.f, stream, use_pdl);
+    } else if (cast_bfloat_for_norm) {
+      launch_pre_head<kHidden, false, true, true>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
+                                                  hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
+                                                  rms_weight_ptr, rms_eps, stream, use_pdl);
+    } else {
+      launch_pre_head<kHidden, false, true, false>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
+                                                   hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
+                                                   rms_weight_ptr, rms_eps, stream, use_pdl);
+    }
+  };
+
   if (hidden_dim == 6144) {
-    if (!fuse_norm) {
-      launch_pre_head<6144, false, false, false>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
-                                                 hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
-                                                 nullptr, 0.f, stream, use_pdl);
-    } else if (cast_bfloat_for_norm) {
-      launch_pre_head<6144, false, true, true>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
-                                               hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
-                                               rms_weight_ptr, rms_eps, stream, use_pdl);
-    } else {
-      launch_pre_head<6144, false, true, false>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
-                                                hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
-                                                rms_weight_ptr, rms_eps, stream, use_pdl);
-    }
+    by_hidden(std::integral_constant<int, 6144>{});
   } else if (hidden_dim == 4096) {
-    if (!fuse_norm) {
-      launch_pre_head<4096, false, false, false>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
-                                                 hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
-                                                 nullptr, 0.f, stream, use_pdl);
-    } else if (cast_bfloat_for_norm) {
-      launch_pre_head<4096, false, true, true>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
-                                               hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
-                                               rms_weight_ptr, rms_eps, stream, use_pdl);
-    } else {
-      launch_pre_head<4096, false, true, false>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
-                                                hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
-                                                rms_weight_ptr, rms_eps, stream, use_pdl);
-    }
+    by_hidden(std::integral_constant<int, 4096>{});
+  } else {
+    return false;
   }
+  return true;
 }
 
 }  // namespace iHC

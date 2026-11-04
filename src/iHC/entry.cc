@@ -78,26 +78,26 @@ std::tuple<torch::Tensor, torch::Tensor> fuse_ihc_pre_entry(
   // Batches with too few tokens to fill the device go to the split-K path.
   // The predicate is the token count, not the inference phase, and it declines
   // on every shape it does not claim, so no #if is needed here.
-  bool handled = false;
+  bool launched = false;
   const bool fuse_rms_norm = rms_weight_ptr != nullptr;
   if (splitk::ihc_pre_splitk_supported(num_batch, hc_mult, hidden_dim, fuse_rms_norm)) {
     const size_t scratch_floats =
         splitk::ihc_pre_splitk_scratch_floats(num_batch, hc_mult, hidden_dim, fuse_rms_norm);
     torch::Tensor scratch =
         torch::empty({static_cast<int64_t>(scratch_floats)}, options.dtype(torch::kFloat32));
-    splitk::fuse_ihc_pre_splitk_async(
+    launched = splitk::fuse_ihc_pre_splitk_async(
         output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
         hc_mult, hidden_dim, norm_eps, hc_eps, magnitude,
         reinterpret_cast<float *>(scratch.mutable_data_ptr()), stream, true, rms_weight_ptr,
         static_cast<float>(rms_eps), cast_bfloat_for_norm);
-    handled = true;
   }
 
-  if (!handled) {
-    fuse_ihc_pre_async(output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
-                       num_batch, hc_mult, hidden_dim, norm_eps, hc_eps, magnitude, stream,
-                       rms_weight_ptr, rms_eps, cast_bfloat_for_norm);
+  if (!launched) {
+    launched = fuse_ihc_pre_async(output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr,
+                                  hc_base_ptr, num_batch, hc_mult, hidden_dim, norm_eps, hc_eps,
+                                  magnitude, stream, rms_weight_ptr, rms_eps, cast_bfloat_for_norm);
   }
+  TORCH_CHECK(launched, "fuse_ihc_pre launch failed!");
 
   return std::make_tuple(output_y, output_H_post);
 }
@@ -168,17 +168,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fuse_ihc_post_pre_entry(
   float *scratch_ptr =
       scratch_floats > 0 ? reinterpret_cast<float *>(scratch.mutable_data_ptr()) : nullptr;
 
-  fuse_ihc_post_pre_async(reinterpret_cast<__nv_bfloat16 *>(y.mutable_data_ptr()),
-                          reinterpret_cast<__nv_bfloat16 *>(z.mutable_data_ptr()),
-                          reinterpret_cast<float *>(H_post_out.mutable_data_ptr()),
-                          reinterpret_cast<const __nv_bfloat16 *>(xa.const_data_ptr()),
-                          reinterpret_cast<const __nv_bfloat16 *>(residual.const_data_ptr()),
-                          reinterpret_cast<const float *>(H_post_in.const_data_ptr()),
-                          reinterpret_cast<const float *>(w.const_data_ptr()),
-                          reinterpret_cast<const float *>(hc_scale.const_data_ptr()),
-                          reinterpret_cast<const float *>(hc_base.const_data_ptr()), num_batch,
-                          hc_mult, hidden_dim, norm_eps, hc_eps, magnitude, scratch_ptr, stream,
-                          rms_weight_ptr, rms_eps, cast_bfloat_for_norm);
+  const bool launched =
+      fuse_ihc_post_pre_async(reinterpret_cast<__nv_bfloat16 *>(y.mutable_data_ptr()),
+                              reinterpret_cast<__nv_bfloat16 *>(z.mutable_data_ptr()),
+                              reinterpret_cast<float *>(H_post_out.mutable_data_ptr()),
+                              reinterpret_cast<const __nv_bfloat16 *>(xa.const_data_ptr()),
+                              reinterpret_cast<const __nv_bfloat16 *>(residual.const_data_ptr()),
+                              reinterpret_cast<const float *>(H_post_in.const_data_ptr()),
+                              reinterpret_cast<const float *>(w.const_data_ptr()),
+                              reinterpret_cast<const float *>(hc_scale.const_data_ptr()),
+                              reinterpret_cast<const float *>(hc_base.const_data_ptr()), num_batch,
+                              hc_mult, hidden_dim, norm_eps, hc_eps, magnitude, scratch_ptr, stream,
+                              rms_weight_ptr, rms_eps, cast_bfloat_for_norm);
+  TORCH_CHECK(launched, "fuse_ihc_post_pre launch failed!");
 
   return std::make_tuple(y, z, H_post_out);
 }
@@ -224,8 +226,9 @@ torch::Tensor fuse_ihc_post_entry(const torch::Tensor &x, const torch::Tensor &r
   const auto *H_post_ptr = reinterpret_cast<const float *>(H_post.const_data_ptr());
   auto *output_ptr = reinterpret_cast<__nv_bfloat16 *>(output.mutable_data_ptr());
 
-  fuse_ihc_post_async(output_ptr, x_ptr, residual_ptr, H_post_ptr, num_batch, hc_mult, hidden_dim,
-                      stream);
+  const bool launched = fuse_ihc_post_async(output_ptr, x_ptr, residual_ptr, H_post_ptr, num_batch,
+                                            hc_mult, hidden_dim, stream);
+  TORCH_CHECK(launched, "fuse_ihc_post launch failed!");
 
   return output;
 }
@@ -292,9 +295,10 @@ torch::Tensor fuse_ihc_head_entry(const torch::Tensor &x, const torch::Tensor &w
   const auto *hc_base_ptr = reinterpret_cast<const float *>(hc_base.const_data_ptr());
   auto *output_ptr = reinterpret_cast<__nv_bfloat16 *>(output.mutable_data_ptr());
 
-  fuse_ihc_head_async(output_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, hc_mult,
-                      hidden_dim, norm_eps, hc_eps, stream, rms_weight_ptr, rms_eps,
-                      cast_bfloat_for_norm);
+  const bool launched = fuse_ihc_head_async(output_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                            num_batch, hc_mult, hidden_dim, norm_eps, hc_eps,
+                                            stream, rms_weight_ptr, rms_eps, cast_bfloat_for_norm);
+  TORCH_CHECK(launched, "fuse_ihc_head launch failed!");
 
   return output;
 }

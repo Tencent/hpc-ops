@@ -112,13 +112,10 @@ int splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
 // B200 holds 1024 to 32 tokens where H20 only wins below 2, and never picks
 // 2048. Carrying H20's table over costs 1.17x at one token, hence per-arch.
 //
-// An unmeasured architecture runs the sm90 table while the threshold model
-// already lets it onto this path -- deliberate, since the path itself is worth
-// 2.9x against the tables' 1.17x spread, so defaulting in with an imperfect
-// BLOCK_K beats defaulting out. Calibrating adds a branch, not a code path.
-// Candidates must divide hc_mult * hidden_dim and be a multiple of 1024.
+// sm103 inherits sm100's arm by family, not by measurement -- unswept there,
+// calibrate with HPC_IHC_SPLITK_FORCE. Candidates must be multiples of 1024.
 constexpr int splitk_block_k(int num_batch) {
-#if HPC_TARGET_ARCH == 100
+#if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
   return num_batch < 48 ? 1024 : 4096;
 #else
   if (num_batch < 2) {
@@ -204,27 +201,27 @@ void launch_splitk_by_block_k(__nv_bfloat16* output_y_ptr, float* output_H_post_
                               float norm_eps, float hc_eps, float magnitude, float* scratch_ptr,
                               cudaStream_t stream, bool use_pdl,
                               const __nv_bfloat16* rms_weight_ptr, float rms_eps) {
-#define HPC_IHC_LAUNCH_SPLITK(block_k)                                                     \
-  launch_splitk<kHiddenDim, block_k, kFuseRmsNorm, kCastBfloatForNorm>(                    \
-      output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, \
-      norm_eps, hc_eps, magnitude, scratch_ptr, stream, use_pdl, rms_weight_ptr, rms_eps)
+  // Tag-dispatched rather than macro-expanded, matching the kUsePDL tag below.
+  auto launch = [&](auto block_k_tag) {
+    launch_splitk<kHiddenDim, decltype(block_k_tag)::value, kFuseRmsNorm, kCastBfloatForNorm>(
+        output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+        norm_eps, hc_eps, magnitude, scratch_ptr, stream, use_pdl, rms_weight_ptr, rms_eps);
+  };
 
   switch (splitk_block_k(num_batch)) {
     case 1024:
-      HPC_IHC_LAUNCH_SPLITK(1024);
+      launch(std::integral_constant<int, 1024>{});
       break;
-#if HPC_TARGET_ARCH != 100
-    // Only instantiated where the table can return it: B200's table never
-    // picks 2048, and an arm no call reaches is still compiled into the module.
+#if HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
+    // Only where the table can return it; an unreachable arm still compiles in.
     case 2048:
-      HPC_IHC_LAUNCH_SPLITK(2048);
+      launch(std::integral_constant<int, 2048>{});
       break;
 #endif
     default:
-      HPC_IHC_LAUNCH_SPLITK(4096);
+      launch(std::integral_constant<int, 4096>{});
       break;
   }
-#undef HPC_IHC_LAUNCH_SPLITK
 }
 
 }  // namespace
@@ -255,37 +252,40 @@ size_t ihc_pre_splitk_scratch_floats(int num_batch, int hc_mult, int hidden_dim,
   return static_cast<size_t>(num_batch) * num_splits * (1 + 2 * hc_mult);
 }
 
-void fuse_ihc_pre_splitk_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
+bool fuse_ihc_pre_splitk_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                                const __nv_bfloat16* x_ptr, const float* w_ptr,
                                const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch,
                                int hc_mult, int hidden_dim, float norm_eps, float hc_eps,
                                float magnitude, float* scratch_ptr, cudaStream_t stream,
                                bool use_pdl, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
                                bool cast_bfloat_for_norm) {
-#define HPC_IHC_SPLITK_BY_HIDDEN(hidden, fuse, cast)                                       \
-  launch_splitk_by_block_k<hidden, fuse, cast>(                                            \
-      output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, \
-      norm_eps, hc_eps, magnitude, scratch_ptr, stream, use_pdl, rms_weight_ptr, rms_eps)
+  // The fold/cast nesting is written once and reused per hidden, rather than
+  // once per hidden as a macro expansion.
+  auto by_hidden = [&](auto hidden_tag) {
+    constexpr int kHidden = decltype(hidden_tag)::value;
+    if (rms_weight_ptr == nullptr) {
+      launch_splitk_by_block_k<kHidden, false, false>(
+          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+          norm_eps, hc_eps, magnitude, scratch_ptr, stream, use_pdl, rms_weight_ptr, rms_eps);
+    } else if (cast_bfloat_for_norm) {
+      launch_splitk_by_block_k<kHidden, true, true>(
+          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+          norm_eps, hc_eps, magnitude, scratch_ptr, stream, use_pdl, rms_weight_ptr, rms_eps);
+    } else {
+      launch_splitk_by_block_k<kHidden, true, false>(
+          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+          norm_eps, hc_eps, magnitude, scratch_ptr, stream, use_pdl, rms_weight_ptr, rms_eps);
+    }
+  };
 
-  const bool fuse_norm = rms_weight_ptr != nullptr;
   if (hidden_dim == 6144) {
-    if (!fuse_norm) {
-      HPC_IHC_SPLITK_BY_HIDDEN(6144, false, false);
-    } else if (cast_bfloat_for_norm) {
-      HPC_IHC_SPLITK_BY_HIDDEN(6144, true, true);
-    } else {
-      HPC_IHC_SPLITK_BY_HIDDEN(6144, true, false);
-    }
+    by_hidden(std::integral_constant<int, 6144>{});
   } else if (hidden_dim == 4096) {
-    if (!fuse_norm) {
-      HPC_IHC_SPLITK_BY_HIDDEN(4096, false, false);
-    } else if (cast_bfloat_for_norm) {
-      HPC_IHC_SPLITK_BY_HIDDEN(4096, true, true);
-    } else {
-      HPC_IHC_SPLITK_BY_HIDDEN(4096, true, false);
-    }
+    by_hidden(std::integral_constant<int, 4096>{});
+  } else {
+    return false;
   }
-#undef HPC_IHC_SPLITK_BY_HIDDEN
+  return true;
 }
 
 }  // namespace splitk
