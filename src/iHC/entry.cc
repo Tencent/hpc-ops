@@ -8,6 +8,10 @@
 #include <tuple>
 
 #include "src/iHC/iHC.h"
+// For HPC_TARGET_ARCH, which gates the sm90-only decode path below. The header
+// also #errors if the macro is missing, rather than letting the gate silently
+// evaluate false.
+#include "src/utils/utils.h"
 
 namespace hpc {
 namespace iHC {
@@ -75,9 +79,31 @@ std::tuple<torch::Tensor, torch::Tensor> fuse_ihc_pre_entry(
   auto *output_y_ptr = reinterpret_cast<__nv_bfloat16 *>(output_y.mutable_data_ptr());
   auto *output_H_post_ptr = reinterpret_cast<float *>(output_H_post.mutable_data_ptr());
 
-  fuse_ihc_pre_async(output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
-                     num_batch, hc_mult, hidden_dim, norm_eps, hc_eps, magnitude, stream,
-                     rms_weight_ptr, rms_eps, cast_bfloat_for_norm);
+  // sm90 routes decode-shaped batches to a K-split path: the kernel below has a
+  // grid of exactly num_batch, which cannot fill an sm90 device at small token
+  // counts (latency-flat ~12-13us from 1 to 64 tokens on H20, against 3.8us for
+  // the K-split path at one token). The RMSNorm fold is not implemented there,
+  // so a request carrying rms_weight stays on the shared kernel.
+  bool handled = false;
+#if HPC_TARGET_ARCH == 90
+  if (rms_weight_ptr == nullptr && sm90::ihc_pre_decode_supported(num_batch, hc_mult, hidden_dim)) {
+    const size_t scratch_floats =
+        sm90::ihc_pre_decode_scratch_floats(num_batch, hc_mult, hidden_dim);
+    torch::Tensor scratch =
+        torch::empty({static_cast<int64_t>(scratch_floats)}, options.dtype(torch::kFloat32));
+    sm90::fuse_ihc_pre_decode_async(output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr,
+                                    hc_base_ptr, num_batch, hc_mult, hidden_dim, norm_eps, hc_eps,
+                                    magnitude,
+                                    reinterpret_cast<float *>(scratch.mutable_data_ptr()), stream);
+    handled = true;
+  }
+#endif
+
+  if (!handled) {
+    fuse_ihc_pre_async(output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                       num_batch, hc_mult, hidden_dim, norm_eps, hc_eps, magnitude, stream,
+                       rms_weight_ptr, rms_eps, cast_bfloat_for_norm);
+  }
 
   return std::make_tuple(output_y, output_H_post);
 }
