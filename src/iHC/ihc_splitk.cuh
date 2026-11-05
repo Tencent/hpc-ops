@@ -1,11 +1,13 @@
 // Copyright 2026 Tencent
 
-// Split-K fuse_ihc_pre, for batches with too few tokens to fill the device.
-// Ported from the FlagGems-vllm Triton kernels (flaggems_vllm/ops/ihc/ihc_pre.py).
+// Split-K fuse_ihc_pre and fuse_ihc_head, for batches too small to fill the
+// device. From the FlagGems-vllm Triton kernels, parameterized by gate group.
 //
-// The shared fuse_ihc_pre_or_head_kernel gives each block one row, so its grid
-// is num_batch: on H20 one token leaves 77 of 78 SMs idle, flat at ~12-13us to
-// 64 tokens. Splitting K exposes num_batch * num_splits blocks instead.
+// fuse_ihc_pre_or_head_kernel gives each block one row, so its grid is
+// num_batch and one token leaves all but one SM idle. Splitting K fixes that.
+//
+// kHasPost picks the operator: pre projects 2*hc rows and emits post gates,
+// head projects hc and emits none. The host tabulates the two separately.
 //
 // The token count is the whole criterion -- decode is the common source of such
 // a batch but neither necessary nor sufficient, so nothing here tests the phase.
@@ -31,27 +33,29 @@ namespace hpc {
 namespace iHC {
 namespace splitk {
 
-// Partial slot layout per (token, split): [sqrsum, mix[0 .. 2*hc-1]].
-template <int kHCMult>
+// Partial slot per (token, split): [sqrsum, mix...]. Head's is hc floats
+// narrower, and stage2 reads it whole per split, so it is real traffic.
+template <int kHCMult, bool kHasPost>
 struct PartialSlot {
-  static constexpr int kStride = 1 + 2 * kHCMult;
+  static constexpr int kProjRows = kHasPost ? 2 * kHCMult : kHCMult;
+  static constexpr int kStride = 1 + kProjRows;
 };
 
 // stage1: one block owns one (token, K-chunk), reduced through warp shuffles
 // then shared memory.
 //
-// The loop reads x once into registers and reuses it across all 2*hc weight
-// rows: the baseline Triton kernel's L1TEX bottleneck was re-reading x per row.
+// The loop reads x once into registers and reuses it across all weight rows:
+// the baseline Triton kernel's L1TEX bottleneck was re-reading x per row.
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, int kBlockK,
-          bool kUsePDL = false>
+          bool kUsePDL = false, bool kHasPost = true>
 __global__ void __launch_bounds__(kThreadsPerBlock)
     ihc_pre_stage1_splitk_kernel(float* partial_ptr, const __nv_bfloat16* x_ptr, const float* w_ptr,
                                  int num_batch) {
-  constexpr int kProjRows = 2 * kHCMult;
+  constexpr int kProjRows = PartialSlot<kHCMult, kHasPost>::kProjRows;
   constexpr int kHCDim = kHCMult * kHiddenDim;
   constexpr int kWarpSize = 32;
   constexpr int kWarpsPerBlock = kThreadsPerBlock / kWarpSize;
-  constexpr int kStride = PartialSlot<kHCMult>::kStride;
+  constexpr int kStride = PartialSlot<kHCMult, kHasPost>::kStride;
   constexpr int kNumSplits = (kHCDim + kBlockK - 1) / kBlockK;
   constexpr int kPerIter = kThreadsPerBlock * kElementsPerThread;
 
@@ -165,7 +169,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 // token, keeping two launches and a block-local reduction. The static_assert
 // below enforces the pairing; the host picks the thread count to match.
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, int kNumSplits,
-          bool kUsePDL = false, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false>
+          bool kUsePDL = false, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false,
+          bool kHasPost = true>
 __global__ void __launch_bounds__(kThreadsPerBlock)
     ihc_pre_stage2_splitk_kernel(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                                  const __nv_bfloat16* x_ptr, const float* partial_ptr,
@@ -173,9 +178,9 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
                                  float norm_eps, float hc_eps, float magnitude,
                                  const __nv_bfloat16* rms_weight_ptr = nullptr,
                                  float rms_eps = 0.f) {
-  constexpr int kProjRows = 2 * kHCMult;
+  constexpr int kProjRows = PartialSlot<kHCMult, kHasPost>::kProjRows;
   constexpr int kHCDim = kHCMult * kHiddenDim;
-  constexpr int kStride = PartialSlot<kHCMult>::kStride;
+  constexpr int kStride = PartialSlot<kHCMult, kHasPost>::kStride;
   // One block covers kBlockD contiguous hidden elements.
   constexpr int kBlockD = kThreadsPerBlock * kElementsPerThread;
   constexpr float kInvHCDim = 1.0f / kHCDim;
@@ -201,6 +206,9 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 
   // Each of the first kProjRows+1 threads owns one slot column and walks the
   // splits; the result goes to shared so every thread can read the gates.
+  //
+  // A warp-parallel rewrite must fix the summation order, not let it fall out
+  // of scheduling: fuse_ihc_pre has a bitwise-repeatability test.
   __shared__ float smem_reduced[kProjRows + 1];
   __shared__ float smem_H_pre[kHCMult];
 
@@ -221,10 +229,13 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     const float mixes_pre = smem_reduced[1 + i] * rms_scale;
     smem_H_pre[i] = sigmoid(hc_scale_ptr[0] * mixes_pre + hc_base_ptr[i]) + hc_eps;
 
-    if (blockIdx.y == 0) {
-      const float mixes_post = smem_reduced[1 + kHCMult + i] * rms_scale;
-      output_H_post_ptr[static_cast<int64_t>(token_idx) * kHCMult + i] =
-          magnitude * sigmoid(hc_scale_ptr[1] * mixes_post + hc_base_ptr[kHCMult + i]) + hc_eps;
+    // Compile-time, not a null check: head's tensors have no hc_scale[1].
+    if constexpr (kHasPost) {
+      if (blockIdx.y == 0) {
+        const float mixes_post = smem_reduced[1 + kHCMult + i] * rms_scale;
+        output_H_post_ptr[static_cast<int64_t>(token_idx) * kHCMult + i] =
+            magnitude * sigmoid(hc_scale_ptr[1] * mixes_post + hc_base_ptr[kHCMult + i]) + hc_eps;
+      }
     }
   }
   __syncthreads();

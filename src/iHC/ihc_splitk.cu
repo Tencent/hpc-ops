@@ -65,6 +65,11 @@ constexpr int kElementsPerThread = 8;
 #define HPC_IHC_SPLITK_FORCE 0
 #endif
 
+// Forced builds override head's threshold too, for calibration runs.
+#ifndef HPC_IHC_HEAD_SPLITK_FORCE
+#define HPC_IHC_HEAD_SPLITK_FORCE 0
+#endif
+
 int splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
 #if HPC_IHC_SPLITK_FORCE == 1
   (void)hidden_dim;
@@ -128,7 +133,77 @@ constexpr int splitk_block_k(int num_batch) {
 #endif
 }
 
-template <int kHiddenDim, int kBlockK, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false>
+// BLOCK_K for head: it halves the projection rows, so it wants a 2048 band pre
+// does not have. Carrying pre's table over costs up to 1.19x (4.99 vs 4.18).
+//
+// Swept with the path forced and BLOCK_K pinned per candidate on B200; the two
+// hidden sizes disagree on where the band starts. sm103 inherits, unswept.
+constexpr int head_splitk_block_k(int num_batch, int hidden_dim) {
+#if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
+  if (hidden_dim == 6144) {
+    if (num_batch < 16) {
+      return 1024;
+    }
+    return num_batch < 96 ? 2048 : 4096;
+  }
+  // hidden 4096.
+  if (num_batch < 48) {
+    return 1024;
+  }
+  return num_batch < 160 ? 2048 : 4096;
+#else
+  // Unswept for head on other architectures; pre's shape, which at least has
+  // the right asymptotes.
+  (void)hidden_dim;
+  if (num_batch < 2) {
+    return 1024;
+  }
+  if (num_batch < 48) {
+    return 2048;
+  }
+  return 4096;
+#endif
+}
+
+// Token count at or above which head declines to the row-per-block kernel.
+//
+// Far earlier than pre's ~1.2 * sm_count: half the work per row means the row
+// path saturates below one block per SM. Measured 112/96 at 6144, 80/48 at 4096.
+//
+// An earlier 1.3 * sm_count was fitted against a row path that still held
+// rows=1 past one wave, and ran split-K where the row path was 1.05x faster.
+int head_splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
+#if HPC_IHC_HEAD_SPLITK_FORCE == 1
+  (void)hidden_dim;
+  (void)fuse_rms_norm;
+  return 1 << 30;
+#elif HPC_IHC_HEAD_SPLITK_FORCE == 2
+  (void)hidden_dim;
+  (void)fuse_rms_norm;
+  return 0;
+#else
+  // 0.75 against pre's 1.2: head's row path fills the device at a fraction of
+  // one block per SM. 0.75 * 148 = 111, against a measured 112 at hidden 6144.
+  constexpr float kSmPerBlockRow = 0.75f;
+  // The fold costs the row path ~8% and split-K ~12%, so it moves the crossing
+  // in; 0.8 errs toward the row path at both hidden sizes.
+  constexpr float kFoldScale = 0.8f;
+  constexpr int kHiddenRef = 6144;
+
+  const int sm_count = get_sm_count();
+  if (sm_count <= 0) {
+    return 0;
+  }
+  // Linear in hidden, not sqrt as pre's is: 80 * 1.5 = 120 is closer to the
+  // measured 112 than 80 * sqrt(1.5) = 98.
+  const float hidden_scale = static_cast<float>(hidden_dim) / kHiddenRef;
+  const float fold_scale = fuse_rms_norm ? kFoldScale : 1.0f;
+  return static_cast<int>(sm_count * kSmPerBlockRow * hidden_scale * fold_scale);
+#endif
+}
+
+template <int kHiddenDim, int kBlockK, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false,
+          bool kHasPost = true>
 void launch_splitk(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                    const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
                    const float* hc_base_ptr, int num_batch, float norm_eps, float hc_eps,
@@ -142,7 +217,7 @@ void launch_splitk(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
     constexpr bool kUsePDL = decltype(pdl_tag)::value;
 
     auto stage1 = ihc_pre_stage1_splitk_kernel<kHCMult, kHiddenDim, kElementsPerThread,
-                                               kStage1Threads, kBlockK, kUsePDL>;
+                                               kStage1Threads, kBlockK, kUsePDL, kHasPost>;
     cudaLaunchConfig_t cfg1{};
     cfg1.gridDim = dim3(num_batch, kNumSplits);
     cfg1.blockDim = dim3(kStage1Threads);
@@ -167,9 +242,9 @@ void launch_splitk(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
     constexpr int kHiddenBlocks = kHiddenDim / kBlockD;
     static_assert(kStage2ThreadsHere <= 1024, "stage2 block exceeds the CUDA limit");
 
-    auto stage2 =
-        ihc_pre_stage2_splitk_kernel<kHCMult, kHiddenDim, kElementsPerThread, kStage2ThreadsHere,
-                                     kNumSplits, kUsePDL, kFuseRmsNorm, kCastBfloatForNorm>;
+    auto stage2 = ihc_pre_stage2_splitk_kernel<kHCMult, kHiddenDim, kElementsPerThread,
+                                               kStage2ThreadsHere, kNumSplits, kUsePDL,
+                                               kFuseRmsNorm, kCastBfloatForNorm, kHasPost>;
     cudaLaunchConfig_t cfg2{};
     cfg2.gridDim = dim3(num_batch, kHiddenBlocks);
     cfg2.blockDim = dim3(kStage2ThreadsHere);
@@ -194,7 +269,7 @@ void launch_splitk(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
   }
 }
 
-template <int kHiddenDim, bool kFuseRmsNorm, bool kCastBfloatForNorm>
+template <int kHiddenDim, bool kFuseRmsNorm, bool kCastBfloatForNorm, bool kHasPost = true>
 void launch_splitk_by_block_k(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                               const __nv_bfloat16* x_ptr, const float* w_ptr,
                               const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch,
@@ -203,21 +278,19 @@ void launch_splitk_by_block_k(__nv_bfloat16* output_y_ptr, float* output_H_post_
                               const __nv_bfloat16* rms_weight_ptr, float rms_eps) {
   // Tag-dispatched rather than macro-expanded, matching the kUsePDL tag below.
   auto launch = [&](auto block_k_tag) {
-    launch_splitk<kHiddenDim, decltype(block_k_tag)::value, kFuseRmsNorm, kCastBfloatForNorm>(
-        output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-        norm_eps, hc_eps, magnitude, scratch_ptr, stream, use_pdl, rms_weight_ptr, rms_eps);
+    launch_splitk<kHiddenDim, decltype(block_k_tag)::value, kFuseRmsNorm, kCastBfloatForNorm,
+                  kHasPost>(output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr,
+                            hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, scratch_ptr,
+                            stream, use_pdl, rms_weight_ptr, rms_eps);
   };
 
-  switch (splitk_block_k(num_batch)) {
+  switch (kHasPost ? splitk_block_k(num_batch) : head_splitk_block_k(num_batch, kHiddenDim)) {
     case 1024:
       launch(std::integral_constant<int, 1024>{});
       break;
-#if HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
-    // Only where the table can return it; an unreachable arm still compiles in.
     case 2048:
       launch(std::integral_constant<int, 2048>{});
       break;
-#endif
     default:
       launch(std::integral_constant<int, 4096>{});
       break;
@@ -252,7 +325,7 @@ size_t ihc_pre_splitk_scratch_floats(int num_batch, int hc_mult, int hidden_dim,
   return static_cast<size_t>(num_batch) * num_splits * (1 + 2 * hc_mult);
 }
 
-bool fuse_ihc_pre_splitk_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
+void fuse_ihc_pre_splitk_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                                const __nv_bfloat16* x_ptr, const float* w_ptr,
                                const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch,
                                int hc_mult, int hidden_dim, float norm_eps, float hc_eps,
@@ -283,9 +356,66 @@ bool fuse_ihc_pre_splitk_async(__nv_bfloat16* output_y_ptr, float* output_H_post
   } else if (hidden_dim == 4096) {
     by_hidden(std::integral_constant<int, 4096>{});
   } else {
+    return;
+  }
+}
+
+bool ihc_head_splitk_supported(int num_batch, int hc_mult, int hidden_dim, bool fuse_rms_norm) {
+  if (hc_mult != 4) {
     return false;
   }
-  return true;
+  if (fuse_rms_norm && hidden_dim / kElementsPerThread > 1024) {
+    return false;
+  }
+  if (hidden_dim != 4096 && hidden_dim != 6144) {
+    return false;
+  }
+  return num_batch > 0 && num_batch < head_splitk_token_threshold(hidden_dim, fuse_rms_norm);
+}
+
+size_t ihc_head_splitk_scratch_floats(int num_batch, int hc_mult, int hidden_dim,
+                                      bool fuse_rms_norm) {
+  if (!ihc_head_splitk_supported(num_batch, hc_mult, hidden_dim, fuse_rms_norm)) {
+    return 0;
+  }
+  const int num_splits = (hc_mult * hidden_dim) / head_splitk_block_k(num_batch, hidden_dim);
+  // One gate group, so the slot is 1 + hc floats rather than pre's 1 + 2*hc.
+  return static_cast<size_t>(num_batch) * num_splits * (1 + hc_mult);
+}
+
+void fuse_ihc_head_splitk_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
+                                const float* w_ptr, const float* hc_scale_ptr,
+                                const float* hc_base_ptr, int num_batch, int hc_mult,
+                                int hidden_dim, float norm_eps, float hc_eps, float* scratch_ptr,
+                                cudaStream_t stream, bool use_pdl,
+                                const __nv_bfloat16* rms_weight_ptr, float rms_eps,
+                                bool cast_bfloat_for_norm) {
+  // kHasPost = false: no post gates, so output_H_post_ptr is null and magnitude
+  // unused. Both still pass, since the specialization is what drops the write.
+  auto by_hidden = [&](auto hidden_tag) {
+    constexpr int kHidden = decltype(hidden_tag)::value;
+    if (rms_weight_ptr == nullptr) {
+      launch_splitk_by_block_k<kHidden, false, false, false>(
+          output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, norm_eps, hc_eps,
+          0.f, scratch_ptr, stream, use_pdl, rms_weight_ptr, rms_eps);
+    } else if (cast_bfloat_for_norm) {
+      launch_splitk_by_block_k<kHidden, true, true, false>(
+          output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, norm_eps, hc_eps,
+          0.f, scratch_ptr, stream, use_pdl, rms_weight_ptr, rms_eps);
+    } else {
+      launch_splitk_by_block_k<kHidden, true, false, false>(
+          output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, norm_eps, hc_eps,
+          0.f, scratch_ptr, stream, use_pdl, rms_weight_ptr, rms_eps);
+    }
+  };
+
+  if (hidden_dim == 6144) {
+    by_hidden(std::integral_constant<int, 6144>{});
+  } else if (hidden_dim == 4096) {
+    by_hidden(std::integral_constant<int, 4096>{});
+  } else {
+    return;
+  }
 }
 
 }  // namespace splitk

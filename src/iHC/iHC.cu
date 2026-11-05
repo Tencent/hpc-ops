@@ -265,8 +265,11 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 }
 
-template <int kHCMult, int kHiddenDim, int kElementsPerThread, bool kUsePDL = false>
-__global__ void __launch_bounds__(128)
+// kThreadsPerBlock is a template parameter because __launch_bounds__ must match
+// the block launched: a hardcoded 128 made every other size an invalid launch.
+template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock,
+          bool kUsePDL = false>
+__global__ void __launch_bounds__(kThreadsPerBlock)
     fuse_ihc_post_kernel(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
                          const __nv_bfloat16* residual_ptr, const float* H_post_ptr) {
   if constexpr (kUsePDL) {
@@ -752,9 +755,8 @@ namespace {
 constexpr int kElementsPerThread = 8;
 constexpr int kPostThreadsPerBlock = 128;
 
-// Rows per block for the pre kernel (kHasPost = true). A block reads all of W
-// once whatever its row count, so more rows amortize the weight traffic until
-// the accumulators leave registers. sm90 has its own table in pre_config().
+// Rows per block for pre (kHasPost = true) at a fixed 256 threads. A block
+// reads all of W once, so more rows amortize it until accumulators spill.
 //
 // The first boundary depends on the RMSNorm fold: on B200 an unfolded request
 // below ~176 tokens goes to the split-K path (src/iHC/ihc_splitk.cu) and never
@@ -766,6 +768,10 @@ constexpr int kPostThreadsPerBlock = 128;
 //        128       18.40       13.85        13.00        15.25
 //        192       18.75       14.03        17.83        15.45
 //        320       24.59       19.13        25.31        20.16
+//
+// sm100/103 use sm100_config() instead; this stays as the fallback elsewhere,
+// gated because -Werror=all-warnings rejects an unreferenced function (#177-D).
+#if HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
 constexpr int pre_rows_per_block(int num_batch, bool fuse_rms_norm) {
   if (num_batch < (fuse_rms_norm ? 192 : 64)) {
     return 1;
@@ -804,6 +810,7 @@ constexpr int head_rows_per_block(int num_batch, int hidden_dim) {
   }
   return 2;
 }
+#endif  // HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
 
 // Rows and block size as a pair, for sm90's pre path. The two interact (192
 // threads wins at several token counts and rows alone cannot reach it), and
@@ -821,11 +828,88 @@ constexpr int head_rows_per_block(int num_batch, int hidden_dim) {
 // Gated on the arch it was measured for: the only caller sits in
 // launch_pre_head()'s HPC_TARGET_ARCH == 90 branch, so an ungated definition is
 // unreferenced elsewhere, which -Werror=all-warnings rejects (#177-D).
-#if HPC_TARGET_ARCH == 90
 struct PreConfig {
   int rows;
   int threads;
 };
+
+// Rows and block size as a pair for sm100/sm103; 256 threads alone is best at
+// neither end. Swept per pair in bench_ihc/sweep_rowpath.cu on B200.
+//
+// The first boundary is sm_count, not a token constant: rows=1 gives a grid of
+// exactly num_batch, and crossing one wave costs 1.7x (6.50 -> 11.20us at 148).
+#if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
+constexpr PreConfig sm100_config(int num_batch, int hidden_dim, bool has_post, bool fuse_rms_norm,
+                                 int sm_count) {
+  if (hidden_dim == 6144) {
+    // One wave of one-row blocks, each as wide as the row.
+    if (num_batch <= sm_count) {
+      return {1, 768};
+    }
+    if (num_batch < 320) {
+      return {2, 384};
+    }
+    if (num_batch < 768) {
+      // head stays at rows=2: <6144, rows=4, 384thr> spills 1336B, and the
+      // spilling pair's 0.5us edge is not worth 2648B of spill loads.
+      return has_post ? PreConfig{4, 384} : PreConfig{2, 384};
+    }
+    if (num_batch < 1024) {
+      // No rows=6 arm: it wins only the 768 cell (22.33 vs 24.14) and loses
+      // 1.3-2.2x elsewhere. An arm for it measured 0.52x end to end.
+      return {4, 256};
+    }
+    // Past ~1k tokens only the block size is left. Unfolded, 256 wins every
+    // cell but head's 2048 (37.55 at 192 vs 38.74), which neighbours contradict.
+    if (!fuse_rms_norm) {
+      return {4, 256};
+    }
+    // Folded, the two go opposite ways: pre crosses to 128 from 2048 and stays,
+    // head takes 192 only in 2048..4096 (36.64 vs 42.98) and returns to 256.
+    if (has_post) {
+      return num_batch < 2048 ? PreConfig{4, 256} : PreConfig{4, 128};
+    }
+    return (num_batch >= 2048 && num_batch < 8192) ? PreConfig{4, 192} : PreConfig{4, 256};
+  }
+  // hidden 4096: threads * 8 must divide 4096, so the wide arm is 512 not 768.
+  if (num_batch <= sm_count) {
+    return {1, 512};
+  }
+  if (num_batch < 320) {
+    // Folded head is the one exception to the wide block here: 8.05/8.10 at
+    // rows=1/256 against 8.17/8.35 for rows=2/512.
+    if (!has_post && fuse_rms_norm) {
+      return {1, 256};
+    }
+    return {2, 512};
+  }
+  if (num_batch < 1024) {
+    // head caps at rows=2: every rows=4 pair at 256 threads spills here, and
+    // rows=4/128 is behind until 1024 -- cutting at 768 measured 0.85x.
+    return has_post ? PreConfig{4, 256} : PreConfig{2, 256};
+  }
+  // No rows=6 arm here either, for the reason given above. pre takes the narrow
+  // block once ahead: from 2048 folded, from 4096 unfolded (67.93 -> 63.89).
+  if (has_post) {
+    const int narrow_from = fuse_rms_norm ? 2048 : 4096;
+    return num_batch < narrow_from ? PreConfig{4, 256} : PreConfig{4, 128};
+  }
+  // head's only rows=4 band here is 1024..4096 (14.31 vs 15.30 unfolded).
+  if (num_batch < 4096) {
+    return {4, 128};
+  }
+  if (!fuse_rms_norm) {
+    // 4096: 51.33 at rows=2/256 against 56.56 for rows=4/128; 8192: 96.86
+    // against 97.70. The rows=4 pairs at 256 threads all spill here.
+    return {2, 256};
+  }
+  // Folded, 4096 and 8192 disagree by enough to each get an arm: 53.02 vs
+  // 57.24 at 4096, then 97.57 vs 102.04 at 8192.
+  return num_batch < 8192 ? PreConfig{2, 128} : PreConfig{4, 128};
+}
+#endif  // HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
+
+#if HPC_TARGET_ARCH == 90
 
 constexpr PreConfig pre_config(int num_batch, int hidden_dim) {
   if (hidden_dim == 6144) {
@@ -918,9 +1002,8 @@ void launch_pre_head_rows(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
   }
 }
 
-// Picks the launch shape and forwards. sm90 takes the (rows, threads) pair from
-// pre_config(); elsewhere only the row count varies at 256 threads, per
-// pre_rows_per_block(). Same kernel either way -- the split is over constants.
+// Picks the launch shape and forwards; same kernel in every case, the split is
+// over constants. sm90 uses pre_config(), sm100/103 sm100_config().
 template <int kHiddenDim, bool kHasPost, bool kFuseRmsNorm, bool kCastBfloatForNorm>
 void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                      const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
@@ -935,6 +1018,86 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
         output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
         norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
   };
+
+#if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
+  {
+    const PreConfig cfg =
+        sm100_config(num_batch, kHiddenDim, kHasPost, kFuseRmsNorm, get_sm_count());
+    // Only the pairs sm100_config() can return here; threads * kElem must
+    // divide kHiddenDim, which is why the two hidden sizes list different ones.
+    if constexpr (kHiddenDim == 6144) {
+      if (cfg.rows == 1 && cfg.threads == 768) {
+        launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 768>{});
+        return;
+      }
+      if (cfg.rows == 2 && cfg.threads == 384) {
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 384>{});
+        return;
+      }
+      // `if constexpr`, not a plain `if`: an arm no call reaches is still
+      // instantiated, and these spill up to 1336B in the head specialization.
+      if constexpr (kHasPost) {
+        if (cfg.rows == 4 && cfg.threads == 384) {
+          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 384>{});
+          return;
+        }
+        if (cfg.rows == 4 && cfg.threads == 128) {
+          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 128>{});
+          return;
+        }
+      }
+      if (cfg.rows == 4 && cfg.threads == 256) {
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
+        return;
+      }
+      // head-only: sm100_config() returns 192 threads only for the folded head.
+      if constexpr (!kHasPost) {
+        if (cfg.rows == 4 && cfg.threads == 192) {
+          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 192>{});
+          return;
+        }
+      }
+    } else if constexpr (kHiddenDim == 4096) {
+      if (cfg.rows == 1 && cfg.threads == 512) {
+        launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 512>{});
+        return;
+      }
+      if (cfg.rows == 2 && cfg.threads == 512) {
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 512>{});
+        return;
+      }
+      if (cfg.rows == 2 && cfg.threads == 256) {
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 256>{});
+        return;
+      }
+      // head-only below 4096 tokens, and pre-only at rows=4/256: that pair
+      // spills 2640B as a head kernel, the largest in the operator.
+      if constexpr (kHasPost) {
+        if (cfg.rows == 4 && cfg.threads == 256) {
+          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
+          return;
+        }
+      } else {
+        if (cfg.rows == 1 && cfg.threads == 256) {
+          launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 256>{});
+          return;
+        }
+        if (cfg.rows == 2 && cfg.threads == 128) {
+          launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 128>{});
+          return;
+        }
+      }
+      if (cfg.rows == 4 && cfg.threads == 128) {
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 128>{});
+        return;
+      }
+    }
+    // Reaching here means the table grew a pair without an arm. Take the one
+    // shape every hidden size can express rather than fall through silently.
+    launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 256>{});
+    return;
+  }
+#endif  // HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
 
   // Head skips pre_config(): two of its pairs spill in the head instantiation,
   // per -Xptxas=-v under sm_90a (a compile-time fact, not an sm100 extrapolation):
@@ -1005,6 +1168,10 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
   // runtime code because a template arm no call reaches is still compiled: the
   // spilling <4096, rows=4, kHasPost=false> instantiation would otherwise stay
   // in the module and in the -Xptxas=-v output, hiding the next real spill.
+  //
+  // sm100/103 returned above; compiling this there would instantiate six pairs
+  // the architecture never launches.
+#if HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
   if constexpr (kHasPost) {
     switch (pre_rows_per_block(num_batch, kFuseRmsNorm)) {
       case 1:
@@ -1035,6 +1202,7 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
         break;
     }
   }
+#endif  // HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
 }
 
 template <int kHiddenDim, bool kFuseRmsNorm, bool kCastBfloatForNorm>
@@ -1125,24 +1293,17 @@ void launch_post_pre(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_o
   }
 }
 
-template <int kHiddenDim>
-void launch_post(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
-                 const __nv_bfloat16* residual_ptr, const float* H_post_ptr, int num_batch,
-                 cudaStream_t stream, bool use_pdl) {
-  constexpr int kMaxSplit = kHiddenDim / (kPostThreadsPerBlock * kElementsPerThread);
-  int block_per_row = 1;
-  if (num_batch > 0) {
-    block_per_row = (get_sm_count() + num_batch - 1) / num_batch;
-    block_per_row = std::min(block_per_row, kMaxSplit);
-    block_per_row = std::max(block_per_row, 1);
-  }
-
-  dim3 block(kPostThreadsPerBlock);
+template <int kHiddenDim, int kThreads>
+void launch_post_shape(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
+                       const __nv_bfloat16* residual_ptr, const float* H_post_ptr, int num_batch,
+                       int block_per_row, cudaStream_t stream, bool use_pdl) {
+  dim3 block(kThreads);
   dim3 grid(num_batch, block_per_row, 1);
 
   auto launch = [&](auto pdl_tag) {
     constexpr bool kUsePDL = decltype(pdl_tag)::value;
-    auto kernel = kernels::fuse_ihc_post_kernel<4, kHiddenDim, kElementsPerThread, kUsePDL>;
+    auto kernel =
+        kernels::fuse_ihc_post_kernel<4, kHiddenDim, kElementsPerThread, kThreads, kUsePDL>;
     cudaLaunchConfig_t config{};
     config.gridDim = grid;
     config.blockDim = block;
@@ -1164,16 +1325,81 @@ void launch_post(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
   }
 }
 
+// post's launch shape: block size, and how many hidden slices cover one token.
+//
+// post is pure streaming (1 read x reused across 4 channels, 4 read residual,
+// 4 write out), so the launch shape is the entire tuning surface.
+//
+// The old policy derived splits as ceil(sm_count / num_batch), so it collapsed
+// to 1 past the SM count. Covering the row exactly wins at every count swept.
+//
+// B200, 148 SM, hidden 6144, us per call (bench_ihc/sweep_post.cu):
+//
+//   hidden 6144, 128 threads: 192 tokens measured 6.91us at 1 split (what the
+//   old policy picked) against 3.44us at 6. bench_ihc/sweep_post.cu.
+//
+// 6 x 128 x 8 = 6144: one block per token covers the whole row in one pass. The
+// 2.01x gap is one the SM-count formula creates, not one it was working around.
+//
+// A block that does not cover its row loops with a grid-wide stride, so each
+// iteration's loads are hidden/span apart and never coalesce with the next's.
+//
+// The block size then barely matters: at hidden 6144 every count lands within
+// 2% of the best at its own full-coverage split, so 128 stays.
+struct PostConfig {
+  int threads;
+  int splits;
+};
+
+constexpr PostConfig post_config(int num_batch, int hidden_dim) {
+  (void)num_batch;
+  int threads = kPostThreadsPerBlock;
+#if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
+  // The one block-size arm: 256x2 measured 47.87/92.11/180.54 at 4096/8192/
+  // 16384 tokens against 48.14/93.19/181.71 for 128x4. hidden 6144 needs none.
+  if (hidden_dim == 4096 && num_batch >= 4096) {
+    threads = 256;
+  }
+#endif
+
+  // Cover the row: one pass, no grid-stride loop. Among shapes that do, the
+  // thread count varies by a percent or two and not monotonically.
+  const int max_split = hidden_dim / (threads * kElementsPerThread);
+  return {threads, max_split > 1 ? max_split : 1};
+}
+
+template <int kHiddenDim>
+void launch_post(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
+                 const __nv_bfloat16* residual_ptr, const float* H_post_ptr, int num_batch,
+                 cudaStream_t stream, bool use_pdl) {
+  const PostConfig cfg = post_config(num_batch, kHiddenDim);
+
+  auto go = [&](auto threads_tag) {
+    launch_post_shape<kHiddenDim, decltype(threads_tag)::value>(
+        output_ptr, x_ptr, residual_ptr, H_post_ptr, num_batch, cfg.splits, stream, use_pdl);
+  };
+
+  // Only the sizes post_config() can return. 256 is reachable only at hidden
+  // 4096, so the arm is `if constexpr`-guarded.
+  if constexpr (kHiddenDim == 4096) {
+    if (cfg.threads == 256) {
+      go(std::integral_constant<int, 256>{});
+      return;
+    }
+  }
+  go(std::integral_constant<int, kPostThreadsPerBlock>{});
+}
+
 }  // namespace
 
-bool fuse_ihc_pre_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
+void fuse_ihc_pre_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                         const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
                         const float* hc_base_ptr, int num_batch, int hc_mult, int hidden_dim,
                         float norm_eps, float hc_eps, float magnitude, cudaStream_t stream,
                         const __nv_bfloat16* rms_weight_ptr, float rms_eps,
                         bool cast_bfloat_for_norm, bool use_pdl) {
   if (hc_mult != 4) {
-    return false;
+    return;
   }
   auto by_hidden = [&](auto hidden_tag) {
     constexpr int kHidden = decltype(hidden_tag)::value;
@@ -1197,12 +1423,11 @@ bool fuse_ihc_pre_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
   } else if (hidden_dim == 4096) {
     by_hidden(std::integral_constant<int, 4096>{});
   } else {
-    return false;
+    return;
   }
-  return true;
 }
 
-bool fuse_ihc_post_pre_async(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr,
+void fuse_ihc_post_pre_async(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr,
                              const __nv_bfloat16* xa_ptr, const __nv_bfloat16* residual_ptr,
                              const float* H_post_in_ptr, const float* w_ptr,
                              const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch,
@@ -1211,7 +1436,7 @@ bool fuse_ihc_post_pre_async(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* 
                              const __nv_bfloat16* rms_weight_ptr, float rms_eps,
                              bool cast_bfloat_for_norm, bool use_pdl) {
   if (hc_mult != 4) {
-    return false;
+    return;
   }
   auto by_hidden = [&](auto hidden_tag) {
     constexpr int kHidden = decltype(hidden_tag)::value;
@@ -1238,9 +1463,8 @@ bool fuse_ihc_post_pre_async(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* 
   } else if (hidden_dim == 4096) {
     by_hidden(std::integral_constant<int, 4096>{});
   } else {
-    return false;
+    return;
   }
-  return true;
 }
 
 size_t ihc_post_pre_scratch_floats(int num_batch, int hc_mult, int hidden_dim) {
@@ -1256,29 +1480,28 @@ size_t ihc_post_pre_scratch_floats(int num_batch, int hc_mult, int hidden_dim) {
   return static_cast<size_t>(num_batch) * chunks * (proj_rows + 1);
 }
 
-bool fuse_ihc_post_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
+void fuse_ihc_post_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
                          const __nv_bfloat16* residual_ptr, const float* H_post_ptr, int num_batch,
                          int hc_mult, int hidden_dim, cudaStream_t stream, bool use_pdl) {
   if (hc_mult != 4) {
-    return false;
+    return;
   }
   if (hidden_dim == 6144) {
     launch_post<6144>(output_ptr, x_ptr, residual_ptr, H_post_ptr, num_batch, stream, use_pdl);
   } else if (hidden_dim == 4096) {
     launch_post<4096>(output_ptr, x_ptr, residual_ptr, H_post_ptr, num_batch, stream, use_pdl);
   } else {
-    return false;
+    return;
   }
-  return true;
 }
 
-bool fuse_ihc_head_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr, const float* w_ptr,
+void fuse_ihc_head_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr, const float* w_ptr,
                          const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch,
                          int hc_mult, int hidden_dim, float norm_eps, float hc_eps,
                          cudaStream_t stream, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
                          bool cast_bfloat_for_norm, bool use_pdl) {
   if (hc_mult != 4) {
-    return false;
+    return;
   }
   auto by_hidden = [&](auto hidden_tag) {
     constexpr int kHidden = decltype(hidden_tag)::value;
@@ -1302,9 +1525,8 @@ bool fuse_ihc_head_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr, 
   } else if (hidden_dim == 4096) {
     by_hidden(std::integral_constant<int, 4096>{});
   } else {
-    return false;
+    return;
   }
-  return true;
 }
 
 }  // namespace iHC
