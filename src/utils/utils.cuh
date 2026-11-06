@@ -665,6 +665,23 @@ __device__ __forceinline__ void cp_async_16b(void *smem_dst, const void *gmem_sr
                "r"(src_size));
 }
 
+// The 4B sibling of cp_async_16b. A src_size below 4 zero-fills the remaining bytes, which is how
+// callers turn an out-of-range source row into zeros without branching.
+__device__ __forceinline__ void cp_async_4b(void *smem_dst, const void *gmem_src, int src_size) {
+  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_dst);
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(smem_addr), "l"(gmem_src),
+               "r"(src_size)
+               : "memory");
+}
+
+// 16B vector atomic add: eight bf16 added to global in one instruction. red (rather than atom)
+// because no thread needs the previous value back.
+__device__ __forceinline__ void red_add_v4_bf16x2(void *ptr, const uint4 &v) {
+  asm volatile("red.global.add.noftz.v4.bf16x2 [%0], {%1, %2, %3, %4};\n" ::"l"(ptr), "r"(v.x),
+               "r"(v.y), "r"(v.z), "r"(v.w)
+               : "memory");
+}
+
 __device__ __forceinline__ void find_next_block(uint4 *clc_response, uint64_t *mbar) {
   uint32_t mbar_ptr = cute::cast_smem_ptr_to_uint(reinterpret_cast<const void *>(mbar));
   uint32_t clc_resp_ptr = cute::cast_smem_ptr_to_uint(reinterpret_cast<const void *>(clc_response));
