@@ -5,10 +5,13 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <cmath>
+#include <limits>
 #include <tuple>
 
 #include "src/fuse_moe/fuse_moe.h"
 #include "src/fuse_moe/fuse_moe_cp_async.h"
+#include "src/fuse_moe/fuse_moe_mxfp8.h"
 #include "src/utils/utils.h"
 
 namespace hpc {
@@ -648,6 +651,155 @@ torch::Tensor fuse_moe_blockwise_entry(
   }
 }
 
+torch::Tensor fuse_moe_mxfp8_entry(
+    const torch::Tensor &x, const torch::Tensor &x_scale, const torch::Tensor &gate_up_weight,
+    const torch::Tensor &gate_up_weight_scale, const torch::Tensor &down_weight,
+    const torch::Tensor &down_weight_scale, const torch::Tensor &topk_ids,
+    const torch::Tensor &topk_scale, std::optional<torch::Tensor> shared_output, int64_t rank_ep,
+    int64_t num_expert_total, double limit, std::optional<torch::Tensor> output) {
+  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
+  int num_tokens = static_cast<int>(x.size(0));
+  int hidden_size = static_cast<int>(x.size(1));
+  int num_topk = static_cast<int>(topk_ids.size(1));
+  int num_experts = static_cast<int>(gate_up_weight.size(0));
+  auto options = x.options();
+
+  // limit <= 0 or inf means no SwiGLU clamp, which the kernel spells as inf.
+  TORCH_CHECK(!std::isnan(limit), "limit must not be NaN");
+  float swiglu_limit = std::numeric_limits<float>::infinity();
+  if (limit > 0.0 && limit != std::numeric_limits<double>::infinity()) {
+    TORCH_CHECK(limit <= std::numeric_limits<float>::max() && static_cast<float>(limit) > 0.f,
+                "positive limit must be representable as float32");
+    swiglu_limit = static_cast<float>(limit);
+  }
+
+  TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn, "x must be float8_e4m3fn");
+  // mxfp8 weights are float8_e4m3fn; mxfp4 weights are uint8 with two e2m1 per byte, so their
+  // last dim is halved.
+  bool is_fp4 = gate_up_weight.dtype() == torch::kUInt8;
+  TORCH_CHECK((!is_fp4 && gate_up_weight.dtype() == torch::kFloat8_e4m3fn &&
+               down_weight.dtype() == torch::kFloat8_e4m3fn) ||
+                  (is_fp4 && down_weight.dtype() == torch::kUInt8),
+              "gate_up_weight and down_weight must both be float8_e4m3fn (mxfp8) or both be "
+              "uint8 (packed mxfp4)");
+  TORCH_CHECK(x_scale.dtype() == torch::kUInt8 && gate_up_weight_scale.dtype() == torch::kUInt8 &&
+                  down_weight_scale.dtype() == torch::kUInt8,
+              "scales must be uint8 UE8M0 bytes in layout_128x4");
+  TORCH_CHECK(topk_ids.dtype() == torch::kInt32, "topk_ids must be int32");
+  TORCH_CHECK(topk_scale.dtype() == torch::kFloat32, "topk_scale must be float32");
+  for (const auto *t : {&x, &x_scale, &gate_up_weight, &gate_up_weight_scale, &down_weight,
+                        &down_weight_scale, &topk_ids, &topk_scale}) {
+    TORCH_CHECK(t->is_cuda() && t->is_contiguous(), "all inputs must be cuda + contiguous");
+    TORCH_CHECK(t->device() == x.device(), "all inputs must be on the same device");
+  }
+  TORCH_CHECK(x.dim() == 2 && x_scale.dim() == 2 && topk_ids.dim() == 2 && topk_scale.dim() == 2,
+              "x / x_scale / topk_ids / topk_scale must be 2D");
+  TORCH_CHECK(gate_up_weight.dim() == 3 && down_weight.dim() == 3, "weights must be 3D");
+
+  int intermediate_size = static_cast<int>(gate_up_weight.size(1)) / 2;
+
+  // num_topk is a template parameter, specialized for 8 and 16 only.
+  TORCH_CHECK(num_topk == 8 || num_topk == 16, "fuse_moe_mxfp8 supports num_topk in {8, 16}, got ",
+              num_topk);
+  TORCH_CHECK(topk_ids.size(0) == num_tokens && topk_scale.size(0) == num_tokens &&
+                  topk_scale.size(1) == num_topk,
+              "topk_ids / topk_scale must be [num_seq, num_topk]");
+  TORCH_CHECK(hidden_size % 128 == 0, "hidden must be a multiple of 128");
+  TORCH_CHECK(intermediate_size % 128 == 0, "intermediate must be a multiple of 128");
+  TORCH_CHECK(num_experts > 0 && num_experts <= 256, "num_expert_local must be in [1, 256]");
+  TORCH_CHECK(num_expert_total >= num_experts * (rank_ep + 1),
+              "rank_ep / num_expert_total mismatch");
+  TORCH_CHECK(x_scale.size(0) == num_tokens && x_scale.size(1) == hidden_size / 32,
+              "x_scale must be [num_seq, hidden / 32]");
+  // mxfp4 weights store K / 2 bytes per row.
+  int w_pack = is_fp4 ? 2 : 1;
+  TORCH_CHECK(gate_up_weight.size(1) == 2 * intermediate_size &&
+                  gate_up_weight.size(2) == hidden_size / w_pack,
+              "gate_up_weight must be [num_expert_local, 2 * intermediate, hidden (/ 2 for "
+              "mxfp4)]");
+  // The weight scales are flashinfer layout_128x4, laid out per expert; 2 * intermediate and
+  // hidden are both multiples of 128, so nothing needs padding. gate_up_weight's rows must be
+  // interleaved 16 at a time (gate16, up16, ...).
+  TORCH_CHECK(gate_up_weight_scale.numel() ==
+                  static_cast<int64_t>(num_experts) * 2 * intermediate_size * (hidden_size / 32),
+              "gate_up_weight_scale must be layout_128x4 of [num_expert_local, 2 * "
+              "intermediate, hidden / 32]");
+  TORCH_CHECK(down_weight.size(0) == num_experts && down_weight.size(1) == hidden_size &&
+                  down_weight.size(2) == intermediate_size / w_pack,
+              "down_weight must be [num_expert_local, hidden, intermediate (/ 2 for mxfp4)]");
+  TORCH_CHECK(down_weight_scale.numel() ==
+                  static_cast<int64_t>(num_experts) * hidden_size * (intermediate_size / 32),
+              "down_weight_scale must be layout_128x4 of [num_expert_local, hidden, "
+              "intermediate / 32]");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(gate_up_weight_scale.const_data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(down_weight_scale.const_data_ptr()) % 16 == 0,
+              "weight scales must be 16B aligned (TMA)");
+  // CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B needs a 32B-aligned globalAddress (cuda.h,
+  // cuTensorMapEncodeTiled).
+  TORCH_CHECK(!is_fp4 || (reinterpret_cast<uintptr_t>(gate_up_weight.const_data_ptr()) % 32 == 0 &&
+                          reinterpret_cast<uintptr_t>(down_weight.const_data_ptr()) % 32 == 0),
+              "mxfp4 weights must be 32B aligned (TMA 16U4_ALIGN16B)");
+
+  auto u8 = options.dtype(torch::kUInt8);
+  auto i32 = options.dtype(torch::kInt32);
+  auto bf16 = options.dtype(torch::kBFloat16);
+
+  int total_num_seq = num_tokens * num_topk;
+  int num_seq_per_group_avg = total_num_seq / static_cast<int>(num_expert_total);
+  int tile_m = 128;
+  if (num_seq_per_group_avg <= 32) {
+    tile_m = 32;
+  } else if (num_seq_per_group_avg <= 64) {
+    tile_m = 64;
+  }
+  int max_tiles = (total_num_seq + tile_m - 1) / tile_m + num_experts;
+
+  // The gate_up output doubles as the down input: rows are tile aligned and the scale is
+  // layout_128x4 with the row count padded to a multiple of 128.
+  torch::Tensor down_input = torch::empty({max_tiles * tile_m, intermediate_size}, u8);
+  torch::Tensor down_input_scale =
+      torch::empty({(max_tiles * tile_m + 127) / 128 * 128, intermediate_size / 32}, u8);
+  torch::Tensor permuted_idx_to_raw_idx = torch::empty({total_num_seq}, i32);
+  torch::Tensor seqlens = torch::zeros({num_experts}, i32);
+  torch::Tensor cu_seqlens = torch::empty({num_experts + 1}, i32);
+  torch::Tensor tiles = torch::empty({2 * num_experts}, i32);
+
+  // The down epilogue atomically adds 16B of bf16 per token into y: every top-k contribution is
+  // rounded to bf16 once and the summation order is undefined, so the result is not
+  // bit-reproducible. y therefore has to start at the value we want to accumulate onto --
+  // shared_output accumulates in place and is returned, otherwise y is output (zeroed first) or a
+  // fresh zeros.
+  torch::Tensor y;
+  if (shared_output.has_value()) {
+    y = shared_output.value();
+    TORCH_CHECK(y.is_cuda() && y.is_contiguous() && y.size(0) == num_tokens &&
+                    y.size(1) == hidden_size && y.dtype() == torch::kBFloat16,
+                "shared_output must be cuda + contiguous bf16 [num_seq, hidden]");
+  } else if (output.has_value()) {
+    y = output.value();
+    TORCH_CHECK(y.is_cuda() && y.is_contiguous() && y.size(0) == num_tokens &&
+                    y.size(1) == hidden_size && y.dtype() == torch::kBFloat16,
+                "output must be cuda + contiguous bf16 [num_seq, hidden]");
+    y.zero_();
+  } else {
+    y = torch::zeros({num_tokens, hidden_size}, bf16);
+  }
+
+  HPC_ARCH_DISPATCH(
+      "fuse_moe_mxfp8", 120,
+      fuse_moe_mxfp8_async(y.mutable_data_ptr(), x.const_data_ptr(), x_scale.const_data_ptr(),
+                           gate_up_weight.const_data_ptr(), gate_up_weight_scale.const_data_ptr(),
+                           down_input.mutable_data_ptr(), down_input_scale.mutable_data_ptr(),
+                           down_weight.const_data_ptr(), down_weight_scale.const_data_ptr(),
+                           topk_ids.const_data_ptr(), topk_scale.const_data_ptr(),
+                           permuted_idx_to_raw_idx.mutable_data_ptr(), seqlens.mutable_data_ptr(),
+                           cu_seqlens.mutable_data_ptr(), tiles.mutable_data_ptr(), num_tokens,
+                           hidden_size, intermediate_size, num_topk, num_experts,
+                           static_cast<int>(rank_ep), max_tiles, tile_m, swiglu_limit, is_fp4,
+                           stream));
+  return y;
+}
+
 }  // namespace fuse_moe
 }  // namespace hpc
 
@@ -691,4 +843,11 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
       "Tensor topk_scale, Tensor ? shared_output, int rank_ep, int num_expert_total, Tensor ? "
       "output) -> (Tensor)");
   m.impl("fuse_moe_blockwise_fp8", torch::kCUDA, &hpc::fuse_moe::fuse_moe_blockwise_entry);
+
+  m.def(
+      "fuse_moe_mxfp8(Tensor x, Tensor x_scale, Tensor gate_up_weight, "
+      "Tensor gate_up_weight_scale, Tensor down_weight, Tensor down_weight_scale, "
+      "Tensor topk_ids, Tensor topk_scale, Tensor? shared_output, int rank_ep, "
+      "int num_expert_total, float limit, Tensor? output) -> (Tensor)");
+  m.impl("fuse_moe_mxfp8", torch::kCUDA, &hpc::fuse_moe::fuse_moe_mxfp8_entry);
 }

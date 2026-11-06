@@ -260,6 +260,73 @@ def fuse_moe_blockwise(
     )
 
 
+def fuse_moe_mxfp8(
+    x: Tensor,
+    x_scale: Tensor,
+    gate_up_weight: Tensor,
+    gate_up_weight_scale: Tensor,
+    down_weight: Tensor,
+    down_weight_scale: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    rank_ep: int,
+    num_expert_total: int,
+    limit: float = float("inf"),
+    shared_output: Tensor = None,
+    output: Tensor = None,
+) -> Tensor:
+    """MXFP8 fused MoE forward (weights may be mxfp8 or mxfp4), sm120.
+
+    Args:
+        x: Input activation, fp8_e4m3, [num_seq, hidden]
+        x_scale: Per-32K UE8M0 scale, uint8, [num_seq, hidden//32]
+        gate_up_weight: Either fp8_e4m3 [num_expert_local, 2 * intermediate, hidden] (mxfp8) or
+            uint8 packed e2m1 [num_expert_local, 2 * intermediate, hidden//2] (mxfp4, two values
+            per byte, the even index in the low 4 bits). Precision is detected from the dtype.
+            Rows are interleaved 16 at a time (gate16, up16, ...).
+        gate_up_weight_scale: uint8 UE8M0 in flashinfer ``layout_128x4`` of
+            [num_expert_local, 2 * intermediate, hidden//32], interleaved like the weight.
+        down_weight: fp8_e4m3 [num_expert_local, hidden, intermediate] (mxfp8) or uint8 packed
+            e2m1 [num_expert_local, hidden, intermediate//2] (mxfp4). Must share precision with
+            gate_up_weight.
+        down_weight_scale: uint8 UE8M0 in ``layout_128x4`` of
+            [num_expert_local, hidden, intermediate//32]
+        topk_ids: int32, [num_seq, num_topk], GLOBAL expert ids (out-of-rank ids are filtered);
+            num_topk is 8 or 16
+        topk_scale: float32, [num_seq, num_topk]
+        rank_ep: int -- this rank within the EP group
+        num_expert_total: int -- total experts across all EP ranks
+        limit: SwiGLU clamp bound: gate is clamped above at ``limit``, up to [-limit, limit].
+            ``inf`` (or <= 0) keeps the unclamped SwiGLU.
+        shared_output: optional bf16, [num_seq, hidden]. The result accumulates into it in place
+            and it is returned.
+        output: optional bf16, [num_seq, hidden], zeroed and written when shared_output is None.
+
+    Returns:
+        bf16 tensor [num_seq, hidden]
+
+    Note:
+        hidden and intermediate must be multiples of 128, and mxfp4 weights 32B aligned. The
+        top-k reduce is fused into the down epilogue as a bf16 atomic add, so the output is not
+        bit-reproducible across runs.
+    """
+    return torch.ops.hpc.fuse_moe_mxfp8(
+        x,
+        x_scale,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids,
+        topk_scale,
+        shared_output,
+        rank_ep,
+        num_expert_total,
+        limit,
+        output,
+    )
+
+
 @torch.library.register_fake("hpc::count_and_gather")
 def count_and_gather_fake(
     x, topk_ids, num_expert, rank_ep, intermediate_size, num_seq_per_group_avg
@@ -366,6 +433,31 @@ def fuse_moe_blockwise_fp8_fake(
     num_expert_total: int,
     output,
 ):
+    return (
+        output
+        if output is not None
+        else torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+    )
+
+
+@torch.library.register_fake("hpc::fuse_moe_mxfp8")
+def fuse_moe_mxfp8_fake(
+    x: Tensor,
+    x_scale: Tensor,
+    gate_up_weight: Tensor,
+    gate_up_weight_scale: Tensor,
+    down_weight: Tensor,
+    down_weight_scale: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    shared_output,
+    rank_ep: int,
+    num_expert_total: int,
+    limit: float,
+    output,
+):
+    if shared_output is not None:
+        return shared_output
     return (
         output
         if output is not None
