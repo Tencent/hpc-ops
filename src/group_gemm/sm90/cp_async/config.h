@@ -21,13 +21,16 @@ CUTE_HOST_DEVICE constexpr auto mma_selector() {
     return SM90_64x16x32_F32E4M3E4M3_SS_TN<>{};
   } else if constexpr (kTileM == 32) {
     return SM90_64x32x32_F32E4M3E4M3_SS_TN<>{};
+  } else if constexpr (kTileM == 40) {
+    return SM90_64x40x32_F32E4M3E4M3_SS_TN<>{};
   } else if constexpr (kTileM == 48) {
     return SM90_64x48x32_F32E4M3E4M3_SS_TN<>{};
   } else if constexpr (kTileM == 64) {
     return SM90_64x64x32_F32E4M3E4M3_SS_TN<>{};
   } else {
-    static_assert(kTileM == 8 || kTileM == 16 || kTileM == 32 || kTileM == 48 || kTileM == 64,
-                  "mma_selector: kTileM must be one of {8, 16, 32, 48, 64}");
+    static_assert(
+        kTileM == 8 || kTileM == 16 || kTileM == 32 || kTileM == 40 || kTileM == 48 || kTileM == 64,
+        "mma_selector: kTileM must be one of {8, 16, 32, 40, 48, 64}");
     return SM90_64x64x32_F32E4M3E4M3_SS_TN<>{};
   }
 }

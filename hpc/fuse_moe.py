@@ -5,6 +5,38 @@ from torch import Tensor
 from typing import Tuple
 
 
+def fuse_moe_w4a8(
+    x: Tensor,
+    w13: Tensor,
+    s13: Tensor,
+    ss13: Tensor,
+    w2: Tensor,
+    s2: Tensor,
+    ss2: Tensor,
+    topk_ids: Tensor,
+    topk_weights: Tensor,
+    output: Tensor = None,
+) -> Tensor:
+    """Run the native H20 E256/H2048/I512 MXFP4/FP8 MoE.
+
+    ``x`` is BF16 [M,2048]; Top-K IDs are int32 [M,K], 1<=K<=8,
+    in [0,256), and their weights are FP32 with the same shape. Weight
+    triples come from ``prepare_w4a8_weights``. Preparation is
+    offline; forward includes dynamic g128 input quantization, routing,
+    both GEMMs, BF16 SiLU/multiply, second quantization, and Top-K sum.
+    IDs are trusted device metadata. Forward performs no CPU contents read.
+    The BF16 [M,2048] result optionally aliases preallocated ``output``.
+    """
+    return torch.ops.hpc.fuse_moe_w4a8(
+        x, w13, s13, ss13, w2, s2, ss2, topk_ids, topk_weights, output
+    )
+
+
+@torch.library.register_fake("hpc::fuse_moe_w4a8")
+def fuse_moe_w4a8_fake(x, w13, s13, ss13, w2, s2, ss2, topk_ids, topk_weights, output=None):
+    return output if output is not None else x.new_empty((x.shape[0], 2048), dtype=torch.bfloat16)
+
+
 def count_and_gather(
     x: Tensor,
     topk_ids: Tensor,
