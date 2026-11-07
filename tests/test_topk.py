@@ -42,31 +42,79 @@ def _persistent_grid():
     return 3 * _sm_count()
 
 
-def _kv_split_schedule_boundaries():
-    """Return both ends of every split-count band active on this GPU."""
-    grid = _persistent_grid()
-    first_split_row = 17 if _sm_major() >= 9 else 1
-    eight_hi = min(192, max(16, _sm_count() // 8))
-    four_hi = min(192, grid // 4)
-    bands = (
-        (8, first_split_row, eight_hi),
-        (4, max(first_split_row, eight_hi + 1), four_hi),
-        (2, max(first_split_row, four_hi + 1), 192),
-    )
-    cases = []
-    for splits, lo, hi in bands:
-        if lo > hi:
-            continue
-        cases.append((lo, splits))
-        if hi != lo:
-            cases.append((hi, splits))
-    return cases
+def _mc_supported():
+    return _sm_major() >= 9
+
+
+def _mc_min_n(m):
+    if m <= 8:
+        return 32768
+    if m <= 16:
+        return 65536
+    if m <= 32:
+        return 65536
+    return 131072
+
+
+def _mc_segments(m, n):
+    """Segments per row of the multi-CTA route, mirroring mc_segs_per_row."""
+    if not _mc_supported() or m <= 0 or m > 64 or n < _mc_min_n(m):
+        return 0
+    short = n <= 262144
+    min_seg = 4096 if short else 16384
+    budget = 8 if short else 19
+    by_budget = max(1, budget // m)
+    by_len = max(1, n // (8 * min_seg))
+    segs = min(min(by_budget, by_len), 64) * 8
+    wave = 2 * _sm_count()
+    if segs * m > wave:
+        return max(1, wave // m)
+    return segs
+
+
+def _row_local_max_n(m):
+    sm = _sm_count()
+    if m <= 0:
+        return 0
+    if m > 2 * sm:
+        return 65536
+    if m >= 64:
+        return 262144
+    if m >= 32:
+        return 196608
+    return 131072
 
 
 def _expected_split_workspace_bytes(m, n, splits):
-    spill = max(_persistent_grid(), m) * 2 * n
-    split_state = m * splits + m * splits * 2048 + m * n
+    # Spill grows a two-slice candidate staging area per segment set and the
+    # candidate list carries (index, ordered-key) pairs, so the state holds two
+    # fine-histogram sets and two ints per candidate slot.
+    spill = max(_persistent_grid(), m) * 4 * n
+    split_state = m * splits + 2 * m * splits * 2048 + 2 * m * n
     return (spill + split_state) * 4
+
+
+def _expected_workspace_bytes(m, n):
+    """Mirror of topk_filtered_workspace_bytes under the current dispatch."""
+    if _mc_segments(m, n) > 0:
+        mc = m * 4 * n * 4 + m * n * 8
+        one_cta = _persistent_grid() * 2 * n * 4
+        return max(mc, one_cta)
+    limit = _row_local_max_n(m)
+    if limit and n <= limit:
+        return _persistent_grid() * 2 * n * 4
+    if n >= 128 * 1024 + 1 and m <= 192:
+        return _expected_split_workspace_bytes(m, n, 8 if m <= 16 else 4)
+    return _persistent_grid() * 2 * n * 4
+
+
+def _routes_split(m, n):
+    if _mc_segments(m, n) > 0:
+        return False
+    limit = _row_local_max_n(m)
+    if limit and n <= limit:
+        return False
+    return n >= 128 * 1024 + 1 and m <= 192
 
 
 def _assert_known_upper_tail(out, n, num_monotonic_rows):
@@ -262,31 +310,37 @@ def test_peak_workspace_size_bounds_every_row_count():
         assert worst == peak, f"n={n}: peak is not tight (worst at num_rows={worst_rows})"
 
 
-def test_peak_workspace_size_serves_every_split_schedule():
-    # Reuse one peak-sized allocation across both ends of every active split
-    # band, then across the adjacent persistent route. The final row forces a
-    # candidate spill, so this exercises the physical layout rather than only
-    # comparing the size arithmetic.
-    n = SPLIT_TEST_N
-    split_cases = _kv_split_schedule_boundaries()
-    assert split_cases, "this GPU exposes no KV-split schedule"
-    cases = [(m, splits) for m, splits in split_cases]
-    cases.append((193, None))
+def test_peak_workspace_size_serves_every_schedule():
+    # Reuse one peak-sized allocation across both ends of every active route
+    # band: the multi-CTA route's width floor and row ceiling, the row-local /
+    # kv-split boundary, the kv-split band ends, and the adjacent persistent
+    # route. The final row forces a candidate spill, so this exercises the
+    # physical layout rather than only comparing the size arithmetic.
+    cases = [
+        (8, 32767),  # below the multi-CTA width floor: row-local
+        (8, 32768),  # multi-CTA width floor edge
+        (64, SPLIT_TEST_N),  # multi-CTA row ceiling (wave-flexed segments)
+        (65, SPLIT_TEST_N),  # first kv-split row at this width
+        (192, SPLIT_TEST_N),  # kv-split row ceiling
+        (193, SPLIT_TEST_N),  # adjacent persistent route
+        (156, 262144),  # row-local upper edge
+        (65, 262144),  # row-local just below the kv-split band
+    ]
+    if not _routes_split(65, SPLIT_TEST_N):
+        pytest.skip("this GPU exposes no KV-split band at the test width")
 
-    peak = hpc.topk_peak_workspace_size(n)
+    peak = max(hpc.topk_peak_workspace_size(n) for _, n in cases)
     ws = torch.full((peak,), 0xA5, dtype=torch.uint8, device="cuda")
     max_m = max(m for m, _ in cases)
-    cnt = torch.zeros(hpc.topk_workspace_size(max_m, n)[0], dtype=torch.uint8, device="cuda")
-    base = -torch.arange(n, dtype=torch.float32, device="cuda") / n
+    max_n = max(n for _, n in cases)
+    cnt = torch.zeros(hpc.topk_workspace_size(max_m, max_n)[0], dtype=torch.uint8, device="cuda")
 
-    for m, splits in cases:
+    for m, n in cases:
         required = hpc.topk_workspace_size(m, n)[1]
         assert required <= peak
-        if splits is None:
-            assert required == hpc.topk_min_workspace_size(n)
-        else:
-            assert required == _expected_split_workspace_bytes(m, n, splits)
+        assert required == _expected_workspace_bytes(m, n)
 
+        base = -torch.arange(n, dtype=torch.float32, device="cuda") / n
         logits = base.expand(m, -1).clone()
         logits[-1].zero_()
         ke = torch.full((m,), n, dtype=torch.int32, device="cuda")
@@ -695,20 +749,19 @@ def test_kv_split_uniform_rows(m, n):
 
 
 def test_kv_split_row_owned_spill_across_grid_boundary():
-    # Use the first two-way split whose direct task grid is larger than the
-    # persistent CTA pool. H20 resolves this to 118 rows and 236 tasks over 234
-    # pool slots. GPUs with at least 128 SMs cannot reach this condition before
-    # the production split-row ceiling and therefore skip it explicitly.
+    # Use the first kv-split row count whose direct task grid is larger than
+    # the persistent CTA pool. The production split factor is four; H20
+    # resolves this to 65 rows and 260 tasks over 234 pool slots. GPUs whose
+    # pool stays ahead of the task grid up to the split-row ceiling skip.
     grid = _persistent_grid()
-    first_split_row = 17 if _sm_major() >= 9 else 1
-    eight_hi = max(16, _sm_count() // 8)
-    m = max(first_split_row, eight_hi + 1, grid // 4 + 1, grid // 2 + 1)
-    if m > 192:
-        pytest.skip("KV-split task grid cannot exceed the persistent pool on this GPU")
     n = SPLIT_TEST_N
+    candidates = [m for m in range(1, 193) if _routes_split(m, n) and 4 * m > grid]
+    if not candidates:
+        pytest.skip("KV-split task grid cannot exceed the persistent pool on this GPU")
+    m = candidates[0]
     _, recommended = hpc.topk_workspace_size(m, n)
-    assert recommended == _expected_split_workspace_bytes(m, n, 2)
-    assert 2 * m > grid
+    assert recommended == _expected_split_workspace_bytes(m, n, 4)
+    assert 4 * m > grid
 
     base = -torch.arange(n, dtype=torch.float32, device="cuda") / n
     logits = base.expand(m, -1).clone()
@@ -792,7 +845,7 @@ def test_kv_split_matches_single_cta():
     # The minimum workspace is too small for the split path, so it gives a
     # reference from the same build on the same data.
     torch.manual_seed(14)
-    m, n = 31, 196608
+    m, n = 65, SPLIT_TEST_N
     logits = torch.randn((m, n), dtype=torch.float32, device="cuda")
     ke = torch.full((m,), n, dtype=torch.int32, device="cuda")
     num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
@@ -857,8 +910,10 @@ def test_kv_split_cuda_graph_replay():
 @pytest.mark.parametrize(
     "m,n,uses_split",
     [
-        (31, 196608, True),
-        (32, 196608, False),
+        (31, 196608, False),  # multi-CTA band: workspace matches the minimum
+        (64, 131072, False),  # multi-CTA row ceiling
+        (156, 262144, False),  # row-local upper edge at this width
+        (157, 262144, True),  # first kv-split row beyond the row-local band
         (192, 393216, True),
         (193, 393216, False),
     ],
