@@ -41,14 +41,14 @@ def test_fused_rmsnorm_with_scale_fake(is_moe):
             x, weight, scale=scale, eps=1e-6, is_moe=is_moe
         )
 
-    assert len(outputs) == 3
-    for output, dtype in zip(outputs, (torch.float8_e4m3fn, torch.float32, torch.float8_e4m3fn)):
-        assert output.shape == x.shape
-        assert output.device == x.device
-        assert output.dtype == dtype
-    result = result if is_moe else (result,)
-    expected_dtypes = (torch.float32, torch.float8_e4m3fn, torch.float8_e4m3fn)
-    assert tuple(t.dtype for t in result) == (expected_dtypes if is_moe else expected_dtypes[1:2])
+    for tensors in (outputs, result):
+        assert len(tensors) == 3
+        for output, dtype in zip(
+            tensors, (torch.float8_e4m3fn, torch.float32, torch.float8_e4m3fn)
+        ):
+            assert output.shape == x.shape
+            assert output.device == x.device
+            assert output.dtype == dtype
 
 
 @pytest.mark.parametrize("is_moe", [False, True])
@@ -64,9 +64,8 @@ def test_fused_rmsnorm_with_scale_compiled(is_moe):
 
     expected = run(x, weight, scale)
     actual = torch.compile(run, backend="eager", fullgraph=True)(x, weight, scale)
-    expected = expected if is_moe else (expected,)
-    actual = actual if is_moe else (actual,)
-    for a, b in zip(actual, expected):
+    assert len(actual) == len(expected) == 3
+    for a, b in zip(actual if is_moe else actual[:1], expected if is_moe else expected[:1]):
         torch.testing.assert_close(a.float(), b.float(), rtol=0, atol=0)
 
 
@@ -94,15 +93,11 @@ def test_fused_rmsnorm_with_scale(batch_size, hidden_states, scale, is_moe):
         gt_2 = gt
 
     gt_fp32 = reference_torch_rmsnorm(x, rmsnorm_weight, eps)
-    output = hpc.normalization.fused_rmsnorm_with_scale(
+    y_fp8, y_fp32, y_fp8_2 = hpc.normalization.fused_rmsnorm_with_scale(
         x, rmsnorm_weight, scale=scale_tensor, eps=eps, is_moe=is_moe
     )
 
     if is_moe:
-        y_fp32, y_fp8, y_fp8_2 = output
-    else:
-        y_fp32, y_fp8, y_fp8_2 = gt_fp32, output, output
-
-    assert allclose(gt_fp32, y_fp32)
-    assert allclose(gt_2, y_fp8_2.to(torch.bfloat16), atol=0.15, rtol=0.0125)
+        assert allclose(gt_fp32, y_fp32)
+        assert allclose(gt_2, y_fp8_2.to(torch.bfloat16), atol=0.15, rtol=0.0125)
     assert allclose(gt, y_fp8.to(torch.bfloat16), atol=0.15, rtol=0.0125)
