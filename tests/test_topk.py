@@ -940,6 +940,25 @@ def test_cluster8_exact_candidate_overflow():
     _validate(logits, out, ke.cpu())
 
 
+@pytest.mark.parametrize("m, n", [(1, 131072), (8, 65536), (16, 196608)])
+def test_cluster8_large_boundary_exact_ties(m, n):
+    # The boundary bin holds a mass of exact ties plus a few values that differ
+    # only in the low mantissa bits. Ties must not take output slots owed to the
+    # strictly greater values, which sit at the row tail to lose any race.
+    logits = torch.full((m, n), 1.0, dtype=torch.float32, device="cuda")
+    bigger = torch.nextafter(torch.tensor(1.0), torch.tensor(2.0)).item()
+    logits[:, -100:] = bigger
+    ke = torch.full((m,), n, dtype=torch.int32, device="cuda")
+    out = torch.full((m, TOP_K), -1, dtype=torch.int32, device="cuda")
+    num_valid = torch.tensor([m], dtype=torch.int32, device="cuda")
+    cnt, ws = _alloc_scratch(logits, ke)
+
+    hpc.topk(logits, ke, out, num_valid, TOP_K, cnt, ws)
+    torch.cuda.synchronize()
+    _validate(logits, out, ke.cpu())
+    assert ((out >= n - 100).sum(dim=1) == 100).all()
+
+
 @pytest.mark.parametrize("padding", [1, 2])
 def test_cluster8_unaligned_candidate_overflow(padding):
     # Exercise the scalar and two-wide continuations with a non-contiguous row

@@ -2110,6 +2110,10 @@ __device__ __noinline__ void refine_large_boundary_single_cta(
     const uint32_t mask = kFineMasks[round];
     const bool is_last = round == NUM_REFINE_ROUNDS - 1;
 
+    if (tidx == 0) {
+      s->ties_remaining = topk_remaining;
+    }
+    __syncthreads();
     if (topk_remaining != 0 && !is_last) {
       for (int bin = tidx; bin < RADIX + 1; bin += kBlockThreads) {
         s->histogram[bin] = 0;
@@ -2135,9 +2139,9 @@ __device__ __noinline__ void refine_large_boundary_single_cta(
         }
       } else if (bin == threshold && topk_remaining != 0) {
         if (is_last) {
-          const int pos = atomicAdd(&s->num_selected, 1);
-          if (pos < kTopK) {
-            dst[pos] = i;
+          const int remaining = atomicAdd(&s->ties_remaining, -1);
+          if (remaining > 0) {
+            dst[kTopK - remaining] = i;
           }
         } else {
           const int next_shift = kFineShifts[round + 1];
