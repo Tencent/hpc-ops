@@ -135,7 +135,7 @@ void launch_group_gemm_fp8(void *y_ptr, const void *x_ptr, const void *w_ptr,
       launch_config.stream = stream;
 
       if (task_map_ptr != nullptr) {
-        constexpr bool kTaskLoopPolicy = 0;
+        constexpr int kTaskLoopPolicy = 0;
 
         int shm_seq = sizeof(int4) * num_waves;
         int shm_size = config.get_shm_size() + shm_seq;
@@ -150,7 +150,7 @@ void launch_group_gemm_fp8(void *y_ptr, const void *x_ptr, const void *w_ptr,
                            (float *)y_scale, (int *)tiles_ptr, (int *)cu_tiles_ptr,
                            (int4 *)task_map_ptr, num_group, m, n, k, flat_divider);
       } else if (k <= 1024 || n <= 1024) {
-        constexpr bool kTaskLoopPolicy = 1;
+        constexpr int kTaskLoopPolicy = 1;
         int shm_seq = sizeof(int) * (num_group + 1);
         int shm_size = config.get_shm_size() + shm_seq;
         launch_config.dynamicSmemBytes = shm_size;
@@ -163,7 +163,7 @@ void launch_group_gemm_fp8(void *y_ptr, const void *x_ptr, const void *w_ptr,
                            (float *)y_scale, (int *)tiles_ptr, (int *)cu_tiles_ptr,
                            (int4 *)task_map_ptr, num_group, m, n, k, flat_divider);
       } else {
-        constexpr bool kTaskLoopPolicy = 2;
+        constexpr int kTaskLoopPolicy = 2;
         int shm_seq = sizeof(int) * (num_group + 1);
         int shm_size = config.get_shm_size() + shm_seq;
         launch_config.dynamicSmemBytes = shm_size;
@@ -180,7 +180,7 @@ void launch_group_gemm_fp8(void *y_ptr, const void *x_ptr, const void *w_ptr,
     } else {
       constexpr bool kUsePDL = false;
       if (task_map_ptr != nullptr) {
-        constexpr bool kTaskLoopPolicy = 0;
+        constexpr int kTaskLoopPolicy = 0;
 
         int shm_seq = sizeof(int4) * num_waves;
         int shm_size = config.get_shm_size() + shm_seq;
@@ -194,7 +194,7 @@ void launch_group_gemm_fp8(void *y_ptr, const void *x_ptr, const void *w_ptr,
             tma_w, tma_xy, (int *)seqlens_ptr, (float *)y_scale, (int *)tiles_ptr,
             (int *)cu_tiles_ptr, (int4 *)task_map_ptr, num_group, m, n, k, flat_divider);
       } else if (k <= 1024 || n <= 1024) {
-        constexpr bool kTaskLoopPolicy = 1;
+        constexpr int kTaskLoopPolicy = 1;
         int shm_seq = sizeof(int) * (num_group + 1);
         int shm_size = config.get_shm_size() + shm_seq;
         auto kernel =
@@ -206,7 +206,7 @@ void launch_group_gemm_fp8(void *y_ptr, const void *x_ptr, const void *w_ptr,
             tma_w, tma_xy, (int *)seqlens_ptr, (float *)y_scale, (int *)tiles_ptr,
             (int *)cu_tiles_ptr, (int4 *)task_map_ptr, num_group, m, n, k, flat_divider);
       } else {
-        constexpr bool kTaskLoopPolicy = 2;
+        constexpr int kTaskLoopPolicy = 2;
         int shm_seq = sizeof(int) * (num_group + 1);
         int shm_size = config.get_shm_size() + shm_seq;
         auto kernel =
