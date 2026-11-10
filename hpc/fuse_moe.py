@@ -302,7 +302,7 @@ def fuse_moe_fake(
     return (
         output
         if output is not None
-        else torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+        else x.new_empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
     )
 
 
@@ -325,7 +325,7 @@ def fuse_moe_pertensor_fp8_fake(
     return (
         output
         if output is not None
-        else torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+        else x.new_empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
     )
 
 
@@ -347,7 +347,7 @@ def fuse_moe_blockwise_fake(
     return (
         output
         if output is not None
-        else torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+        else x.new_empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
     )
 
 
@@ -369,5 +369,5 @@ def fuse_moe_blockwise_fp8_fake(
     return (
         output
         if output is not None
-        else torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+        else x.new_empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
     )
