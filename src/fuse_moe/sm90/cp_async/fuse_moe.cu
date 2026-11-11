@@ -30,6 +30,16 @@ void fuse_moe_cp_async(void *output_ptr, const void *input_ptr, void *gate_up_ou
 
   int total_num_seq = num_seq * num_topk;
   int num_seq_per_group_avg = total_num_seq / num_expert_total;
+  // Preserve the FP8 GEMMs' average-based tile selection for routing.
+  const int tile_m = num_seq_per_group_avg <= 8     ? 8
+                     : num_seq_per_group_avg <= 16  ? 16
+                     : num_seq_per_group_avg <= 32  ? 32
+                     : num_seq_per_group_avg <= 48  ? 48
+                     : num_seq_per_group_avg <= 64  ? 64
+                     : num_seq_per_group_avg <= 96  ? 48
+                     : num_seq_per_group_avg <= 128 ? 64
+                     : num_seq_per_group_avg <= 144 ? 48
+                                                    : 64;
 
   int gate_up_num_tile_n = (intermediate_size + kGemmTileN - 1) / kGemmTileN;
   int down_num_tile_n = (hidden_size + kGemmTileN - 1) / kGemmTileN;
@@ -40,7 +50,7 @@ void fuse_moe_cp_async(void *output_ptr, const void *input_ptr, void *gate_up_ou
                                 cu_seqlens_ptr, tiles_ptr, cu_tiles_ptr, gateup_task_map_ptr,
                                 down_task_map_ptr, gate_up_num_tile_n, down_num_tile_n,
                                 gateup_task_map_len, down_task_map_len, num_seq, num_topk,
-                                num_expert_local, rank_ep, num_seq_per_group_avg, stream);
+                                num_expert_local, rank_ep, tile_m, stream);
 
   group_gemm_cp_async::group_gemm_fp8_scatter_async(
       gate_up_output_ptr, input_ptr, gate_up_weight_ptr, gate_up_scale_ptr, row_indices_ptr,
