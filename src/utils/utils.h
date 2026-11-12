@@ -59,6 +59,12 @@ int get_sm_arch();
 #define HPC_ARCH_EVAL_103(expr) HPC_ARCH_UNEVAL(expr)
 #endif
 
+#if HPC_TARGET_ARCH == 120
+#define HPC_ARCH_EVAL_120(expr) HPC_ARCH_EVAL_LIVE(120, expr)
+#else
+#define HPC_ARCH_EVAL_120(expr) HPC_ARCH_UNEVAL(expr)
+#endif
+
 #define HPC_ARCH_CAT(a, b) HPC_ARCH_CAT_(a, b)
 #define HPC_ARCH_CAT_(a, b) a##b
 
@@ -94,6 +100,33 @@ int get_sm_arch();
     if (!hpc_arch_dispatched_) {                                                             \
       ::hpc::throw_arch_not_supported(op, HPC_ARCH_CAT(HPC_ARCH_IMPL_STR_, n)(__VA_ARGS__)); \
     }                                                                                        \
+  } while (0)
+
+#define HPC_ARCH_UNPAREN(...) __VA_ARGS__
+
+// Architecture membership for both #if source guards and if constexpr dispatch.
+#define HPC_ARCH_IN(archs) HPC_ARCH_IN_(HPC_ARCH_UNPAREN archs)
+#define HPC_ARCH_IN_(...) HPC_ARCH_CAT(HPC_ARCH_IN_, HPC_ARCH_NARGS(__VA_ARGS__))(__VA_ARGS__)
+#define HPC_ARCH_IN_1(a) (HPC_TARGET_ARCH == (a))
+#define HPC_ARCH_IN_2(a, ...) (HPC_ARCH_IN_1(a) || HPC_ARCH_IN_1(__VA_ARGS__))
+#define HPC_ARCH_IN_3(a, ...) (HPC_ARCH_IN_1(a) || HPC_ARCH_IN_2(__VA_ARGS__))
+#define HPC_ARCH_IN_4(a, ...) (HPC_ARCH_IN_1(a) || HPC_ARCH_IN_3(__VA_ARGS__))
+#define HPC_ARCH_IN_5(a, ...) (HPC_ARCH_IN_1(a) || HPC_ARCH_IN_4(__VA_ARGS__))
+
+#define HPC_ARCH_STRINGIFY(...) HPC_ARCH_STRINGIFY_(__VA_ARGS__)
+#define HPC_ARCH_STRINGIFY_(...) #__VA_ARGS__
+
+// One expression for a parenthesized architecture list; top-level commas are allowed.
+#define HPC_ARCH_DISPATCH_ANY(op, archs, ...)                                            \
+  do {                                                                                   \
+    if constexpr (HPC_ARCH_IN(archs)) {                                                  \
+      if (::hpc::get_sm_arch() != HPC_TARGET_ARCH) {                                     \
+        ::hpc::throw_arch_not_supported(op, HPC_ARCH_STRINGIFY(HPC_ARCH_UNPAREN archs)); \
+      }                                                                                  \
+      __VA_ARGS__;                                                                       \
+    } else {                                                                             \
+      ::hpc::throw_arch_not_supported(op, HPC_ARCH_STRINGIFY(HPC_ARCH_UNPAREN archs));   \
+    }                                                                                    \
   } while (0)
 
 #endif  // SRC_UTILS_UTILS_H_
