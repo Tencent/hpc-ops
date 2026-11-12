@@ -49,7 +49,7 @@ struct GroupGemmMxfp8Config {
 
   static constexpr bool kIsGateUp = sizeof(TC) == 1;
   static constexpr int kTileM = kTileM_;  // 32/64/128
-  static constexpr int kTileN = kTileN_;  // 128
+  static constexpr int kTileN = kTileN_;  // 128, or 256 for gate_up
   static constexpr int kTileK = kTileK_;  // 128
   static constexpr int kSFVecSize = 32;
   static constexpr int kSFPerTile = kTileK / kSFVecSize;  // 4
@@ -57,14 +57,16 @@ struct GroupGemmMxfp8Config {
   // Scales use the flashinfer layout_128x4.
   static constexpr int kSFBlockM = 128;
   static constexpr int kSFBlockBytes = kSFBlockM * kSFPerTile * sizeof(TSF);
+  static constexpr int kNumSFB = kTileN / kSFBlockM;
   static constexpr int kSFABytesPerStage = kIsGateUp ? kTileM * kSFPerTile : kSFBlockBytes;
   static constexpr int kTileNC = kIsGateUp ? kTileN / 2 : kTileN;
 
   static constexpr int kStageABMax = 4;
   static constexpr int kShmBudget = 98 * 1024;
-  static constexpr int kCBytes = sizeof(TC) * kTileM * kTileNC;
+  // down adds into y from registers.
+  static constexpr int kCBytes = kIsGateUp ? sizeof(TC) * kTileM * kTileNC : 0;
   static constexpr int kStageBytes = sizeof(TA) * kTileM * kTileK + sizeof(TB) * kTileN * kTileK +
-                                     kSFABytesPerStage + kSFBlockBytes;
+                                     kSFABytesPerStage + kNumSFB * kSFBlockBytes;
   static constexpr int kStageABFit = (kShmBudget - kCBytes) / kStageBytes;
   static constexpr int kStageAB = kStageABFit > kStageABMax ? kStageABMax : kStageABFit;
   static_assert(kStageAB >= 2, "the pipeline needs at least 2 stages");
@@ -75,8 +77,8 @@ struct GroupGemmMxfp8Config {
       UMMA::Layout_K_SW128_Atom<TA>{}, make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStageAB>{})));
   using SLayoutB = decltype(tile_to_shape(
       UMMA::Layout_K_SW128_Atom<TB>{}, make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStageAB>{})));
-  using CAtom =
-      std::conditional_t<kIsGateUp, UMMA::Layout_K_SW64_Atom<TC>, UMMA::Layout_K_SW128_Atom<TC>>;
+  using CAtom = std::conditional_t<sizeof(TC) * kTileNC >= 128, UMMA::Layout_K_SW128_Atom<TC>,
+                                   UMMA::Layout_K_SW64_Atom<TC>>;
   using SLayoutC = decltype(tile_to_shape(CAtom{}, make_shape(Int<kTileM>{}, Int<kTileNC>{})));
 
   // copybox
@@ -91,8 +93,8 @@ struct GroupGemmMxfp8Config {
   static constexpr int kSFARowsPerLane = 4;
   static_assert(!kIsGateUp || (kTileM % kSFARowsPerLane == 0 && kTileM / kSFARowsPerLane <= 32),
                 "one warp's lanes must cover A's kTileM scale rows");
-  static_assert(kTileN == kSFBlockM && kSFPerTile == 4,
-                "one tile of B's scales is exactly one 128x4 block");
+  static_assert(kTileN % kSFBlockM == 0 && kSFPerTile == 4,
+                "one tile of B's scales is a whole number of 128x4 blocks");
   using SLayoutSF128x4 =
       Layout<Shape<_4, _128, Int<kStageAB>>, Stride<_128, _1, Int<kSFBlockBytes>>>;
   using CopyBoxSF = Layout<Shape<_4, _128>, Stride<_128, _1>>;
@@ -100,11 +102,15 @@ struct GroupGemmMxfp8Config {
   using SLayoutSFARow = Layout<Shape<Int<kTileM>, Int<kSFPerTile>, Int<kStageAB>>,
                                Stride<Int<kSFPerTile>, _1, Int<kTileM * kSFPerTile>>>;
   using SLayoutSFA = std::conditional_t<kIsGateUp, SLayoutSFARow, SLayoutSF128x4>;
-  using SLayoutSFB = SLayoutSF128x4;
+  // (.., 128x4 block within the tile, stage)
+  using SLayoutSFB = Layout<Shape<_4, _128, Int<kNumSFB>, Int<kStageAB>>,
+                            Stride<_128, _1, Int<kSFBlockBytes>, Int<kNumSFB * kSFBlockBytes>>>;
 
-  // A 128x4 block keeps row r at (r % 32) * 16 + r / 32 * 4.
-  using SLayoutSF128x4MK = Layout<Shape<Shape<_32, _4>, Shape<_32, Int<kSFPerTile>>, Int<kStageAB>>,
-                                  Stride<Stride<_16, _4>, Stride<_0, _1>, Int<kSFBlockBytes>>>;
+  // The MMA's view of the scales, (MN, K, stage): one UE8M0 per 32 K, broadcast over them.
+  // A 128x4 block keeps row r at (r % 32) * 16 + r / 32 * 4; B's tile spans kNumSFB blocks.
+  using SLayoutSFBMK = Layout<
+      Shape<Shape<_32, _4, Int<kNumSFB>>, Shape<_32, Int<kSFPerTile>>, Int<kStageAB>>,
+      Stride<Stride<_16, _4, Int<kSFBlockBytes>>, Stride<_0, _1>, Int<kNumSFB * kSFBlockBytes>>>;
   // down's A tile is kTileM of a block's rows, so the block holds kTilePerSFBlock of them:
   // (M, K, stage, tile in block), tile t starting at t * kTileM / 32 * 4.
   static constexpr int kTilePerSFBlock = kSFBlockM / kTileM;
@@ -115,7 +121,6 @@ struct GroupGemmMxfp8Config {
   using SLayoutSFARowMK = Layout<Shape<Int<kTileM>, Shape<_32, Int<kSFPerTile>>, Int<kStageAB>>,
                                  Stride<Int<kSFPerTile>, Stride<_0, _1>, Int<kTileM * kSFPerTile>>>;
   using SLayoutSFAMK = std::conditional_t<kIsGateUp, SLayoutSFARowMK, SLayoutSF128x4TileMK>;
-  using SLayoutSFBMK = SLayoutSF128x4MK;
 
   // mma
   static constexpr int kNumMmaWarps = 8;
@@ -128,7 +133,7 @@ struct GroupGemmMxfp8Config {
   using WarpLayout = Layout<Shape<_2, _4, _1>, Stride<_4, _1, _0>>;
   // (coordinate within the atom, warp coordinate, repeated block within the warp)
   using PermM = Layout<Shape<_16, _2, Int<kTileM / 32>>, Stride<_1, _16, _32>>;
-  using PermN = Layout<Shape<_8, _4, _4>, Stride<_1, _32, _8>>;
+  using PermN = Layout<Shape<_8, _4, Int<kTileN / 32>>, Stride<_1, Int<kTileN / 4>, _8>>;
   // cute's block-scaled atom takes one UE8M0 per 32-K step (byte-id fixed at 0), fed through
   // zipped A/SFA and B/SFB tensors.
   using MmaOp = SM120::BLOCKSCALED::SM120_16x8x32_TN_VS<
@@ -143,17 +148,21 @@ struct GroupGemmMxfp8Config {
   // bits
   using LdsmOpB = std::conditional_t<kIsFp4W, SM100_SU4_DU8x16_x4_LDSM_N, SM75_U32x4_LDSM_N>;
   using TiledCopyB = decltype(make_tiled_copy_B(Copy_Atom<LdsmOpB, TB>{}, TiledMma{}));
-  using StsmOp = std::conditional_t<(kTileM / 32) % 2 == 0, SM90_U32x4_STSM_N, SM90_U32x2_STSM_N>;
-  using TiledCopyC = decltype(make_tiled_copy_C(Copy_Atom<StsmOp, TC>{}, TiledMma{}));
 
-  static_assert((kTileM == 32 || kTileM == 64 || kTileM == 128) && kTileN == 128,
-                "MMA permutation requires kTileM in {32, 64, 128} and kTileN = 128");
+  static_assert((kTileM == 32 || kTileM == 64 || kTileM == 128) &&
+                    (kTileN == 128 || (kIsGateUp && kTileN == 256)),
+                "MMA permutation requires kTileM in {32, 64, 128} and kTileN = 128 (or 256 for "
+                "gate_up)");
   static_assert(size(TiledMma{}) == kNumMmaWarps * 32, "MMA must use 8 warps");
 
   static constexpr int kShmABytes = sizeof_bits_v<TA> * cosize(SLayoutA{}) / 8;
   static_assert(kShmABytes % 1024 == 0, "B must start on a 1024-byte swizzle boundary");
   static constexpr int kShmBBytes = sizeof_bits_v<TB> * cosize(SLayoutB{}) / 8;
-  static constexpr int kShmCBytes = sizeof_bits_v<TC> * cosize(SLayoutC{}) / 8;
+  // gate_up's epilogue writes C through a position-independent swizzle view, which needs C to
+  // start on a swizzle-period boundary.
+  static_assert(!kIsGateUp || (kShmABytes + kShmBBytes) % 1024 == 0,
+                "C must start on a 1024-byte swizzle boundary");
+  static constexpr int kShmCBytes = kIsGateUp ? sizeof_bits_v<TC> * cosize(SLayoutC{}) / 8 : 0;
   static constexpr int kShmSFABytes = sizeof_bits_v<TSF> * cosize(SLayoutSFA{}) / 8;
   static constexpr int kShmSFBBytes = sizeof_bits_v<TSF> * cosize(SLayoutSFB{}) / 8;
   static constexpr int kShmSize =
@@ -161,25 +170,11 @@ struct GroupGemmMxfp8Config {
   static_assert(kShmSize <= kShmBudget, "shm overflow");
 };
 
+// 64-row gate_up tiles go 256 wide, so each warp still holds 32x64.
 template <int kTileM, typename TW>
-using GateUpConfig = GroupGemmMxfp8Config<uint8_t, TW, kTileM, 128, 128>;
+using GateUpConfig = GroupGemmMxfp8Config<uint8_t, TW, kTileM, kTileM == 64 ? 256 : 128, 128>;
 template <int kTileM, typename TW>
 using DownConfig = GroupGemmMxfp8Config<cute::bfloat16_t, TW, kTileM, 128, 128>;
-
-template <typename F>
-void dispatch_topk(int num_topk, F &&f) {
-  switch (num_topk) {
-    case 8:
-      f(std::integral_constant<int, 8>{});
-      break;
-    case 16:
-      f(std::integral_constant<int, 16>{});
-      break;
-    default:
-      throw std::invalid_argument("fuse_moe_mxfp8: unsupported num_topk " +
-                                  std::to_string(num_topk) + ", supported: 8, 16");
-  }
-}
 
 // W's gmem type: float_e2m1_unpacksmem_t for mxfp4 weights, uint8_t otherwise.
 template <typename F>
@@ -189,6 +184,18 @@ void dispatch_w_type(bool is_fp4, F &&f) {
   } else {
     f(uint8_t{});
   }
+}
+
+// Calls f(Int<n>) for n clamped to [0, kMax], so each count gets straight-line code.
+template <int kMax, typename F>
+CUTE_DEVICE void dispatch_num_valid_m(int n, F &&f) {
+  if constexpr (kMax > 0) {
+    if (n < kMax) {
+      dispatch_num_valid_m<kMax - 1>(n, f);
+      return;
+    }
+  }
+  f(Int<kMax>{});
 }
 
 template <typename F>

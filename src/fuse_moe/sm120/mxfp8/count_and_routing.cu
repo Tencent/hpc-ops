@@ -20,11 +20,13 @@ namespace fuse_moe {
 
 // gate_up and down share one kTileM, so one tile count per expert serves both.
 template <int kTileM>
-static bool launch_count_and_route_mxfp8(const void *topk_ids_ptr,
-                                         void *permuted_idx_to_raw_idx_ptr, void *seqlens_ptr,
-                                         void *cu_seqlens_ptr, void *tiles_ptr, int num_seq,
-                                         int num_topk, int num_expert_local, int rank_ep,
-                                         cudaStream_t stream) {
+static bool launch_count_and_route_mxfp8(const void *topk_ids_ptr, const void *topk_scale_ptr,
+                                         void *permuted_idx_to_raw_idx_ptr,
+                                         void *permuted_topk_scale_ptr, void *seqlens_ptr,
+                                         void *cu_seqlens_ptr, void *tiles_ptr,
+                                         const void *init_src_ptr, void *init_dst_ptr,
+                                         int64_t init_bytes, int num_seq, int num_topk,
+                                         int num_expert_local, int rank_ep, cudaStream_t stream) {
   int total_num_topk = num_seq * num_topk;
   int start_expert = rank_ep * num_expert_local;
   int end_expert = (rank_ep + 1) * num_expert_local;
@@ -56,7 +58,13 @@ static bool launch_count_and_route_mxfp8(const void *topk_ids_ptr,
 
   int route_blocks = (total_num_topk + kThreadPerBlock * routes_per_thread - 1) /
                      (kThreadPerBlock * routes_per_thread);
-  int blocks = std::max(1, std::min(max_blocks, route_blocks));
+  // Extra blocks for the output init own no routes.
+  constexpr int kInitVectorsPerThread = 2;
+  int64_t init_vectors = init_dst_ptr != nullptr ? init_bytes / 16 : 0;
+  int64_t init_blocks = (init_vectors + kThreadPerBlock * kInitVectorsPerThread - 1) /
+                        (kThreadPerBlock * kInitVectorsPerThread);
+  int blocks = std::max(
+      1, std::min<int>(max_blocks, std::max(static_cast<int64_t>(route_blocks), init_blocks)));
 
   cudaLaunchAttribute attrs[2];
   attrs[0].id = cudaLaunchAttributeCooperative;
@@ -83,10 +91,14 @@ static bool launch_count_and_route_mxfp8(const void *topk_ids_ptr,
       throw std::runtime_error("fuse_moe_mxfp8: routing grid too large for a cooperative launch");
     }
     return cudaLaunchKernelEx(&cfg, kernel, reinterpret_cast<const int *>(topk_ids_ptr),
+                              reinterpret_cast<const float *>(topk_scale_ptr),
                               reinterpret_cast<int *>(seqlens_ptr),
                               reinterpret_cast<int *>(cu_seqlens_ptr),
                               reinterpret_cast<int *>(tiles_ptr),
-                              reinterpret_cast<int *>(permuted_idx_to_raw_idx_ptr), total_num_topk,
+                              reinterpret_cast<int *>(permuted_idx_to_raw_idx_ptr),
+                              reinterpret_cast<float *>(permuted_topk_scale_ptr),
+                              reinterpret_cast<const int4 *>(init_src_ptr),
+                              reinterpret_cast<int4 *>(init_dst_ptr), init_vectors, total_num_topk,
                               num_expert_local, start_expert, end_expert) == cudaSuccess;
   };
   switch (routes_per_thread) {
@@ -102,14 +114,17 @@ static bool launch_count_and_route_mxfp8(const void *topk_ids_ptr,
   }
 }
 
-bool count_and_route_mxfp8_async(const void *topk_ids_ptr, void *permuted_idx_to_raw_idx_ptr,
+bool count_and_route_mxfp8_async(const void *topk_ids_ptr, const void *topk_scale_ptr,
+                                 void *permuted_idx_to_raw_idx_ptr, void *permuted_topk_scale_ptr,
                                  void *seqlens_ptr, void *cu_seqlens_ptr, void *tiles_ptr,
+                                 const void *init_src_ptr, void *init_dst_ptr, int64_t init_bytes,
                                  int num_seq, int num_topk, int num_expert_local, int rank_ep,
                                  int tile_m, cudaStream_t stream) {
   bool launched = false;
   dispatch_tile_m(tile_m, [&](auto kTileM) {
     launched = launch_count_and_route_mxfp8<decltype(kTileM)::value>(
-        topk_ids_ptr, permuted_idx_to_raw_idx_ptr, seqlens_ptr, cu_seqlens_ptr, tiles_ptr, num_seq,
+        topk_ids_ptr, topk_scale_ptr, permuted_idx_to_raw_idx_ptr, permuted_topk_scale_ptr,
+        seqlens_ptr, cu_seqlens_ptr, tiles_ptr, init_src_ptr, init_dst_ptr, init_bytes, num_seq,
         num_topk, num_expert_local, rank_ep, stream);
   });
   return launched;
