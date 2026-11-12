@@ -44,10 +44,8 @@ std::tuple<torch::Tensor, torch::Tensor> fuse_ihc_pre_entry(
   int hidden_dim = x.size(2);
 
   TORCH_CHECK(hc_mult == 4, "hc_mult must be 4");
-  TORCH_CHECK(hidden_dim == 4096 || hidden_dim == 6144, "hidden_dim must be 4096 or 6144, got ",
+  TORCH_CHECK(hidden_dim == 4096 || hidden_dim == 6144, "hidden dim must be 6144 (HYV4 production) or 4096, got ",
               hidden_dim);
-  TORCH_CHECK(hidden_dim == 6144 || hidden_dim == 4096,
-              "hidden dim must be 6144 (HYV4 production) or 4096");
   TORCH_CHECK(w.size(0) == 2 * hc_mult, "w tensor's first dim must be 2 * hc_mult");
   TORCH_CHECK(w.size(1) == hc_mult * hidden_dim,
               "w tensor's second dim must be hc_mult * hidden_dim");
@@ -131,10 +129,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fuse_ihc_post_pre_entry(
   const int hc_mult = residual.size(1);
 
   TORCH_CHECK(hc_mult == 4, "hc_mult must be 4");
-  TORCH_CHECK(hidden_dim == 4096 || hidden_dim == 6144, "hidden_dim must be 4096 or 6144, got ",
+  TORCH_CHECK(hidden_dim == 4096 || hidden_dim == 6144, "hidden dim must be 6144 (HYV4 production) or 4096, got ",
               hidden_dim);
-  TORCH_CHECK(hidden_dim == 6144 || hidden_dim == 4096,
-              "hidden dim must be 6144 (HYV4 production) or 4096");
   TORCH_CHECK(residual.size(0) == num_batch && residual.size(2) == hidden_dim,
               "residual must be (num_batch, hc_mult, hidden_dim)");
   TORCH_CHECK(H_post_in.size(0) == num_batch && H_post_in.size(1) == hc_mult,
@@ -209,10 +205,8 @@ torch::Tensor fuse_ihc_post_entry(const torch::Tensor &x, const torch::Tensor &r
   int hidden_dim = residual.size(2);
 
   TORCH_CHECK(hc_mult == 4, "hc_mult must be 4");
-  TORCH_CHECK(hidden_dim == 4096 || hidden_dim == 6144, "hidden_dim must be 4096 or 6144, got ",
+  TORCH_CHECK(hidden_dim == 4096 || hidden_dim == 6144, "hidden dim must be 6144 (HYV4 production) or 4096, got ",
               hidden_dim);
-  TORCH_CHECK(hidden_dim == 6144 || hidden_dim == 4096,
-              "hidden dim must be 6144 (HYV4 production) or 4096");
   TORCH_CHECK(x.size(0) == num_batch, "x tensor's first dim must be num_batch");
   TORCH_CHECK(x.size(1) == hidden_dim, "x tensor's second dim must be hidden_dim");
   TORCH_CHECK(H_post.size(0) == num_batch, "H_post tensor's first dim must be num_batch");
@@ -265,10 +259,8 @@ torch::Tensor fuse_ihc_head_entry(const torch::Tensor &x, const torch::Tensor &w
   int hidden_dim = x.size(2);
 
   TORCH_CHECK(hc_mult == 4, "hc_mult must be 4");
-  TORCH_CHECK(hidden_dim == 4096 || hidden_dim == 6144, "hidden_dim must be 4096 or 6144, got ",
+  TORCH_CHECK(hidden_dim == 4096 || hidden_dim == 6144, "hidden dim must be 6144 (HYV4 production) or 4096, got ",
               hidden_dim);
-  TORCH_CHECK(hidden_dim == 6144 || hidden_dim == 4096,
-              "hidden dim must be 6144 (HYV4 production) or 4096");
   TORCH_CHECK(w.size(0) == hc_mult, "w tensor's first dim must be hc_mult");
   TORCH_CHECK(w.size(1) == hc_mult * hidden_dim,
               "w tensor's second dim must be hc_mult * hidden_dim");

@@ -1,25 +1,13 @@
 // Copyright 2026 Tencent
 
-// Split-K fuse_ihc_pre and fuse_ihc_head, for batches too small to fill the
-// device. From the FlagGems-vllm Triton kernels, parameterized by gate group.
-//
-// fuse_ihc_pre_or_head_kernel gives each block one row, so its grid is
-// num_batch and one token leaves all but one SM idle. Splitting K fixes that.
-//
+// Split-K fuse_ihc_pre and fuse_ihc_head for small batches.
 // kHasPost picks the operator: pre projects 2*hc rows and emits post gates,
-// head projects hc and emits none. The host tabulates the two separately.
+// head projects hc and emits none.
 //
-// The token count is the whole criterion -- decode is the common source of such
-// a batch but neither necessary nor sufficient, so nothing here tests the phase.
+// stage1: one block per (token, K-chunk) → partial slot, no atomics.
+// stage2: reduces slots, forms gates, emits the pre-gated channel sum.
 //
-// At the operator root because it runs on every KNOWN_ARCHS: fp32 FFMA, warp
-// shuffles and PDL, no wgmma/TMA/cluster. Only ihc_splitk.cu's tables are arch-specific.
-//
-// stage1 one block per (token, K-chunk) -> its own partial slot, no atomics.
-// stage2 reduces the slots, forms the gates, emits the pre-gated channel sum.
-//
-// fp32 throughout, no tensor cores: K is 24576 at hidden 6144, and a bf16/tf32
-// dot would blow the 2e-5 tolerance the post gates are held to.
+// fp32 throughout: a bf16/tf32 dot would violate the post-gate tolerance.
 
 #ifndef SRC_IHC_IHC_SPLITK_CUH_
 #define SRC_IHC_IHC_SPLITK_CUH_
@@ -33,19 +21,15 @@ namespace hpc {
 namespace iHC {
 namespace splitk {
 
-// Partial slot per (token, split): [sqrsum, mix...]. Head's is hc floats
-// narrower, and stage2 reads it whole per split, so it is real traffic.
+// Partial slot per (token, split): [sqrsum, mix...].
 template <int kHCMult, bool kHasPost>
 struct PartialSlot {
   static constexpr int kProjRows = kHasPost ? 2 * kHCMult : kHCMult;
   static constexpr int kStride = 1 + kProjRows;
 };
 
-// stage1: one block owns one (token, K-chunk), reduced through warp shuffles
-// then shared memory.
-//
-// The loop reads x once into registers and reuses it across all weight rows:
-// the baseline Triton kernel's L1TEX bottleneck was re-reading x per row.
+// stage1: one block owns one (token, K-chunk). Reads x into registers once
+// and reuses it across all weight rows.
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, int kBlockK,
           bool kUsePDL = false, bool kHasPost = true>
 __global__ void __launch_bounds__(kThreadsPerBlock)
@@ -100,7 +84,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
       acc_sqsum += x2[j].y * x2[j].y;
     }
 
-    // x is in registers; walk the projection rows against it.
+  // x is in registers; walk the projection rows against it.
 #pragma unroll
     for (int c = 0; c < kProjRows; ++c) {
       constexpr int kHalf = kElementsPerThread / 2;
@@ -119,8 +103,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     }
   }
 
-  // Warp-level reduction, then combine the per-warp results through shared
-  // memory. kProjRows + 1 values per block: the projections plus the sqrsum.
+  // Warp-level reduction then cross-warp through shared memory.
   __shared__ float smem[kProjRows + 1][kWarpsPerBlock];
 #pragma unroll
   for (int c = 0; c < kProjRows; ++c) {
@@ -145,8 +128,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     for (int w = 0; w < kWarpsPerBlock; ++w) {
       sum += smem[threadIdx.x][w];
     }
-    // Slot is [sqrsum, mix...]; smem holds [mix..., sqrsum].
-    const int out_idx = (threadIdx.x == kProjRows) ? 0 : static_cast<int>(threadIdx.x) + 1;
+  // Slot is [sqrsum, mix...]; smem holds [mix..., sqrsum].
+  const int out_idx = (threadIdx.x == kProjRows) ? 0 : static_cast<int>(threadIdx.x) + 1;
     slot[out_idx] = sum;
   }
 
@@ -155,19 +138,10 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 }
 
-// stage2: one block per (token, hidden-slice). Reduces that token's slots,
-// forms the gates, writes the pre-gated channel sum. Only slice 0 stores post.
-//
-// Slicing the hidden dim beats walking it in one block (4.9us vs 1.7us across
-// six): one block would reproduce the occupancy problem this path exists to
-// avoid. The gate math is redone per slice -- a few dozen flops against a
-// kHiddenDim streaming load.
-//
-// kFuseRmsNorm gives that up: sum(y^2) spans the row, and both alternatives
-// cost more than the slicing saves (a third kernel ~4.5us; cross-block atomics
-// plus a grid barrier worse still). So a folded launch runs one wide block per
-// token, keeping two launches and a block-local reduction. The static_assert
-// below enforces the pairing; the host picks the thread count to match.
+// stage2: one block per (token, hidden-slice). Reduces slots, forms gates,
+// writes the pre-gated channel sum. Only slice 0 stores post gates.
+// kFuseRmsNorm disables slicing: sum(y^2) spans the row, so a folded launch
+// uses one wide block per token with a block-local reduction.
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, int kNumSplits,
           bool kUsePDL = false, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false,
           bool kHasPost = true>
@@ -204,11 +178,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     return;
   }
 
-  // Each of the first kProjRows+1 threads owns one slot column and walks the
-  // splits; the result goes to shared so every thread can read the gates.
-  //
-  // A warp-parallel rewrite must fix the summation order, not let it fall out
-  // of scheduling: fuse_ihc_pre has a bitwise-repeatability test.
+  // First kProjRows+1 threads each own one slot column and reduce across splits.
   __shared__ float smem_reduced[kProjRows + 1];
   __shared__ float smem_H_pre[kHCMult];
 
@@ -225,11 +195,11 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   const float rms_scale = rsqrtf_ftz(smem_reduced[0] * kInvHCDim + norm_eps);
   if (threadIdx.x < kHCMult) {
     const int i = threadIdx.x;
-    // smem_reduced is [sqrsum, mix...]: pre logits at 1+i, post at 1+hc+i.
-    const float mixes_pre = smem_reduced[1 + i] * rms_scale;
+  // smem_reduced is [sqrsum, mix...]: pre logits at 1+i, post at 1+hc+i.
+  const float mixes_pre = smem_reduced[1 + i] * rms_scale;
     smem_H_pre[i] = sigmoid(hc_scale_ptr[0] * mixes_pre + hc_base_ptr[i]) + hc_eps;
 
-    // Compile-time, not a null check: head's tensors have no hc_scale[1].
+    // Compile-time check: head has no hc_scale[1].
     if constexpr (kHasPost) {
       if (blockIdx.y == 0) {
         const float mixes_post = smem_reduced[1 + kHCMult + i] * rms_scale;
@@ -269,12 +239,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   if constexpr (!kFuseRmsNorm) {
     store<__nv_bfloat16, kElementsPerThread>(y_row + icol, to<__nv_bfloat16>(acc));
   } else {
-    // y never reaches HBM unnormalized: it stays in acc while the row's sqsum
-    // is reduced block-locally (kBlockD == kHiddenDim), then goes out scaled.
-    //
-    // kCastBfloatForNorm rounds y to bf16 before squaring, matching what the
-    // unfused path would read back from HBM; without it the norm is more
-    // accurate but not bit-identical. The caller picks.
+    // y stays in registers; kCastBfloatForNorm rounds to bf16 before squaring
+    // to match what the unfused path reads back from HBM.
     float y_sqsum = 0.f;
     if constexpr (kCastBfloatForNorm) {
       auto acc_bf = to<__nv_bfloat16>(acc);

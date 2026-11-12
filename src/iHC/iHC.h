@@ -40,15 +40,8 @@ void fuse_ihc_head_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr, 
                          float rms_eps = 0.f, bool cast_bfloat_for_norm = false,
                          bool use_pdl = true);
 
-// A split-K pre path for batches with too few tokens to fill the device, where
-// fuse_ihc_pre_async's grid of num_batch leaves most SMs idle. The selector is
-// the token count against an SM-count-scaled threshold, not the inference
-// phase -- a short prefill or a speculative-decode verify step qualifies on the
-// same terms as a decode step.
-//
-// The kernels are portable across KNOWN_ARCHS but the crossover is not, so the
-// threshold is derived per device; ihc_pre_splitk_supported() answers for the
-// module it was built into, so the caller needs no #if of its own.
+// Split-K pre path for small batches. ihc_pre_splitk_supported() encodes the
+// per-device threshold; the caller queries it instead of #if-ing on arch.
 namespace splitk {
 
 bool ihc_pre_splitk_supported(int num_batch, int hc_mult, int hidden_dim, bool fuse_rms_norm);
