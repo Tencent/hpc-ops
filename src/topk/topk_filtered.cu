@@ -1,14 +1,18 @@
 // Copyright (C) 2026 Tencent.
 
+#include "src/topk/topk.h"
+#include "src/utils/utils.h"
+
+// The 1024-thread/two-CTA launch bounds exclude SM120.
+#if HPC_ARCH_IN((90, 100, 103))
+
 #include <cooperative_groups.h>
 #include <cuda.h>
 #include <cuda_fp16.h>
 
 #include <algorithm>
 
-#include "src/topk/topk.h"
 #include "src/topk/topk_filtered_boundary.cuh"
-#include "src/utils/utils.h"
 
 namespace hpc {
 namespace topk {
@@ -3019,3 +3023,5 @@ size_t topk_filtered_peak_workspace_bytes(int max_kv_len) {
 
 }  // namespace topk
 }  // namespace hpc
+
+#endif  // HPC_ARCH_IN((90, 100, 103))
