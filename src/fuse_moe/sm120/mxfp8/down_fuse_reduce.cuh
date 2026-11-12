@@ -17,36 +17,62 @@ namespace fuse_moe {
 namespace kernels {
 namespace mxfp8 {
 
+// Called by all 32 lanes of a warp.
 __device__ __forceinline__ void get_next_tile_horizon(const int *tiles_ptr, int iblock,
                                                       int num_group, int &igroup, int &itile_n,
                                                       int &itile_m, int &itile_mg, int &sum_tile_m,
                                                       cutlass::FastDivmod flat_divider) {
-  int num_tile_m;
+  int ilane = threadIdx.x % 32;
 
   flat_divider(itile_mg, itile_n, iblock);
-  for (int i = igroup; i < num_group; i++) {
-    num_tile_m = tiles_ptr[i];
-    sum_tile_m += num_tile_m;
-    if (itile_mg < sum_tile_m) {
-      igroup = i;
-      sum_tile_m = sum_tile_m - num_tile_m;
+  for (int base = igroup; base < num_group; base += 32) {
+    int num_tile_m = base + ilane < num_group ? tiles_ptr[base + ilane] : 0;
+    int incl = num_tile_m;
+#pragma unroll
+    for (int d = 1; d < 32; d *= 2) {
+      int up = __shfl_up_sync(0xFFFFFFFF, incl, d);
+      incl += ilane >= d ? up : 0;
+    }
+    int total = __shfl_sync(0xFFFFFFFF, incl, 31);
+    if (itile_mg < sum_tile_m + total) {
+      int src = __ffs(__ballot_sync(0xFFFFFFFF, sum_tile_m + incl > itile_mg)) - 1;
+      igroup = base + src;
+      sum_tile_m += __shfl_sync(0xFFFFFFFF, incl - num_tile_m, src);
       itile_m = itile_mg - sum_tile_m;
       return;
     }
+    sum_tile_m += total;
   }
   igroup = -1;
 }
 
-template <typename Config, int kNumTopk, typename TmaA, typename TmaB, typename TmaSFA,
-          typename TmaSFB>
+// 16B unit c of row r in a warp's 8x32 bf16 block, swizzled against bank conflicts.
+__device__ __forceinline__ int epi_unit(int r, int c) { return r * 4 + (c ^ (r / 2)); }
+
+// mma accumulator pairs of the 8x32 block in, columns lane % 4 * 8 .. + 8 of row lane / 4 out.
+__device__ __forceinline__ uint4 epi_transpose(const uint32_t (&pairs)[4], uint4 *buf) {
+  int ilane = threadIdx.x % 32;
+  uint32_t addr = cute::cast_smem_ptr_to_uint(buf + epi_unit(ilane % 8, ilane / 8));
+  asm volatile("stmatrix.sync.aligned.x4.m8n8.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"r"(addr),
+               "r"(pairs[0]), "r"(pairs[1]), "r"(pairs[2]), "r"(pairs[3])
+               : "memory");
+  __syncwarp();
+  uint4 v = buf[epi_unit(ilane / 4, ilane % 4)];
+  __syncwarp();
+  return v;
+}
+
+template <typename Config, typename TmaA, typename TmaB, typename TmaSFA, typename TmaSFB>
 __global__ void __launch_bounds__(Config::kNumThreads, 1)
     down_fuse_reduce_kernel(const __grid_constant__ TmaA tma_a, const __grid_constant__ TmaB tma_b,
                             const __grid_constant__ TmaSFA tma_sfa,
                             const __grid_constant__ TmaSFB tma_sfb, typename Config::TC *y_ptr,
-                            const float *topk_scale_ptr, const int *seqlens_ptr,
+                            const float *permuted_topk_scale_ptr, const int *seqlens_ptr,
                             const int *cu_seqlens_ptr, const int *tiles_ptr,
                             const int *permuted_idx_to_raw_idx_ptr, int num_group, int m_pad, int n,
-                            int k, cutlass::FastDivmod tile_n_divider) {
+                            int k, cutlass::FastDivmod tile_n_divider,
+                            cutlass::FastDivmod topk_divider, cute::TMA::CacheHintSm90 w_cache_hint,
+                            cute::TMA::CacheHintSm90 a_cache_hint) {
   using namespace cute;  // NOLINT
 
   using TA = typename Config::TA;
@@ -56,25 +82,23 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1)
 
   using SLayoutA = typename Config::SLayoutA;
   using SLayoutB = typename Config::SLayoutB;
-  using SLayoutC = typename Config::SLayoutC;
   using SLayoutSFA = typename Config::SLayoutSFA;
   using SLayoutSFB = typename Config::SLayoutSFB;
-  using SLayoutSFAMK = typename Config::SLayoutSFAMK;
-  using SLayoutSFBMK = typename Config::SLayoutSFBMK;
+  using SLayoutSFARead = typename Config::SLayoutSFARead;
+  using SLayoutSFBRead = typename Config::SLayoutSFBRead;
   using TiledMma = typename Config::TiledMma;
-  using TiledSF = typename Config::TiledSF;
   using TiledCopyA = typename Config::TiledCopyA;
   using TiledCopyB = typename Config::TiledCopyB;
-  using TiledCopyC = typename Config::TiledCopyC;
 
   constexpr int kTileM = Config::kTileM;
   constexpr int kTileN = Config::kTileN;
   constexpr int kTileK = Config::kTileK;
   constexpr int kStageAB = Config::kStageAB;
-  constexpr int kStageTask = Config::kStageTask;
+  // One more stage: the MMA warps hold a task through the epilogue.
+  constexpr int kStageTask = Config::kStageTask + 1;
   constexpr int kMathThreads = Config::kMathThreads;
   constexpr int kSFBlockM = Config::kSFBlockM;
-  constexpr int kTilePerSFBlock = Config::kTilePerSFBlock;
+  constexpr int kTilePerSFBlock = kSFBlockM / kTileM;
 
   // idx
   int idx = threadIdx.x;
@@ -89,21 +113,22 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1)
 
   __shared__ uint64_t task_readable[kStageTask];
   __shared__ uint64_t task_writable[kStageTask];
-  __shared__ int task_shm[kStageTask][4];
-
-  __shared__ int row_token_shm[kTileM];
+  // {igroup, itile_m, itile_n, itile_mg, seqlen}
+  __shared__ int task_shm[kStageTask][5];
+  // {token, topk scale bits} per row, token -1 for padding.
+  __shared__ int2 task_rows_shm[kStageTask][kTileM];
+  __shared__ uint4 epi_shm[Config::kNumMmaWarps][32];
 
   // shm
-  extern __shared__ uint8_t shm_data[] alignas(1024);
+  // 1024B aligned for the position-independent swizzle views.
+  extern __shared__ __align__(1024) uint8_t shm_data[];
   auto *shm_a = reinterpret_cast<TA *>(shm_data);
   auto *shm_b = reinterpret_cast<TB *>(shm_a + cosize(SLayoutA{}));
-  auto *shm_c = reinterpret_cast<TC *>(shm_b + cosize(SLayoutB{}));
-  auto *shm_sfa = reinterpret_cast<TSF *>(shm_c + cosize(SLayoutC{}));
+  auto *shm_sfa = reinterpret_cast<TSF *>(shm_b + cosize(SLayoutB{}));
   auto *shm_sfb = reinterpret_cast<TSF *>(shm_sfa + cosize(SLayoutSFA{}));
 
   auto sA = make_tensor(make_smem_ptr(shm_a), SLayoutA{});
   auto sB = make_tensor(make_smem_ptr(shm_b), SLayoutB{});
-  auto sC = make_tensor(make_smem_ptr(shm_c), SLayoutC{});
   auto sSFA = make_tensor(make_smem_ptr(shm_sfa), SLayoutSFA{});
   auto sSFB = make_tensor(make_smem_ptr(shm_sfb), SLayoutSFB{});
 
@@ -131,7 +156,7 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1)
   auto tSFAs = btma_sfa.partition_D(sSFA);  // (V, 1, 1, kStageAB)
 
   auto tSFBg = btma_sfb.partition_S(gSFB);  // (V, 1, 1, N / 128, K, G)
-  auto tSFBs = btma_sfb.partition_D(sSFB);  // (V, 1, 1, kStageAB)
+  auto tSFBs = btma_sfb.partition_D(sSFB);  // (V, 1, 1, 1, kStageAB)
 
   int num_tile_k = k / kTileK;
 
@@ -140,7 +165,7 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1)
       (sizeof_bits_v<TA> * cosize(SLayoutA{}(_, _, 0)) +                   // NOLINT
        sizeof_bits_v<typename Config::TW> * cosize(SLayoutB{}(_, _, 0)) +  // NOLINT
        sizeof_bits_v<TSF> * cosize(SLayoutSFA{}(_, _, 0)) +                // NOLINT
-       sizeof_bits_v<TSF> * cosize(SLayoutSFB{}(_, _, 0))) /               // NOLINT
+       sizeof_bits_v<TSF> * cosize(SLayoutSFB{}(_, _, _, 0))) /            // NOLINT
       8;
 
   constexpr int kNumMmaWarps = Config::kNumMmaWarps;
@@ -162,8 +187,9 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1)
   }
   __syncthreads();
 
-  // PDL
-  cudaGridDependencySynchronize();
+  // PDL: only A and SFA come from gate_up; the routing outputs were complete before gate_up got
+  // past its own cudaGridDependencySynchronize, which precedes its launch trigger. So only the
+  // TMA thread waits, after issuing the weights of its first task.
 
   if (idx >= kMathThreads) {
     cutlass::arch::warpgroup_reg_dealloc<Config::kLoadRegisters>();
@@ -172,37 +198,57 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1)
   // main
   if (iwarp == 8) {
     // scheduler warp
-    if (elected) {
-      int istage_task = 0;
-      int phase_task = 1;
+    int istage_task = 0;
+    int phase_task = 1;
 
-      int igroup = 0;
-      int itile_m = 0;
-      int itile_n = 0;
-      int itile_mg = 0;
-      int sum_tile_m = 0;
+    int ilane = idx % 32;
+    int igroup = 0;
+    int itile_m = 0;
+    int itile_n = 0;
+    int itile_mg = 0;
+    int sum_tile_m = 0;
 
-      while (true) {
-        wait_barrier(task_writable[istage_task], phase_task);
+    for (;; iblock += gridDim.x) {
+      get_next_tile_horizon(tiles_ptr, iblock, num_group, igroup, itile_n, itile_m, itile_mg,
+                            sum_tile_m, tile_n_divider);
+      int seqlen = igroup >= 0 ? seqlens_ptr[igroup] : 0;
+      int cu_seqlen = igroup >= 0 ? cu_seqlens_ptr[igroup] : 0;
+      int2 rows[kTileM / 32];
+#pragma unroll
+      for (int j = 0; j < kTileM / 32; j++) {
+        int irow = itile_m * kTileM + ilane + 32 * j;
+        rows[j] = make_int2(-1, 0);
+        if (irow < seqlen) {
+          int route = permuted_idx_to_raw_idx_ptr[cu_seqlen + irow];
+          int token;
+          int slot;
+          topk_divider(token, slot, route);
+          rows[j] = make_int2(token, __float_as_int(permuted_topk_scale_ptr[cu_seqlen + irow]));
+        }
+      }
 
-        iblock += gridDim.x;
-        get_next_tile_horizon(tiles_ptr, iblock, num_group, igroup, itile_n, itile_m, itile_mg,
-                              sum_tile_m, tile_n_divider);
+      wait_barrier(task_writable[istage_task], phase_task);
+#pragma unroll
+      for (int j = 0; j < kTileM / 32; j++) {
+        task_rows_shm[istage_task][ilane + 32 * j] = rows[j];
+      }
+      __syncwarp();
+      if (elected) {
         task_shm[istage_task][0] = igroup;
         task_shm[istage_task][1] = itile_m;
         task_shm[istage_task][2] = itile_n;
         task_shm[istage_task][3] = itile_mg;
-
+        task_shm[istage_task][4] = seqlen;
         arrive_barrier(task_readable[istage_task]);
-        if (igroup < 0) {
-          break;
-        }
-        if (++istage_task == kStageTask) {
-          istage_task = 0;
-          phase_task ^= 1;
-        }
-      }  // while
-    }
+      }
+      if (igroup < 0) {
+        break;
+      }
+      if (++istage_task == kStageTask) {
+        istage_task = 0;
+        phase_task ^= 1;
+      }
+    }  // while
   } else if (iwarp == 9) {
     // tma warp
     if (elected) {
@@ -210,29 +256,62 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1)
       int phase = 1;
       int istage_task = 0;
       int phase_task = 0;
+      bool dep_ready = false;
 
-      int igroup = 0;
-      int itile_m = 0;
-      int itile_n = 0;
-      int itile_mg = 0;
-      int sum_tile_m = 0;
-      get_next_tile_horizon(tiles_ptr, iblock, num_group, igroup, itile_n, itile_m, itile_mg,
-                            sum_tile_m, tile_n_divider);
+      while (true) {
+        wait_barrier(task_readable[istage_task], phase_task);
+        int igroup = task_shm[istage_task][0];
+        int itile_n = task_shm[istage_task][2];
+        int itile_mg = task_shm[istage_task][3];
+        arrive_barrier(task_writable[istage_task]);
+        if (++istage_task == kStageTask) {
+          istage_task = 0;
+          phase_task ^= 1;
+        }
+        if (igroup < 0) {
+          break;
+        }
 
-      while (igroup >= 0) {
+        int itile_k = 0;
+        if (!dep_ready) {
+          // The first stages are still free: fill their B/SFB now, A/SFA once gate_up is done.
+          int num_pre = num_tile_k < kStageAB ? num_tile_k : kStageAB;
 #pragma unroll 1
-        for (int itile_k = 0; itile_k < num_tile_k; itile_k++) {
+          for (; itile_k < num_pre; itile_k++) {
+            set_barrier_transaction_bytes(shmab_readable[itile_k], kTransactionBytes);
+            cute::copy(tma_b.with(shmab_readable[itile_k], 0, w_cache_hint),
+                       tBg(_, itile_n, itile_k, igroup), tBs(_, 0, 0, itile_k));
+            cute::copy(tma_sfb.with(shmab_readable[itile_k]),
+                       tSFBg(_, 0, 0, itile_n, itile_k, igroup), tSFBs(_, 0, 0, 0, itile_k));
+          }
+          cudaGridDependencySynchronize();
+          dep_ready = true;
+#pragma unroll 1
+          for (int i = 0; i < num_pre; i++) {
+            cute::copy(tma_a.with(shmab_readable[i], 0, a_cache_hint), tAg(_, itile_mg, i),
+                       tAs(_, 0, 0, i));
+            cute::copy(tma_sfa.with(shmab_readable[i], 0, a_cache_hint),
+                       tSFAg(_, 0, 0, itile_mg / kTilePerSFBlock, i), tSFAs(_, 0, 0, i));
+          }
+          ismem_write = num_pre % kStageAB;
+          if (num_pre == kStageAB) {
+            phase ^= 1;
+          }
+        }
+
+#pragma unroll 1
+        for (; itile_k < num_tile_k; itile_k++) {
           wait_barrier(shmab_writable[ismem_write], phase);
 
-          cute::copy(tma_a.with(shmab_readable[ismem_write]), tAg(_, itile_mg, itile_k),
-                     tAs(_, 0, 0, ismem_write));
-          cute::copy(tma_b.with(shmab_readable[ismem_write], 0, TMA::CacheHintSm90::EVICT_FIRST),
+          cute::copy(tma_a.with(shmab_readable[ismem_write], 0, a_cache_hint),
+                     tAg(_, itile_mg, itile_k), tAs(_, 0, 0, ismem_write));
+          cute::copy(tma_b.with(shmab_readable[ismem_write], 0, w_cache_hint),
                      tBg(_, itile_n, itile_k, igroup), tBs(_, 0, 0, ismem_write));
-          cute::copy(tma_sfa.with(shmab_readable[ismem_write]),
+          cute::copy(tma_sfa.with(shmab_readable[ismem_write], 0, a_cache_hint),
                      tSFAg(_, 0, 0, itile_mg / kTilePerSFBlock, itile_k),
                      tSFAs(_, 0, 0, ismem_write));
-          cute::copy(tma_sfb.with(shmab_readable[ismem_write], 0, TMA::CacheHintSm90::EVICT_FIRST),
-                     tSFBg(_, 0, 0, itile_n, itile_k, igroup), tSFBs(_, 0, 0, ismem_write));
+          cute::copy(tma_sfb.with(shmab_readable[ismem_write]),
+                     tSFBg(_, 0, 0, itile_n, itile_k, igroup), tSFBs(_, 0, 0, 0, ismem_write));
           set_barrier_transaction_bytes(shmab_readable[ismem_write], kTransactionBytes);
 
           ++ismem_write;
@@ -241,18 +320,6 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1)
             phase ^= 1;
           }
         }  // for itile_k
-
-        // fetch the next task
-        wait_barrier(task_readable[istage_task], phase_task);
-        igroup = task_shm[istage_task][0];
-        itile_m = task_shm[istage_task][1];
-        itile_n = task_shm[istage_task][2];
-        itile_mg = task_shm[istage_task][3];
-        arrive_barrier(task_writable[istage_task]);
-        if (++istage_task == kStageTask) {
-          istage_task = 0;
-          phase_task ^= 1;
-        }
       }  // while
     }
   } else if (iwarp < 8) {
@@ -271,131 +338,138 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1)
     auto tIC = thr_mma.partition_C(make_identity_tensor(Shape<Int<kTileM>, Int<kTileN>>{}));
     CUTE_STATIC_ASSERT_V(size(acc) == Int<kTileM * kTileN / (kNumMmaWarps * 32)>{});
 
-    TiledSF tiled_sf;
-    auto thr_sf = tiled_sf.get_slice(idx);
-    auto tCsSFA = thr_sf.partition_A(make_tensor(make_smem_ptr(shm_sfa), SLayoutSFAMK{}));
-    auto tCsSFB = thr_sf.partition_B(make_tensor(make_smem_ptr(shm_sfb), SLayoutSFBMK{}));
-    auto tCrSFA = make_fragment_like(tCsSFA(_, _, _, 0, 0));
-    auto tCrSFB = make_fragment_like(tCsSFB(_, _, _, 0));
-
     TiledCopyA tiled_copy_a;
     TiledCopyB tiled_copy_b;
-    TiledCopyC tiled_copy_c;
     auto thr_copy_a = tiled_copy_a.get_slice(idx);
     auto thr_copy_b = tiled_copy_b.get_slice(idx);
-    auto thr_copy_c = tiled_copy_c.get_slice(idx);
-    auto tAsA = thr_copy_a.partition_S(sA);
-    auto tBsB = thr_copy_b.partition_S(sB);
+    auto psA = as_position_independent_swizzle_tensor(sA);
+    auto psB = as_position_independent_swizzle_tensor(sB);
+    auto tAsA = thr_copy_a.partition_S(psA);
+    auto tBsB = thr_copy_b.partition_S(psB);
     auto tArA = thr_copy_a.retile_D(tCrA);
     auto tBrB = thr_copy_b.retile_D(tCrB);
-    auto tCsC = thr_copy_c.partition_D(sC);
 
     constexpr int kNumM = size<1>(decltype(tCrA){});
     constexpr int kNumN = size<1>(decltype(tCrB){});
+    constexpr int kWarpCols = kTileN / 4;
+    static_assert(kNumN == 4 && kWarpCols == 32, "the epilogue transposes four 8-column blocks");
+    int ilane = idx % 32;
+    int warp_m = idx / 32 / 4;
+    int warp_n = idx / 32 % 4;
+    auto sSFAr = make_tensor(make_smem_ptr(shm_sfa), SLayoutSFARead{});
+    auto sSFBr = make_tensor(make_smem_ptr(shm_sfb), SLayoutSFBRead{});
+
+    int sfa_row[kNumM];
+    int sfb_row[kNumN];
+#pragma unroll
+    for (int im = 0; im < kNumM; im++) {
+      sfa_row[im] = im * 32 + warp_m * 16 + ilane / 4 + (ilane % 2) * 8;
+    }
+#pragma unroll
+    for (int in = 0; in < kNumN; in++) {
+      sfb_row[in] = warp_n * 32 + in * 8 + ilane / 4;
+    }
 
     int istage_task = 0;
     int phase_task = 0;
 
-    int igroup = 0;
-    int itile_m = 0;
-    int itile_n = 0;
-    int itile_mg = 0;
-    int sum_tile_m = 0;
-    get_next_tile_horizon(tiles_ptr, iblock, num_group, igroup, itile_n, itile_m, itile_mg,
-                          sum_tile_m, tile_n_divider);
-
-    while (igroup >= 0) {
+    while (true) {
+      wait_barrier(task_readable[istage_task], phase_task);
+      int igroup = task_shm[istage_task][0];
+      int itile_m = task_shm[istage_task][1];
+      int itile_n = task_shm[istage_task][2];
+      int itile_mg = task_shm[istage_task][3];
+      int seqlen = task_shm[istage_task][4];
+      if (igroup < 0) {
+        break;
+      }
+      const int2 *rows = task_rows_shm[istage_task];
       clear(acc);
 
-      int isf_tile = itile_mg % kTilePerSFBlock;
+      int sfa_col = (itile_mg % kTilePerSFBlock) * (kTileM / 32) * 4;
 
-      for (int itile_k = 0; itile_k < num_tile_k; itile_k++) {
-        wait_barrier(shmab_readable[ismem_read], phase_shmab);
+      // Skip this warp's 16-row blocks past the valid rows.
+      int num_valid_m = (seqlen - itile_m * kTileM - warp_m * 16 + 31) / 32;
+      dispatch_num_valid_m<kNumM>(num_valid_m, [&](auto valid_m) {
+        constexpr int kNumValidM = decltype(valid_m)::value;
+        for (int itile_k = 0; itile_k < num_tile_k; itile_k++) {
+          wait_barrier(shmab_readable[ismem_read], phase_shmab);
 
-        // cp sfa/sfb from smem to reg
-        cute::copy(tCsSFA(_, _, _, ismem_read, isf_tile), tCrSFA);
-        cute::copy(tCsSFB(_, _, _, ismem_read), tCrSFB);
+          // load sfa
+          uint32_t sfa4[kNumM];
+          uint32_t sfb4[kNumN];
+#pragma unroll
+          for (int im = 0; im < kNumValidM; im++) {
+            sfa4[im] = *reinterpret_cast<const uint32_t *>(
+                &sSFAr(sfa_row[im] % 32, sfa_row[im] / 32 * 4 + sfa_col, ismem_read));
+          }
+
+          // load sfb
+#pragma unroll
+          for (int in = 0; in < kNumN; in++) {
+            sfb4[in] = *reinterpret_cast<const uint32_t *>(
+                &sSFBr(sfb_row[in] % 32, sfb_row[in] / 32 * 4, 0, ismem_read));
+          }
 
 #pragma unroll
-        for (int ik = 0; ik < size<2>(tCrA); ++ik) {
-          cute::copy(tiled_copy_a, tAsA(_, _, ik, ismem_read), tArA(_, _, ik));
-          cute::copy(tiled_copy_b, tBsB(_, _, ik, ismem_read), tBrB(_, _, ik));
-          // fp4: ldmatrix leaves each value in a byte's low 4 bits, the MMA reads bits [5:2]
-          fp4_shift_B(typename TiledMma::MMA_Op{}, tCrB(_, _, ik));
+          for (int ik = 0; ik < (kNumValidM > 0 ? kTileK / 32 : 0); ik++) {
+#pragma unroll
+            for (int im = 0; im < kNumValidM; im++) {
+              cute::copy(tiled_copy_a, tAsA(_, im, ik, ismem_read), tArA(_, im, ik));
+            }
+            cute::copy(tiled_copy_b, tBsB(_, _, ik, ismem_read), tBrB(_, _, ik));
+            if constexpr (Config::kIsFp4W) {
+              // ldmatrix .b4x16_p64 puts each fp4 in a byte's low 4 bits, mxf8f6f4 wants it in
+              // the middle 4: shift left by 2 (same as cute's fp4_shift_B).
+              cute::transform(recast<uint32_t>(tCrB(_, _, ik)), [](uint32_t &v) { return v << 2; });
+            }
 
-          cute::gemm(tiled_mma, make_zip_tensor(tCrA(_, _, ik), tCrSFA(_, _, ik)),
-                     make_zip_tensor(tCrB(_, _, ik), tCrSFB(_, _, ik)), acc);
-        }
+#pragma unroll
+            for (int im = 0; im < kNumValidM; im++) {
+#pragma unroll
+              for (int in = 0; in < kNumN; in++) {
+                cute::gemm(tiled_mma.with(sfa4[im], sfb4[in], ik), tCrA(_, im, ik), tCrB(_, in, ik),
+                           acc(_, im, in));
+              }
+            }
+          }
 
-        // tell TMA this stage may be overwritten
-        cutlass::arch::fence_view_async_shared();
-        arrive_barrier(shmab_writable[ismem_read]);
+          // tell TMA this stage may be overwritten
+          cutlass::arch::fence_view_async_shared();
+          arrive_barrier(shmab_writable[ismem_read]);
 
-        ++ismem_read;
-        if (ismem_read == kStageAB) {
-          ismem_read = 0;
-          phase_shmab ^= 1;
-        }
-      }  // for itile_k
+          ++ismem_read;
+          if (ismem_read == kStageAB) {
+            ismem_read = 0;
+            phase_shmab ^= 1;
+          }
+        }  // for itile_k
+      });
 
-      // epilogue
-      int seqlen = seqlens_ptr[igroup];
-      int cu_seqlen = cu_seqlens_ptr[igroup];
-      float row_scale[kNumM][2];
+      // epilogue: transpose 8 rows at a time, then each lane adds 16B of one row into y.
 #pragma unroll
       for (int im = 0; im < kNumM; im++) {
 #pragma unroll
         for (int h = 0; h < 2; h++) {
-          int irow = itile_m * kTileM + get<0>(tIC(2 * h, im, 0));
-          row_scale[im][h] =
-              (irow < seqlen) ? topk_scale_ptr[permuted_idx_to_raw_idx_ptr[cu_seqlen + irow]] : 0.f;
-        }
-      }
-
-      // The token each row accumulates into, -1 meaning do not write.
-      if (idx < kTileM) {
-        int irow = itile_m * kTileM + idx;
-        row_token_shm[idx] =
-            (irow < seqlen) ? permuted_idx_to_raw_idx_ptr[cu_seqlen + irow] / kNumTopk : -1;
-      }
-
-      auto rC = make_tensor_like<TC>(acc);
+          int2 row = rows[get<0>(tIC(2 * h, im, 0))];
+          float row_scale = __int_as_float(row.y);
+          uint32_t pairs[kNumN];
 #pragma unroll
-      for (int im = 0; im < kNumM; im++) {
-#pragma unroll
-        for (int in = 0; in < kNumN; in++) {
-#pragma unroll
-          for (int v = 0; v < 4; v++) {
-            rC(v, im, in) = static_cast<TC>(acc(v, im, in) * row_scale[im][v / 2]);
+          for (int in = 0; in < kNumN; in++) {
+            __nv_bfloat162 v = __floats2bfloat162_rn(acc(2 * h, im, in) * row_scale,
+                                                     acc(2 * h + 1, im, in) * row_scale);
+            pairs[in] = *reinterpret_cast<uint32_t *>(&v);
+          }
+          uint4 block = epi_transpose(pairs, epi_shm[idx / 32]);
+          if (row.x >= 0) {
+            int col = warp_n * kWarpCols + ilane % 4 * 8;
+            red_add_v4_bf16x2(y_ptr + static_cast<int64_t>(row.x) * n + itile_n * kTileN + col,
+                              block);
           }
         }
       }
-      auto tCrC = thr_copy_c.retile_S(rC);
-      cute::copy(tiled_copy_c, tCrC, tCsC);
 
-      // Read 16B rows (eight bf16) back out of shared -- adjacent threads cover adjacent columns
-      // of one row -- and atomically add them to y by token.
-      cutlass::arch::NamedBarrier::sync(kNumMmaWarps * 32, 1);
-      constexpr int kVecPerRow = kTileN / 8;
-#pragma unroll
-      for (int i = idx; i < kTileM * kVecPerRow; i += kNumMmaWarps * 32) {
-        int row = i / kVecPerRow;
-        int col = i % kVecPerRow * 8;
-        int token = row_token_shm[row];
-        if (token >= 0) {
-          red_add_v4_bf16x2(y_ptr + static_cast<int64_t>(token) * n + itile_n * kTileN + col,
-                            *reinterpret_cast<const uint4 *>(&sC(row, col)));
-        }
-      }
-      // Without this some warps race ahead into the next task.
-      cutlass::arch::NamedBarrier::sync(kNumMmaWarps * 32, 1);
-
-      // fetch the next task
-      wait_barrier(task_readable[istage_task], phase_task);
-      igroup = task_shm[istage_task][0];
-      itile_m = task_shm[istage_task][1];
-      itile_n = task_shm[istage_task][2];
-      itile_mg = task_shm[istage_task][3];
+      // done with the task's rows
       arrive_barrier(task_writable[istage_task]);
       if (++istage_task == kStageTask) {
         istage_task = 0;

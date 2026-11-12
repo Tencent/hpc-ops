@@ -23,12 +23,14 @@ namespace mxfp8 {
 //   gateup_tiles                M-direction tile count of the GateUp GEMM
 //   down_tiles                  M-direction tile count of the Down GEMM
 //   permuted_idx_to_raw_idx     GEMM row -> raw flat index (reverse map)
+//   permuted_topk_scale         GEMM row -> topk scale
+//   init_dst                    init_src, or zeros (optional)
 template <int kThreadPerBlock, int kTileM_Gateup, int kTileM_Down, int kRoutesPerThread>
-__global__ void fused_count_scan_route_kernel(const int *topk_ids_ptr, int *seqlens_ptr,
-                                              int *cu_seqlens_ptr, int *gateup_tiles_ptr,
-                                              int *down_tiles_ptr, int *permuted_idx_to_raw_idx_ptr,
-                                              int total_num_topk, int num_expert, int start_expert,
-                                              int end_expert) {
+__global__ void fused_count_scan_route_kernel(
+    const int *topk_ids_ptr, const float *topk_scale_ptr, int *seqlens_ptr, int *cu_seqlens_ptr,
+    int *gateup_tiles_ptr, int *down_tiles_ptr, int *permuted_idx_to_raw_idx_ptr,
+    float *permuted_topk_scale_ptr, const int4 *init_src_ptr, int4 *init_dst_ptr,
+    int64_t init_vectors, int total_num_topk, int num_expert, int start_expert, int end_expert) {
   int tid = threadIdx.x;
   int idx = tid + blockDim.x * blockIdx.x;
   int stride = blockDim.x * gridDim.x;
@@ -97,53 +99,75 @@ __global__ void fused_count_scan_route_kernel(const int *topk_ids_ptr, int *seql
     block_base_shm[i] = (count > 0) ? atomicAdd(&seqlens_ptr[i], count) : 0;
   }
 
+  // ---- Output init, ahead of the grid sync ----
+  int64_t i = idx;
+  for (; i + 3 * stride < init_vectors; i += 4 * stride) {
+    int4 v[4];
+#pragma unroll
+    for (int d = 0; d < 4; d++) {
+      v[d] = init_src_ptr != nullptr ? init_src_ptr[i + d * stride] : make_int4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int d = 0; d < 4; d++) {
+      init_dst_ptr[i + d * stride] = v[d];
+    }
+  }
+  for (; i < init_vectors; i += stride) {
+    init_dst_ptr[i] = init_src_ptr != nullptr ? init_src_ptr[i] : make_int4(0, 0, 0, 0);
+  }
+
   // The only grid-wide sync: after this, seqlens_ptr holds the final per-expert totals and is
   // visible to every block. Legal because the launcher uses a cooperative launch with a
   // co-resident grid.
   cooperative_groups::this_grid().sync();
 
-  // ---- Stage C: every block redundantly scans (num_expert <= 256) ----
+  // ---- Stage C: every block redundantly scans (num_expert <= 2 * kThreadPerBlock) ----
   // Recomputing this tiny block scan in all blocks is cheaper than a second grid sync to
   // broadcast block 0's result. Only cu_seqlens needs a scan: the GEMMs consume the per-expert
   // tile counts directly, since get_next_tile_horizon accumulates them as it walks.
-  int iseq = (tid < num_expert) ? seqlens_ptr[tid] : 0;
-  int itiles_gate_up = (iseq + kTileM_Gateup - 1) / kTileM_Gateup;
-  int itiles_down = (iseq + kTileM_Down - 1) / kTileM_Down;
+  constexpr int kExpertsPerThread = 2;
+  int iseq[kExpertsPerThread];
+#pragma unroll
+  for (int j = 0; j < kExpertsPerThread; j++) {
+    int e = tid * kExpertsPerThread + j;
+    iseq[j] = (e < num_expert) ? seqlens_ptr[e] : 0;
+  }
 
   int seq_total;
-  int cu_seqlen;
+  int cu_seqlen[kExpertsPerThread];
   BlockScan(temp_storage_seqs).ExclusiveSum(iseq, cu_seqlen, seq_total);
 
   // Only block 0 publishes the metadata the downstream GEMMs consume; every block computed
-  // identical values, so the rest would be redundant traffic.
-  if (blockIdx.x == 0) {
-    if (tid < num_expert) {
-      gateup_tiles_ptr[tid] = itiles_gate_up;
-      down_tiles_ptr[tid] = itiles_down;
-      cu_seqlens_ptr[tid] = cu_seqlen;
-    }
-    if (tid == 0) {
-      cu_seqlens_ptr[num_expert] = seq_total;
+  // identical values, so the rest would be redundant traffic. Broadcast cu_seqlen into smem too
+  // (seqlens_shm is dead after Stage B) so the emit stage can look up any local_expert[r].
+#pragma unroll
+  for (int j = 0; j < kExpertsPerThread; j++) {
+    int e = tid * kExpertsPerThread + j;
+    if (e < num_expert) {
+      if (blockIdx.x == 0) {
+        gateup_tiles_ptr[e] = (iseq[j] + kTileM_Gateup - 1) / kTileM_Gateup;
+        down_tiles_ptr[e] = (iseq[j] + kTileM_Down - 1) / kTileM_Down;
+        cu_seqlens_ptr[e] = cu_seqlen[j];
+      }
+      seqlens_shm[e] = cu_seqlen[j];
     }
   }
-
-  // Broadcast cu_seqlen into smem (seqlens_shm is dead after Stage B) so the emit stage can look
-  // up any local_expert[r], not just tid's own expert.
-  if (tid < num_expert) {
-    seqlens_shm[tid] = cu_seqlen;
+  if (blockIdx.x == 0 && tid == 0) {
+    cu_seqlens_ptr[num_expert] = seq_total;
   }
   __syncthreads();
 
 // ---- Stage D: emit permuted_idx_to_raw_idx ----
 // Row = global expert base + this block's slice + slot within the block. It stores the raw flat
 // index (token_idx*num_topk + topk_idx), which is the dense row space the GEMMs read; they decode
-// token_idx via a compile-time divide and read topk_scale[i].
+// token_idx with a divide by num_topk.
 #pragma unroll
   for (int r = 0; r < kRoutesPerThread; r++) {
     int le = local_expert[r];
     if (le >= 0) {
-      permuted_idx_to_raw_idx_ptr[seqlens_shm[le] + block_base_shm[le] + local_slot[r]] =
-          idx + r * stride;
+      int row = seqlens_shm[le] + block_base_shm[le] + local_slot[r];
+      permuted_idx_to_raw_idx_ptr[row] = idx + r * stride;
+      permuted_topk_scale_ptr[row] = topk_scale_ptr[idx + r * stride];
     }
   }
 

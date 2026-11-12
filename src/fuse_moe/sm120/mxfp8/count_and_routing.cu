@@ -19,11 +19,11 @@ namespace fuse_moe {
 
 // gate_up and down share one kTileM.
 template <int kTileM>
-static void launch_count_and_route_mxfp8(const void *topk_ids_ptr,
-                                         void *permuted_idx_to_raw_idx_ptr, void *seqlens_ptr,
-                                         void *cu_seqlens_ptr, void *gateup_tiles_ptr,
-                                         void *down_tiles_ptr, int num_seq, int num_topk,
-                                         int num_expert_local, int rank_ep, cudaStream_t stream) {
+static void launch_count_and_route_mxfp8(
+    const void *topk_ids_ptr, const void *topk_scale_ptr, void *permuted_idx_to_raw_idx_ptr,
+    void *permuted_topk_scale_ptr, void *seqlens_ptr, void *cu_seqlens_ptr, void *gateup_tiles_ptr,
+    void *down_tiles_ptr, const void *init_src_ptr, void *init_dst_ptr, int64_t init_bytes,
+    int num_seq, int num_topk, int num_expert_local, int rank_ep, cudaStream_t stream) {
   constexpr int kTileM_GateUp = kTileM;
   constexpr int kTileM_Down = kTileM;
 
@@ -52,7 +52,13 @@ static void launch_count_and_route_mxfp8(const void *topk_ids_ptr,
 
   int route_blocks = (total_num_topk + kThreadPerBlock * routes_per_thread - 1) /
                      (kThreadPerBlock * routes_per_thread);
-  int blocks = std::max(1, std::min(max_blocks, route_blocks));
+  // Extra blocks for the output init own no routes.
+  constexpr int kInitVectorsPerThread = 2;
+  int64_t init_vectors = init_dst_ptr != nullptr ? init_bytes / 16 : 0;
+  int64_t init_blocks = (init_vectors + kThreadPerBlock * kInitVectorsPerThread - 1) /
+                        (kThreadPerBlock * kInitVectorsPerThread);
+  int blocks = std::max(
+      1, std::min<int>(max_blocks, std::max(static_cast<int64_t>(route_blocks), init_blocks)));
 
   cudaLaunchAttribute attrs[2];
   attrs[0].id = cudaLaunchAttributeCooperative;
@@ -77,10 +83,13 @@ static void launch_count_and_route_mxfp8(const void *topk_ids_ptr,
            "fused_count_scan_route_kernel: grid too large for a cooperative launch");
     cudaLaunchKernelEx(
         &cfg, kernel, reinterpret_cast<const int *>(topk_ids_ptr),
-        reinterpret_cast<int *>(seqlens_ptr), reinterpret_cast<int *>(cu_seqlens_ptr),
-        reinterpret_cast<int *>(gateup_tiles_ptr), reinterpret_cast<int *>(down_tiles_ptr),
-        reinterpret_cast<int *>(permuted_idx_to_raw_idx_ptr), total_num_topk, num_expert_local,
-        start_expert, end_expert);
+        reinterpret_cast<const float *>(topk_scale_ptr), reinterpret_cast<int *>(seqlens_ptr),
+        reinterpret_cast<int *>(cu_seqlens_ptr), reinterpret_cast<int *>(gateup_tiles_ptr),
+        reinterpret_cast<int *>(down_tiles_ptr),
+        reinterpret_cast<int *>(permuted_idx_to_raw_idx_ptr),
+        reinterpret_cast<float *>(permuted_topk_scale_ptr),
+        reinterpret_cast<const int4 *>(init_src_ptr), reinterpret_cast<int4 *>(init_dst_ptr),
+        init_vectors, total_num_topk, num_expert_local, start_expert, end_expert);
   };
   switch (routes_per_thread) {
     case 8:
@@ -98,15 +107,18 @@ static void launch_count_and_route_mxfp8(const void *topk_ids_ptr,
   }
 }
 
-void count_and_route_mxfp8_async(const void *topk_ids_ptr, void *permuted_idx_to_raw_idx_ptr,
+void count_and_route_mxfp8_async(const void *topk_ids_ptr, const void *topk_scale_ptr,
+                                 void *permuted_idx_to_raw_idx_ptr, void *permuted_topk_scale_ptr,
                                  void *seqlens_ptr, void *cu_seqlens_ptr, void *gateup_tiles_ptr,
-                                 void *down_tiles_ptr, int num_seq, int num_topk,
+                                 void *down_tiles_ptr, const void *init_src_ptr, void *init_dst_ptr,
+                                 int64_t init_bytes, int num_seq, int num_topk,
                                  int num_expert_local, int rank_ep, int tile_m,
                                  cudaStream_t stream) {
   dispatch_tile_m(tile_m, [&](auto kTileM) {
     launch_count_and_route_mxfp8<decltype(kTileM)::value>(
-        topk_ids_ptr, permuted_idx_to_raw_idx_ptr, seqlens_ptr, cu_seqlens_ptr, gateup_tiles_ptr,
-        down_tiles_ptr, num_seq, num_topk, num_expert_local, rank_ep, stream);
+        topk_ids_ptr, topk_scale_ptr, permuted_idx_to_raw_idx_ptr, permuted_topk_scale_ptr,
+        seqlens_ptr, cu_seqlens_ptr, gateup_tiles_ptr, down_tiles_ptr, init_src_ptr, init_dst_ptr,
+        init_bytes, num_seq, num_topk, num_expert_local, rank_ep, stream);
   });
 }
 

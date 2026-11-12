@@ -698,15 +698,13 @@ torch::Tensor fuse_moe_mxfp8_entry(
 
   int intermediate_size = static_cast<int>(gate_up_weight.size(1)) / 2;
 
-  // num_topk is a template parameter, specialized for 8 and 16 only.
-  TORCH_CHECK(num_topk == 8 || num_topk == 16, "fuse_moe_mxfp8 supports num_topk in {8, 16}, got ",
-              num_topk);
+  TORCH_CHECK(num_topk >= 1, "fuse_moe_mxfp8 needs num_topk >= 1, got ", num_topk);
   TORCH_CHECK(topk_ids.size(0) == num_tokens && topk_scale.size(0) == num_tokens &&
                   topk_scale.size(1) == num_topk,
               "topk_ids / topk_scale must be [num_seq, num_topk]");
   TORCH_CHECK(hidden_size % 128 == 0, "hidden must be a multiple of 128");
   TORCH_CHECK(intermediate_size % 128 == 0, "intermediate must be a multiple of 128");
-  TORCH_CHECK(num_experts > 0 && num_experts <= 256, "num_expert_local must be in [1, 256]");
+  TORCH_CHECK(num_experts > 0 && num_experts <= 512, "num_expert_local must be in [1, 512]");
   TORCH_CHECK(num_expert_total >= num_experts * (rank_ep + 1),
               "rank_ep / num_expert_total mismatch");
   TORCH_CHECK(x_scale.size(0) == num_tokens && x_scale.size(1) == hidden_size / 32,
@@ -739,6 +737,12 @@ torch::Tensor fuse_moe_mxfp8_entry(
   TORCH_CHECK(!is_fp4 || (reinterpret_cast<uintptr_t>(gate_up_weight.const_data_ptr()) % 32 == 0 &&
                           reinterpret_cast<uintptr_t>(down_weight.const_data_ptr()) % 32 == 0),
               "mxfp4 weights must be 32B aligned (TMA 16U4_ALIGN16B)");
+  TORCH_CHECK(is_fp4 || (reinterpret_cast<uintptr_t>(gate_up_weight.const_data_ptr()) % 16 == 0 &&
+                         reinterpret_cast<uintptr_t>(down_weight.const_data_ptr()) % 16 == 0),
+              "mxfp8 weights must be 16B aligned (TMA)");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(x.const_data_ptr()) % 16 == 0, "x must be 16B aligned");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(x_scale.const_data_ptr()) % 4 == 0,
+              "x_scale must be 4B aligned (cp.async 4B)");
 
   auto u8 = options.dtype(torch::kUInt8);
   auto i32 = options.dtype(torch::kInt32);
@@ -746,12 +750,23 @@ torch::Tensor fuse_moe_mxfp8_entry(
 
   int total_num_seq = num_tokens * num_topk;
   int num_seq_per_group_avg = total_num_seq / static_cast<int>(num_expert_total);
-  int tile_m = 128;
-  if (num_seq_per_group_avg <= 32) {
+  // 128-row tiles when an expert fits one, or for mxfp8 when they pad at most ~9% more rows.
+  auto padded_rows = [&](int tm) { return (num_seq_per_group_avg + tm - 1) / tm * tm; };
+  int tile_m = 64;
+  if (num_seq_per_group_avg < 32) {
     tile_m = 32;
-  } else if (num_seq_per_group_avg <= 64) {
-    tile_m = 64;
+  } else if ((num_seq_per_group_avg * 5 > 64 * 4 && num_seq_per_group_avg * 5 <= 128 * 4) ||
+             (!is_fp4 && num_seq_per_group_avg > 256 &&
+              padded_rows(128) * 11 <= padded_rows(64) * 12)) {
+    tile_m = 128;
   }
+  // Evict-first weights only when an expert fits one M tile and the live weights overflow L2.
+  double num_expert_live =
+      num_experts * (1.0 - std::pow(1.0 - 1.0 / num_expert_total, total_num_seq));
+  double live_weight_bytes = num_expert_live * 3.0 * intermediate_size * hidden_size / w_pack;
+  bool stream_weights =
+      num_seq_per_group_avg * 5 <= tile_m * 4 &&
+      live_weight_bytes >= 1.25 * at::cuda::getCurrentDeviceProperties()->l2CacheSize;
   int max_tiles = (total_num_seq + tile_m - 1) / tile_m + num_experts;
 
   // The gate_up output doubles as the down input: rows are tile aligned and the scale is
@@ -760,30 +775,39 @@ torch::Tensor fuse_moe_mxfp8_entry(
   torch::Tensor down_input_scale =
       torch::empty({(max_tiles * tile_m + 127) / 128 * 128, intermediate_size / 32}, u8);
   torch::Tensor permuted_idx_to_raw_idx = torch::empty({total_num_seq}, i32);
+  torch::Tensor permuted_topk_scale = torch::empty({total_num_seq}, options.dtype(torch::kFloat32));
   torch::Tensor seqlens = torch::zeros({num_experts}, i32);
   torch::Tensor cu_seqlens = torch::empty({num_experts + 1}, i32);
   torch::Tensor tiles = torch::empty({2 * num_experts}, i32);
 
   // The down epilogue atomically adds 16B of bf16 per token into y: every top-k contribution is
   // rounded to bf16 once and the summation order is undefined, so the result is not
-  // bit-reproducible. y therefore has to start at the value we want to accumulate onto --
-  // shared_output accumulates in place and is returned, otherwise y is output (zeroed first) or a
-  // fresh zeros.
-  torch::Tensor y;
+  // bit-reproducible. y therefore has to start at shared_output, or zeros without it.
+  torch::Tensor y =
+      output.has_value() ? output.value() : torch::empty({num_tokens, hidden_size}, bf16);
+  TORCH_CHECK(y.is_cuda() && y.is_contiguous() && y.size(0) == num_tokens &&
+                  y.size(1) == hidden_size && y.dtype() == torch::kBFloat16,
+              "output must be cuda + contiguous bf16 [num_seq, hidden]");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(y.const_data_ptr()) % 16 == 0,
+              "output must be 16B aligned (red.global.add.v4.bf16x2)");
+  const void *init_src_ptr = nullptr;
+  void *init_dst_ptr = y.mutable_data_ptr();
   if (shared_output.has_value()) {
-    y = shared_output.value();
-    TORCH_CHECK(y.is_cuda() && y.is_contiguous() && y.size(0) == num_tokens &&
-                    y.size(1) == hidden_size && y.dtype() == torch::kBFloat16,
-                "shared_output must be cuda + contiguous bf16 [num_seq, hidden]");
-  } else if (output.has_value()) {
-    y = output.value();
-    TORCH_CHECK(y.is_cuda() && y.is_contiguous() && y.size(0) == num_tokens &&
-                    y.size(1) == hidden_size && y.dtype() == torch::kBFloat16,
-                "output must be cuda + contiguous bf16 [num_seq, hidden]");
-    y.zero_();
-  } else {
-    y = torch::zeros({num_tokens, hidden_size}, bf16);
+    const auto &so = shared_output.value();
+    TORCH_CHECK(so.is_cuda() && so.size(0) == num_tokens && so.size(1) == hidden_size &&
+                    so.dtype() == torch::kBFloat16,
+                "shared_output must be cuda bf16 [num_seq, hidden]");
+    bool contiguous = so.is_contiguous();
+    if (contiguous && so.const_data_ptr() == y.const_data_ptr()) {
+      init_dst_ptr = nullptr;
+    } else if (contiguous && reinterpret_cast<uintptr_t>(so.const_data_ptr()) % 16 == 0) {
+      init_src_ptr = so.const_data_ptr();
+    } else {
+      y.copy_(so);
+      init_dst_ptr = nullptr;
+    }
   }
+  int64_t init_bytes = static_cast<int64_t>(num_tokens) * hidden_size * 2;
 
   HPC_ARCH_DISPATCH(
       "fuse_moe_mxfp8", 120,
@@ -793,10 +817,11 @@ torch::Tensor fuse_moe_mxfp8_entry(
                            down_weight.const_data_ptr(), down_weight_scale.const_data_ptr(),
                            topk_ids.const_data_ptr(), topk_scale.const_data_ptr(),
                            permuted_idx_to_raw_idx.mutable_data_ptr(), seqlens.mutable_data_ptr(),
-                           cu_seqlens.mutable_data_ptr(), tiles.mutable_data_ptr(), num_tokens,
-                           hidden_size, intermediate_size, num_topk, num_experts,
-                           static_cast<int>(rank_ep), max_tiles, tile_m, swiglu_limit, is_fp4,
-                           stream));
+                           cu_seqlens.mutable_data_ptr(), tiles.mutable_data_ptr(),
+                           permuted_topk_scale.mutable_data_ptr(), init_src_ptr, init_dst_ptr,
+                           init_bytes, num_tokens, hidden_size, intermediate_size, num_topk,
+                           num_experts, static_cast<int>(rank_ep), max_tiles, tile_m, swiglu_limit,
+                           is_fp4, stream_weights, stream));
   return y;
 }
 

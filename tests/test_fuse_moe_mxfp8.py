@@ -185,10 +185,30 @@ def run_op(
         num_expert_total,
         limit=limit,
         shared_output=shared,
+        output=shared,
     )
     if shared is not None:
         assert y.data_ptr() == shared.data_ptr(), "the epilogue must accumulate into shared_output"
     return y
+
+
+def _op_weights(w_gu, w_dn):
+    """The weight scales are interleaved with the weights first, then moved into layout_128x4."""
+    return (
+        interleave_gate_up(w_gu[0]),
+        to_layout_128x4(interleave_gate_up(w_gu[1])),
+        w_dn[0],
+        to_layout_128x4(w_dn[1]),
+    )
+
+
+def _shifted(t, offset_bytes):
+    """A contiguous copy of t whose storage starts offset_bytes past an aligned address."""
+    pad = offset_bytes // t.element_size()
+    buf = torch.empty(t.numel() + pad, dtype=t.dtype, device=t.device)
+    view = buf[pad:].view(t.shape)
+    view.copy_(t)
+    return view
 
 
 @pytest.mark.parametrize("w_fp4", [False, True])
@@ -197,10 +217,15 @@ def run_op(
     [
         (17, 1024, 384, 16, 16, 0, False, 8),  # tile_m 32, m tile tail
         (90, 1024, 384, 16, 16, 0, False, 8),  # tile_m 64
-        (256, 1024, 384, 16, 16, 0, True, 8),  # tile_m 128, with shared_output
+        (256, 1024, 384, 16, 16, 0, True, 8),  # tile_m 64, with shared_output
         (256, 1024, 384, 8, 16, 1, False, 8),  # rank_ep 1: half the routes are filtered out
         (64, 7168, 2048, 32, 256, 0, False, 8),  # tile_m 32, target shape
-        (48, 1024, 384, 32, 64, 0, False, 16),  # tile_m 32, num_topk 16 is the other instance
+        (48, 1024, 384, 32, 64, 0, False, 16),  # tile_m 32
+        (300, 1024, 384, 16, 16, 0, False, 6),  # tile_m 128
+        (200, 2560, 640, 32, 32, 0, True, 10),
+        (33, 1024, 384, 8, 8, 0, False, 1),
+        (200, 512, 256, 320, 640, 1, False, 8),  # more local experts than routing threads
+        (100, 512, 256, 512, 512, 0, False, 8),
     ],
 )
 def test_fuse_moe_mxfp8(
@@ -233,6 +258,101 @@ def test_fuse_moe_mxfp8(
 @pytest.mark.parametrize("limit", [0.5, 2.0])
 def test_fuse_moe_mxfp8_swiglu_limit(limit, w_fp4):
     _check(256, 1024, 384, 16, 16, 0, False, 8, limit, w_fp4)
+
+
+def _make_shared(kind, num_seq, hidden):
+    if kind is None:
+        return None
+    values = torch.randn((num_seq, hidden), device="cuda").to(torch.bfloat16)
+    if kind == "misaligned":
+        return _shifted(values, 2)
+    if kind == "strided":
+        return values.t().contiguous().t()
+    return values
+
+
+@pytest.mark.parametrize("num_seq", [37, 4096])
+@pytest.mark.parametrize("shared_kind", [None, "aligned", "misaligned", "strided"])
+@pytest.mark.parametrize("with_output", [True, False])
+def test_fuse_moe_mxfp8_output(num_seq, shared_kind, with_output):
+    x, w_gu, w_dn, topk_ids, topk_scale = make_inputs(num_seq, 1024, 384, 16, 16)
+    shared = _make_shared(shared_kind, num_seq, 1024)
+    args = (x[0], x[1], *_op_weights(w_gu, w_dn), topk_ids, topk_scale, 0, 16)
+    expected = torch_ref(x, w_gu, w_dn, topk_ids, topk_scale, shared, 0, float("inf"))
+    # A stale output catches a missing init.
+    output = (
+        torch.full((num_seq, 1024), 777.0, dtype=torch.bfloat16, device="cuda")
+        if with_output
+        else None
+    )
+    shared_before = None if shared is None else shared.clone()
+    y = hpc.fuse_moe_mxfp8(*args, shared_output=shared, output=output)
+    if output is not None:
+        assert y.data_ptr() == output.data_ptr()
+    if shared is not None:
+        assert torch.equal(shared, shared_before), "shared_output must only be read"
+    torch.testing.assert_close(
+        y.float(), expected, rtol=0.02, atol=0.02 * expected.abs().max().item()
+    )
+
+
+# A TP shard padded with zero weights gives all-zero quantization groups, which must not be NaN.
+@pytest.mark.parametrize("w_fp4", [False, True])
+@pytest.mark.parametrize("real", [128, 0])
+def test_fuse_moe_mxfp8_zero_padded_intermediate(real, w_fp4):
+    num_seq, hidden, inter, num_expert = 64, 1024, 256, 16
+    x, _, _, topk_ids, topk_scale = make_inputs(num_seq, hidden, inter, num_expert, num_expert)
+    gu = torch.randn((num_expert, 2 * inter, hidden), device="cuda") * 0.05
+    gu[:, real:inter] = 0
+    gu[:, inter + real :] = 0
+    dn = torch.randn((num_expert, hidden, inter), device="cuda") * 0.05
+    dn[:, :, real:] = 0
+    w_gu, w_dn = _quantize(gu, fp4=w_fp4), _quantize(dn, fp4=w_fp4)
+    y = hpc.fuse_moe_mxfp8(
+        x[0], x[1], *_op_weights(w_gu, w_dn), topk_ids, topk_scale, 0, num_expert
+    )
+    expected = torch_ref(x, w_gu, w_dn, topk_ids, topk_scale, None, 0, float("inf"))
+    assert torch.isfinite(y).all()
+    torch.testing.assert_close(
+        y.float(), expected, rtol=0.02, atol=0.02 * max(expected.abs().max().item(), 1e-6)
+    )
+
+
+@pytest.mark.parametrize(
+    "name,offset", [("x", 1), ("x_scale", 1), ("w_gu", 1), ("w_down", 1), ("output", 2)]
+)
+def test_fuse_moe_mxfp8_misaligned_rejected(name, offset):
+    x, w_gu, w_dn, topk_ids, topk_scale = make_inputs(37, 1024, 384, 16, 16)
+    tensors = dict(zip(("x", "x_scale"), x))
+    tensors["w_gu"], gu_scale, tensors["w_down"], down_scale = _op_weights(w_gu, w_dn)
+    tensors["output"] = torch.empty((37, 1024), dtype=torch.bfloat16, device="cuda")
+    tensors[name] = _shifted(tensors[name], offset)
+    with pytest.raises(RuntimeError, match="aligned"):
+        hpc.fuse_moe_mxfp8(
+            tensors["x"],
+            tensors["x_scale"],
+            tensors["w_gu"],
+            gu_scale,
+            tensors["w_down"],
+            down_scale,
+            topk_ids,
+            topk_scale,
+            0,
+            16,
+            output=tensors["output"],
+        )
+
+
+def test_fuse_moe_mxfp8_opcheck():
+    x, w_gu, w_dn, topk_ids, topk_scale = make_inputs(37, 1024, 384, 16, 16)
+    shared = torch.randn((37, 1024), device="cuda").to(torch.bfloat16)
+    args = (x[0], x[1], *_op_weights(w_gu, w_dn), topk_ids, topk_scale, shared, 0, 16, 2.0, None)
+    # test_schema is skipped: the bf16 atomic sum differs between runs in its last bits.
+    torch.library.opcheck(
+        torch.ops.hpc.fuse_moe_mxfp8.default,
+        args,
+        test_utils=("test_autograd_registration", "test_faketensor"),
+    )
 
 
 def _check(

@@ -16,12 +16,13 @@ namespace fuse_moe {
 
 using namespace cute;  // NOLINT
 
-template <int kTileM_, int kNumTopk, typename TW>
+template <int kTileM_, typename TW>
 static void launch_down(void *y_ptr, const void *a_ptr, const void *a_scale_ptr, const void *w_ptr,
-                        const void *w_scale_ptr, const void *topk_scale_ptr,
+                        const void *w_scale_ptr, const void *permuted_topk_scale_ptr,
                         const void *seqlens_ptr, const void *cu_seqlens_ptr, const void *tiles_ptr,
                         const void *permuted_idx_to_raw_idx_ptr, int num_group, int max_tiles,
-                        int n, int k, cudaStream_t stream) {
+                        int num_topk, int n, int k, TMA::CacheHintSm90 w_cache_hint,
+                        TMA::CacheHintSm90 a_cache_hint, cudaStream_t stream) {
   using Config = DownConfig<kTileM_, TW>;
 
   using TA = typename Config::TA;
@@ -67,6 +68,7 @@ static void launch_down(void *y_ptr, const void *a_ptr, const void *a_scale_ptr,
 
   int num_tile_n = n / kTileN;
   cutlass::FastDivmod tile_n_divider(num_tile_n);
+  cutlass::FastDivmod topk_divider(num_topk);
 
   dim3 block(Config::kNumThreads);
   int num_sm = get_sm_count();
@@ -85,32 +87,35 @@ static void launch_down(void *y_ptr, const void *a_ptr, const void *a_scale_ptr,
   config_launch.attrs = attrs;
   config_launch.numAttrs = 1;
 
-  auto kernel =
-      kernels::mxfp8::down_fuse_reduce_kernel<Config, kNumTopk, decltype(tma_a), decltype(tma_b),
-                                              decltype(tma_sfa), decltype(tma_sfb)>;
+  auto kernel = kernels::mxfp8::down_fuse_reduce_kernel<Config, decltype(tma_a), decltype(tma_b),
+                                                        decltype(tma_sfa), decltype(tma_sfb)>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Config::kShmSize);
   cudaLaunchKernelEx(
       &config_launch, kernel, tma_a, tma_b, tma_sfa, tma_sfb, reinterpret_cast<TC *>(y_ptr),
-      reinterpret_cast<const float *>(topk_scale_ptr), reinterpret_cast<const int *>(seqlens_ptr),
-      reinterpret_cast<const int *>(cu_seqlens_ptr), reinterpret_cast<const int *>(tiles_ptr),
+      reinterpret_cast<const float *>(permuted_topk_scale_ptr),
+      reinterpret_cast<const int *>(seqlens_ptr), reinterpret_cast<const int *>(cu_seqlens_ptr),
+      reinterpret_cast<const int *>(tiles_ptr),
       reinterpret_cast<const int *>(permuted_idx_to_raw_idx_ptr), num_group, m_pad, n, k,
-      tile_n_divider);
+      tile_n_divider, topk_divider, w_cache_hint, a_cache_hint);
 }
 
 void down_fuse_reduce_async(void *y_ptr, const void *a_ptr, const void *a_scale_ptr,
-                            const void *w_ptr, const void *w_scale_ptr, const void *topk_scale_ptr,
-                            const void *seqlens_ptr, const void *cu_seqlens_ptr,
-                            const void *tiles_ptr, const void *permuted_idx_to_raw_idx_ptr,
-                            int num_group, int max_tiles, int n, int k, int tile_m, int num_topk,
-                            bool is_fp4, cudaStream_t stream) {
+                            const void *w_ptr, const void *w_scale_ptr,
+                            const void *permuted_topk_scale_ptr, const void *seqlens_ptr,
+                            const void *cu_seqlens_ptr, const void *tiles_ptr,
+                            const void *permuted_idx_to_raw_idx_ptr, int num_group, int max_tiles,
+                            int n, int k, int tile_m, int num_topk, bool is_fp4,
+                            bool stream_weights, cudaStream_t stream) {
+  auto w_cache_hint =
+      stream_weights ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_NORMAL;
+  auto a_cache_hint =
+      stream_weights ? TMA::CacheHintSm90::EVICT_LAST : TMA::CacheHintSm90::EVICT_NORMAL;
   dispatch_tile_m(tile_m, [&](auto kTileM) {
-    dispatch_topk(num_topk, [&](auto kNumTopk) {
-      dispatch_w_type(is_fp4, [&](auto tw) {
-        launch_down<decltype(kTileM)::value, decltype(kNumTopk)::value, decltype(tw)>(
-            y_ptr, a_ptr, a_scale_ptr, w_ptr, w_scale_ptr, topk_scale_ptr, seqlens_ptr,
-            cu_seqlens_ptr, tiles_ptr, permuted_idx_to_raw_idx_ptr, num_group, max_tiles, n, k,
-            stream);
-      });
+    dispatch_w_type(is_fp4, [&](auto tw) {
+      launch_down<decltype(kTileM)::value, decltype(tw)>(
+          y_ptr, a_ptr, a_scale_ptr, w_ptr, w_scale_ptr, permuted_topk_scale_ptr, seqlens_ptr,
+          cu_seqlens_ptr, tiles_ptr, permuted_idx_to_raw_idx_ptr, num_group, max_tiles, num_topk, n,
+          k, w_cache_hint, a_cache_hint, stream);
     });
   });
 }

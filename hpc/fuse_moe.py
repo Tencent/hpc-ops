@@ -291,24 +291,22 @@ def fuse_moe_mxfp8(
             gate_up_weight.
         down_weight_scale: uint8 UE8M0 in ``layout_128x4`` of
             [num_expert_local, hidden, intermediate//32]
-        topk_ids: int32, [num_seq, num_topk], GLOBAL expert ids (out-of-rank ids are filtered);
-            num_topk is 8 or 16
+        topk_ids: int32, [num_seq, num_topk], GLOBAL expert ids (out-of-rank ids are filtered)
         topk_scale: float32, [num_seq, num_topk]
         rank_ep: int -- this rank within the EP group
         num_expert_total: int -- total experts across all EP ranks
         limit: SwiGLU clamp bound: gate is clamped above at ``limit``, up to [-limit, limit].
             ``inf`` (or <= 0) keeps the unclamped SwiGLU.
-        shared_output: optional bf16, [num_seq, hidden]. The result accumulates into it in place
-            and it is returned.
-        output: optional bf16, [num_seq, hidden], zeroed and written when shared_output is None.
+        shared_output: optional bf16, [num_seq, hidden], added to the result (only read).
+        output: optional bf16, [num_seq, hidden], written and returned.
 
     Returns:
         bf16 tensor [num_seq, hidden]
 
     Note:
-        hidden and intermediate must be multiples of 128, and mxfp4 weights 32B aligned. The
-        top-k reduce is fused into the down epilogue as a bf16 atomic add, so the output is not
-        bit-reproducible across runs.
+        hidden and intermediate must be multiples of 128, num_expert_local at most 512, and
+        mxfp4 weights 32B aligned. The top-k reduce is fused into the down epilogue as a bf16
+        atomic add, so the output is not bit-reproducible across runs.
     """
     return torch.ops.hpc.fuse_moe_mxfp8(
         x,
@@ -456,10 +454,8 @@ def fuse_moe_mxfp8_fake(
     limit: float,
     output,
 ):
-    if shared_output is not None:
-        return shared_output
     return (
         output
         if output is not None
-        else torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16)
+        else torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16, device=x.device)
     )

@@ -16,12 +16,13 @@ namespace fuse_moe {
 
 using namespace cute;  // NOLINT
 
-template <int kTileM_, int kNumTopk, typename TW>
+template <int kTileM_, typename TW>
 static void launch_gate_up(void *y_ptr, void *y_scale_ptr, const void *x_ptr,
                            const void *x_scale_ptr, const void *w_ptr, const void *w_scale_ptr,
                            const void *seqlens_ptr, const void *cu_seqlens_ptr,
                            const void *tiles_ptr, const void *permuted_idx_to_raw_idx_ptr,
-                           int num_group, int max_tiles, int n, int k, float limit,
+                           int num_group, int max_tiles, int num_topk, int n, int k, float limit,
+                           TMA::CacheHintSm90 w_cache_hint, TMA::CacheHintSm90 a_cache_hint,
                            cudaStream_t stream) {
   using Config = GateUpConfig<kTileM_, TW>;
   using TA = typename Config::TA;
@@ -56,12 +57,13 @@ static void launch_gate_up(void *y_ptr, void *y_scale_ptr, const void *x_ptr,
   auto tma_sfb = make_tma_copy(SM90_TMA_LOAD{}, SFW, typename Config::CopyBoxSF{});
 
   auto kernel =
-      kernels::mxfp8::gate_up_fuse_act_mul_quant_kernel<Config, kNumTopk, decltype(tma_b),
-                                                        decltype(tma_y), decltype(tma_sfb)>;
+      kernels::mxfp8::gate_up_fuse_act_mul_quant_kernel<Config, decltype(tma_b), decltype(tma_y),
+                                                        decltype(tma_sfb)>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Config::kShmSize);
 
   int num_tile_n = n / kTileN;
   cutlass::FastDivmod tile_n_divider(num_tile_n);
+  cutlass::FastDivmod topk_divider(num_topk);
 
   dim3 block(Config::kNumThreads);
   int num_sm = get_sm_count();
@@ -86,7 +88,7 @@ static void launch_gate_up(void *y_ptr, void *y_scale_ptr, const void *x_ptr,
       reinterpret_cast<const int *>(seqlens_ptr), reinterpret_cast<const int *>(cu_seqlens_ptr),
       reinterpret_cast<const int *>(tiles_ptr),
       reinterpret_cast<const int *>(permuted_idx_to_raw_idx_ptr), num_group, m_pad, n, k, limit,
-      tile_n_divider);
+      tile_n_divider, topk_divider, w_cache_hint, a_cache_hint);
 }
 
 void gate_up_fuse_act_mul_quant_async(void *y_ptr, void *y_scale_ptr, const void *x_ptr,
@@ -95,14 +97,18 @@ void gate_up_fuse_act_mul_quant_async(void *y_ptr, void *y_scale_ptr, const void
                                       const void *cu_seqlens_ptr, const void *tiles_ptr,
                                       const void *permuted_idx_to_raw_idx_ptr, int num_group,
                                       int max_tiles, int n, int k, int tile_m, int num_topk,
-                                      float limit, bool is_fp4, cudaStream_t stream) {
+                                      float limit, bool is_fp4, bool stream_weights,
+                                      cudaStream_t stream) {
+  auto w_cache_hint =
+      stream_weights ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_NORMAL;
+  auto a_cache_hint =
+      stream_weights ? TMA::CacheHintSm90::EVICT_LAST : TMA::CacheHintSm90::EVICT_NORMAL;
   dispatch_tile_m(tile_m, [&](auto kTileM) {
-    dispatch_topk(num_topk, [&](auto kNumTopk) {
-      dispatch_w_type(is_fp4, [&](auto tw) {
-        launch_gate_up<decltype(kTileM)::value, decltype(kNumTopk)::value, decltype(tw)>(
-            y_ptr, y_scale_ptr, x_ptr, x_scale_ptr, w_ptr, w_scale_ptr, seqlens_ptr, cu_seqlens_ptr,
-            tiles_ptr, permuted_idx_to_raw_idx_ptr, num_group, max_tiles, n, k, limit, stream);
-      });
+    dispatch_w_type(is_fp4, [&](auto tw) {
+      launch_gate_up<decltype(kTileM)::value, decltype(tw)>(
+          y_ptr, y_scale_ptr, x_ptr, x_scale_ptr, w_ptr, w_scale_ptr, seqlens_ptr, cu_seqlens_ptr,
+          tiles_ptr, permuted_idx_to_raw_idx_ptr, num_group, max_tiles, num_topk, n, k, limit,
+          w_cache_hint, a_cache_hint, stream);
     });
   });
 }
