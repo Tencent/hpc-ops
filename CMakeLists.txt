@@ -3,6 +3,14 @@
 # One module per architecture. See CLAUDE.md for layout and source selection.
 
 cmake_minimum_required(VERSION 3.26)
+
+# Passed by setup.py from the Makefile's exported architecture list.
+if(NOT HPC_KNOWN_ARCHS)
+  message(FATAL_ERROR
+          "HPC_KNOWN_ARCHS is not set. Build through the Makefile "
+          "(make / make sm90 / make wheel).")
+endif()
+
 project(hpc_ops LANGUAGES CXX CUDA)
 
 enable_language(CUDA)
@@ -15,13 +23,8 @@ find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 #    Architecture selection
 # ============================================================
 
-# Architectures the build supports. The same list is in the Makefile and
-# setup.py; adding one also needs an HPC_ARCH_EVAL_<arch> block in
-# src/utils/utils.h.
-set(HPC_KNOWN_ARCHS 90 100 103 120)
-
-# Architectures whose gencode needs the "a" suffix for wgmma/TMA instructions.
-set(HPC_ARCH_SPECIFIC_ARCHS 90 100 103 120)
+# All currently supported architectures use the "a" gencode suffix.
+set(HPC_ARCH_SPECIFIC_ARCHS ${HPC_KNOWN_ARCHS})
 
 # Source fallback: an architecture with no sm<arch>/ of its own inherits the
 # listed one's sources, recompiled with its own gencode. Only sm103 -> sm100,

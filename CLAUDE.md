@@ -406,12 +406,14 @@ SM_ARCH=90,100,103 make wheel     # one wheel, three modules
 `SM_ARCH` from the environment or the command line overrides the `wheel` default,
 which is how `make sm<arch>` narrows it to one architecture.
 
-The architecture list lives in three places that must agree: `KNOWN_ARCHS` in the
-`Makefile` (which derives the `make sm<arch>` targets and the `make wheel`
-default), `HPC_KNOWN_ARCHS` in `CMakeLists.txt` (which rejects an unknown
-`HPC_TARGET_ARCH`), and `KNOWN_ARCHS` in `setup.py` (which validates `SM_ARCH`
-and decides the wheel suffix). An unknown architecture is rejected by `setup.py`
-before any build starts, so a partial package is never produced.
+The supported architecture list is defined once as `KNOWN_ARCHS` in the
+`Makefile`, which derives the `make sm<arch>` targets and `make wheel` default.
+Make exports it to `setup.py`, which reads it to validate
+`SM_ARCH` and decide the wheel suffix, then passes it to CMake through
+`-DHPC_KNOWN_ARCHS` to validate `HPC_TARGET_ARCH`. An unknown architecture is
+rejected by `setup.py` before any build starts, so a partial package is never
+produced. Always build through Make; `setup.py` and a fresh CMake configuration
+report an error if the architecture list is missing.
 
 CMake is configured once per architecture, into `build/sm<arch>`, so switching
 targets reuses prior objects. The setuptools `build/lib.*` output contains the
@@ -508,11 +510,12 @@ For an operator already present:
 
 ### Add a new architecture to the build system
 
-1. Add the architecture number to `KNOWN_ARCHS` in the `Makefile`, `setup.py`,
-   and `HPC_KNOWN_ARCHS` in `CMakeLists.txt`.
+1. Add the architecture number to `KNOWN_ARCHS` in the `Makefile`, keeping
+   the list sorted. Make exports it to setuptools, which passes it to CMake.
 2. Add an `HPC_ARCH_EVAL_<arch>` block in `src/utils/utils.h`.
-3. If required by its instruction set, add the architecture to
-   `HPC_ARCH_SPECIFIC_ARCHS` in `CMakeLists.txt` for the `a` gencode suffix.
+3. Confirm its gencode suffix: `HPC_ARCH_SPECIFIC_ARCHS` in `CMakeLists.txt`
+   defaults to all known architectures; adjust it if the new target does not
+   use the `a` suffix.
 4. Add a source fallback link only after running the inherited kernels on the new
    hardware. Compiling is not evidence; see "Source fallback".
 5. Add an `sm<arch>/` directory for every operator that should support it, and
