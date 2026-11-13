@@ -1,4 +1,5 @@
 // Copyright 2026 Tencent
+// Copyright 2026, The FlagOS Contributors.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime_api.h>
@@ -44,8 +45,8 @@ std::tuple<torch::Tensor, torch::Tensor> fuse_ihc_pre_entry(
   int hidden_dim = x.size(2);
 
   TORCH_CHECK(hc_mult == 4, "hc_mult must be 4");
-  TORCH_CHECK(hidden_dim == 6144 || hidden_dim == 4096,
-              "hidden dim must be 6144 (HYV4 production) or 4096");
+  TORCH_CHECK(hidden_dim == 4096 || hidden_dim == 6144, "hidden dim must be 6144 (HYV4 production) or 4096, got ",
+              hidden_dim);
   TORCH_CHECK(w.size(0) == 2 * hc_mult, "w tensor's first dim must be 2 * hc_mult");
   TORCH_CHECK(w.size(1) == hc_mult * hidden_dim,
               "w tensor's second dim must be hc_mult * hidden_dim");
@@ -75,9 +76,25 @@ std::tuple<torch::Tensor, torch::Tensor> fuse_ihc_pre_entry(
   auto *output_y_ptr = reinterpret_cast<__nv_bfloat16 *>(output_y.mutable_data_ptr());
   auto *output_H_post_ptr = reinterpret_cast<float *>(output_H_post.mutable_data_ptr());
 
-  fuse_ihc_pre_async(output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
-                     num_batch, hc_mult, hidden_dim, norm_eps, hc_eps, magnitude, stream,
-                     rms_weight_ptr, rms_eps, cast_bfloat_for_norm);
+  // Batches with too few tokens to fill the device go to the split-K path.
+  // The predicate is the token count, not the inference phase, and it declines
+  // on every shape it does not claim, so no #if is needed here.
+  const bool fuse_rms_norm = rms_weight_ptr != nullptr;
+  if (splitk::ihc_pre_splitk_supported(num_batch, hc_mult, hidden_dim, fuse_rms_norm)) {
+    const size_t scratch_floats =
+        splitk::ihc_pre_splitk_scratch_floats(num_batch, hc_mult, hidden_dim, fuse_rms_norm);
+    torch::Tensor scratch =
+        torch::empty({static_cast<int64_t>(scratch_floats)}, options.dtype(torch::kFloat32));
+    splitk::fuse_ihc_pre_splitk_async(
+        output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+        hc_mult, hidden_dim, norm_eps, hc_eps, magnitude,
+        reinterpret_cast<float *>(scratch.mutable_data_ptr()), stream, true, rms_weight_ptr,
+        static_cast<float>(rms_eps), cast_bfloat_for_norm);
+  } else {
+    fuse_ihc_pre_async(output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                       num_batch, hc_mult, hidden_dim, norm_eps, hc_eps, magnitude, stream,
+                       rms_weight_ptr, rms_eps, cast_bfloat_for_norm);
+  }
 
   return std::make_tuple(output_y, output_H_post);
 }
@@ -113,8 +130,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fuse_ihc_post_pre_entry(
   const int hc_mult = residual.size(1);
 
   TORCH_CHECK(hc_mult == 4, "hc_mult must be 4");
-  TORCH_CHECK(hidden_dim == 6144 || hidden_dim == 4096,
-              "hidden dim must be 6144 (HYV4 production) or 4096");
+  TORCH_CHECK(hidden_dim == 4096 || hidden_dim == 6144, "hidden dim must be 6144 (HYV4 production) or 4096, got ",
+              hidden_dim);
   TORCH_CHECK(residual.size(0) == num_batch && residual.size(2) == hidden_dim,
               "residual must be (num_batch, hc_mult, hidden_dim)");
   TORCH_CHECK(H_post_in.size(0) == num_batch && H_post_in.size(1) == hc_mult,
@@ -189,8 +206,8 @@ torch::Tensor fuse_ihc_post_entry(const torch::Tensor &x, const torch::Tensor &r
   int hidden_dim = residual.size(2);
 
   TORCH_CHECK(hc_mult == 4, "hc_mult must be 4");
-  TORCH_CHECK(hidden_dim == 6144 || hidden_dim == 4096,
-              "hidden dim must be 6144 (HYV4 production) or 4096");
+  TORCH_CHECK(hidden_dim == 4096 || hidden_dim == 6144, "hidden dim must be 6144 (HYV4 production) or 4096, got ",
+              hidden_dim);
   TORCH_CHECK(x.size(0) == num_batch, "x tensor's first dim must be num_batch");
   TORCH_CHECK(x.size(1) == hidden_dim, "x tensor's second dim must be hidden_dim");
   TORCH_CHECK(H_post.size(0) == num_batch, "H_post tensor's first dim must be num_batch");
@@ -243,8 +260,8 @@ torch::Tensor fuse_ihc_head_entry(const torch::Tensor &x, const torch::Tensor &w
   int hidden_dim = x.size(2);
 
   TORCH_CHECK(hc_mult == 4, "hc_mult must be 4");
-  TORCH_CHECK(hidden_dim == 6144 || hidden_dim == 4096,
-              "hidden dim must be 6144 (HYV4 production) or 4096");
+  TORCH_CHECK(hidden_dim == 4096 || hidden_dim == 6144, "hidden dim must be 6144 (HYV4 production) or 4096, got ",
+              hidden_dim);
   TORCH_CHECK(w.size(0) == hc_mult, "w tensor's first dim must be hc_mult");
   TORCH_CHECK(w.size(1) == hc_mult * hidden_dim,
               "w tensor's second dim must be hc_mult * hidden_dim");
@@ -272,9 +289,23 @@ torch::Tensor fuse_ihc_head_entry(const torch::Tensor &x, const torch::Tensor &w
   const auto *hc_base_ptr = reinterpret_cast<const float *>(hc_base.const_data_ptr());
   auto *output_ptr = reinterpret_cast<__nv_bfloat16 *>(output.mutable_data_ptr());
 
-  fuse_ihc_head_async(output_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, hc_mult,
-                      hidden_dim, norm_eps, hc_eps, stream, rms_weight_ptr, rms_eps,
-                      cast_bfloat_for_norm);
+  // Same split-K routing as pre, on head's own threshold: its blocks do half
+  // pre's work, so the crossover is not the same.
+  const bool fuse_rms_norm = rms_weight_ptr != nullptr;
+  if (splitk::ihc_head_splitk_supported(num_batch, hc_mult, hidden_dim, fuse_rms_norm)) {
+    const size_t scratch_floats =
+        splitk::ihc_head_splitk_scratch_floats(num_batch, hc_mult, hidden_dim, fuse_rms_norm);
+    torch::Tensor scratch =
+        torch::empty({static_cast<int64_t>(scratch_floats)}, options.dtype(torch::kFloat32));
+    splitk::fuse_ihc_head_splitk_async(
+        output_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, hc_mult, hidden_dim,
+        norm_eps, hc_eps, reinterpret_cast<float *>(scratch.mutable_data_ptr()), stream, true,
+        rms_weight_ptr, static_cast<float>(rms_eps), cast_bfloat_for_norm);
+  } else {
+    fuse_ihc_head_async(output_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, hc_mult,
+                        hidden_dim, norm_eps, hc_eps, stream, rms_weight_ptr, rms_eps,
+                        cast_bfloat_for_norm);
+  }
 
   return output;
 }

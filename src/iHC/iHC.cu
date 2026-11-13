@@ -1,4 +1,5 @@
 // Copyright 2026 Tencent
+// Copyright 2026, The FlagOS Contributors.
 
 #include <cuda.h>
 #include <stdio.h>
@@ -14,6 +15,59 @@
 namespace hpc {
 namespace iHC {
 namespace kernels {
+
+// Projection/sqrsum accumulation for one block's rows.
+// kActiveRows is a compile-time constant so the compiler can unroll and hoist loads.
+template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kRowsPerBlock,
+          int kThreadsPerBlock, int kProjRows, int kActiveRows>
+__device__ __forceinline__ void ihc_pre_accumulate(const __nv_bfloat16* x_ptr, const float* w_ptr,
+                                                   int row_base,
+                                                   float (&acc_dot)[kRowsPerBlock][kProjRows],
+                                                   float (&acc_sqsum)[kRowsPerBlock],
+                                                   int row_offset) {
+  constexpr int kHCDim = kHCMult * kHiddenDim;
+  constexpr int kSpan = kThreadsPerBlock * kElementsPerThread;
+  constexpr int kSteps = kHCDim / kSpan;
+  constexpr int kHalf = kElementsPerThread / 2;
+
+  static_assert(kHCDim % kSpan == 0, "the block's span must divide hc_mult * hidden_dim");
+
+  // Flat pass over hc_mult * hidden_dim.
+  for (int step = 0; step < kSteps; ++step) {
+    const int iflat = step * kSpan + threadIdx.x * kElementsPerThread;
+
+    vec_t<float, kElementsPerThread> reg_w[kProjRows];
+#pragma unroll
+    for (int c = 0; c < kProjRows; ++c) {
+      const float* w_row_ptr = w_ptr + static_cast<int64_t>(c) * kHCDim + iflat;
+      *reinterpret_cast<vec_t<float, kHalf>*>(&reg_w[c][0]) = load<float, kHalf>(w_row_ptr);
+      *reinterpret_cast<vec_t<float, kHalf>*>(&reg_w[c][kHalf]) =
+          load<float, kHalf>(w_row_ptr + kHalf);
+    }
+
+#pragma unroll
+    for (int rr = 0; rr < kActiveRows; ++rr) {
+      const int r = row_offset + rr;
+      auto reg_x = to<float>(load<__nv_bfloat16, kElementsPerThread>(
+          x_ptr + static_cast<int64_t>(row_base + r) * kHCDim + iflat));
+      const auto* x2 = reinterpret_cast<const float2*>(&reg_x[0]);
+#pragma unroll
+      for (int j = 0; j < kElementsPerThread / 2; ++j) {
+        acc_sqsum[r] += x2[j].x * x2[j].x;
+        acc_sqsum[r] += x2[j].y * x2[j].y;
+      }
+#pragma unroll
+      for (int c = 0; c < kProjRows; ++c) {
+        const auto* w2 = reinterpret_cast<const float2*>(&reg_w[c][0]);
+#pragma unroll
+        for (int j = 0; j < kElementsPerThread / 2; ++j) {
+          acc_dot[r][c] += x2[j].x * w2[j].x;
+          acc_dot[r][c] += x2[j].y * w2[j].y;
+        }
+      }
+    }
+  }
+}
 
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kRowsPerBlock,
           int kThreadsPerBlock, bool kHasPost, bool kUsePDL = false, bool kFuseRmsNorm = false,
@@ -61,41 +115,14 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     }
   }
 
-#pragma unroll
-  for (int i = 0; i < kHCMult; ++i) {
-#pragma unroll
-    for (int ch = 0; ch < kChunks; ++ch) {
-      const int icol = (ch * kThreadsPerBlock + threadIdx.x) * kElementsPerThread;
-      const int iflat = i * kHiddenDim + icol;
-      constexpr int kHalf = kElementsPerThread / 2;
-      vec_t<float, kElementsPerThread> reg_w[kProjRows];
-#pragma unroll
-      for (int c = 0; c < kProjRows; ++c) {
-        const float* w_row_ptr = w_ptr + c * kHCDim + iflat;
-        *reinterpret_cast<vec_t<float, kHalf>*>(&reg_w[c][0]) = load<float, kHalf>(w_row_ptr);
-        *reinterpret_cast<vec_t<float, kHalf>*>(&reg_w[c][kHalf]) =
-            load<float, kHalf>(w_row_ptr + kHalf);
-      }
-
-      for (int r = 0; r < num_valid_rows; ++r) {
-        auto reg_x = to<float>(
-            load<__nv_bfloat16, kElementsPerThread>(x_ptr + (row_base + r) * kHCDim + iflat));
-        const auto* x2 = reinterpret_cast<const float2*>(&reg_x[0]);
-#pragma unroll
-        for (int j = 0; j < kElementsPerThread / 2; ++j) {
-          acc_sqsum[r] += x2[j].x * x2[j].x;
-          acc_sqsum[r] += x2[j].y * x2[j].y;
-        }
-#pragma unroll
-        for (int c = 0; c < kProjRows; ++c) {
-          const auto* w2 = reinterpret_cast<const float2*>(&reg_w[c][0]);
-#pragma unroll
-          for (int j = 0; j < kElementsPerThread / 2; ++j) {
-            acc_dot[r][c] += x2[j].x * w2[j].x;
-            acc_dot[r][c] += x2[j].y * w2[j].y;
-          }
-        }
-      }
+  // Full tiles use the compile-time trip count; the partial tail falls back to one row at a time.
+  if (num_valid_rows == kRowsPerBlock) {
+    ihc_pre_accumulate<kHCMult, kHiddenDim, kElementsPerThread, kRowsPerBlock, kThreadsPerBlock,
+                       kProjRows, kRowsPerBlock>(x_ptr, w_ptr, row_base, acc_dot, acc_sqsum, 0);
+  } else {
+    for (int r = 0; r < num_valid_rows; ++r) {
+      ihc_pre_accumulate<kHCMult, kHiddenDim, kElementsPerThread, kRowsPerBlock, kThreadsPerBlock,
+                         kProjRows, 1>(x_ptr, w_ptr, row_base, acc_dot, acc_sqsum, r);
     }
   }
 
@@ -226,8 +253,10 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 }
 
-template <int kHCMult, int kHiddenDim, int kElementsPerThread, bool kUsePDL = false>
-__global__ void __launch_bounds__(128)
+// kThreadsPerBlock is templated so __launch_bounds__ matches the launched block.
+template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock,
+          bool kUsePDL = false>
+__global__ void __launch_bounds__(kThreadsPerBlock)
     fuse_ihc_post_kernel(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
                          const __nv_bfloat16* residual_ptr, const float* H_post_ptr) {
   if constexpr (kUsePDL) {
@@ -711,22 +740,154 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 namespace {
 
 constexpr int kElementsPerThread = 8;
-constexpr int kPreRowsPerBlock = 1;
 constexpr int kPostThreadsPerBlock = 128;
 
-template <int kHiddenDim, bool kHasPost, bool kFuseRmsNorm, bool kCastBfloatForNorm>
-void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
-                     const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
-                     const float* hc_base_ptr, int num_batch, float norm_eps, float hc_eps,
-                     float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
-                     cudaStream_t stream, bool use_pdl) {
-  constexpr int kThreads = 256;
-  const int num_block = (num_batch + kPreRowsPerBlock - 1) / kPreRowsPerBlock;
+// Rows per block for pre (kHasPost = true) at 256 threads.
+// More rows amortize the W tile load until accumulators spill.
+// sm100/103 use sm100_config() instead; gated to avoid -Werror=all-warnings (#177-D).
+#if HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
+constexpr int pre_rows_per_block(int num_batch, bool fuse_rms_norm) {
+  if (num_batch < (fuse_rms_norm ? 192 : 64)) {
+    return 1;
+  }
+  if (num_batch < 320) {
+    return 2;
+  }
+  return 4;
+}
+
+// Rows per block for the head kernel (kHasPost = false). Head needs its own
+// table since kHasPost halves kProjRows and its register use differs from pre's.
+constexpr int head_rows_per_block(int num_batch, int hidden_dim) {
+  if (num_batch < 320) {
+    return 1;
+  }
+  if (hidden_dim == 6144 && num_batch >= 1024) {
+    return 4;
+  }
+  return 2;
+}
+#endif  // HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
+
+// {rows, threads} config for sm90's pre path. The two parameters interact
+// and valid block sizes differ by hidden dim, so each gets its own table.
+// Gated on sm90: the only caller is in the HPC_TARGET_ARCH == 90 branch (#177-D).
+struct PreConfig {
+  int rows;
+  int threads;
+};
+
+// {rows, threads} config for sm100/sm103. The first boundary is sm_count so
+// rows=1 fills exactly one wave.
+#if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
+constexpr PreConfig sm100_config(int num_batch, int hidden_dim, bool has_post, bool fuse_rms_norm,
+                                 int sm_count) {
+  if (hidden_dim == 6144) {
+    if (num_batch <= sm_count) {
+      return {1, 768};
+    }
+    if (num_batch < 320) {
+      return {2, 384};
+    }
+    if (num_batch < 768) {
+      // head: <6144, rows=4, 384thr> spills, so cap at rows=2.
+      return has_post ? PreConfig{4, 384} : PreConfig{2, 384};
+    }
+    if (num_batch < 1024) {
+      return {4, 256};
+    }
+    if (!fuse_rms_norm) {
+      return {4, 256};
+    }
+    if (has_post) {
+      return num_batch < 2048 ? PreConfig{4, 256} : PreConfig{4, 128};
+    }
+    return (num_batch >= 2048 && num_batch < 8192) ? PreConfig{4, 192} : PreConfig{4, 256};
+  }
+  // hidden 4096: threads * 8 must divide 4096, so the wide arm is 512 not 768.
+  if (num_batch <= sm_count) {
+    return {1, 512};
+  }
+  if (num_batch < 320) {
+    if (!has_post && fuse_rms_norm) {
+      return {1, 256};
+    }
+    return {2, 512};
+  }
+  if (num_batch < 1024) {
+    // head caps at rows=2: rows=4/256 spills at this hidden size.
+    return has_post ? PreConfig{4, 256} : PreConfig{2, 256};
+  }
+  if (has_post) {
+    const int narrow_from = fuse_rms_norm ? 2048 : 4096;
+    return num_batch < narrow_from ? PreConfig{4, 256} : PreConfig{4, 128};
+  }
+  if (num_batch < 4096) {
+    return {4, 128};
+  }
+  if (!fuse_rms_norm) {
+    return {2, 256};
+  }
+  return num_batch < 8192 ? PreConfig{2, 128} : PreConfig{4, 128};
+}
+#endif  // HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
+
+#if HPC_TARGET_ARCH == 90
+
+constexpr PreConfig pre_config(int num_batch, int hidden_dim) {
+  if (hidden_dim == 6144) {
+    if (num_batch < 192) {
+      return {2, 256};
+    }
+    if (num_batch < 320) {
+      return {4, 384};
+    }
+    if (num_batch < 512) {
+      return {6, 256};
+    }
+    if (num_batch < 768) {
+      return {4, 256};
+    }
+    // Notch at ~1024 tokens from wave quantization against 78 SMs.
+    if (num_batch >= 896 && num_batch < 1152) {
+      return {8, 192};
+    }
+    if (num_batch < 12288) {
+      return {6, 192};
+    }
+    return {8, 128};
+  }
+  // hidden 4096.
+  if (num_batch < 384) {
+    return {2, 256};
+  }
+  if (num_batch < 768) {
+    return {4, 256};
+  }
+  // Same wave-quantization notch as above.
+  if (num_batch >= 896 && num_batch < 1152) {
+    return {8, 128};
+  }
+  if (num_batch < 12288) {
+    return {6, 128};
+  }
+  return {4, 256};
+}
+#endif  // HPC_TARGET_ARCH == 90
+
+template <int kHiddenDim, int kRowsPerBlock, bool kHasPost, bool kFuseRmsNorm,
+          bool kCastBfloatForNorm, int kThreads = 256>
+void launch_pre_head_rows(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
+                          const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
+                          const float* hc_base_ptr, int num_batch, float norm_eps, float hc_eps,
+                          float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
+                          cudaStream_t stream, bool use_pdl) {
+  const int num_block = (num_batch + kRowsPerBlock - 1) / kRowsPerBlock;
   auto launch = [&](auto pdl_tag) {
     constexpr bool kUsePDL = decltype(pdl_tag)::value;
     auto kernel = kernels::fuse_ihc_pre_or_head_kernel<4, kHiddenDim, kElementsPerThread,
-                                                       kPreRowsPerBlock, kThreads, kHasPost,
-                                                       kUsePDL, kFuseRmsNorm, kCastBfloatForNorm>;
+                                                       kRowsPerBlock, kThreads, kHasPost, kUsePDL,
+                                                       kFuseRmsNorm, kCastBfloatForNorm>;
     cudaLaunchConfig_t config{};
     config.gridDim = dim3(num_block);
     config.blockDim = dim3(kThreads);
@@ -748,6 +909,187 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
   } else {
     launch(std::false_type{});
   }
+}
+
+// Selects launch shape and forwards to launch_pre_head_rows.
+// sm90 uses pre_config(), sm100/103 use sm100_config().
+template <int kHiddenDim, bool kHasPost, bool kFuseRmsNorm, bool kCastBfloatForNorm>
+void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
+                     const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
+                     const float* hc_base_ptr, int num_batch, float norm_eps, float hc_eps,
+                     float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
+                     cudaStream_t stream, bool use_pdl) {
+  auto launch = [&](auto rows_tag, auto threads_tag) {
+    launch_pre_head_rows<kHiddenDim, decltype(rows_tag)::value, kHasPost, kFuseRmsNorm,
+                         kCastBfloatForNorm, decltype(threads_tag)::value>(
+        output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+        norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
+  };
+
+#if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
+  {
+    const PreConfig cfg =
+        sm100_config(num_batch, kHiddenDim, kHasPost, kFuseRmsNorm, get_sm_count());
+    // Only instantiate pairs sm100_config() can return.
+    if constexpr (kHiddenDim == 6144) {
+      if (cfg.rows == 1 && cfg.threads == 768) {
+        launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 768>{});
+        return;
+      }
+      if (cfg.rows == 2 && cfg.threads == 384) {
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 384>{});
+        return;
+      }
+      // `if constexpr` because these spill in the head specialization.
+      if constexpr (kHasPost) {
+        if (cfg.rows == 4 && cfg.threads == 384) {
+          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 384>{});
+          return;
+        }
+        if (cfg.rows == 4 && cfg.threads == 128) {
+          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 128>{});
+          return;
+        }
+      }
+      if (cfg.rows == 4 && cfg.threads == 256) {
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
+        return;
+      }
+      // 192 threads only returned by sm100_config() for folded head.
+      if constexpr (!kHasPost) {
+        if (cfg.rows == 4 && cfg.threads == 192) {
+          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 192>{});
+          return;
+        }
+      }
+    } else if constexpr (kHiddenDim == 4096) {
+      if (cfg.rows == 1 && cfg.threads == 512) {
+        launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 512>{});
+        return;
+      }
+      if (cfg.rows == 2 && cfg.threads == 512) {
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 512>{});
+        return;
+      }
+      if (cfg.rows == 2 && cfg.threads == 256) {
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 256>{});
+        return;
+      }
+      // rows=4/256 spills badly as a head kernel, so this pair is pre-only.
+      if constexpr (kHasPost) {
+        if (cfg.rows == 4 && cfg.threads == 256) {
+          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
+          return;
+        }
+      } else {
+        if (cfg.rows == 1 && cfg.threads == 256) {
+          launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 256>{});
+          return;
+        }
+        if (cfg.rows == 2 && cfg.threads == 128) {
+          launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 128>{});
+          return;
+        }
+      }
+      if (cfg.rows == 4 && cfg.threads == 128) {
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 128>{});
+        return;
+      }
+    }
+    // Fallback for any pair not covered above.
+    launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 256>{});
+    return;
+  }
+#endif  // HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
+
+  // Head skips pre_config() because two of its pairs spill under sm_90a;
+  // it falls through to head_rows_per_block() instead.
+#if HPC_TARGET_ARCH == 90
+  if constexpr (kHasPost) {
+    const PreConfig cfg = pre_config(num_batch, kHiddenDim);
+    // Only instantiate pairs pre_config() can return.
+    if constexpr (kHiddenDim == 6144) {
+      if (cfg.rows == 2 && cfg.threads == 256) {
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 256>{});
+        return;
+      }
+      if (cfg.rows == 4 && cfg.threads == 384) {
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 384>{});
+        return;
+      }
+      if (cfg.rows == 6 && cfg.threads == 256) {
+        launch(std::integral_constant<int, 6>{}, std::integral_constant<int, 256>{});
+        return;
+      }
+      if (cfg.rows == 4 && cfg.threads == 256) {
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
+        return;
+      }
+      if (cfg.rows == 8 && cfg.threads == 192) {
+        launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 192>{});
+        return;
+      }
+      if (cfg.rows == 6 && cfg.threads == 192) {
+        launch(std::integral_constant<int, 6>{}, std::integral_constant<int, 192>{});
+        return;
+      }
+      if (cfg.rows == 8 && cfg.threads == 128) {
+        launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 128>{});
+        return;
+      }
+    } else if constexpr (kHiddenDim == 4096) {
+      if (cfg.rows == 2 && cfg.threads == 256) {
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 256>{});
+        return;
+      }
+      if (cfg.rows == 4 && cfg.threads == 256) {
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
+        return;
+      }
+      if (cfg.rows == 8 && cfg.threads == 128) {
+        launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 128>{});
+        return;
+      }
+      if (cfg.rows == 6 && cfg.threads == 128) {
+        launch(std::integral_constant<int, 6>{}, std::integral_constant<int, 128>{});
+        return;
+      }
+    }
+    // Anything pre_config() does not cover falls through below.
+  }
+#endif
+
+  // `if constexpr` guard avoids instantiating the spilling <4096, rows=4, head> arm.
+#if HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
+  if constexpr (kHasPost) {
+    switch (pre_rows_per_block(num_batch, kFuseRmsNorm)) {
+      case 1:
+        launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 256>{});
+        break;
+      case 2:
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 256>{});
+        break;
+      default:
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
+        break;
+    }
+  } else {
+    switch (head_rows_per_block(num_batch, kHiddenDim)) {
+      case 1:
+        launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 256>{});
+        break;
+      case 2:
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 256>{});
+        break;
+      default:
+        // rows=4 is valid only at hidden 6144; 4096 caps at 2 above.
+        if constexpr (kHiddenDim == 6144) {
+          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
+        }
+        break;
+    }
+  }
+#endif  // HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
 }
 
 template <int kHiddenDim, bool kFuseRmsNorm, bool kCastBfloatForNorm>
@@ -838,24 +1180,17 @@ void launch_post_pre(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_o
   }
 }
 
-template <int kHiddenDim>
-void launch_post(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
-                 const __nv_bfloat16* residual_ptr, const float* H_post_ptr, int num_batch,
-                 cudaStream_t stream, bool use_pdl) {
-  constexpr int kMaxSplit = kHiddenDim / (kPostThreadsPerBlock * kElementsPerThread);
-  int block_per_row = 1;
-  if (num_batch > 0) {
-    block_per_row = (get_sm_count() + num_batch - 1) / num_batch;
-    block_per_row = std::min(block_per_row, kMaxSplit);
-    block_per_row = std::max(block_per_row, 1);
-  }
-
-  dim3 block(kPostThreadsPerBlock);
+template <int kHiddenDim, int kThreads>
+void launch_post_shape(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
+                       const __nv_bfloat16* residual_ptr, const float* H_post_ptr, int num_batch,
+                       int block_per_row, cudaStream_t stream, bool use_pdl) {
+  dim3 block(kThreads);
   dim3 grid(num_batch, block_per_row, 1);
 
   auto launch = [&](auto pdl_tag) {
     constexpr bool kUsePDL = decltype(pdl_tag)::value;
-    auto kernel = kernels::fuse_ihc_post_kernel<4, kHiddenDim, kElementsPerThread, kUsePDL>;
+    auto kernel =
+        kernels::fuse_ihc_post_kernel<4, kHiddenDim, kElementsPerThread, kThreads, kUsePDL>;
     cudaLaunchConfig_t config{};
     config.gridDim = grid;
     config.blockDim = block;
@@ -877,6 +1212,49 @@ void launch_post(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
   }
 }
 
+// post's launch shape: use enough splits to cover each token's row in one pass.
+struct PostConfig {
+  int threads;
+  int splits;
+};
+
+constexpr PostConfig post_config(int num_batch, int hidden_dim) {
+  (void)num_batch;
+  int threads = kPostThreadsPerBlock;
+#if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
+  // The one block-size arm: 256x2 is faster than 128x4 at hidden 4096 from
+  // 4096 tokens up. hidden 6144 needs none.
+  if (hidden_dim == 4096 && num_batch >= 4096) {
+    threads = 256;
+  }
+#endif
+
+  // Cover the row in one pass; no grid-stride loop needed.
+  const int max_split = hidden_dim / (threads * kElementsPerThread);
+  return {threads, max_split > 1 ? max_split : 1};
+}
+
+template <int kHiddenDim>
+void launch_post(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
+                 const __nv_bfloat16* residual_ptr, const float* H_post_ptr, int num_batch,
+                 cudaStream_t stream, bool use_pdl) {
+  const PostConfig cfg = post_config(num_batch, kHiddenDim);
+
+  auto go = [&](auto threads_tag) {
+    launch_post_shape<kHiddenDim, decltype(threads_tag)::value>(
+        output_ptr, x_ptr, residual_ptr, H_post_ptr, num_batch, cfg.splits, stream, use_pdl);
+  };
+
+  // 256 threads is reachable only at hidden 4096; guard to avoid instantiating it elsewhere.
+  if constexpr (kHiddenDim == 4096) {
+    if (cfg.threads == 256) {
+      go(std::integral_constant<int, 256>{});
+      return;
+    }
+  }
+  go(std::integral_constant<int, kPostThreadsPerBlock>{});
+}
+
 }  // namespace
 
 void fuse_ihc_pre_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
@@ -888,35 +1266,29 @@ void fuse_ihc_pre_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
   if (hc_mult != 4) {
     return;
   }
-  const bool fuse_norm = rms_weight_ptr != nullptr;
+  auto by_hidden = [&](auto hidden_tag) {
+    constexpr int kHidden = decltype(hidden_tag)::value;
+    if (rms_weight_ptr == nullptr) {
+      launch_pre_head<kHidden, true, false, false>(
+          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+          norm_eps, hc_eps, magnitude, nullptr, 0.f, stream, use_pdl);
+    } else if (cast_bfloat_for_norm) {
+      launch_pre_head<kHidden, true, true, true>(
+          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
+    } else {
+      launch_pre_head<kHidden, true, true, false>(
+          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
+    }
+  };
+
   if (hidden_dim == 6144) {
-    if (!fuse_norm) {
-      launch_pre_head<6144, true, false, false>(output_y_ptr, output_H_post_ptr, x_ptr, w_ptr,
-                                                hc_scale_ptr, hc_base_ptr, num_batch, norm_eps,
-                                                hc_eps, magnitude, nullptr, 0.f, stream, use_pdl);
-    } else if (cast_bfloat_for_norm) {
-      launch_pre_head<6144, true, true, true>(
-          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
-    } else {
-      launch_pre_head<6144, true, true, false>(
-          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
-    }
+    by_hidden(std::integral_constant<int, 6144>{});
   } else if (hidden_dim == 4096) {
-    if (!fuse_norm) {
-      launch_pre_head<4096, true, false, false>(output_y_ptr, output_H_post_ptr, x_ptr, w_ptr,
-                                                hc_scale_ptr, hc_base_ptr, num_batch, norm_eps,
-                                                hc_eps, magnitude, nullptr, 0.f, stream, use_pdl);
-    } else if (cast_bfloat_for_norm) {
-      launch_pre_head<4096, true, true, true>(
-          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
-    } else {
-      launch_pre_head<4096, true, true, false>(
-          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
-    }
+    by_hidden(std::integral_constant<int, 4096>{});
+  } else {
+    return;
   }
 }
 
@@ -931,42 +1303,32 @@ void fuse_ihc_post_pre_async(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* 
   if (hc_mult != 4) {
     return;
   }
-  const bool fuse_norm = rms_weight_ptr != nullptr;
+  auto by_hidden = [&](auto hidden_tag) {
+    constexpr int kHidden = decltype(hidden_tag)::value;
+    if (rms_weight_ptr == nullptr) {
+      launch_post_pre<kHidden, false, false>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
+                                             H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                             num_batch, norm_eps, hc_eps, magnitude, nullptr, 0.f,
+                                             scratch_ptr, stream, use_pdl);
+    } else if (cast_bfloat_for_norm) {
+      launch_post_pre<kHidden, true, true>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
+                                           H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                           num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr,
+                                           rms_eps, scratch_ptr, stream, use_pdl);
+    } else {
+      launch_post_pre<kHidden, true, false>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
+                                            H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                            num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr,
+                                            rms_eps, scratch_ptr, stream, use_pdl);
+    }
+  };
 
   if (hidden_dim == 6144) {
-    if (!fuse_norm) {
-      launch_post_pre<6144, false, false>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
-                                          H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
-                                          num_batch, norm_eps, hc_eps, magnitude, nullptr, 0.f,
-                                          scratch_ptr, stream, use_pdl);
-    } else if (cast_bfloat_for_norm) {
-      launch_post_pre<6144, true, true>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
-                                        H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-                                        norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps,
-                                        scratch_ptr, stream, use_pdl);
-    } else {
-      launch_post_pre<6144, true, false>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
-                                         H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-                                         norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps,
-                                         scratch_ptr, stream, use_pdl);
-    }
+    by_hidden(std::integral_constant<int, 6144>{});
   } else if (hidden_dim == 4096) {
-    if (!fuse_norm) {
-      launch_post_pre<4096, false, false>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
-                                          H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
-                                          num_batch, norm_eps, hc_eps, magnitude, nullptr, 0.f,
-                                          scratch_ptr, stream, use_pdl);
-    } else if (cast_bfloat_for_norm) {
-      launch_post_pre<4096, true, true>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
-                                        H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-                                        norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps,
-                                        scratch_ptr, stream, use_pdl);
-    } else {
-      launch_post_pre<4096, true, false>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
-                                         H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
-                                         norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps,
-                                         scratch_ptr, stream, use_pdl);
-    }
+    by_hidden(std::integral_constant<int, 4096>{});
+  } else {
+    return;
   }
 }
 
@@ -993,6 +1355,8 @@ void fuse_ihc_post_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
     launch_post<6144>(output_ptr, x_ptr, residual_ptr, H_post_ptr, num_batch, stream, use_pdl);
   } else if (hidden_dim == 4096) {
     launch_post<4096>(output_ptr, x_ptr, residual_ptr, H_post_ptr, num_batch, stream, use_pdl);
+  } else {
+    return;
   }
 }
 
@@ -1004,35 +1368,29 @@ void fuse_ihc_head_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr, 
   if (hc_mult != 4) {
     return;
   }
-  const bool fuse_norm = rms_weight_ptr != nullptr;
+  auto by_hidden = [&](auto hidden_tag) {
+    constexpr int kHidden = decltype(hidden_tag)::value;
+    if (rms_weight_ptr == nullptr) {
+      launch_pre_head<kHidden, false, false, false>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
+                                                    hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
+                                                    nullptr, 0.f, stream, use_pdl);
+    } else if (cast_bfloat_for_norm) {
+      launch_pre_head<kHidden, false, true, true>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
+                                                  hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
+                                                  rms_weight_ptr, rms_eps, stream, use_pdl);
+    } else {
+      launch_pre_head<kHidden, false, true, false>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
+                                                   hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
+                                                   rms_weight_ptr, rms_eps, stream, use_pdl);
+    }
+  };
+
   if (hidden_dim == 6144) {
-    if (!fuse_norm) {
-      launch_pre_head<6144, false, false, false>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
-                                                 hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
-                                                 nullptr, 0.f, stream, use_pdl);
-    } else if (cast_bfloat_for_norm) {
-      launch_pre_head<6144, false, true, true>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
-                                               hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
-                                               rms_weight_ptr, rms_eps, stream, use_pdl);
-    } else {
-      launch_pre_head<6144, false, true, false>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
-                                                hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
-                                                rms_weight_ptr, rms_eps, stream, use_pdl);
-    }
+    by_hidden(std::integral_constant<int, 6144>{});
   } else if (hidden_dim == 4096) {
-    if (!fuse_norm) {
-      launch_pre_head<4096, false, false, false>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
-                                                 hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
-                                                 nullptr, 0.f, stream, use_pdl);
-    } else if (cast_bfloat_for_norm) {
-      launch_pre_head<4096, false, true, true>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
-                                               hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
-                                               rms_weight_ptr, rms_eps, stream, use_pdl);
-    } else {
-      launch_pre_head<4096, false, true, false>(output_ptr, nullptr, x_ptr, w_ptr, hc_scale_ptr,
-                                                hc_base_ptr, num_batch, norm_eps, hc_eps, 0.f,
-                                                rms_weight_ptr, rms_eps, stream, use_pdl);
-    }
+    by_hidden(std::integral_constant<int, 4096>{});
+  } else {
+    return;
   }
 }
 
