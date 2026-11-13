@@ -20,19 +20,30 @@ constexpr int NUM_REFINE_ROUNDS = 3;
 // The sampled paths derive a coarse threshold from a fixed systematic view.
 constexpr int SAMPLE_STRIDE = 64;
 constexpr int SAMPLE_RANK = 48;
-[[maybe_unused]] constexpr int WIDE_SAMPLE_STRIDE = 128;
-[[maybe_unused]] constexpr int WIDE_SAMPLE_RANK = 24;
+constexpr int WIDE_SAMPLE_STRIDE = 128;
+constexpr int WIDE_SAMPLE_RANK = 24;
 
 // Bit layouts of the three fp32-ordered fine refinement rounds.
 //   round 0 → bits [21..31]  (top 11 bits)
 //   round 1 → bits [10..20]  (middle 11 bits)
 //   round 2 → bits [0..9]    (low 10 bits, back-fill round)
-[[maybe_unused]] __device__ constexpr int kFineShifts[NUM_REFINE_ROUNDS] = {21, 10, 0};
-[[maybe_unused]] __device__ constexpr uint32_t kFineMasks[NUM_REFINE_ROUNDS] = {0x7FFu, 0x7FFu,
-                                                                                0x3FFu};
+__device__ constexpr int kFineShifts[NUM_REFINE_ROUNDS] = {21, 10, 0};
+__device__ constexpr uint32_t kFineMasks[NUM_REFINE_ROUNDS] = {0x7FFu, 0x7FFu, 0x3FFu};
 
 constexpr int THREADS = 512;
 constexpr int MIN_BLOCKS = 3;
+
+// SM120 keeps 1536 resident threads per SM, so only one 1024-thread CTA fits;
+// ptxas rejects a launch-bounds minimum that cannot be resident.
+#if HPC_TARGET_ARCH == 120
+constexpr int MAX_THREADS_PER_SM = 1536;
+#else
+constexpr int MAX_THREADS_PER_SM = 2048;
+#endif
+
+constexpr int resident_min_blocks(int threads, int min_blocks) {
+  return std::min(min_blocks, MAX_THREADS_PER_SM / threads);
+}
 
 // smem candidate capacity per ping-pong slot. The sampled path keeps twice as many
 // because its predicted threshold intentionally admits more than top_k.
@@ -1405,8 +1416,8 @@ __device__ __noinline__ void refine_row_local_rescan(RowLocalSmem<kTopK, kBlockT
 }
 
 constexpr int SHORT_THREADS = 1024;
-[[maybe_unused]] constexpr int ROW_LOCAL_SMALL_RANK_CAPACITY = 64;
-[[maybe_unused]] constexpr int ROW_LOCAL_MEDIUM_RANK_CAPACITY = 128;
+constexpr int ROW_LOCAL_SMALL_RANK_CAPACITY = 64;
+constexpr int ROW_LOCAL_MEDIUM_RANK_CAPACITY = 128;
 
 __device__ __forceinline__ bool row_candidate_precedes(const RowCandidate& lhs,
                                                        const RowCandidate& rhs) {
@@ -1481,7 +1492,7 @@ __device__ __forceinline__ bool claim_streaming_row(int tidx, bool first_wave, i
 }
 
 template <int kVecs, int kTopK, int kMinBlocks>
-__global__ void __launch_bounds__(SHORT_THREADS, kMinBlocks)
+__global__ void __launch_bounds__(SHORT_THREADS, resident_min_blocks(SHORT_THREADS, kMinBlocks))
     topk_filtered_row_local_register_kernel(const float* __restrict__ input,
                                             int32_t* __restrict__ output,
                                             const int32_t* __restrict__ ke,
@@ -1643,7 +1654,7 @@ __global__ void __launch_bounds__(SHORT_THREADS, kMinBlocks)
 }
 
 template <uint32_t VEC, int kTopK, bool kBounded, int kMinBlocks, int kMinLength = 0>
-__global__ void __launch_bounds__(SHORT_THREADS, kMinBlocks)
+__global__ void __launch_bounds__(SHORT_THREADS, resident_min_blocks(SHORT_THREADS, kMinBlocks))
     topk_filtered_row_local_streaming_kernel(
         const float* __restrict__ input, int32_t* __restrict__ output,
         const int32_t* __restrict__ ke, int32_t* __restrict__ spill_buffer,
@@ -2262,7 +2273,7 @@ __device__ __noinline__ void run_cluster_unaligned_overflow(RowSmem<kTopK, false
 // definitely selected prefix and the boundary-bin candidates through DSM. The
 // primary alone runs the FP32 refinement rounds.
 template <uint32_t VEC, int kTopK, int kSplits, int kBlockThreads>
-__global__ void __launch_bounds__(kBlockThreads, 2)
+__global__ void __launch_bounds__(kBlockThreads, resident_min_blocks(kBlockThreads, 2))
     topk_filtered_cluster8_exact_kernel(const float* __restrict__ input,
                                         int32_t* __restrict__ output,
                                         const int32_t* __restrict__ ke,
@@ -2900,10 +2911,6 @@ inline DispatchPlan choose_topk2048_plan(int m, int n) {
 
 }  // namespace filtered
 
-// This is the kernel-template instantiation boundary. Keep workspace queries
-// available on every architecture, but do not instantiate unsupported kernels
-// (in particular, the 1024-thread/two-CTA launch bounds do not fit SM120).
-#if HPC_ARCH_IN((90, 100, 103))
 bool topk_filtered_async(int* topk_indices, const float* logits, const int* ke, int topk,
                          const int* num_valid_rows, int m, int n, int row_stride, int out_stride,
                          void* counters, size_t counters_bytes, void* workspace,
@@ -2994,8 +3001,6 @@ bool topk_filtered_async(int* topk_indices, const float* logits, const int* ke, 
       topk_indices, logits, ke, num_valid_rows, m, n, row_stride, out_stride, counters,
       counters_bytes, workspace, workspace_bytes, stream);
 }
-
-#endif  // HPC_ARCH_IN((90, 100, 103))
 
 size_t topk_filtered_counters_bytes(int num_rows) { return filtered::counters_bytes_for(num_rows); }
 
