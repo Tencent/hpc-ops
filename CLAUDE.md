@@ -121,9 +121,9 @@ top level:
 Do not infer the current operator catalog, or any operator's architecture
 coverage, from this guide. Both change as operators are added and ported;
 discover them from `hpc/`, `src/`, and `tests/` — the directory tree and the
-`HPC_ARCH_DISPATCH` pairs are the authority. Names used below are examples of
-structure or dispatch rules only, and a wrapper file name need not match its
-operator directory.
+`HPC_ARCH_DISPATCH` pairs or `HPC_ARCH_DISPATCH_ANY` architecture lists are the
+authority. Names used below are examples of structure or dispatch rules only,
+and a wrapper file name need not match its operator directory.
 
 ### Large operators with sub-parts
 
@@ -314,9 +314,9 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 The two pairs say the operator is implemented for sm90 and sm100 and nothing
 else. A real operator's pairs are whatever its `sm<arch>/` directories support.
 
-Each architecture repeats the call expression rather than sharing one, because
-the architectures may not call the same `*_async` — the pair is `<arch>, <expr>`,
-and the expr is free to differ.
+`HPC_ARCH_DISPATCH` accepts `<arch>, <expr>` pairs when call expressions differ.
+For one shared expression, use `HPC_ARCH_DISPATCH_ANY(op, (90, 100, 103), expr)`;
+it selects the compiled target with `if constexpr` and checks the runtime device.
 
 `HPC_ARCH_DISPATCH` is one chain: if nothing launched, it raises before any host
 code after it runs. A function with launches in separate branches gets one
@@ -327,8 +327,9 @@ nothing to choose between: its `*_async` lives at the operator root and every
 module has it, so `entry.cc` calls the async directly. Such an operator has no
 `sm<N>/` directory at all, which is how you recognise one from the tree.
 
-Only the pair matching `HPC_TARGET_ARCH` expands to a call; the others expand to
-an unevaluated `sizeof`, so a module never references an implementation it did
+In `HPC_ARCH_DISPATCH`, only the pair matching `HPC_TARGET_ARCH` expands to a
+call; the others expand to an unevaluated `sizeof`, so a module never references
+an implementation it did
 not compile, and the shared host code above the chain does not collect
 unused-variable warnings in the builds that dispatch elsewhere. The architecture
 numbers in the `HPC_ARCH_DISPATCH` call are the operator's declared support

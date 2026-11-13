@@ -5,7 +5,7 @@
   </h2>
   <p>
     <img alt="CUDA" src="https://img.shields.io/badge/CUDA-12.9%2B-76B900">
-    <img alt="GPU" src="https://img.shields.io/badge/GPU-H20%20%7C%20SM90-76B900">
+    <img alt="GPU" src="https://img.shields.io/badge/GPU-SM90%20%7C%20SM100%20%7C%20SM103%20%7C%20SM120-76B900">
     <img alt="Python" src="https://img.shields.io/badge/Python-3.8%2B-3776AB">
     <img alt="License" src="https://img.shields.io/badge/License-MIT-blue">
   </p>
@@ -184,9 +184,9 @@ softmax statistics to reduce vocabulary reads and fixed launch overhead.
 ## Quick Start
 
 ### Requirements
-- NVIDIA SM90 architecture GPU
+- NVIDIA SM90, SM100, SM103 or SM120 architecture GPU (operator coverage varies)
 - Python 3.8 or higher
-- Compilers with C++17 support
+- Compilers with C++20 support
 - CUDA Toolkit: CUDA 12.9 or higher (`make wheel` covers sm103, whose
   `compute_103a` gencode requires 12.9; `make sm90` builds with 12.8)
 
