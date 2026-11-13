@@ -20,15 +20,16 @@ constexpr int NUM_REFINE_ROUNDS = 3;
 // The sampled paths derive a coarse threshold from a fixed systematic view.
 constexpr int SAMPLE_STRIDE = 64;
 constexpr int SAMPLE_RANK = 48;
-constexpr int WIDE_SAMPLE_STRIDE = 128;
-constexpr int WIDE_SAMPLE_RANK = 24;
+[[maybe_unused]] constexpr int WIDE_SAMPLE_STRIDE = 128;
+[[maybe_unused]] constexpr int WIDE_SAMPLE_RANK = 24;
 
 // Bit layouts of the three fp32-ordered fine refinement rounds.
 //   round 0 → bits [21..31]  (top 11 bits)
 //   round 1 → bits [10..20]  (middle 11 bits)
 //   round 2 → bits [0..9]    (low 10 bits, back-fill round)
-__device__ constexpr int kFineShifts[NUM_REFINE_ROUNDS] = {21, 10, 0};
-__device__ constexpr uint32_t kFineMasks[NUM_REFINE_ROUNDS] = {0x7FFu, 0x7FFu, 0x3FFu};
+[[maybe_unused]] __device__ constexpr int kFineShifts[NUM_REFINE_ROUNDS] = {21, 10, 0};
+[[maybe_unused]] __device__ constexpr uint32_t kFineMasks[NUM_REFINE_ROUNDS] = {0x7FFu, 0x7FFu,
+                                                                                0x3FFu};
 
 constexpr int THREADS = 512;
 constexpr int MIN_BLOCKS = 3;
@@ -1404,8 +1405,8 @@ __device__ __noinline__ void refine_row_local_rescan(RowLocalSmem<kTopK, kBlockT
 }
 
 constexpr int SHORT_THREADS = 1024;
-constexpr int ROW_LOCAL_SMALL_RANK_CAPACITY = 64;
-constexpr int ROW_LOCAL_MEDIUM_RANK_CAPACITY = 128;
+[[maybe_unused]] constexpr int ROW_LOCAL_SMALL_RANK_CAPACITY = 64;
+[[maybe_unused]] constexpr int ROW_LOCAL_MEDIUM_RANK_CAPACITY = 128;
 
 __device__ __forceinline__ bool row_candidate_precedes(const RowCandidate& lhs,
                                                        const RowCandidate& rhs) {
@@ -2899,6 +2900,10 @@ inline DispatchPlan choose_topk2048_plan(int m, int n) {
 
 }  // namespace filtered
 
+// This is the kernel-template instantiation boundary. Keep workspace queries
+// available on every architecture, but do not instantiate unsupported kernels
+// (in particular, the 1024-thread/two-CTA launch bounds do not fit SM120).
+#if HPC_ARCH_IN((90, 100, 103))
 bool topk_filtered_async(int* topk_indices, const float* logits, const int* ke, int topk,
                          const int* num_valid_rows, int m, int n, int row_stride, int out_stride,
                          void* counters, size_t counters_bytes, void* workspace,
@@ -2989,6 +2994,8 @@ bool topk_filtered_async(int* topk_indices, const float* logits, const int* ke, 
       topk_indices, logits, ke, num_valid_rows, m, n, row_stride, out_stride, counters,
       counters_bytes, workspace, workspace_bytes, stream);
 }
+
+#endif  // HPC_ARCH_IN((90, 100, 103))
 
 size_t topk_filtered_counters_bytes(int num_rows) { return filtered::counters_bytes_for(num_rows); }
 

@@ -10,6 +10,7 @@
 #include <tuple>
 
 #include "src/topk/topk.h"
+#include "src/utils/utils.h"
 
 namespace hpc {
 namespace topk {
@@ -92,10 +93,13 @@ torch::Tensor topk_filtered_entry(const torch::Tensor &logits, const torch::Tens
   }
 
   auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
-  bool ok = topk_filtered_async(
-      output.mutable_data_ptr<int>(), logits.const_data_ptr<float>(), ke.const_data_ptr<int>(),
-      topk, num_valid_rows.const_data_ptr<int>(), row_capacity, n, row_stride, out_stride,
-      cnt.mutable_data_ptr(), cnt.numel(), ws.mutable_data_ptr(), ws.numel(), stream);
+  bool ok = false;
+  HPC_ARCH_DISPATCH_ANY(
+      "topk_filtered", (90, 100, 103),
+      ok = topk_filtered_async(output.mutable_data_ptr<int>(), logits.const_data_ptr<float>(),
+                               ke.const_data_ptr<int>(), topk, num_valid_rows.const_data_ptr<int>(),
+                               row_capacity, n, row_stride, out_stride, cnt.mutable_data_ptr(),
+                               cnt.numel(), ws.mutable_data_ptr(), ws.numel(), stream));
   TORCH_CHECK(ok, "launch topk_filtered kernel failed!");
 
   return output;
