@@ -343,10 +343,6 @@ queries outside the guard. An implementation that supports all known targets,
 such as Top-K, needs no dispatch guard; small hardware differences can use
 `HPC_TARGET_ARCH` inside the implementation. Both dispatch forms support SM120.
 
-The macro regression test compiles and links at `-O0` for all four targets,
-leaving excluded implementations undefined, then checks dispatch and errors:
-`python3 -m pytest --confcutdir=tests tests/test_arch_dispatch.py`.
-
 `HPC_ARCH_DISPATCH` is one chain: if nothing launched, it raises before any host
 code after it runs. A function with launches in separate branches gets one
 `HPC_ARCH_DISPATCH` per branch — each is a complete decision on its own.
