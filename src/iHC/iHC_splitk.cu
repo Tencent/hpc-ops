@@ -1,4 +1,5 @@
 // Copyright 2026 Tencent
+// Copyright 2026, The FlagOS Contributors.
 
 // Host dispatch for the split-K fuse_ihc_pre / fuse_ihc_head implementation.
 // Routes by token count; defers to the row-per-block kernel once its grid is large enough.

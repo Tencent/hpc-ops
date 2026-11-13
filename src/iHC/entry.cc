@@ -1,4 +1,5 @@
 // Copyright 2026 Tencent
+// Copyright 2026, The FlagOS Contributors.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime_api.h>

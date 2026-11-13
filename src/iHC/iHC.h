@@ -1,4 +1,5 @@
 // Copyright 2026 Tencent
+// Copyright 2026, The FlagOS Contributors.
 
 #ifndef SRC_IHC_IHC_H_
 #define SRC_IHC_IHC_H_

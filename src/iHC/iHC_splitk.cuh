@@ -1,4 +1,5 @@
 // Copyright 2026 Tencent
+// Copyright 2026, The FlagOS Contributors.
 
 // Split-K fuse_ihc_pre and fuse_ihc_head for small batches.
 // kHasPost picks the operator: pre projects 2*hc rows and emits post gates,
