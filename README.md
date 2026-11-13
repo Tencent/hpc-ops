@@ -184,9 +184,9 @@ softmax statistics to reduce vocabulary reads and fixed launch overhead.
 ## Quick Start
 
 ### Requirements
-- NVIDIA SM90, SM100, SM103 or SM120 architecture GPU (operator coverage varies)
+- NVIDIA SM90 architecture GPU
 - Python 3.8 or higher
-- Compilers with C++20 support
+- Compilers with C++17 support
 - CUDA Toolkit: CUDA 12.9 or higher (`make wheel` covers sm103, whose
   `compute_103a` gencode requires 12.9; `make sm90` builds with 12.8)
 
@@ -205,17 +205,10 @@ python3 -m pip install dist/*.whl
 
 A wheel carries one extension module per SM architecture it was built for, and
 `import hpc` loads the one matching the device. `make wheel` covers every
-supported architecture (SM90, SM100, SM103 and SM120); `make sm90` or `make sm120`
-builds a wheel for that architecture only, and
+supported architecture; `make sm90` builds a wheel for sm90 only, and
 `SM_ARCH=90,103 make wheel` builds one usable on both. Wheels that cover only
 part of the supported architectures say so in their version, e.g.
 `0.0.1.dev0+g1234567.sm90`.
-
-For an SM120-only development build, use `SM_ARCH=120 make`. SM120 uses
-`sm_120a` code generation and includes shared operators such as Top-K. It does
-not inherit SM90 or SM100 implementations. Operators without an implementation
-for the selected architecture raise an explicit unsupported-architecture error
-when called; building a module does not imply that every operator supports it.
 
 ### Basic Usage
 

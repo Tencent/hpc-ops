@@ -51,7 +51,6 @@ Use the shortest command that covers the change:
 ```bash
 make                         # build a module for the local GPU architecture
 make sm90                    # wheel for sm90 only
-make sm120                   # wheel for sm120 only
 SM_ARCH=90,100 make          # build two modules, sm90 and sm100
 make test                    # run the test suite
 python3 -m pytest -v tests/test_<op>.py
@@ -318,30 +317,6 @@ else. A real operator's pairs are whatever its `sm<arch>/` directories support.
 Each architecture repeats the call expression rather than sharing one, because
 the architectures may not call the same `*_async` — the pair is `<arch>, <expr>`,
 and the expr is free to differ.
-
-When several architectures share the same call expression, use
-`HPC_ARCH_DISPATCH_ANY` instead of repeating it:
-
-```cpp
-HPC_ARCH_DISPATCH_ANY("widget", (90, 100, 103),
-                      ok = widget_async(y_ptr, x_ptr, m, n, scale, stream));
-```
-
-The architecture list is parenthesized. The variadic body accepts template
-commas, multiple statements, or a `return`. It runs only when the compiled
-target is listed and the runtime device matches that target; otherwise it
-raises the same unsupported-architecture error as `HPC_ARCH_DISPATCH`, before
-executing the body. It uses `if constexpr`, so declarations must remain visible
-and well-formed even for excluded targets, but excluded calls do not require
-implementation symbols at link time.
-
-`HPC_ARCH_IN((90, 100, 103))` tests the compiled target in either `#if` or
-`if constexpr`. A shared source that only supports a subset of targets may use
-it around kernel instantiation, with the same list at the entry dispatch site.
-Keep shared tensor validation, allocation and universally available workspace
-queries outside the guard. An implementation that supports all known targets,
-such as Top-K, needs no dispatch guard; small hardware differences can use
-`HPC_TARGET_ARCH` inside the implementation. Both dispatch forms support SM120.
 
 `HPC_ARCH_DISPATCH` is one chain: if nothing launched, it raises before any host
 code after it runs. A function with launches in separate branches gets one
