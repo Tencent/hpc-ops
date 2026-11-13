@@ -8,10 +8,12 @@ import sys
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 
-# Architectures the build supports. The same list is in the Makefile and
-# CMakeLists.txt; adding one also needs an HPC_ARCH_EVAL_<arch> block in
-# src/utils/utils.h.
-KNOWN_ARCHS = [90, 100, 103]
+# The Makefile owns the supported architecture list and exports it to the build.
+KNOWN_ARCHS = [int(arch) for arch in os.getenv("KNOWN_ARCHS", "").split()]
+if not KNOWN_ARCHS:
+    raise SystemExit(
+        "KNOWN_ARCHS is not set. Build through the Makefile (make / make sm90 / make wheel)."
+    )
 
 
 class CMakeExtension(Extension):
@@ -43,6 +45,7 @@ class CMakeBuild(build_ext):
                 f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={build_temp_dir}",
                 f"-DPython3_EXECUTABLE={sys.executable}",
                 f"-DHPC_TARGET_ARCH={arch}",
+                f"-DHPC_KNOWN_ARCHS={';'.join(map(str, KNOWN_ARCHS))}",
                 *ext.version_macros,
             ]
 
