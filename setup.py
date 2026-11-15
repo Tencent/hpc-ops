@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import sys
 
-from setuptools import Extension, setup
+from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
 # Architectures the build supports. The same list is in the Makefile and
@@ -123,10 +123,11 @@ setup(
     author_email="authors@hpc-ops",
     url="https://github.com/Tencent/hpc-ops",
     license="Copyright (C) 2026 Tencent.",
-    packages=["hpc"],
+    packages=find_packages(include=["hpc", "hpc.*"]),
     ext_modules=[CMakeExtension("hpc", version_macros)],
     cmdclass={"build_ext": CMakeBuild},
     package_data={"hpc": ["*.so"]},
     options={"bdist_wheel": bdist_wheel_options},
     install_requires=["torch"],
+    extras_require={"cute-dsl": ["nvidia-cutlass-dsl>=4.7.1"]},
 )

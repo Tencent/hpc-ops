@@ -160,6 +160,8 @@ softmax statistics to reduce vocabulary reads and fixed launch overhead.
 | GEMM | BF16 x FP32 GEMM | MoE router GEMM, sparse/linear attention state-compress GEMM | BF16 x FP32 | `hpc/gemm.py` |
 | Grouped GEMM | FP8 grouped GEMM | Expert-parallel and grouped expert matmul | FP8 | `hpc/group_gemm.py` |
 | Fused MoE | Fused FP8 MoE pipeline | Low-latency MoE inference under TP/EP shapes | FP8 | `hpc/fuse_moe.py` |
+| Fused MoE | SM120 fused FP8 MoE (CuTe DSL) | Qwen-style 128-block FP8 checkpoints on RTX PRO Blackwell (SM120) | FP8 128-block, run on the MXFP8 MMA | `hpc/fuse_moe.py`, `hpc/cute/fuse_moe/` |
+| Fused MoE | SM120 fused W4A8 MoE (CuTe DSL) | DeepSeek-V4-style MXFP4 checkpoints on RTX PRO Blackwell (SM120) | MXFP4 weights x MXFP8 activations | `hpc/fuse_moe.py`, `hpc/cute/fuse_moe/` |
 | Communication | Fused AllReduce + Residual + RMSNorm | Tensor-parallel post-GEMM fusion | BF16 | `hpc/allreduce.py` |
 | Sampling | Fused sampler | Decode-step token sampling | BF16 / FP32 | `hpc/sampler.py` |
 | Normalization / RoPE / activation | RMSNorm, RoPE + KV store, activation quantization | Common LLM layer utilities | BF16 / FP8 | `hpc/normalization.py`, `hpc/rope.py`, `hpc/act.py` |
@@ -174,6 +176,8 @@ softmax statistics to reduce vocabulary reads and fixed launch overhead.
 | Dynamic decode attention | Variable KV-cache decode, long single-batch cases, mixed-length batch cases | Static split-k scheduling | Up to 2.88x |
 | BF16 x FP32 GEMM | Router GEMM shapes, state-compress GEMM shapes | cuBLAS FP32, cuBLAS TF32 | Up to 3.22x |
 | Fused FP8 MoE | DeepSeek-V3, Hunyuan-V3, Qwen3-235B under TP=8 EP=1, TP=1 EP=8 | vLLM CUTLASS, vLLM Triton, SGLang | Up to 1.6x TP, 1.5x EP |
+| SM120 fused FP8 MoE | Qwen3.8-Flash-Next EP4 shapes, 1-8192 tokens, RTX PRO 5000 | vLLM DeepGEMM, Triton, Marlin | Up to 1.36x DeepGEMM, 1.18x Triton, 2.1x Marlin |
+| SM120 fused W4A8 MoE | DeepSeek-V4-Flash TP4 shapes, 1-8192 tokens, RTX PRO 5000 | vLLM DeepGEMM, Marlin, FlashInfer CUTLASS, b12x | Up to 1.83x DeepGEMM, 1.7x Marlin, 2.5x FlashInfer CUTLASS, 1.26x b12x |
 | Fused AllReduce + Residual + RMSNorm | Single-node BF16 tensor-parallel shapes, hidden sizes 4096/5120/7168 | NCCL, FlashInfer | Up to 1.76x |
 | Fused sampler | BF16 logits, vocab size 120832, batch size 1-512 | vLLM-style PyTorch, FlashInfer | Up to 8.5x |
 | GroupGEMM FP8 | Expert grouped matmul, prefill, decode | DeepGEMM | Up to 1.1x prefill, 1.88x decode |
@@ -184,7 +188,9 @@ softmax statistics to reduce vocabulary reads and fixed launch overhead.
 ## Quick Start
 
 ### Requirements
-- NVIDIA SM90 architecture GPU
+- NVIDIA SM90 architecture GPU; SM120 is supported by the CuTe DSL fused MoE only
+  (`pip install "hpc-ops[cute-dsl]"`). It compiles from Python at runtime, so no
+  sm120 C++ module is built and any wheel of the package works there.
 - Python 3.8 or higher
 - Compilers with C++17 support
 - CUDA Toolkit: CUDA 12.9 or higher (`make wheel` covers sm103, whose

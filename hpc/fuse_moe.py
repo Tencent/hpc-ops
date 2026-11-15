@@ -1,8 +1,9 @@
 # Copyright (C) 2026 Tencent.
 
+from typing import Optional, Tuple
+
 import torch
 from torch import Tensor
-from typing import Tuple
 
 
 def count_and_gather(
@@ -257,6 +258,118 @@ def fuse_moe_blockwise(
         rank_ep,
         num_expert_total,
         output,
+    )
+
+
+def fuse_moe_blockwise_fp8_dsl(
+    x: Tensor,
+    x_scale: Tensor,
+    gate_up_weight: Tensor,
+    gate_up_weight_scale: Tensor,
+    down_weight: Tensor,
+    down_weight_scale: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    rank_ep: int,
+    num_expert_total: int,
+    shared_output: Optional[Tensor] = None,
+    output: Optional[Tensor] = None,
+    swiglu_limit: Optional[float] = None,
+    mx_mma: bool = True,
+) -> Tensor:
+    """SM120 CuTe DSL counterpart of :func:`fuse_moe_blockwise_fp8`.
+
+    Takes FP8 E4M3 weights with float32 scales per 128x128 block, as in
+    Qwen-style FP8 checkpoints. ``mx_mma=True`` (default) rounds those scales up
+    to UE8M0 and runs a native MXFP8 block-scaled GEMM; ``False`` keeps exact
+    float32 128-block arithmetic.
+
+    ``mx_mma=True`` requires ``x_scale`` to hold exact powers of two, because the
+    kernel reads those scales as UE8M0 without rescaling ``x``. The first call on
+    each device checks it. Weights should be passed through
+    :func:`hpc.prepare_fp8_mx_mma_weights` at load time; float32
+    weight scales are otherwise requantized in place on first use, which a CUDA
+    graph capture cannot do.
+
+    Requires ``nvidia-cutlass-dsl``; imported lazily because it pulls in ``cutlass``.
+    """
+    from .cute.fuse_moe import fuse_moe_blockwise_fp8_dsl as _impl
+
+    return _impl(
+        x,
+        x_scale,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids,
+        topk_scale,
+        rank_ep=rank_ep,
+        num_expert_total=num_expert_total,
+        shared_output=shared_output,
+        output=output,
+        swiglu_limit=swiglu_limit,
+        mx_mma=mx_mma,
+    )
+
+
+def fuse_moe_blockwise_w4a8_mxfp4_mxfp8_dsl(
+    x: Tensor,
+    x_scale: Optional[Tensor],
+    gate_up_weight: Tensor,
+    gate_up_weight_scale: Tensor,
+    down_weight: Tensor,
+    down_weight_scale: Tensor,
+    topk_ids: Tensor,
+    topk_scale: Tensor,
+    rank_ep: int,
+    num_expert_total: int,
+    shared_output: Optional[Tensor] = None,
+    output: Optional[Tensor] = None,
+    swiglu_limit: Optional[float] = None,
+) -> Tensor:
+    """Run the SM120 blockwise MXFP4 x MXFP8 fused MoE (CuTe DSL).
+
+    Args:
+        x: Activations, shape ``[tokens, hidden]``: MXFP8 E4M3, or BF16 to have
+            the kernel quantize them to MXFP8 (one UE8M0 scale per 32 elements,
+            rounded up to a power of two).
+        x_scale: Raw UE8M0 activation scales, one per 32 hidden elements;
+            ``None`` when ``x`` is BF16.
+        gate_up_weight: Packed MXFP4 E2M1 data, shape
+            ``[local_experts, 2 * intermediate, hidden // 2]``, dtype ``uint8``.
+        gate_up_weight_scale: Raw UE8M0 weight scales, either logical
+            ``[local_experts, 2 * intermediate, hidden // 32]`` or the packed
+            layout from :func:`hpc.pack_mxfp_weight_scale_sm120`.
+        down_weight: Packed MXFP4 E2M1 data, shape
+            ``[local_experts, hidden, intermediate // 2]``, dtype ``uint8``.
+        down_weight_scale: As ``gate_up_weight_scale``, for ``down_weight``.
+        topk_ids: Global expert IDs, shape ``[tokens, topk]``, dtype ``int32``.
+        topk_scale: Router weights, shape ``[tokens, topk]``, dtype ``float32``.
+        rank_ep: Rank within the expert-parallel group.
+        num_expert_total: Total experts across all expert-parallel ranks.
+        shared_output: Optional BF16 shared-expert result to add.
+        output: Optional preallocated BF16 output.
+        swiglu_limit: Optional DeepSeek-style SwiGLU clamp.
+
+    Requires ``nvidia-cutlass-dsl``; imported lazily because it pulls in ``cutlass``.
+    """
+    from .cute.fuse_moe import fuse_moe_blockwise_w4a8_mxfp4_mxfp8_dsl as _impl
+
+    return _impl(
+        x,
+        x_scale,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        topk_ids,
+        topk_scale,
+        rank_ep=rank_ep,
+        num_expert_total=num_expert_total,
+        shared_output=shared_output,
+        output=output,
+        swiglu_limit=swiglu_limit,
     )
 
 
