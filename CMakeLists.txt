@@ -18,10 +18,10 @@ find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 # Architectures the build supports. The same list is in the Makefile and
 # setup.py; adding one also needs an HPC_ARCH_EVAL_<arch> block in
 # src/utils/utils.h.
-set(HPC_KNOWN_ARCHS 90 100 103)
+set(HPC_KNOWN_ARCHS 90 100 103 120)
 
 # Architectures whose gencode needs the "a" suffix for wgmma/TMA instructions.
-set(HPC_ARCH_SPECIFIC_ARCHS 90 100 103)
+set(HPC_ARCH_SPECIFIC_ARCHS 90 100 103 120)
 
 # Source fallback: an architecture with no sm<arch>/ of its own inherits the
 # listed one's sources, recompiled with its own gencode. Only sm103 -> sm100,
