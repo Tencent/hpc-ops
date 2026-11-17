@@ -77,13 +77,15 @@ def test_fuse_ihc_post(num_batch, hc_mult, hidden_dim):
     assert allclose(ref_y, real_y, atol=2e-2, rtol=1e-2)
 
 
-def naive_fuse_ihc_head(x, w, hc_scale, hc_base, norm_eps, hc_eps):
+def naive_fuse_ihc_head(x, w, hc_scale, hc_base, norm_eps, hc_eps, rms_weight=None, rms_eps=0.0):
     x_flat = x.flatten(1).float()
     r = torch.rsqrt(x_flat.square().mean(dim=-1, keepdim=True) + norm_eps)
     mixes = F.linear(x_flat, w) * r
     H_pre = torch.sigmoid(hc_scale * mixes + hc_base) + hc_eps
-    y = torch.sum(H_pre.unsqueeze(-1) * x.float(), dim=1).to(dtype=torch.bfloat16)
-    return y
+    y = torch.sum(H_pre.unsqueeze(-1) * x.float(), dim=1)
+    if rms_weight is not None:
+        y = naive_rms_norm(y, rms_weight, rms_eps)
+    return y.to(dtype=torch.bfloat16)
 
 
 @pytest.mark.parametrize("num_batch", [1, 7, 128, 16384])
@@ -379,3 +381,66 @@ def test_fuse_ihc_post_deterministic(num_batch, hidden_dim):
         assert torch.equal(
             hpc.fuse_ihc_post(x, residual, H_post), first
         ), "post is not deterministic"
+
+
+def naive_rms_norm(y, rms_weight, rms_eps):
+    yf = y.float()
+    scale = torch.rsqrt(yf.square().mean(dim=-1, keepdim=True) + rms_eps)
+    return (yf * scale * rms_weight.float()).to(dtype=torch.bfloat16)
+
+
+@pytest.mark.parametrize("num_batch", [1, 7, 16, 128, 512, 4096])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096])
+@pytest.mark.parametrize("norm_eps", [1e-5])
+@pytest.mark.parametrize("hc_eps", [1e-6])
+@pytest.mark.parametrize("magnitude", [2.0])
+def test_fuse_ihc_pre_with_rms_weight(num_batch, hidden_dim, norm_eps, hc_eps, magnitude):
+    torch.cuda.manual_seed(13)
+    hc_mult = HC_MULT
+    dev = "cuda"
+
+    x = torch.rand((num_batch, hc_mult, hidden_dim), dtype=torch.float32, device=dev).to(
+        dtype=torch.bfloat16
+    )
+    w = torch.rand((2 * hc_mult, hc_mult * hidden_dim), dtype=torch.float32, device=dev) * 6e-3
+    hc_scale = torch.rand((2,), dtype=torch.float32, device=dev)
+    hc_base = torch.rand((2 * hc_mult,), dtype=torch.float32, device=dev)
+    rms_weight = torch.rand((hidden_dim,), dtype=torch.float32, device=dev).to(dtype=torch.bfloat16)
+
+    ref_y, ref_H_post = naive_fuse_ihc_pre(
+        x, w, hc_scale, hc_base, hc_mult, norm_eps, hc_eps, magnitude
+    )
+    ref_y = naive_rms_norm(ref_y, rms_weight, RMS_EPS)
+
+    real_y, real_H_post = hpc.fuse_ihc_pre(
+        x, w, hc_scale, hc_base, norm_eps, hc_eps, magnitude, rms_weight, RMS_EPS
+    )
+
+    assert allclose(ref_y, real_y, atol=2e-2, rtol=1e-2)
+    assert allclose(ref_H_post, real_H_post, atol=2e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("num_batch", [1, 7, 16, 128, 512, 4096])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096])
+@pytest.mark.parametrize("norm_eps", [1e-5])
+@pytest.mark.parametrize("hc_eps", [1e-6])
+def test_fuse_ihc_head_with_rms_weight(num_batch, hidden_dim, norm_eps, hc_eps):
+    torch.cuda.manual_seed(13)
+    hc_mult = HC_MULT
+    dev = "cuda"
+
+    x = torch.rand((num_batch, hc_mult, hidden_dim), dtype=torch.float32, device=dev).to(
+        dtype=torch.bfloat16
+    )
+    w = torch.rand((hc_mult, hc_mult * hidden_dim), dtype=torch.float32, device=dev) * 6e-3
+    hc_scale = torch.rand((1,), dtype=torch.float32, device=dev)
+    hc_base = torch.rand((hc_mult,), dtype=torch.float32, device=dev)
+    rms_weight = torch.rand((hidden_dim,), dtype=torch.float32, device=dev).to(dtype=torch.bfloat16)
+
+    ref_y = naive_fuse_ihc_head(x, w, hc_scale, hc_base, norm_eps, hc_eps, rms_weight, RMS_EPS)
+
+    real_y = torch.ops.hpc.fuse_ihc_head(
+        x, w, hc_scale, hc_base, norm_eps, hc_eps, rms_weight, RMS_EPS
+    )
+
+    assert allclose(ref_y, real_y, atol=2e-2, rtol=1e-2)
