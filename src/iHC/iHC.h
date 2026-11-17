@@ -10,8 +10,7 @@
 namespace hpc {
 namespace iHC {
 
-// Each returns false, launching nothing, on a shape it has no instantiation
-// for; the caller must treat that as an error rather than read the output.
+// Callers must validate hc_mult and hidden_dim; unsupported shapes launch nothing.
 void fuse_ihc_pre_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                         const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
                         const float* hc_base_ptr, int num_batch, int hc_mult, int hidden_dim,
@@ -41,8 +40,7 @@ void fuse_ihc_head_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr, 
                          float rms_eps = 0.f, bool cast_bfloat_for_norm = false,
                          bool use_pdl = true);
 
-// Split-K pre path for small batches. ihc_pre_splitk_supported() encodes the
-// per-device threshold; the caller queries it instead of #if-ing on arch.
+// Split-K pre dispatch uses a device-specific token threshold.
 namespace splitk {
 
 bool ihc_pre_splitk_supported(int num_batch, int hc_mult, int hidden_dim, bool fuse_rms_norm);
@@ -58,8 +56,7 @@ void fuse_ihc_pre_splitk_async(__nv_bfloat16* output_y_ptr, float* output_H_post
                                bool use_pdl = true, const __nv_bfloat16* rms_weight_ptr = nullptr,
                                float rms_eps = 0.f, bool cast_bfloat_for_norm = false);
 
-// The same split over K for fuse_ihc_head: shares the kernels (kHasPost =
-// false) but not the tuning, hence separate entry points.
+// Head shares the split-K kernels (kHasPost=false) with its own dispatch threshold.
 bool ihc_head_splitk_supported(int num_batch, int hc_mult, int hidden_dim, bool fuse_rms_norm);
 
 size_t ihc_head_splitk_scratch_floats(int num_batch, int hc_mult, int hidden_dim,

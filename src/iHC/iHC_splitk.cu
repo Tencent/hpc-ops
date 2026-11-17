@@ -24,16 +24,16 @@ constexpr int kStage1Threads = 128;
 constexpr int kStage2Threads = 256;
 constexpr int kElementsPerThread = 8;
 
-// Token count at or above which this path declines to the row-per-block kernel.
+// Force controls: 0=automatic dispatch, 1=split-K, 2=row kernel.
 #ifndef HPC_IHC_SPLITK_FORCE
 #define HPC_IHC_SPLITK_FORCE 0
 #endif
 
-// Forced builds override head's threshold too, for calibration runs.
 #ifndef HPC_IHC_HEAD_SPLITK_FORCE
 #define HPC_IHC_HEAD_SPLITK_FORCE 0
 #endif
 
+// Split-K applies below a device- and shape-dependent token threshold.
 int splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
 #if HPC_IHC_SPLITK_FORCE == 1
   (void)hidden_dim;
@@ -44,7 +44,6 @@ int splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
   (void)fuse_rms_norm;
   return 0;
 #else
-  // Constants declared here so forced builds don't carry unreferenced vars (#177-D).
   constexpr float kSmPerBlockRow = 1.2f;
   constexpr float kFoldScale = 1.2f;
   constexpr int kHiddenRef = 6144;
@@ -53,8 +52,6 @@ int splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
   if (sm_count <= 0) {
     return 0;
   }
-  // sqrt rather than linear: row path's cost per block grows with row width, so
-  // a wider row moves the crossing out sub-proportionally.
   const float hidden_scale = sqrtf(static_cast<float>(hidden_dim) / kHiddenRef);
   const float fold_scale = fuse_rms_norm ? kFoldScale : 1.0f;
   return static_cast<int>(sm_count * kSmPerBlockRow * hidden_scale * fold_scale);
@@ -111,7 +108,6 @@ int head_splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
   return 0;
 #else
   constexpr float kSmPerBlockRow = 0.75f;
-  // Fold moves the crossing in; 0.8 errs toward the row path.
   constexpr float kFoldScale = 0.8f;
   constexpr int kHiddenRef = 6144;
 
@@ -119,7 +115,6 @@ int head_splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
   if (sm_count <= 0) {
     return 0;
   }
-  // Linear in hidden, not sqrt as pre's is.
   const float hidden_scale = static_cast<float>(hidden_dim) / kHiddenRef;
   const float fold_scale = fuse_rms_norm ? kFoldScale : 1.0f;
   return static_cast<int>(sm_count * kSmPerBlockRow * hidden_scale * fold_scale);
@@ -156,7 +151,7 @@ void launch_splitk(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
     }
     cudaLaunchKernelEx(&cfg1, stage1, scratch_ptr, x_ptr, w_ptr, num_batch);
 
-    // Slice the hidden dim across blocks; folded launches cannot slice
+    // RMSNorm requires one block to cover the full hidden row.
     constexpr int kStage2ThreadsHere =
         kFuseRmsNorm ? kHiddenDim / kElementsPerThread : kStage2Threads;
     constexpr int kBlockD = kStage2ThreadsHere * kElementsPerThread;
@@ -252,8 +247,6 @@ void fuse_ihc_pre_splitk_async(__nv_bfloat16* output_y_ptr, float* output_H_post
                                float magnitude, float* scratch_ptr, cudaStream_t stream,
                                bool use_pdl, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
                                bool cast_bfloat_for_norm) {
-  // The fold/cast nesting is written once and reused per hidden, rather than
-  // once per hidden as a macro expansion.
   auto by_hidden = [&](auto hidden_tag) {
     constexpr int kHidden = decltype(hidden_tag)::value;
     if (rms_weight_ptr == nullptr) {

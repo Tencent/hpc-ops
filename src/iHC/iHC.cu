@@ -50,8 +50,7 @@ __device__ __forceinline__ vec_t<float, 8> ihc_load_weight8(const float* p) {
   return v;
 }
 
-// Scalar projection accumulation avoids the extra register pairs required by
-// FFMA2, while loading a pair of weight rows amortizes loads across tokens.
+// Accumulate two projection rows in FP32, reusing each input vector.
 template <int N>
 __device__ __forceinline__ void ihc_dot_pair(float& acc0, float& acc1, const vec_t<float, N>& x,
                                              const vec_t<float, N>& w0, const vec_t<float, N>& w1) {
@@ -1140,9 +1139,7 @@ namespace {
 constexpr int kElementsPerThread = 8;
 constexpr int kPostThreadsPerBlock = 128;
 
-// Rows per block for pre (kHasPost = true) at 256 threads.
-// More rows amortize the W tile load until accumulators spill.
-// sm100/103 use sm100_config() instead; gated to avoid -Werror=all-warnings (#177-D).
+// Pre row counts at 256 threads for targets other than SM100/SM103.
 #if HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
 constexpr int pre_rows_per_block(int num_batch, bool fuse_rms_norm) {
   if (num_batch < (fuse_rms_norm ? 192 : 64)) {
@@ -1154,8 +1151,7 @@ constexpr int pre_rows_per_block(int num_batch, bool fuse_rms_norm) {
   return 4;
 }
 
-// Rows per block for the head kernel (kHasPost = false). Head needs its own
-// table since kHasPost halves kProjRows and its register use differs from pre's.
+// Head projects half as many rows as pre and uses separate batch thresholds.
 constexpr int head_rows_per_block(int num_batch, int hidden_dim) {
   if (num_batch < 320) {
     return 1;
@@ -1167,16 +1163,13 @@ constexpr int head_rows_per_block(int num_batch, int hidden_dim) {
 }
 #endif  // HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
 
-// {rows, threads} config for sm90's pre path. The two parameters interact
-// and valid block sizes differ by hidden dim, so each gets its own table.
-// Gated on sm90: the only caller is in the HPC_TARGET_ARCH == 90 branch (#177-D).
+// Launch geometry for the pre/head row kernel.
 struct PreConfig {
   int rows;
   int threads;
 };
 
-// {rows, threads} config for sm100/sm103. The first boundary is sm_count so
-// rows=1 fills exactly one wave.
+// SM100/SM103 use one CTA per token for batches up to the SM count.
 #if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
 constexpr PreConfig sm100_config(int num_batch, int hidden_dim, bool has_post, bool fuse_rms_norm,
                                  int sm_count) {
@@ -1188,7 +1181,6 @@ constexpr PreConfig sm100_config(int num_batch, int hidden_dim, bool has_post, b
       return {2, 384};
     }
     if (num_batch < 768) {
-      // head: <6144, rows=4, 384thr> spills, so cap at rows=2.
       return has_post ? PreConfig{4, 384} : PreConfig{2, 384};
     }
     if (num_batch < 1024) {
@@ -1213,7 +1205,6 @@ constexpr PreConfig sm100_config(int num_batch, int hidden_dim, bool has_post, b
     return {2, 512};
   }
   if (num_batch < 1024) {
-    // head caps at rows=2: rows=4/256 spills at this hidden size.
     return has_post ? PreConfig{4, 256} : PreConfig{2, 256};
   }
   if (has_post) {
@@ -1246,7 +1237,6 @@ constexpr PreConfig pre_config(int num_batch, int hidden_dim) {
     if (num_batch < 768) {
       return {4, 256};
     }
-    // Notch at ~1024 tokens from wave quantization against 78 SMs.
     if (num_batch >= 896 && num_batch < 1152) {
       return {8, 192};
     }
@@ -1262,7 +1252,6 @@ constexpr PreConfig pre_config(int num_batch, int hidden_dim) {
   if (num_batch < 768) {
     return {4, 256};
   }
-  // Same wave-quantization notch as above.
   if (num_batch >= 896 && num_batch < 1152) {
     return {8, 128};
   }
@@ -1338,7 +1327,7 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
         launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 384>{});
         return;
       }
-      // `if constexpr` because these spill in the head specialization.
+      // Instantiate these configurations only for pre.
       if constexpr (kHasPost) {
         if (cfg.rows == 4 && cfg.threads == 384) {
           launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 384>{});
@@ -1373,7 +1362,7 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
         launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 256>{});
         return;
       }
-      // rows=4/256 spills badly as a head kernel, so this pair is pre-only.
+      // This configuration is selected only for pre.
       if constexpr (kHasPost) {
         if (cfg.rows == 4 && cfg.threads == 256) {
           launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
@@ -1400,8 +1389,7 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
   }
 #endif  // HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
 
-  // Head skips pre_config() because two of its pairs spill under sm_90a;
-  // it falls through to head_rows_per_block() instead.
+  // SM90 head uses head_rows_per_block() instead of pre_config().
 #if HPC_TARGET_ARCH == 90
   if constexpr (kHasPost) {
     const PreConfig cfg = pre_config(num_batch, kHiddenDim);
@@ -1457,7 +1445,7 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
   }
 #endif
 
-  // `if constexpr` guard avoids instantiating the spilling <4096, rows=4, head> arm.
+  // Keep pre-only row configurations out of the head specialization.
 #if HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
   if constexpr (kHasPost) {
     switch (pre_rows_per_block(num_batch, kFuseRmsNorm)) {
@@ -1480,7 +1468,7 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
         launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 256>{});
         break;
       default:
-        // rows=4 is valid only at hidden 6144; 4096 caps at 2 above.
+        // Head selects four rows only for D=6144.
         if constexpr (kHiddenDim == 6144) {
           launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
         }
@@ -1490,8 +1478,7 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
 #endif  // HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
 }
 
-// Match launch geometry to the kernel's uniform M branch. The caller still
-// controls scratch allocation and the existing single-stage/two-stage choice.
+// Match grid, block and cluster dimensions to the kernel's uniform M branch.
 template <int kHiddenDim, bool kFuseRmsNorm, bool kCastBfloatForNorm, bool kUsePDL>
 cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bfloat16* y_ptr,
                                      __nv_bfloat16* z_ptr, float* H_post_out_ptr,
@@ -1661,8 +1648,6 @@ constexpr PostConfig post_config(int num_batch, int hidden_dim) {
   (void)num_batch;
   int threads = kPostThreadsPerBlock;
 #if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
-  // The one block-size arm: 256x2 is faster than 128x4 at hidden 4096 from
-  // 4096 tokens up. hidden 6144 needs none.
   if (hidden_dim == 4096 && num_batch >= 4096) {
     threads = 256;
   }

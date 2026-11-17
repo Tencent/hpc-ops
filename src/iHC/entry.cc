@@ -76,9 +76,7 @@ std::tuple<torch::Tensor, torch::Tensor> fuse_ihc_pre_entry(
   auto *output_y_ptr = reinterpret_cast<__nv_bfloat16 *>(output_y.mutable_data_ptr());
   auto *output_H_post_ptr = reinterpret_cast<float *>(output_H_post.mutable_data_ptr());
 
-  // Batches with too few tokens to fill the device go to the split-K path.
-  // The predicate is the token count, not the inference phase, and it declines
-  // on every shape it does not claim, so no #if is needed here.
+  // Use split-K only when its support predicate accepts the batch and shape.
   const bool fuse_rms_norm = rms_weight_ptr != nullptr;
   if (splitk::ihc_pre_splitk_supported(num_batch, hc_mult, hidden_dim, fuse_rms_norm)) {
     const size_t scratch_floats =
@@ -289,8 +287,7 @@ torch::Tensor fuse_ihc_head_entry(const torch::Tensor &x, const torch::Tensor &w
   const auto *hc_base_ptr = reinterpret_cast<const float *>(hc_base.const_data_ptr());
   auto *output_ptr = reinterpret_cast<__nv_bfloat16 *>(output.mutable_data_ptr());
 
-  // Same split-K routing as pre, on head's own threshold: its blocks do half
-  // pre's work, so the crossover is not the same.
+  // Head has its own split-K support predicate and token threshold.
   const bool fuse_rms_norm = rms_weight_ptr != nullptr;
   if (splitk::ihc_head_splitk_supported(num_batch, hc_mult, hidden_dim, fuse_rms_norm)) {
     const size_t scratch_floats =
