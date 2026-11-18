@@ -14,6 +14,13 @@
 #include "src/iHC/iHC.h"
 #include "src/utils/utils.cuh"
 
+#if HPC_TARGET_ARCH == 100
+#include "cute/arch/copy_sm100.hpp"
+#include "cute/arch/tmem_allocator_sm100.hpp"
+#include "cute/atom/mma_traits_sm100.hpp"
+#include "cutlass/arch/barrier.h"
+#endif
+
 namespace hpc {
 namespace iHC {
 
@@ -299,7 +306,8 @@ __device__ __forceinline__ void ihc_post_pre_cluster_device(
 // A single CTA owns a token and retains its rounded BF16 post result until
 // gates are available. Mix and optional RMSNorm consume registers directly;
 // only the required residual Y and final Z are written to global memory.
-template <int D, int T, bool Norm, bool Cast, bool PDL = false, bool Aligned32 = false>
+template <int D, int T, bool Norm, bool Cast, bool PDL = false, bool Aligned32 = false,
+          bool PairFma = false>
 __device__ __forceinline__ void ihc_post_pre_retained_device(
     __nv_bfloat16* y, __nv_bfloat16* z, float* hp, const __nv_bfloat16* xa,
     const __nv_bfloat16* res, const float* hi, const float* w, const float* scale,
@@ -334,13 +342,28 @@ __device__ __forceinline__ void ihc_post_pre_retained_device(
       v = to<float>(bf);
 #pragma unroll
       for (int j = 0; j < E; ++j) sq += v[j] * v[j];
+      if constexpr (PairFma) {
 #pragma unroll
-      for (int p = 0; p < 8; ++p) {
-        vec_t<float, E> ww;
-        auto wp = w + static_cast<int64_t>(p) * 4 * D + i * D + col;
-        ww = ihc_load_weight8<Aligned32>(wp);
+        for (int p = 0; p < 8; p += 2) {
+          const auto* wp = w + static_cast<int64_t>(p) * 4 * D + i * D + col;
+          const auto w0 = ihc_load_weight8<Aligned32>(wp);
+          const auto w1 = ihc_load_weight8<Aligned32>(wp + 4 * D);
+          auto acc = make_float2(dot[p], dot[p + 1]);
 #pragma unroll
-        for (int j = 0; j < E; ++j) dot[p] += v[j] * ww[j];
+          for (int j = 0; j < E; ++j)
+            acc = ihc_fma2(make_float2(v[j], v[j]), make_float2(w0[j], w1[j]), acc);
+          dot[p] = acc.x;
+          dot[p + 1] = acc.y;
+        }
+      } else {
+#pragma unroll
+        for (int p = 0; p < 8; ++p) {
+          vec_t<float, E> ww;
+          auto wp = w + static_cast<int64_t>(p) * 4 * D + i * D + col;
+          ww = ihc_load_weight8<Aligned32>(wp);
+#pragma unroll
+          for (int j = 0; j < E; ++j) dot[p] += v[j] * ww[j];
+        }
       }
     }
   }
@@ -901,6 +924,494 @@ __global__ void __launch_bounds__(HPC_TARGET_ARCH == 100 ? 768 : kThreadsPerBloc
       hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
 #endif
 }
+
+#if HPC_TARGET_ARCH == 100
+__device__ __forceinline__ void ihc_tmem_fence_before_sync() {
+  asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+}
+
+__device__ __forceinline__ void ihc_tmem_fence_after_sync() {
+  asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+}
+
+template <int BK, int Parts>
+struct IhcPostPreUmmaStorage {
+  using LA = decltype(cute::tile_to_shape(cute::UMMA::Layout_K_SW128_Atom<cute::bfloat16_t>{},
+                                          cute::Shape<cute::_64, cute::Int<BK>>{}));
+  using LB = decltype(cute::tile_to_shape(cute::UMMA::Layout_K_SW128_Atom<cute::bfloat16_t>{},
+                                          cute::Shape<cute::Int<8 * Parts>, cute::Int<BK>>{}));
+  __align__(1024) __nv_bfloat16 a[2][cute::cosize_v<LA>];
+  __align__(1024) __nv_bfloat16 b[2][cute::cosize_v<LB>];
+  __align__(8) uint64_t barrier[2];
+  uint32_t tmem;
+  float sq[64];
+  float projection[64][8];
+  float normsum[64];
+  __align__(16) float gate[64][4];
+};
+
+// M64 accumulators use half the TMEM datapaths. Interleave independent
+// accumulators across both halves to shorten the FP32 summation chains.
+template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, bool kUsePDL,
+          bool kFuseRmsNorm, bool kCastBfloatForNorm, bool kWeightsAligned, int kAccumulatorGroups>
+__global__ void __maxnreg__(64)
+    fuse_ihc_post_pre_kernel(__nv_bfloat16* y, __nv_bfloat16* z, float* hp, const __nv_bfloat16* xa,
+                             const __nv_bfloat16* residual, const float* hi, const float* w,
+                             const float* scale, const float* bias, int m, float norm_eps,
+                             float eps, float magnitude, const __nv_bfloat16* gamma,
+                             float rms_eps) {
+  static_assert((kHiddenDim == 4096 || kHiddenDim == 6144) && kHCMult == 4 &&
+                    kElementsPerThread == 8 && kThreadsPerBlock == 256 && kWeightsAligned,
+                "supported UMMA layout");
+  static_assert(!kFuseRmsNorm || kCastBfloatForNorm, "RMSNorm requires BF16 intermediate");
+  static_assert(kAccumulatorGroups == 8, "supported TMEM layout");
+  constexpr int D = kHiddenDim, BK = 128, Parts = 3, Blocks = 8, Groups = kAccumulatorGroups;
+  constexpr bool Norm = kFuseRmsNorm;
+  constexpr int T = 256, E = 8, Vecs = BK / E, RowsPerThread = 64 * Vecs / T;
+  constexpr int Columns = 128;
+  using Storage = IhcPostPreUmmaStorage<BK, Parts>;
+  using LA = typename Storage::LA;
+  using LB = typename Storage::LB;
+  using MMA = cute::SM100_MMA_F16BF16_SS<cute::bfloat16_t, cute::bfloat16_t, float, 64, 8 * Parts,
+                                         cute::UMMA::Major::K, cute::UMMA::Major::K>;
+  extern __shared__ __align__(1024) unsigned char storage[];
+  auto& s = *reinterpret_cast<Storage*>(storage);
+  auto cluster = cooperative_groups::this_cluster();
+  const int rank = cluster.block_rank();
+  constexpr int Slice = D / Blocks;
+  const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, base = (blockIdx.x / Blocks) * 64;
+  const int valid = min(64, m - base);
+  if constexpr (kUsePDL) cudaGridDependencySynchronize();
+  if (tid < 32) {
+    cute::TMEM::Allocator1Sm alloc;
+    alloc.allocate(Columns, &s.tmem);
+    alloc.release_allocation_lock();
+    ihc_tmem_fence_before_sync();
+  }
+  if (tid == 0) {
+    cutlass::arch::ClusterBarrier::init(&s.barrier[0], 1);
+    cutlass::arch::ClusterBarrier::init(&s.barrier[1], 1);
+  }
+  float sq[RowsPerThread] = {};
+  __syncthreads();
+  ihc_tmem_fence_after_sync();
+  using LDA = cute::ComposedLayout<
+      cute::Swizzle<3, 4, 3>, cute::smem_ptr_flag_bits<16>,
+      cute::Layout<cute::Shape<cute::_64, cute::_64>, cute::Stride<cute::_64, cute::_1>>>;
+  using LDB = cute::ComposedLayout<cute::Swizzle<3, 4, 3>, cute::smem_ptr_flag_bits<16>,
+                                   cute::Layout<cute::Shape<cute::Int<8 * Parts>, cute::_64>,
+                                                cute::Stride<cute::_64, cute::_1>>>;
+  auto ta =
+      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[0])), LDA{});
+  auto tb =
+      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[0])), LDB{});
+  const uint64_t ad = cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(ta);
+  const uint64_t bd = cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(tb);
+  const auto id =
+      cute::UMMA::make_runtime_instr_desc<cute::bfloat16_t, cute::bfloat16_t, float, 64, 8 * Parts,
+                                          cute::UMMA::Major::K, cute::UMMA::Major::K>();
+  int phase[2] = {0, 0};
+  constexpr int TilesPerChannel = Slice / BK;
+  // Keep each XA tile hot while visiting all channels for D6144.
+#pragma unroll 1
+  for (int outer = 0; outer < (D == 6144 ? TilesPerChannel : 4); ++outer) {
+#pragma unroll 1
+    for (int inner = 0; inner < (D == 6144 ? 4 : TilesPerChannel); ++inner) {
+      const int ch = D == 6144 ? inner : outer;
+      const int k0 = (D == 6144 ? outer : inner) * BK;
+      const int tile = D == 6144 ? outer * 4 + inner : outer * TilesPerChannel + inner;
+      const int slot = tile & 1;
+      if (tile >= 2) {
+        if (tid < 32) cutlass::arch::ClusterBarrier::wait(&s.barrier[slot], phase[slot]);
+        phase[slot] ^= 1;
+        __syncthreads();
+      }
+#pragma unroll
+      for (int j = 0; j < RowsPerThread; ++j) {
+        const int idx = j * T + tid, row = idx / Vecs, k = (idx % Vecs) * E,
+                  col = rank * Slice + k0 + k;
+        vec_t<__nv_bfloat16, E> bf{};
+        if (row < valid) {
+          const auto a = to<float>(load<__nv_bfloat16, E>(xa + int64_t(base + row) * D + col));
+          const auto b = to<float>(
+              load<__nv_bfloat16, E>(residual + int64_t(base + row) * 4 * D + ch * D + col));
+          const float h = hi[(base + row) * 4 + ch];
+          vec_t<float, E> v;
+          auto* v2 = reinterpret_cast<float2*>(&v[0]);
+          const auto* a2 = reinterpret_cast<const float2*>(&a[0]);
+          const auto* b2 = reinterpret_cast<const float2*>(&b[0]);
+#pragma unroll
+          for (int q = 0; q < E / 2; ++q) v2[q] = ihc_fma2(make_float2(h, h), a2[q], b2[q]);
+          bf = to<__nv_bfloat16>(v);
+          store(y + int64_t(base + row) * 4 * D + ch * D + col, bf);
+          v = to<float>(bf);
+#pragma unroll
+          for (int q = 0; q < E; ++q) sq[j] += v[q] * v[q];
+        }
+        store(s.a[slot] + cute::Swizzle<3, 4, 3>{}(LA{}.layout_b()(row, k) * 2) / 2, bf);
+      }
+      // Preserve the FP32 weight residuals in separate BF16 projection terms.
+      for (int idx = tid; idx < 8 * Vecs; idx += T) {
+        const int p = idx / Vecs, k = (idx % Vecs) * E;
+        auto ww = ihc_load_weight8<true>(w + int64_t(p) * 4 * D + ch * D + rank * Slice + k0 + k);
+#pragma unroll
+        for (int part = 0; part < Parts; ++part) {
+          const auto bf = to<__nv_bfloat16>(ww);
+          store(s.b[slot] + cute::Swizzle<3, 4, 3>{}(LB{}.layout_b()(part * 8 + p, k) * 2) / 2, bf);
+          const auto rounded = to<float>(bf);
+#pragma unroll
+          for (int q = 0; q < E; ++q) ww[q] -= rounded[q];
+        }
+      }
+      cutlass::arch::fence_view_async_shared();
+      __syncthreads();
+      if (tid < 32) {
+#pragma unroll
+        for (int k = 0; k < BK; k += 16)
+          MMA::fma(ad + (sizeof(s.a[0]) / 16) * slot + LA{}.layout_b()(0, k) / 8,
+                   bd + (sizeof(s.b[0]) / 16) * slot + LB{}.layout_b()(0, k) / 8,
+                   s.tmem + ((tile % Groups) / 2) * (8 * Parts) + (((tile % Groups) & 1) << 20),
+                   (tile >= Groups || k != 0), id);
+        cutlass::arch::umma_arrive(&s.barrier[slot]);
+      }
+      __syncthreads();
+    }
+  }
+  if (tid < 32) {
+    for (int slot = 0; slot < 2; ++slot)
+      cutlass::arch::ClusterBarrier::wait(&s.barrier[slot], phase[slot]);
+    ihc_tmem_fence_before_sync();
+  }
+  __syncthreads();
+  ihc_tmem_fence_after_sync();
+#pragma unroll
+  for (int j = 0; j < RowsPerThread; ++j) {
+    constexpr int Width = Vecs < 32 ? Vecs : 32;
+    float total = sq[j];
+#pragma unroll
+    for (int mask = Width / 2; mask > 0; mask /= 2)
+      total += __shfl_xor_sync(0xffffffff, total, mask);
+    if (tid % Vecs == 0) s.sq[(j * T + tid) / Vecs] = total;
+    if constexpr (Vecs > 32) {
+      if (tid % Vecs == 32) s.gate[(j * T + tid) / Vecs][0] = total;
+    }
+  }
+  __syncthreads();
+  if constexpr (Vecs > 32) {
+    if (tid < 64) s.sq[tid] += s.gate[tid][0];
+    __syncthreads();
+  }
+  if (tid < 128) {
+    float projection[8] = {};
+#pragma unroll
+    for (int group = 0; group < Groups / 2; ++group) {
+      float partial[8] = {};
+#pragma unroll
+      for (int part = Parts - 1; part >= 0; --part) {
+        uint32_t v[8];
+        cute::SM100_TMEM_LOAD_32dp32b8x::copy(
+            s.tmem + (warp * 32 << 16) + group * (8 * Parts) + part * 8, v[0], v[1], v[2], v[3],
+            v[4], v[5], v[6], v[7]);
+        cutlass::arch::fence_view_async_tmem_load();
+#pragma unroll
+        for (int p = 0; p < 8; ++p) partial[p] += __uint_as_float(v[p]);
+      }
+#pragma unroll
+      for (int p = 0; p < 8; ++p) projection[p] += partial[p];
+    }
+#pragma unroll
+    for (int p = 0; p < 8; ++p) projection[p] += __shfl_xor_sync(0xffffffff, projection[p], 16);
+    const int row = warp * 16 + lane;
+    if (lane < 16) {
+#pragma unroll
+      for (int p = 0; p < 8; ++p) s.projection[row][p] = projection[p];
+    }
+    ihc_tmem_fence_before_sync();
+  }
+  __syncthreads();
+  if (tid < 32) {
+    ihc_tmem_fence_after_sync();
+    cute::TMEM::Allocator1Sm alloc;
+    alloc.free(s.tmem, Columns);
+  }
+  cluster.sync();
+  if (rank == 0 && tid < valid) {
+    float projection[8] = {}, total = 0;
+#pragma unroll
+    for (int b = 0; b < Blocks; ++b) {
+      const auto* remote = cluster.map_shared_rank(&s, b);
+      total += remote->sq[tid];
+#pragma unroll
+      for (int p = 0; p < 8; ++p) projection[p] += remote->projection[tid][p];
+    }
+    const float inv = rsqrtf_ftz(total * (1.f / (4 * D)) + norm_eps);
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+      s.gate[tid][p] = sigmoid(scale[0] * (projection[p] * inv) + bias[p]) + eps;
+      hp[(base + tid) * 4 + p] =
+          magnitude * sigmoid(scale[1] * (projection[p + 4] * inv) + bias[p + 4]) + eps;
+    }
+  }
+  cluster.sync();
+  const auto* root = cluster.map_shared_rank(&s, 0);
+#pragma unroll 1
+  for (int row = warp; row < valid; row += 8) {
+    constexpr int Chunks = Slice / (32 * E);
+    const auto gates = load<float, 4>(&root->gate[row][0]);
+    float total = 0;
+#pragma unroll
+    for (int chunk = 0; chunk < Chunks; ++chunk) {
+      const int col = rank * Slice + (chunk * 32 + lane) * E;
+      vec_t<float, E> v{};
+      auto* v2 = reinterpret_cast<float2*>(&v[0]);
+#pragma unroll
+      for (int p = 0; p < 4; ++p) {
+        const auto in =
+            to<float>(load<__nv_bfloat16, E>(y + int64_t(base + row) * 4 * D + p * D + col));
+        const auto* in2 = reinterpret_cast<const float2*>(&in[0]);
+#pragma unroll
+        for (int q = 0; q < E / 2; ++q)
+          v2[q] = ihc_fma2(make_float2(gates[p], gates[p]), in2[q], v2[q]);
+      }
+      const auto bf = to<__nv_bfloat162>(v);
+      store(z + int64_t(base + row) * D + col, bf);
+      if constexpr (Norm) {
+        v = to<float>(bf);
+#pragma unroll
+        for (int q = 0; q < E; ++q) total += v[q] * v[q];
+      }
+    }
+    if constexpr (Norm) {
+      total = warp_reduce_sum_xor(total);
+      if (lane == 0) s.normsum[row] = total;
+    }
+  }
+  if constexpr (Norm) {
+    cluster.sync();
+    if (rank == 0 && tid < valid) {
+      float total = 0;
+#pragma unroll
+      for (int b = 0; b < Blocks; ++b) total += cluster.map_shared_rank(&s, b)->normsum[tid];
+      s.normsum[tid] = rsqrtf_ftz(total * (1.f / D) + rms_eps);
+    }
+    cluster.sync();
+#pragma unroll 1
+    for (int row = warp; row < valid; row += 8) {
+      const float inv = root->normsum[row];
+#pragma unroll
+      for (int chunk = 0; chunk < Slice / (32 * E); ++chunk) {
+        const int col = rank * Slice + (chunk * 32 + lane) * E;
+        auto v = to<float>(load<__nv_bfloat16, E>(z + int64_t(base + row) * D + col));
+        const auto g = to<float>(load<__nv_bfloat16, E>(gamma + col));
+        auto* v2 = reinterpret_cast<float2*>(&v[0]);
+        const auto* g2 = reinterpret_cast<const float2*>(&g[0]);
+#pragma unroll
+        for (int q = 0; q < E / 2; ++q)
+          v2[q] = ihc_mul2(ihc_mul2(v2[q], make_float2(inv, inv)), g2[q]);
+        store(z + int64_t(base + row) * D + col, to<__nv_bfloat16>(v));
+      }
+    }
+  }
+  cluster.sync();
+
+  if constexpr (kUsePDL) cudaTriggerProgrammaticLaunchCompletion();
+}
+
+// WG0 produces rounded Y; WG1/2 project four outputs each. The shared Y
+// remains live until the fused mixing and optional normalization complete.
+struct IhcPostPreThreeWarpGroups {};
+
+template <int D>
+struct IhcPostPreThreeWarpStorage {
+  __align__(16) __nv_bfloat16 y[1][4][D];
+  float part[1][9][4];
+  float gates[1][4];
+  float norm[1][4];
+  float rn[1];
+};
+
+template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, bool kUsePDL,
+          bool kFuseRmsNorm, bool kCastBfloatForNorm, bool kWeightsAligned, typename Layout>
+__global__ void __launch_bounds__(384, kHiddenDim == 6144 ? 1 : 2)
+    fuse_ihc_post_pre_kernel(__nv_bfloat16* y, __nv_bfloat16* z, float* hp, const __nv_bfloat16* xa,
+                             const __nv_bfloat16* res, const float* hi, const float* w,
+                             const float* scale, const float* bias, int m, float norm_eps,
+                             float hc_eps, float magnitude, const __nv_bfloat16* gamma,
+                             float rms_eps) {
+  static_assert(std::is_same_v<Layout, IhcPostPreThreeWarpGroups>, "supported warp layout");
+  static_assert(
+      kHCMult == 4 && kElementsPerThread == 8 && kThreadsPerBlock == 384 && kWeightsAligned,
+      "supported three-warp-group layout");
+  static_assert(!kFuseRmsNorm || kCastBfloatForNorm, "RMSNorm requires BF16 intermediate");
+  if constexpr (kHiddenDim == 6144) {
+    ihc_post_pre_retained_device<6144, 384, kFuseRmsNorm, kCastBfloatForNorm, kUsePDL,
+                                 kWeightsAligned, true>(
+        y, z, hp, xa, res, hi, w, scale, bias, m, norm_eps, hc_eps, magnitude, gamma, rms_eps);
+  } else {
+    static_assert(kHiddenDim == 4096, "supported hidden dimension");
+    constexpr int D = kHiddenDim, Rows = 1;
+    constexpr bool Norm = kFuseRmsNorm;
+    constexpr int T = 128, E = 8, C = D / (T * E);
+    extern __shared__ __align__(16) unsigned char three_warp_storage[];
+    auto& s = *reinterpret_cast<IhcPostPreThreeWarpStorage<D>*>(three_warp_storage);
+    const int wg = threadIdx.x / T, tid = threadIdx.x % T;
+    const int lane = tid % 32, warp = tid / 32;
+    const int base = blockIdx.x * Rows;
+    const int valid = min(Rows, m - base);
+    if constexpr (kUsePDL) cudaGridDependencySynchronize();
+    if (wg == 0) {
+      float sq[Rows] = {};
+#pragma unroll 1
+      for (int ch = 0; ch < C; ++ch) {
+        const int col = (ch * T + tid) * E;
+        vec_t<float, E> a[Rows];
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+          if (r < valid) a[r] = to<float>(load<__nv_bfloat16, E>(xa + int64_t(base + r) * D + col));
+        }
+#pragma unroll 1
+        for (int c = 0; c < 4; ++c) {
+#pragma unroll
+          for (int r = 0; r < Rows; ++r) {
+            if (r < valid) {
+              const int64_t flat = int64_t(base + r) * 4 * D + c * D + col;
+              const auto b = to<float>(load<__nv_bfloat16, E>(res + flat));
+              const float h = hi[(base + r) * 4 + c];
+              vec_t<float, E> v;
+              auto* v2 = reinterpret_cast<float2*>(&v[0]);
+              const auto* a2 = reinterpret_cast<const float2*>(&a[r][0]);
+              const auto* b2 = reinterpret_cast<const float2*>(&b[0]);
+#pragma unroll
+              for (int j = 0; j < E / 2; ++j) v2[j] = ihc_fma2(make_float2(h, h), a2[j], b2[j]);
+              const auto bf = to<__nv_bfloat16>(v);
+              store(y + flat, bf);
+              store(&s.y[r][c][col], bf);
+              const auto rounded = to<float>(bf);
+#pragma unroll
+              for (int j = 0; j < E; ++j) sq[r] += rounded[j] * rounded[j];
+            }
+          }
+        }
+        asm volatile("barrier.sync 1, 384;" ::: "memory");
+      }
+#pragma unroll
+      for (int r = 0; r < Rows; ++r) {
+        const float sum = warp_reduce_sum_xor(sq[r]);
+        if (lane == 0) s.part[r][8][warp] = sum;
+      }
+    } else {
+      float dot[Rows][4] = {};
+#pragma unroll 1
+      for (int ch = 0; ch < C; ++ch) {
+        const int col = (ch * T + tid) * E;
+        asm volatile("barrier.sync 1, 384;" ::: "memory");
+#pragma unroll 1
+        for (int c = 0; c < 4; ++c) {
+          vec_t<float, E> v[Rows];
+#pragma unroll
+          for (int r = 0; r < Rows; ++r)
+            if (r < valid) v[r] = to<float>(load<__nv_bfloat16, E>(&s.y[r][c][col]));
+#pragma unroll
+          for (int p = 0; p < 4; ++p) {
+            const int proj = (wg - 1) * 4 + p;
+            const float* wp = w + int64_t(proj) * 4 * D + c * D + col;
+            const auto weights = ihc_load_weight8<true>(wp);
+#pragma unroll
+            for (int r = 0; r < Rows; ++r) {
+              if (r < valid) {
+#pragma unroll
+                for (int j = 0; j < E; ++j) dot[r][p] += v[r][j] * weights[j];
+              }
+            }
+          }
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < Rows; ++r) {
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+          const float sum = warp_reduce_sum_xor(dot[r][p]);
+          if (lane == 0) s.part[r][(wg - 1) * 4 + p][warp] = sum;
+        }
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x < Rows * 4) {
+      const int r = threadIdx.x / 4, i = threadIdx.x % 4;
+      if (r < valid) {
+        float pre = 0, post = 0, sq = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          pre += s.part[r][i][k];
+          post += s.part[r][i + 4][k];
+          sq += s.part[r][8][k];
+        }
+        const float inv = rsqrtf_ftz(sq * (1.f / (4 * D)) + norm_eps);
+        s.gates[r][i] = sigmoid(scale[0] * (pre * inv) + bias[i]) + hc_eps;
+        hp[(base + r) * 4 + i] =
+            magnitude * sigmoid(scale[1] * (post * inv) + bias[i + 4]) + hc_eps;
+      }
+    }
+    __syncthreads();
+#pragma unroll 1
+    for (int wave = 0; wave < (Rows + 2) / 3; ++wave) {
+      const int r = wave * 3 + wg;
+      const bool active = r < valid;
+      vec_t<__nv_bfloat16, E> saved[C];
+      float sq = 0;
+      if (active) {
+#pragma unroll
+        for (int ch = 0; ch < C; ++ch) {
+          const int col = (ch * T + tid) * E;
+          vec_t<float, E> out = {};
+#pragma unroll
+          for (int c = 0; c < 4; ++c) {
+            const auto v = to<float>(load<__nv_bfloat16, E>(&s.y[r][c][col]));
+            auto* o2 = reinterpret_cast<float2*>(&out[0]);
+            const auto* v2 = reinterpret_cast<const float2*>(&v[0]);
+#pragma unroll
+            for (int j = 0; j < E / 2; ++j)
+              o2[j] = ihc_fma2(make_float2(s.gates[r][c], s.gates[r][c]), v2[j], o2[j]);
+          }
+          saved[ch] = to<__nv_bfloat16>(out);
+          if constexpr (Norm) {
+            out = to<float>(saved[ch]);
+#pragma unroll
+            for (int j = 0; j < E; ++j) sq += out[j] * out[j];
+          } else {
+            store(z + int64_t(base + r) * D + col, saved[ch]);
+          }
+        }
+      }
+      if constexpr (Norm) {
+        const float sum = warp_reduce_sum_xor(sq);
+        if (lane == 0 && r < Rows) s.norm[r][warp] = sum;
+        __syncthreads();
+        if (active) {
+          float total = 0;
+#pragma unroll
+          for (int k = 0; k < 4; ++k) total += s.norm[r][k];
+          const float inv = rsqrtf_ftz(total * (1.f / D) + rms_eps);
+#pragma unroll
+          for (int ch = 0; ch < C; ++ch) {
+            const int col = (ch * T + tid) * E;
+            const auto g = to<float>(load<__nv_bfloat16, E>(gamma + col));
+            auto out = to<float>(saved[ch]);
+            auto* o2 = reinterpret_cast<float2*>(&out[0]);
+            const auto* g2 = reinterpret_cast<const float2*>(&g[0]);
+#pragma unroll
+            for (int j = 0; j < E / 2; ++j)
+              o2[j] = ihc_mul2(ihc_mul2(o2[j], make_float2(inv, inv)), g2[j]);
+            store(z + int64_t(base + r) * D + col, to<__nv_bfloat16>(out));
+          }
+        }
+      }
+    }
+    if constexpr (kUsePDL) cudaTriggerProgrammaticLaunchCompletion();
+  }
+}
+
+#endif  // HPC_TARGET_ARCH == 100
 
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock,
           bool kUsePDL = false>
@@ -1488,6 +1999,64 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
                                      float norm_eps, float hc_eps, float magnitude,
                                      const __nv_bfloat16* rms_weight_ptr, float rms_eps) {
   constexpr int kThreads = 256;
+  const bool weights_aligned = (reinterpret_cast<uintptr_t>(w_ptr) & 31) == 0;
+#if HPC_TARGET_ARCH == 100
+  if constexpr (kUsePDL && (!kFuseRmsNorm || kCastBfloatForNorm)) {
+    if (num_batch >= 8192 && weights_aligned) {
+      auto kernel = kernels::fuse_ihc_post_pre_kernel<4, kHiddenDim, 8, kThreads, kUsePDL,
+                                                      kFuseRmsNorm, kCastBfloatForNorm, true, 8>;
+      constexpr size_t kShared = sizeof(kernels::IhcPostPreUmmaStorage<128, 3>);
+      const cudaError_t setup =
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+      if (setup != cudaSuccess) return setup;
+      cudaLaunchConfig_t umma_config{};
+      umma_config.gridDim = dim3(((num_batch + 63) / 64) * 8);
+      umma_config.blockDim = dim3(kThreads);
+      umma_config.dynamicSmemBytes = kShared;
+      umma_config.stream = stream;
+      cudaLaunchAttribute umma_attrs[2]{};
+      umma_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      umma_attrs[0].val.programmaticStreamSerializationAllowed = 1;
+      umma_attrs[1].id = cudaLaunchAttributeClusterDimension;
+      umma_attrs[1].val.clusterDim.x = 8;
+      umma_attrs[1].val.clusterDim.y = 1;
+      umma_attrs[1].val.clusterDim.z = 1;
+      umma_config.attrs = umma_attrs;
+      umma_config.numAttrs = 2;
+      return cudaLaunchKernelEx(&umma_config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr,
+                                residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
+    }
+    if constexpr (kHiddenDim == 6144 || !kFuseRmsNorm) {
+      constexpr int kThreeWarpMin = kHiddenDim == 6144 ? 80 : 149;
+      if (num_batch >= kThreeWarpMin && num_batch <= 296 && weights_aligned) {
+        auto kernel = kernels::fuse_ihc_post_pre_kernel<4, kHiddenDim, 8, 384, kUsePDL,
+                                                        kFuseRmsNorm, kCastBfloatForNorm, true,
+                                                        kernels::IhcPostPreThreeWarpGroups>;
+        constexpr size_t kShared =
+            kHiddenDim == 4096 ? sizeof(kernels::IhcPostPreThreeWarpStorage<4096>) : 0;
+        if constexpr (kShared > 0) {
+          const cudaError_t setup =
+              cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+          if (setup != cudaSuccess) return setup;
+        }
+        cudaLaunchConfig_t three_warp_config{};
+        three_warp_config.gridDim = dim3(num_batch);
+        three_warp_config.blockDim = dim3(384);
+        three_warp_config.dynamicSmemBytes = kShared;
+        three_warp_config.stream = stream;
+        cudaLaunchAttribute attr{};
+        attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr.val.programmaticStreamSerializationAllowed = 1;
+        three_warp_config.attrs = &attr;
+        three_warp_config.numAttrs = 1;
+        return cudaLaunchKernelEx(&three_warp_config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr,
+                                  residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                  num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
+      }
+    }
+  }
+#endif
   cudaLaunchConfig_t config{};
   config.stream = stream;
   config.gridDim = dim3(num_batch);
@@ -1519,7 +2088,6 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
   attr.val.clusterDim.y = 1;
   attr.val.clusterDim.z = 1;
 #endif
-  const bool weights_aligned = (reinterpret_cast<uintptr_t>(w_ptr) & 31) == 0;
   auto launch = [&](auto aligned_tag) {
     constexpr bool kWeightsAligned = decltype(aligned_tag)::value;
     auto kernel =

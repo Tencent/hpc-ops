@@ -85,7 +85,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
       acc_sqsum += x2[j].y * x2[j].y;
     }
 
-  // x is in registers; walk the projection rows against it.
+    // x is in registers; walk the projection rows against it.
 #pragma unroll
     for (int c = 0; c < kProjRows; ++c) {
       constexpr int kHalf = kElementsPerThread / 2;
@@ -129,8 +129,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     for (int w = 0; w < kWarpsPerBlock; ++w) {
       sum += smem[threadIdx.x][w];
     }
-  // Slot is [sqrsum, mix...]; smem holds [mix..., sqrsum].
-  const int out_idx = (threadIdx.x == kProjRows) ? 0 : static_cast<int>(threadIdx.x) + 1;
+    // Slot is [sqrsum, mix...]; smem holds [mix..., sqrsum].
+    const int out_idx = (threadIdx.x == kProjRows) ? 0 : static_cast<int>(threadIdx.x) + 1;
     slot[out_idx] = sum;
   }
 
@@ -196,8 +196,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   const float rms_scale = rsqrtf_ftz(smem_reduced[0] * kInvHCDim + norm_eps);
   if (threadIdx.x < kHCMult) {
     const int i = threadIdx.x;
-  // smem_reduced is [sqrsum, mix...]: pre logits at 1+i, post at 1+hc+i.
-  const float mixes_pre = smem_reduced[1 + i] * rms_scale;
+    // smem_reduced is [sqrsum, mix...]: pre logits at 1+i, post at 1+hc+i.
+    const float mixes_pre = smem_reduced[1 + i] * rms_scale;
     smem_H_pre[i] = sigmoid(hc_scale_ptr[0] * mixes_pre + hc_base_ptr[i]) + hc_eps;
 
     // Compile-time check: head has no hc_scale[1].
