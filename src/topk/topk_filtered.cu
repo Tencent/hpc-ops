@@ -33,6 +33,18 @@ __device__ constexpr uint32_t kFineMasks[NUM_REFINE_ROUNDS] = {0x7FFu, 0x7FFu, 0
 constexpr int THREADS = 512;
 constexpr int MIN_BLOCKS = 3;
 
+// SM120 keeps 1536 resident threads per SM, so only one 1024-thread CTA fits;
+// ptxas rejects a launch-bounds minimum that cannot be resident.
+#if HPC_TARGET_ARCH == 120
+constexpr int MAX_THREADS_PER_SM = 1536;
+#else
+constexpr int MAX_THREADS_PER_SM = 2048;
+#endif
+
+constexpr int resident_min_blocks(int threads, int min_blocks) {
+  return std::min(min_blocks, MAX_THREADS_PER_SM / threads);
+}
+
 // smem candidate capacity per ping-pong slot. The sampled path keeps twice as many
 // because its predicted threshold intentionally admits more than top_k.
 constexpr int COARSE_CANDIDATE_CAPACITY = 2048;
@@ -1480,7 +1492,7 @@ __device__ __forceinline__ bool claim_streaming_row(int tidx, bool first_wave, i
 }
 
 template <int kVecs, int kTopK, int kMinBlocks>
-__global__ void __launch_bounds__(SHORT_THREADS, kMinBlocks)
+__global__ void __launch_bounds__(SHORT_THREADS, resident_min_blocks(SHORT_THREADS, kMinBlocks))
     topk_filtered_row_local_register_kernel(const float* __restrict__ input,
                                             int32_t* __restrict__ output,
                                             const int32_t* __restrict__ ke,
@@ -1642,7 +1654,7 @@ __global__ void __launch_bounds__(SHORT_THREADS, kMinBlocks)
 }
 
 template <uint32_t VEC, int kTopK, bool kBounded, int kMinBlocks, int kMinLength = 0>
-__global__ void __launch_bounds__(SHORT_THREADS, kMinBlocks)
+__global__ void __launch_bounds__(SHORT_THREADS, resident_min_blocks(SHORT_THREADS, kMinBlocks))
     topk_filtered_row_local_streaming_kernel(
         const float* __restrict__ input, int32_t* __restrict__ output,
         const int32_t* __restrict__ ke, int32_t* __restrict__ spill_buffer,
@@ -2261,7 +2273,7 @@ __device__ __noinline__ void run_cluster_unaligned_overflow(RowSmem<kTopK, false
 // definitely selected prefix and the boundary-bin candidates through DSM. The
 // primary alone runs the FP32 refinement rounds.
 template <uint32_t VEC, int kTopK, int kSplits, int kBlockThreads>
-__global__ void __launch_bounds__(kBlockThreads, 2)
+__global__ void __launch_bounds__(kBlockThreads, resident_min_blocks(kBlockThreads, 2))
     topk_filtered_cluster8_exact_kernel(const float* __restrict__ input,
                                         int32_t* __restrict__ output,
                                         const int32_t* __restrict__ ke,
