@@ -52,6 +52,9 @@ int splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
   if (sm_count <= 0) {
     return 0;
   }
+  if (hidden_dim == 3072) {
+    return sm_count * 2 / 3;
+  }
   const float hidden_scale = sqrtf(static_cast<float>(hidden_dim) / kHiddenRef);
   const float fold_scale = fuse_rms_norm ? kFoldScale : 1.0f;
   return static_cast<int>(sm_count * kSmPerBlockRow * hidden_scale * fold_scale);
@@ -115,6 +118,9 @@ int head_splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
   if (sm_count <= 0) {
     return 0;
   }
+  if (hidden_dim == 3072 && !fuse_rms_norm) {
+    return sm_count / 3;
+  }
   const float hidden_scale = static_cast<float>(hidden_dim) / kHiddenRef;
   const float fold_scale = fuse_rms_norm ? kFoldScale : 1.0f;
   return static_cast<int>(sm_count * kSmPerBlockRow * hidden_scale * fold_scale);
@@ -153,7 +159,9 @@ void launch_splitk(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
 
     // RMSNorm requires one block to cover the full hidden row.
     constexpr int kStage2ThreadsHere =
-        kFuseRmsNorm ? kHiddenDim / kElementsPerThread : kStage2Threads;
+        kFuseRmsNorm ? kHiddenDim / kElementsPerThread
+        : kHiddenDim % (kStage2Threads * kElementsPerThread) == 0 ? kStage2Threads
+                                                                   : 192;
     constexpr int kBlockD = kStage2ThreadsHere * kElementsPerThread;
     constexpr int kHiddenBlocks = kHiddenDim / kBlockD;
     static_assert(kStage2ThreadsHere <= 1024, "stage2 block exceeds the CUDA limit");
@@ -224,7 +232,7 @@ bool ihc_pre_splitk_supported(int num_batch, int hc_mult, int hidden_dim, bool f
   if (fuse_rms_norm && hidden_dim / kElementsPerThread > 1024) {
     return false;
   }
-  if (hidden_dim != 4096 && hidden_dim != 6144) {
+  if (hidden_dim != 3072 && hidden_dim != 4096 && hidden_dim != 6144) {
     return false;
   }
   // Check shape before threshold: threshold scales with hidden_dim.
@@ -268,6 +276,8 @@ void fuse_ihc_pre_splitk_async(__nv_bfloat16* output_y_ptr, float* output_H_post
     by_hidden(std::integral_constant<int, 6144>{});
   } else if (hidden_dim == 4096) {
     by_hidden(std::integral_constant<int, 4096>{});
+  } else if (hidden_dim == 3072) {
+    by_hidden(std::integral_constant<int, 3072>{});
   } else {
     return;
   }
@@ -280,7 +290,7 @@ bool ihc_head_splitk_supported(int num_batch, int hc_mult, int hidden_dim, bool 
   if (fuse_rms_norm && hidden_dim / kElementsPerThread > 1024) {
     return false;
   }
-  if (hidden_dim != 4096 && hidden_dim != 6144) {
+  if (hidden_dim != 3072 && hidden_dim != 4096 && hidden_dim != 6144) {
     return false;
   }
   return num_batch > 0 && num_batch < head_splitk_token_threshold(hidden_dim, fuse_rms_norm);
@@ -325,6 +335,8 @@ void fuse_ihc_head_splitk_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* 
     by_hidden(std::integral_constant<int, 6144>{});
   } else if (hidden_dim == 4096) {
     by_hidden(std::integral_constant<int, 4096>{});
+  } else if (hidden_dim == 3072) {
+    by_hidden(std::integral_constant<int, 3072>{});
   } else {
     return;
   }
