@@ -2,6 +2,8 @@
 
 Benchmark blockwise FP8 FusedMoE kernels across HPC-Ops and optional comparison backends.
 
+For the H20 MXFP4/FP8 comparison against Humming, see [W4A8](w4a8/README.md).
+
 ## Overview
 
 - Operator: SM90 blockwise FP8 FusedMoE

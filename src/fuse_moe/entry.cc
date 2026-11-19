@@ -1,18 +1,95 @@
 // Copyright (C) 2026 Tencent.
 
+#include <ATen/MemoryOverlap.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime_api.h>
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <tuple>
 
 #include "src/fuse_moe/fuse_moe.h"
 #include "src/fuse_moe/fuse_moe_cp_async.h"
+#include "src/fuse_moe/fuse_moe_w4a8.h"
 #include "src/utils/utils.h"
 
 namespace hpc {
 namespace fuse_moe {
+
+torch::Tensor fuse_moe_w4a8_entry(const torch::Tensor &x, const torch::Tensor &w13,
+                                  const torch::Tensor &s13, const torch::Tensor &ss13,
+                                  const torch::Tensor &w2, const torch::Tensor &s2,
+                                  const torch::Tensor &ss2, const torch::Tensor &topk_ids,
+                                  const torch::Tensor &topk_weights,
+                                  std::optional<torch::Tensor> output) {
+  const torch::Tensor inputs[] = {x, w13, s13, ss13, w2, s2, ss2, topk_ids, topk_weights};
+  for (const auto &tensor : inputs) {
+    TORCH_CHECK(tensor.is_cuda() && tensor.device() == x.device() && tensor.is_contiguous(),
+                "all inputs must be contiguous tensors on the same CUDA device");
+  }
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(1) == 2048,
+              "x must be BF16 [M,2048]");
+  TORCH_CHECK(w13.scalar_type() == at::kInt && w2.scalar_type() == at::kInt,
+              "packed weights must be int32");
+  TORCH_CHECK(s13.scalar_type() == at::kByte && s2.scalar_type() == at::kByte,
+              "relative weight scales must be uint8");
+  TORCH_CHECK(ss13.scalar_type() == at::kFloat && ss2.scalar_type() == at::kFloat &&
+                  topk_weights.scalar_type() == at::kFloat,
+              "common weight and Top-K scales must be FP32");
+  TORCH_CHECK(w13.sizes() == at::IntArrayRef({256, 32, 8192}) &&
+                  w2.sizes() == at::IntArrayRef({256, 8, 16384}),
+              "packed weights must have E256/H2048/I512 native packed-K shapes");
+  TORCH_CHECK(s13.sizes() == at::IntArrayRef({256, 64, 1024}) &&
+                  s2.sizes() == at::IntArrayRef({256, 16, 2048}) &&
+                  ss13.sizes() == at::IntArrayRef({256}) && ss2.sizes() == at::IntArrayRef({256}),
+              "weight scales must have E256/H2048/I512 prepared shapes");
+  TORCH_CHECK(topk_ids.scalar_type() == at::kInt && topk_ids.dim() == 2 &&
+                  topk_ids.size(0) == x.size(0) && topk_ids.size(1) >= 1 && topk_ids.size(1) <= 8 &&
+                  topk_weights.sizes() == topk_ids.sizes(),
+              "Top-K tensors must have shape [M,K], 1<=K<=8, with int32 IDs");
+  const int top_k = static_cast<int>(topk_ids.size(1));
+  TORCH_CHECK(x.size(0) <= std::numeric_limits<int>::max() / 2048 / top_k,
+              "expanded output element offsets must fit int32");
+  for (const auto &tensor : {x, w13, s13, w2, s2}) {
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(tensor.const_data_ptr()) % 16 == 0,
+                "vectorized input and weight storage must be 16-byte aligned");
+  }
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  torch::Tensor y = output.has_value()
+                        ? output.value()
+                        : torch::empty({x.size(0), 2048}, x.options().dtype(at::kBFloat16));
+  TORCH_CHECK(y.device() == x.device() && y.scalar_type() == at::kBFloat16 && y.is_contiguous() &&
+                  y.sizes() == x.sizes(),
+              "output must be contiguous BF16 [M,2048] on the input device");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(y.const_data_ptr()) % 16 == 0,
+              "output must be 16-byte aligned");
+  if (output.has_value()) {
+    for (const auto &tensor : inputs) at::assert_no_overlap(y, tensor);
+  }
+  const int num_seq = static_cast<int>(x.size(0));
+  if (num_seq == 0) return y;
+  std::size_t workspace_size = 0;
+  HPC_ARCH_DISPATCH("fuse_moe_w4a8", 90,
+                    workspace_size = fuse_moe_w4a8_workspace_size(num_seq, top_k));
+  auto workspace =
+      torch::empty({static_cast<int64_t>(workspace_size)}, x.options().dtype(at::kByte));
+  auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
+  bool launched = false;
+  HPC_ARCH_DISPATCH(
+      "fuse_moe_w4a8", 90,
+      launched = fuse_moe_w4a8_async(y.mutable_data_ptr(), x.const_data_ptr(), w13.const_data_ptr(),
+                                     s13.const_data_ptr<uint8_t>(), ss13.const_data_ptr<float>(),
+                                     w2.const_data_ptr(), s2.const_data_ptr<uint8_t>(),
+                                     ss2.const_data_ptr<float>(), topk_ids.const_data_ptr<int>(),
+                                     topk_weights.const_data_ptr<float>(),
+                                     workspace.mutable_data_ptr(), num_seq, top_k, stream));
+  TORCH_CHECK(launched, "fuse_moe_w4a8 launch failed");
+  return y;
+}
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor>
@@ -652,6 +729,10 @@ torch::Tensor fuse_moe_blockwise_entry(
 }  // namespace hpc
 
 TORCH_LIBRARY_FRAGMENT(hpc, m) {
+  m.def(
+      "fuse_moe_w4a8(Tensor x, Tensor w13, Tensor s13, Tensor ss13, Tensor w2, Tensor s2, "
+      "Tensor ss2, Tensor topk_ids, Tensor topk_weights, Tensor(a!)? output=None) -> Tensor(a!)");
+  m.impl("fuse_moe_w4a8", torch::kCUDA, &hpc::fuse_moe::fuse_moe_w4a8_entry);
   m.def(
       "count_and_gather(Tensor x, Tensor topk_ids, int num_expert, int rank_ep, int "
       "intermediate_size, int num_seq_per_group_avg"

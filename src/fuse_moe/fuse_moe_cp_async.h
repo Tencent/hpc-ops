@@ -12,13 +12,14 @@ namespace fuse_moe_cp_async {
 
 // Count tokens per expert and build auxiliary index arrays for the cp.async path.
 // Optional task maps use int4 {igroup, itile_m, itile_n, 0}; unused entries use igroup = -1.
+// tile_m is the selected GEMM task height: 8, 16, 32, 40, 48, or 64.
 void count_and_build_indices_async(const void *topk_ids_ptr, void *row_indices_ptr,
                                    void *topk_pos_ptr, void *seqlens_ptr, void *cu_seqlens_ptr,
                                    void *tiles_ptr, void *cu_tiles_ptr, void *gateup_task_map_ptr,
                                    void *down_task_map_ptr, int gate_up_num_tile_n,
                                    int down_num_tile_n, int gateup_task_map_len,
                                    int down_task_map_len, int num_seq, int num_topk, int num_expert,
-                                   int eprank, int num_seq_per_group_avg, cudaStream_t stream);
+                                   int eprank, int tile_m, cudaStream_t stream);
 
 // Full fused MoE forward pass using cp.async-based group GEMM kernels.
 void fuse_moe_cp_async(void *output_ptr, const void *input_ptr, void *gate_up_output_ptr,
