@@ -340,7 +340,6 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1)
         }
 
         // tell TMA this stage may be overwritten
-        cutlass::arch::fence_view_async_shared();
         arrive_barrier(shmab_writable[ismem_read]);
 
         ++ismem_read;

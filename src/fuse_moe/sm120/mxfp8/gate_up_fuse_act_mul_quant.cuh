@@ -436,7 +436,6 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1) gate_up_fuse_act_mul_q
         }
 
         // tell TMA this stage may be overwritten
-        cutlass::arch::fence_view_async_shared();
         arrive_barrier(shmab_writable[ismem_read]);
 
         ++ismem_read;
@@ -479,6 +478,8 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1) gate_up_fuse_act_mul_q
           }
         }
       }
+      // Wait for the previous TMA store to read sY before reusing it.
+      tma_store_wait<0>();
       cutlass::arch::NamedBarrier::sync(kNumMmaWarps * 32, 1);
 
 #pragma unroll
@@ -521,10 +522,7 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1) gate_up_fuse_act_mul_q
         auto tYs = btma_y.partition_D(sY);
         cute::copy(tma_y, tYs(_, 0, 0), tYg(_, itile_mg, itile_n));
         tma_store_arrive();
-        tma_store_wait<0>();
       }
-      // Without this some warps race ahead into the next task.
-      cutlass::arch::NamedBarrier::sync(kNumMmaWarps * 32, 1);
 
       // fetch the next task
       wait_barrier(task_readable[istage_task], phase_task);
