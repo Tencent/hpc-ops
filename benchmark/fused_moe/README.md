@@ -2,6 +2,9 @@
 
 Benchmark blockwise FP8 FusedMoE kernels across HPC-Ops and optional comparison backends.
 
+The SM120 fused MoE (MXFP4 and 128-block FP8 checkpoints) has its own benchmark
+against the vLLM MoE backends in [`sm120/`](sm120/README.md).
+
 ## Overview
 
 - Operator: SM90 blockwise FP8 FusedMoE

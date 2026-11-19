@@ -25,8 +25,8 @@ Keep these boundaries intact:
   architecture at the point where it launches. There is no separate dispatch
   layer and no `host.cc`.
 - `.cu` and `.cuh` files contain kernels and device-side implementation.
-- Architecture-specific code lives in `sm<arch>/`; code that works on every
-  supported architecture lives at the operator root. Different architectures may
+- Architecture-specific implementations live in `sm<arch>/`; shared
+  implementations live at the operator root. Different architectures may
   use entirely different algorithms below the common `*_async` signature.
 
 Architecture handling has two stages:
@@ -95,7 +95,7 @@ src/<op>/sm90/<kernel>.cu         sm90 kernels and the sm90 *_async definitions
 src/<op>/sm90/<kernel>.cuh        kernel templates and inline device helpers
 src/<op>/sm90/<variant>/<kernel>.cu   an alternative sm90 implementation path
 src/<op>/sm100/...                an independent architecture implementation
-src/<op>/<kernel>.{cu,cuh}        kernels that work on every architecture, at the operator root
+src/<op>/<kernel>.{cu,cuh}        shared kernels, optionally guarded by HPC_ARCH_IN
 tests/test_<op>.py                correctness and API tests
 benchmark/                        performance reproduction and comparison
 ```
@@ -104,8 +104,8 @@ Only two things justify a directory level: `sm<N>/` marks architecture-specific
 code, and a named subdirectory of the operator root marks a feature with its own
 `*_async` contract (`attention/decode/`). Everything else — including a variant
 implementation strategy — is a file name, or a directory below the `sm<arch>/`
-that chose it. Whether code is architecture-specific is therefore always readable
-off the path: it is, exactly when the path contains an `sm<N>/` component.
+that chose it. Architecture implementations are identified by `sm<N>/` paths;
+shared implementations declare any support limits with `HPC_ARCH_IN`.
 
 There is no `entry.h`: nothing outside `entry.cc` calls the host entry point, and
 the signature the architectures share is the `*_async` one in the header at the
@@ -189,6 +189,13 @@ being built:
    configured source fallback, see below);
 4. any other `sm<N>/` — another architecture's code, not compiled.
 
+Register all operators and import all wrappers on every architecture; do not add
+operator or wrapper allowlists. Keep `entry.cc` common and reject unsupported
+calls, including workspace queries, through dispatch. Guard shared kernels with
+`#if HPC_ARCH_IN((90, 100, 103))` when needed; use `sm<arch>/` for distinct
+implementations. Write matching architecture numbers directly in source guards
+and dispatch calls: dispatch alone does not prevent kernel compilation.
+
 Rule 4 is what makes the directory layout the visibility boundary: in an
 `sm<TARGET>` module, another architecture's `src/<op>/sm<N>/` is not merely
 unreachable, it was never compiled in.
@@ -223,11 +230,8 @@ possible evidence here, so a link belongs in the table only between architecture
 that share an instruction set, and only after the inherited kernels have run on
 the new hardware. Read `CMakeLists.txt` for the links that currently exist.
 
-An implementation that is not portable to every known architecture lives in
-`sm<arch>/` for each architecture it supports; an architecture no operator
-directory covers raises "not implemented" when that operator is called. Where a
-fallback link applies, an operator with the source architecture's directory but
-not the target's is compiled into the target module with the target's own
+For implementations in `sm<arch>/`, a fallback link selects the source
+architecture's directory when the target's is absent, using the target's own
 gencode. Duplicating it into a directory of its own would be two copies to keep
 in step for no gain — the fallback is what the link is for. `entry.cc` still
 needs the `HPC_ARCH_DISPATCH` pair for the target: the fallback decides which
@@ -312,11 +316,18 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 ```
 
 The two pairs say the operator is implemented for sm90 and sm100 and nothing
-else. A real operator's pairs are whatever its `sm<arch>/` directories support.
+else. The support list must match its source directories or `HPC_ARCH_IN` guard.
 
 Each architecture repeats the call expression rather than sharing one, because
 the architectures may not call the same `*_async` — the pair is `<arch>, <expr>`,
 and the expr is free to differ.
+
+When the expression is identical, use the list form; unsupported builds discard
+the call with `if constexpr`:
+
+```cpp
+HPC_ARCH_DISPATCH_ANY("widget", (90, 100), launched = widget_async(...));
+```
 
 `HPC_ARCH_DISPATCH` is one chain: if nothing launched, it raises before any host
 code after it runs. A function with launches in separate branches gets one
@@ -324,8 +335,8 @@ code after it runs. A function with launches in separate branches gets one
 
 An operator whose kernels compile for every architecture in `KNOWN_ARCHS` has
 nothing to choose between: its `*_async` lives at the operator root and every
-module has it, so `entry.cc` calls the async directly. Such an operator has no
-`sm<N>/` directory at all, which is how you recognise one from the tree.
+module has it, so `entry.cc` calls the async directly without an architecture
+guard or dispatch.
 
 Only the pair matching `HPC_TARGET_ARCH` expands to a call; the others expand to
 an unevaluated `sizeof`, so a module never references an implementation it did
@@ -379,9 +390,8 @@ src/gemm/entry.cc:142: undefined reference to
 Without it a MODULE library would link happily and fail at import with nothing
 but "could not load this library". When this fires, check:
 
-1. does `src/<op>/sm<arch>/` exist for the architecture being built? If not, the
-   `HPC_ARCH_DISPATCH` pair for that architecture must go, so the error says
-   "does not run on sm<arch>" instead;
+1. do source selection and any `HPC_ARCH_IN` guard include an implementation
+   for the architecture declared by the dispatch?
 2. is the call inside a dispatch at all? A bare call in `entry.cc` is compiled
    into every module, whether or not the callee was built;
 3. does every subdirectory of the operator cover that architecture?
@@ -456,12 +466,11 @@ examples in documentation must not become a second source of truth.
 2. Add `src/<op>/<kernel>.h` with the `*_async` declarations — the signature every
    architecture will implement.
 3. Add `src/<op>/entry.cc`: the host logic, the `TORCH_LIBRARY_FRAGMENT`, and at
-   each launch site one `HPC_ARCH_DISPATCH` with a pair per architecture you
-   implement. If the kernels compile for every known architecture, call the
-   async directly.
-4. Implement the kernels: at the operator root if the code works on every
-   architecture in `KNOWN_ARCHS`, in `sm<arch>/` otherwise — one directory per
-   architecture it supports.
+   each launch site `HPC_ARCH_DISPATCH_ANY` for a shared expression or
+   `HPC_ARCH_DISPATCH` for different expressions. If the kernels compile for
+   every known architecture, call the async directly.
+4. Keep shared kernels at the operator root, guarded by `HPC_ARCH_IN` when
+   needed; put distinct architecture implementations in `sm<arch>/`.
 5. Add focused correctness and fake-tensor tests under `tests/`.
 6. Build relevant architectures, run focused tests, then format checks.
 
@@ -479,12 +488,12 @@ First classify the change:
   architectures genuinely disagree about it.
 - **Kernel implementation:** update only the architecture directories that should
   change. Do not assume siblings share internals.
-- **Portable behavior:** keep it at the operator root only when it really works
-  on every architecture in `KNOWN_ARCHS`.
+- **Shared behavior:** keep it at the operator root, with an `HPC_ARCH_IN` guard
+  if it supports only some architectures.
 - **Architecture-specific behavior:** add or modify `sm<arch>/`; avoid growing
   large `HPC_TARGET_ARCH` branches in shared code.
-- **Architecture support:** the `HPC_ARCH_DISPATCH` pairs in `entry.cc` change
-  together with the directories.
+- **Architecture support:** keep dispatch lists consistent with source guards
+  and architecture directories.
 - **Cross-operator call:** verify that caller and callee cover the same
   architectures.
 
@@ -497,11 +506,11 @@ build may not compile all changed paths.
 For an operator already present:
 
 1. Determine whether the shared implementation at the operator root covers the
-   architecture. If it does, only the `entry.cc` lists need it.
+   architecture. If it does, update its source guard and dispatch lists, if any.
 2. If not, create `src/<op>/sm<arch>/` implementing the `*_async` declarations
    from the operator root.
 3. Preserve those signatures; they are the cross-architecture contract.
-4. Add an `HPC_ARCH_DISPATCH` pair for `<arch>` at every launch site in `entry.cc`.
+4. Ensure every launch site's dispatch includes `<arch>`.
 5. Build with `SM_ARCH=<arch>` and run focused tests.
 6. When the operator has sub-parts, verify every subdirectory covers it, or the
    link fails.
@@ -515,9 +524,8 @@ For an operator already present:
    `HPC_ARCH_SPECIFIC_ARCHS` in `CMakeLists.txt` for the `a` gencode suffix.
 4. Add a source fallback link only after running the inherited kernels on the new
    hardware. Compiling is not evidence; see "Source fallback".
-5. Add an `sm<arch>/` directory for every operator that should support it, and
-   extend that operator's `entry.cc` lists. An operator whose shared code at the
-   root already covers the architecture only needs the `entry.cc` lines.
+5. For each operator, extend a compatible shared implementation's support lists
+   or add an `sm<arch>/` implementation, keeping its dispatch consistent.
 6. Build it and a multi-architecture set, then check import, module selection,
    dispatch errors, and tests.
 
