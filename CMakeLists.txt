@@ -182,6 +182,14 @@ target_compile_options(
   >
 )
 
+# Preserve the arithmetic mode used to validate the optional warp_decode path.
+# Other hpc-ops kernels keep the target's existing compiler options.
+set_source_files_properties(
+  "${CMAKE_SOURCE_DIR}/src/fuse_moe/sm90/warp_decode/gate_up.cu"
+  "${CMAKE_SOURCE_DIR}/src/fuse_moe/sm90/warp_decode/down.cu"
+  PROPERTIES COMPILE_OPTIONS "--use_fast_math"
+)
+
 target_link_directories(
   ${HPC_MODULE_NAME} PRIVATE
   ${TORCH_LIBRARY_PATHS}

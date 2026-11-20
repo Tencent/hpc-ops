@@ -9,6 +9,7 @@
 
 #include "src/fuse_moe/fuse_moe.h"
 #include "src/fuse_moe/fuse_moe_cp_async.h"
+#include "src/fuse_moe/fuse_moe_warp_decode.h"
 #include "src/utils/utils.h"
 
 namespace hpc {
@@ -271,6 +272,228 @@ torch::Tensor fuse_moe_cp_async_entry(
   return y;
 }
 
+namespace {
+
+constexpr int kWarpDecodeScaleGroup = 128;
+
+bool is_warp_decode_shape(int64_t hidden, int64_t inter, int64_t experts, int64_t topk) {
+  if (experts == 256 && topk == 8) {
+    return (hidden == 2048 || hidden == 3072) && (inter == 256 || inter == 512);
+  }
+  if (experts == 512 && topk == 10) {
+    return (hidden == 2048 && (inter == 256 || inter == 512)) ||
+           (hidden == 4096 && (inter == 128 || inter == 256));
+  }
+  return false;
+}
+
+// Common tensor checks run in the public entries before decode is selected.
+torch::Tensor fuse_moe_pertensor_warp_decode_entry(
+    const torch::Tensor &x, const torch::Tensor &gate_up_weight, const torch::Tensor &down_weight,
+    const torch::Tensor &gate_up_scale, const torch::Tensor &down_scale,
+    const torch::Tensor &act_and_mul_scale, const torch::Tensor &topk_ids,
+    const torch::Tensor &topk_scale, std::optional<torch::Tensor> shared_output, int64_t rank_ep,
+    int64_t num_expert_total, bool use_bf16_mul, std::optional<torch::Tensor> output) {
+  const auto device = x.device();
+  constexpr int64_t hidden = 4096;
+  constexpr int64_t inter = 192;
+  constexpr int64_t topk = 8;
+  const int64_t batch_size = x.size(0);
+  const int64_t local_experts = gate_up_weight.size(0);
+
+  TORCH_CHECK(down_weight.dim() == 3 && topk_scale.dim() == 2,
+              "down_weight must be 3D and topk_scale must be 2D");
+  TORCH_CHECK(gate_up_weight.device() == device && down_weight.device() == device &&
+                  gate_up_scale.device() == device && down_scale.device() == device &&
+                  act_and_mul_scale.device() == device && topk_ids.device() == device &&
+                  topk_scale.device() == device,
+              "all inputs must be on the same CUDA device as x");
+  TORCH_CHECK(act_and_mul_scale.is_contiguous(), "act_and_mul_scale must be contiguous");
+  TORCH_CHECK(local_experts > 0 && num_expert_total % local_experts == 0 && rank_ep >= 0 &&
+                  rank_ep < num_expert_total / local_experts,
+              "rank_ep and local experts must form a valid partition of num_expert_total");
+  TORCH_CHECK(down_weight.size(1) == hidden && down_weight.size(2) == inter,
+              "down_weight shape must be [local_experts, hidden, intermediate]");
+  TORCH_CHECK(gate_up_scale.numel() >= local_experts && down_scale.numel() >= local_experts &&
+                  act_and_mul_scale.numel() >= 1,
+              "projection scales must contain one value per local expert and the activation "
+              "scale must be nonempty");
+  TORCH_CHECK(reinterpret_cast<size_t>(x.const_data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<size_t>(gate_up_weight.const_data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<size_t>(down_weight.const_data_ptr()) % 16 == 0,
+              "x, gate_up_weight and down_weight must be 16-byte aligned");
+
+  const void *shared_ptr = nullptr;
+  if (shared_output.has_value()) {
+    const auto &so = shared_output.value();
+    TORCH_CHECK(so.device() == device, "shared_output must be on the same CUDA device as x");
+    TORCH_CHECK(so.sizes() == x.sizes(), "shared_output shape must match x");
+    shared_ptr = so.const_data_ptr();
+  }
+  if (output.has_value()) {
+    const auto &out = output.value();
+    TORCH_CHECK(out.device() == device, "output must be on the same CUDA device as x");
+    TORCH_CHECK(out.is_contiguous(), "output must be contiguous");
+    TORCH_CHECK(out.dtype() == torch::kBFloat16, "output dtype must be bfloat16");
+    TORCH_CHECK(out.sizes() == x.sizes(), "output shape must match x");
+    for (const auto &input : {x, gate_up_weight, down_weight, gate_up_scale, down_scale,
+                              act_and_mul_scale, topk_ids, topk_scale}) {
+      at::assert_no_overlap(out, input);
+    }
+    if (shared_output.has_value()) {
+      at::assert_no_partial_overlap(out, *shared_output);
+    }
+  }
+
+  const c10::DeviceGuard device_guard(device);
+  const auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
+  auto options = x.options();
+  auto y = output.has_value() ? *output
+                              : torch::empty({batch_size, hidden}, options.dtype(at::kBFloat16));
+  if (batch_size == 0) return y;
+
+  const int expert_start = rank_ep * local_experts;
+  auto buffer = torch::empty({batch_size * topk, inter}, options.dtype(at::kFloat8_e4m3fn));
+  // GEMM scales are per-expert multipliers. The activation scale is instead
+  // multiplied before FP8 conversion; no blockwise amax quantization is used.
+  HPC_ARCH_DISPATCH(
+      "fuse_moe.warp_decode", 90,
+      warp_decode::gate_up_pertensor_async(
+          x.const_data_ptr(), gate_up_weight.const_data_ptr(),
+          gate_up_scale.const_data_ptr<float>(), act_and_mul_scale.const_data_ptr<float>(),
+          topk_ids.const_data_ptr<int>(), buffer.mutable_data_ptr(), batch_size, local_experts,
+          expert_start, use_bf16_mul, stream));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  HPC_ARCH_DISPATCH(
+      "fuse_moe.warp_decode", 90,
+      warp_decode::down_pertensor_async(
+          buffer.const_data_ptr(), down_weight.const_data_ptr(), down_scale.const_data_ptr<float>(),
+          topk_ids.const_data_ptr<int>(), topk_scale.const_data_ptr<float>(), shared_ptr,
+          y.mutable_data_ptr(), batch_size, local_experts, expert_start, stream));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return y;
+}
+
+torch::Tensor fuse_moe_warp_decode_entry(
+    const torch::Tensor &x, const torch::Tensor &x_scale, const torch::Tensor &gate_up_weight,
+    const torch::Tensor &gate_up_weight_scale, const torch::Tensor &down_weight,
+    const torch::Tensor &down_weight_scale, const torch::Tensor &topk_ids,
+    const torch::Tensor &topk_scale, std::optional<torch::Tensor> shared_output, int64_t rank_ep,
+    int64_t num_expert_total, std::optional<torch::Tensor> output) {
+  const auto device = x.device();
+  const int64_t batch_size = x.size(0);
+  const int64_t hidden = x.size(1);
+  const int64_t inter = gate_up_weight.size(1) / 2;
+  const int64_t local_experts = gate_up_weight.size(0);
+  const int64_t topk = topk_ids.size(1);
+  constexpr int q = kWarpDecodeScaleGroup;
+
+  TORCH_CHECK(down_weight.dim() == 3 && topk_scale.dim() == 2,
+              "down_weight must be 3D and topk_scale must be 2D");
+  TORCH_CHECK(x_scale.dtype() == torch::kFloat32, "x_scale dtype must be float32");
+  TORCH_CHECK(x_scale.device() == device && gate_up_weight.device() == device &&
+                  gate_up_weight_scale.device() == device && down_weight.device() == device &&
+                  down_weight_scale.device() == device && topk_ids.device() == device &&
+                  topk_scale.device() == device,
+              "all inputs must be on the same CUDA device as x");
+  TORCH_CHECK(local_experts > 0 && num_expert_total % local_experts == 0 && rank_ep >= 0 &&
+                  rank_ep < num_expert_total / local_experts,
+              "rank_ep and local experts must form a valid partition of num_expert_total");
+  TORCH_CHECK(gate_up_weight.size(1) == 2 * inter && down_weight.size(1) == hidden &&
+                  down_weight.size(2) == inter,
+              "gate_up_weight and down_weight must have shapes [E,2*I,H] and [E,H,I]");
+  TORCH_CHECK(
+      gate_up_weight_scale.size(0) >= local_experts && down_weight_scale.size(0) >= local_experts,
+      "weight scales must contain one block-scale matrix per local expert");
+  TORCH_CHECK(reinterpret_cast<size_t>(x.const_data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<size_t>(gate_up_weight.const_data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<size_t>(down_weight.const_data_ptr()) % 16 == 0,
+              "x, gate_up_weight and down_weight must be 16-byte aligned");
+
+  const void *shared_ptr = nullptr;
+  if (shared_output.has_value()) {
+    const auto &so = shared_output.value();
+    TORCH_CHECK(so.device() == device, "shared_output must be on the same CUDA device as x");
+    TORCH_CHECK(so.sizes() == x.sizes(), "shared_output shape must match x");
+    shared_ptr = so.const_data_ptr();
+  }
+  if (output.has_value()) {
+    const auto &out = output.value();
+    TORCH_CHECK(out.device() == device, "output must be on the same CUDA device as x");
+    TORCH_CHECK(out.is_contiguous(), "output must be contiguous");
+    TORCH_CHECK(out.dtype() == torch::kBFloat16, "output dtype must be bfloat16");
+    TORCH_CHECK(out.sizes() == x.sizes(), "output shape must match x");
+    for (const auto &input : {x, x_scale, gate_up_weight, gate_up_weight_scale, down_weight,
+                              down_weight_scale, topk_ids, topk_scale}) {
+      at::assert_no_overlap(out, input);
+    }
+    if (shared_output.has_value()) {
+      at::assert_no_partial_overlap(out, *shared_output);
+    }
+  }
+
+  const c10::DeviceGuard device_guard(device);
+  const auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
+  auto options = x.options();
+  auto y = output.has_value() ? *output
+                              : torch::empty({batch_size, hidden}, options.dtype(at::kBFloat16));
+  if (batch_size == 0) return y;
+
+  // Keep the standalone warp_decode rounding boundaries and measured policy.
+  // HPC's TMA backend has different activation and per-expert BF16 boundaries.
+  // The narrow 397B TP8 path also benefits from inline quantization at B=2.
+  const bool fuse_quant = (batch_size == 1 && inter == 256 && (hidden == 2048 || hidden == 3072)) ||
+                          (batch_size <= 2 && inter == 128 && hidden == 4096 && topk == 10);
+  const int expert_start = rank_ep * local_experts;
+  const int num_tokens = batch_size;
+  const int hidden_size = hidden;
+  const int intermediate_size = inter;
+  const int num_experts = local_experts;
+  const int num_topk = topk;
+  auto buffer = torch::empty({batch_size * topk, inter}, options.dtype(at::kBFloat16));
+
+  HPC_ARCH_DISPATCH(
+      "fuse_moe_blockwise.warp_decode", 90,
+      warp_decode::gate_up_async(
+          x.const_data_ptr(), gate_up_weight.const_data_ptr(), x_scale.const_data_ptr<float>(),
+          gate_up_weight_scale.const_data_ptr<float>(), topk_ids.const_data_ptr<int>(),
+          buffer.mutable_data_ptr(), num_tokens, hidden_size, intermediate_size, num_experts,
+          num_topk, expert_start, stream));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  if (fuse_quant) {
+    HPC_ARCH_DISPATCH(
+        "fuse_moe_blockwise.warp_decode", 90,
+        warp_decode::down_bf16_async(
+            buffer.const_data_ptr(), down_weight.const_data_ptr(),
+            down_weight_scale.const_data_ptr<float>(), topk_ids.const_data_ptr<int>(),
+            topk_scale.const_data_ptr<float>(), shared_ptr, y.mutable_data_ptr(), num_tokens,
+            hidden_size, intermediate_size, num_experts, num_topk, expert_start, stream));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  } else {
+    auto quantized = torch::empty({batch_size * topk, inter}, options.dtype(at::kFloat8_e4m3fn));
+    auto buffer_scale = torch::empty({batch_size * topk, inter / q}, options.dtype(at::kFloat));
+    HPC_ARCH_DISPATCH(
+        "fuse_moe_blockwise.warp_decode", 90,
+        warp_decode::quantize_async(buffer.const_data_ptr(), quantized.mutable_data_ptr(),
+                                    buffer_scale.mutable_data_ptr<float>(), num_tokens * num_topk,
+                                    intermediate_size, stream));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    HPC_ARCH_DISPATCH(
+        "fuse_moe_blockwise.warp_decode", 90,
+        warp_decode::down_async(quantized.const_data_ptr(), down_weight.const_data_ptr(),
+                                buffer_scale.const_data_ptr<float>(),
+                                down_weight_scale.const_data_ptr<float>(),
+                                topk_ids.const_data_ptr<int>(), topk_scale.const_data_ptr<float>(),
+                                shared_ptr, y.mutable_data_ptr(), num_tokens, hidden_size,
+                                intermediate_size, num_experts, num_topk, expert_start, stream));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return y;
+}
+
+}  // namespace
+
 torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_up_weight,
                              const torch::Tensor &down_weight, const torch::Tensor &gate_up_scale,
                              const torch::Tensor &down_scale,
@@ -279,6 +502,8 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
                              std::optional<torch::Tensor> shared_output, int64_t rank_ep,
                              int64_t num_expert_total, bool use_bf16_mul,
                              std::optional<torch::Tensor> output) {
+  TORCH_CHECK(num_expert_total > 0, "num_expert_total must be positive");
+
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn &&
@@ -336,6 +561,17 @@ torch::Tensor fuse_moe_entry(const torch::Tensor &x, const torch::Tensor &gate_u
   int aligned_size = 0;
   int num_tokens_per_group_avg = num_seq * num_topk / num_expert_total;
   TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
+
+  // SM90 per-tensor FP8 decode: Hunyuan-v3 TP8, batch 0-8.
+  // H=4096, intermediate/rank=192, E=192, top-k=8.
+  if (x.is_cuda() && x.dim() == 2 && gate_up_weight.dim() == 3 && topk_ids.dim() == 2 &&
+      get_sm_arch() == 90 && x.size(0) <= 8 && x.size(1) == 4096 && gate_up_weight.size(1) == 384 &&
+      num_expert_total == 192 && topk_ids.size(1) == 8 && gate_up_scale.dim() == 1 &&
+      down_scale.dim() == 1 && act_and_mul_scale.dim() == 1) {
+    return fuse_moe_pertensor_warp_decode_entry(
+        x, gate_up_weight, down_weight, gate_up_scale, down_scale, act_and_mul_scale, topk_ids,
+        topk_scale, shared_output, rank_ep, num_expert_total, use_bf16_mul, output);
+  }
 
   if (intermediate_size / 2 <= 512 && (intermediate_size / 2) % 64 == 0 && hidden_size % 64 == 0) {
     return fuse_moe_cp_async_entry(x, gate_up_weight, down_weight, gate_up_scale, down_scale,
@@ -455,6 +691,8 @@ torch::Tensor fuse_moe_blockwise_entry(
     const torch::Tensor &down_weight_scale, const torch::Tensor &topk_ids,
     const torch::Tensor &topk_scale, std::optional<torch::Tensor> shared_output, int64_t rank_ep,
     int64_t num_expert_total, std::optional<torch::Tensor> output) {
+  TORCH_CHECK(num_expert_total > 0, "num_expert_total must be positive");
+
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   TORCH_CHECK(x.dtype() == torch::kFloat8_e4m3fn &&
@@ -528,6 +766,19 @@ torch::Tensor fuse_moe_blockwise_entry(
   int down_weight_scale_lastdim_pad4 = down_weight_scale.size(-1);
 
   TORCH_CHECK(num_topk <= 128, "num_topk must less than or equal to 128");
+
+  // SM90 blockwise FP8 decode, batch 0-8:
+  // Qwen3.5/3.6-35B-A3B TP1/TP2; Qwen3.5-122B-A10B TP2/TP4;
+  // Qwen3.5-397B-A17B TP4/TP8; Qwen3-Next-80B-A3B TP1/TP2.
+  if (x.is_cuda() && x.dim() == 2 && gate_up_weight.dim() == 3 && topk_ids.dim() == 2 &&
+      get_sm_arch() == 90 && x.size(0) <= 8 &&
+      is_warp_decode_shape(x.size(1), gate_up_weight.size(1) / 2, num_expert_total,
+                           topk_ids.size(1)) &&
+      x_scale.dim() == 2 && gate_up_weight_scale.dim() == 3 && down_weight_scale.dim() == 3) {
+    return fuse_moe_warp_decode_entry(x, x_scale, gate_up_weight, gate_up_weight_scale, down_weight,
+                                      down_weight_scale, topk_ids, topk_scale, shared_output,
+                                      rank_ep, num_expert_total, output);
+  }
 
   if (num_tokens_per_group_avg <= 8) {
     aligned_size = 8;
