@@ -14,7 +14,7 @@
 #include "src/iHC/iHC.h"
 #include "src/utils/utils.cuh"
 
-#if HPC_TARGET_ARCH == 100
+#if HPC_TARGET_ARCH != 90
 #include "cute/arch/copy_sm100.hpp"
 #include "cute/arch/tmem_allocator_sm100.hpp"
 #include "cute/atom/mma_traits_sm100.hpp"
@@ -863,7 +863,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock,
           bool kUsePDL = false, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false,
           bool kWeightsAligned = true>
-__global__ void __launch_bounds__(HPC_TARGET_ARCH == 100 ? 768 : kThreadsPerBlock)
+__global__ void __launch_bounds__(HPC_TARGET_ARCH == 90 ? kThreadsPerBlock : 768)
     fuse_ihc_post_pre_kernel(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr,
                              const __nv_bfloat16* xa_ptr, const __nv_bfloat16* residual_ptr,
                              const float* H_post_in_ptr, const float* w_ptr,
@@ -873,7 +873,12 @@ __global__ void __launch_bounds__(HPC_TARGET_ARCH == 100 ? 768 : kThreadsPerBloc
   static_assert(kHCMult == 4 && kElementsPerThread == 8, "supported fused layout");
   static_assert(kHiddenDim == 3072 || kHiddenDim == 4096 || kHiddenDim == 6144,
                 "supported hidden dimensions");
-#if HPC_TARGET_ARCH == 100
+#if HPC_TARGET_ARCH == 90
+  ihc_post_pre_rows_device<kHiddenDim, 1, kThreadsPerBlock, kThreadsPerBlock, kFuseRmsNorm,
+                           kCastBfloatForNorm, kUsePDL, kWeightsAligned>(
+      y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
+      hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
+#else
   if constexpr (kHiddenDim == 6144) {
     if (num_batch < 80) {
       ihc_post_pre_cluster_device<kHiddenDim, 8, kFuseRmsNorm, kCastBfloatForNorm, kUsePDL>(
@@ -908,15 +913,10 @@ __global__ void __launch_bounds__(HPC_TARGET_ARCH == 100 ? 768 : kThreadsPerBloc
           hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
     }
   }
-#else
-  ihc_post_pre_rows_device<kHiddenDim, 1, kThreadsPerBlock, kThreadsPerBlock, kFuseRmsNorm,
-                           kCastBfloatForNorm, kUsePDL, kWeightsAligned>(
-      y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
-      hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
 #endif
 }
 
-#if HPC_TARGET_ARCH == 100
+#if HPC_TARGET_ARCH != 90
 __device__ __forceinline__ void ihc_tmem_fence_before_sync() {
   asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
 }
@@ -1404,237 +1404,7 @@ __global__ void __launch_bounds__(384, kHiddenDim == 6144 ? 1 : 2)
   }
 }
 
-#endif  // HPC_TARGET_ARCH == 100
-
-template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock,
-          bool kUsePDL = false>
-__global__ void __launch_bounds__(kThreadsPerBlock)
-    fuse_ihc_post_pre_stage1_kernel(__nv_bfloat16* y_ptr, float* scratch_ptr,
-                                    const __nv_bfloat16* xa_ptr, const __nv_bfloat16* residual_ptr,
-                                    const float* H_post_in_ptr, const float* w_ptr, int num_batch) {
-  constexpr int kProjRows = 2 * kHCMult;
-  constexpr int kHCDim = kHCMult * kHiddenDim;
-  constexpr int kColsPerBlock = kThreadsPerBlock * kElementsPerThread;
-  constexpr int kWarpSize = 32;
-  constexpr int kWarpsPerBlock = kThreadsPerBlock / kWarpSize;
-  constexpr int kNumChunks = kHiddenDim / kColsPerBlock;
-  static_assert(kHiddenDim % kColsPerBlock == 0, "block cols must divide hidden dim");
-
-  if constexpr (kUsePDL) {
-    cudaGridDependencySynchronize();
-  }
-  const int ch = blockIdx.x;
-  const int irow = blockIdx.y;
-  const int iwarp = threadIdx.x / kWarpSize;
-  const int ilane = threadIdx.x % kWarpSize;
-  const int icol = ch * kColsPerBlock + threadIdx.x * kElementsPerThread;
-
-  __shared__ float smem_partial[kProjRows + 1][kWarpsPerBlock];
-
-  const auto reg_H_post_in = load<float, kHCMult>(H_post_in_ptr + irow * kHCMult);
-  const __nv_bfloat16* xa_row_ptr = xa_ptr + irow * kHiddenDim;
-  const __nv_bfloat16* res_row_ptr = residual_ptr + irow * kHCDim;
-  __nv_bfloat16* y_row_ptr = y_ptr + irow * kHCDim;
-
-  float acc_dot[kProjRows];
-  float acc_sqsum = 0.f;
-#pragma unroll
-  for (int c = 0; c < kProjRows; ++c) {
-    acc_dot[c] = 0.f;
-  }
-
-  const auto reg_xa = to<float>(load<__nv_bfloat16, kElementsPerThread>(xa_row_ptr + icol));
-#pragma unroll
-  for (int i = 0; i < kHCMult; ++i) {
-    const int iflat = i * kHiddenDim + icol;
-    const auto reg_res = to<float>(load<__nv_bfloat16, kElementsPerThread>(res_row_ptr + iflat));
-    vec_t<float, kElementsPerThread> reg_y;
-    auto* y2 = reinterpret_cast<float2*>(&reg_y[0]);
-    const auto* xa2 = reinterpret_cast<const float2*>(&reg_xa[0]);
-    const auto* res2 = reinterpret_cast<const float2*>(&reg_res[0]);
-    const float h = reg_H_post_in[i];
-#pragma unroll
-    for (int j = 0; j < kElementsPerThread / 2; ++j) {
-      y2[j].x = h * xa2[j].x + res2[j].x;
-      y2[j].y = h * xa2[j].y + res2[j].y;
-    }
-    store(y_row_ptr + iflat, to<__nv_bfloat16>(reg_y));
-    const auto reg_y_bf = to<float>(to<__nv_bfloat16>(reg_y));
-    const auto* yb2 = reinterpret_cast<const float2*>(&reg_y_bf[0]);
-#pragma unroll
-    for (int j = 0; j < kElementsPerThread / 2; ++j) {
-      acc_sqsum += yb2[j].x * yb2[j].x;
-      acc_sqsum += yb2[j].y * yb2[j].y;
-    }
-    constexpr int kHalf = kElementsPerThread / 2;
-#pragma unroll
-    for (int c = 0; c < kProjRows; ++c) {
-      const float* w_row_ptr = w_ptr + c * kHCDim + iflat;
-      vec_t<float, kElementsPerThread> reg_w;
-      *reinterpret_cast<vec_t<float, kHalf>*>(&reg_w[0]) = load<float, kHalf>(w_row_ptr);
-      *reinterpret_cast<vec_t<float, kHalf>*>(&reg_w[kHalf]) =
-          load<float, kHalf>(w_row_ptr + kHalf);
-      const auto* w2 = reinterpret_cast<const float2*>(&reg_w[0]);
-#pragma unroll
-      for (int j = 0; j < kElementsPerThread / 2; ++j) {
-        acc_dot[c] += yb2[j].x * w2[j].x;
-        acc_dot[c] += yb2[j].y * w2[j].y;
-      }
-    }
-  }
-
-#pragma unroll
-  for (int c = 0; c < kProjRows; ++c) {
-    const float v = warp_reduce_sum_xor(acc_dot[c]);
-    if (ilane == 0) {
-      smem_partial[c][iwarp] = v;
-    }
-  }
-  {
-    const float v = warp_reduce_sum_xor(acc_sqsum);
-    if (ilane == 0) {
-      smem_partial[kProjRows][iwarp] = v;
-    }
-  }
-  __syncthreads();
-  float* scratch_row = scratch_ptr + (irow * kNumChunks + ch) * (kProjRows + 1);
-  for (int c = threadIdx.x; c < kProjRows + 1; c += kThreadsPerBlock) {
-    float sum = 0.f;
-#pragma unroll
-    for (int w = 0; w < kWarpsPerBlock; ++w) {
-      sum += smem_partial[c][w];
-    }
-    scratch_row[c] = sum;
-  }
-
-  if constexpr (kUsePDL) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-}
-
-template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock,
-          bool kUsePDL = false, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false>
-__global__ void __launch_bounds__(kThreadsPerBlock)
-    fuse_ihc_post_pre_stage2_kernel(__nv_bfloat16* z_ptr, float* H_post_out_ptr,
-                                    const __nv_bfloat16* y_ptr, const float* scratch_ptr,
-                                    const float* hc_scale_ptr, const float* hc_base_ptr,
-                                    int num_batch, float norm_eps, float hc_eps, float magnitude,
-                                    const __nv_bfloat16* rms_weight_ptr = nullptr,
-                                    float rms_eps = 0.f) {
-  constexpr int kProjRows = 2 * kHCMult;
-  constexpr int kHCDim = kHCMult * kHiddenDim;
-  constexpr int kChunks = kHiddenDim / (kThreadsPerBlock * kElementsPerThread);
-  constexpr int kWarpSize = 32;
-  constexpr int kWarpsPerBlock = kThreadsPerBlock / kWarpSize;
-  constexpr float kInvHCDim = 1.0f / kHCDim;
-  constexpr float kInvHiddenDim = 1.0f / kHiddenDim;
-
-  const int irow = blockIdx.x;
-  const int iwarp = threadIdx.x / kWarpSize;
-  const int ilane = threadIdx.x % kWarpSize;
-
-  __shared__ float smem_partial[kWarpsPerBlock];
-  __shared__ __align__(sizeof(float) * kHCMult) float smem_H_pre[kHCMult];
-
-  float full[kProjRows + 1];
-#pragma unroll
-  for (int c = 0; c < kProjRows + 1; ++c) {
-    full[c] = 0.f;
-  }
-  if constexpr (kUsePDL) {
-    cudaGridDependencySynchronize();
-  }
-#pragma unroll
-  for (int ch = 0; ch < kChunks; ++ch) {
-    const float* scratch_row = scratch_ptr + (irow * kChunks + ch) * (kProjRows + 1);
-#pragma unroll
-    for (int c = 0; c < kProjRows + 1; ++c) {
-      full[c] += scratch_row[c];
-    }
-  }
-
-  const float rms_scale = rsqrtf_ftz(full[kProjRows] * kInvHCDim + norm_eps);
-  for (int i = threadIdx.x; i < kHCMult; i += kThreadsPerBlock) {
-    const float mixes_pre = full[i] * rms_scale;
-    smem_H_pre[i] = sigmoid(hc_scale_ptr[0] * mixes_pre + hc_base_ptr[i]) + hc_eps;
-    const float mixes_post = full[kHCMult + i] * rms_scale;
-    H_post_out_ptr[irow * kHCMult + i] =
-        magnitude * sigmoid(hc_scale_ptr[1] * mixes_post + hc_base_ptr[kHCMult + i]) + hc_eps;
-  }
-  __syncthreads();
-
-  const auto reg_H_pre = load<float, kHCMult>(&smem_H_pre[0]);
-  const __nv_bfloat16* y_row_ptr = y_ptr + irow * kHCDim;
-  __nv_bfloat16* z_row_ptr = z_ptr + irow * kHiddenDim;
-
-  vec_t<float, kElementsPerThread> reg_z[kChunks];
-  float z_sqsum = 0.f;
-#pragma unroll
-  for (int ch = 0; ch < kChunks; ++ch) {
-    const int icol = (ch * kThreadsPerBlock + threadIdx.x) * kElementsPerThread;
-#pragma unroll
-    for (int j = 0; j < kElementsPerThread; ++j) {
-      reg_z[ch][j] = 0.f;
-    }
-    auto* z2 = reinterpret_cast<float2*>(&reg_z[ch][0]);
-#pragma unroll
-    for (int i = 0; i < kHCMult; ++i) {
-      const auto reg_y =
-          to<float>(load<__nv_bfloat16, kElementsPerThread>(y_row_ptr + i * kHiddenDim + icol));
-      const float h = reg_H_pre[i];
-      const auto* y2 = reinterpret_cast<const float2*>(&reg_y[0]);
-#pragma unroll
-      for (int j = 0; j < kElementsPerThread / 2; ++j) {
-        z2[j].x += h * y2[j].x;
-        z2[j].y += h * y2[j].y;
-      }
-    }
-    if constexpr (kFuseRmsNorm) {
-#pragma unroll
-      for (int j = 0; j < kElementsPerThread / 2; ++j) {
-        if constexpr (kCastBfloatForNorm) {
-          z2[j].x = __bfloat162float(__float2bfloat16(z2[j].x));
-          z2[j].y = __bfloat162float(__float2bfloat16(z2[j].y));
-        }
-        z_sqsum += z2[j].x * z2[j].x;
-        z_sqsum += z2[j].y * z2[j].y;
-      }
-    } else {
-      store(z_row_ptr + icol, to<__nv_bfloat16>(reg_z[ch]));
-    }
-  }
-
-  if constexpr (kFuseRmsNorm) {
-    const float v = warp_reduce_sum_xor(z_sqsum);
-    if (ilane == 0) {
-      smem_partial[iwarp] = v;
-    }
-    __syncthreads();
-    float total = 0.f;
-#pragma unroll
-    for (int w = 0; w < kWarpsPerBlock; ++w) {
-      total += smem_partial[w];
-    }
-    const float z_scale = rsqrtf_ftz(total * kInvHiddenDim + rms_eps);
-#pragma unroll
-    for (int ch = 0; ch < kChunks; ++ch) {
-      const int icol = (ch * kThreadsPerBlock + threadIdx.x) * kElementsPerThread;
-      const auto reg_g = to<float>(load<__nv_bfloat16, kElementsPerThread>(rms_weight_ptr + icol));
-      auto* z2 = reinterpret_cast<float2*>(&reg_z[ch][0]);
-      const auto* g2 = reinterpret_cast<const float2*>(&reg_g[0]);
-#pragma unroll
-      for (int j = 0; j < kElementsPerThread / 2; ++j) {
-        z2[j].x = z2[j].x * z_scale * g2[j].x;
-        z2[j].y = z2[j].y * z_scale * g2[j].y;
-      }
-      store(z_row_ptr + icol, to<__nv_bfloat16>(reg_z[ch]));
-    }
-  }
-
-  if constexpr (kUsePDL) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-}
+#endif  // HPC_TARGET_ARCH != 90
 
 }  // namespace kernels
 
@@ -1643,8 +1413,14 @@ namespace {
 constexpr int kElementsPerThread = 8;
 constexpr int kPostThreadsPerBlock = 128;
 
-// Pre row counts at 256 threads for targets other than SM100/SM103.
-#if HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
+// Launch geometry for the pre/head row kernel.
+struct PreConfig {
+  int rows;
+  int threads;
+};
+
+#if HPC_TARGET_ARCH == 90
+// Pre row counts at 256 threads.
 constexpr int pre_rows_per_block(int num_batch, bool fuse_rms_norm) {
   if (num_batch < (fuse_rms_norm ? 192 : 64)) {
     return 1;
@@ -1665,16 +1441,46 @@ constexpr int head_rows_per_block(int num_batch, int hidden_dim) {
   }
   return 2;
 }
-#endif  // HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
 
-// Launch geometry for the pre/head row kernel.
-struct PreConfig {
-  int rows;
-  int threads;
-};
-
-// SM100/SM103 use one CTA per token for batches up to the SM count.
-#if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
+constexpr PreConfig pre_config(int num_batch, int hidden_dim) {
+  if (hidden_dim == 6144) {
+    if (num_batch < 192) {
+      return {2, 256};
+    }
+    if (num_batch < 320) {
+      return {4, 384};
+    }
+    if (num_batch < 512) {
+      return {6, 256};
+    }
+    if (num_batch < 768) {
+      return {4, 256};
+    }
+    if (num_batch >= 896 && num_batch < 1152) {
+      return {8, 192};
+    }
+    if (num_batch < 12288) {
+      return {6, 192};
+    }
+    return {8, 128};
+  }
+  // hidden 4096.
+  if (num_batch < 384) {
+    return {2, 256};
+  }
+  if (num_batch < 768) {
+    return {4, 256};
+  }
+  if (num_batch >= 896 && num_batch < 1152) {
+    return {8, 128};
+  }
+  if (num_batch < 12288) {
+    return {6, 128};
+  }
+  return {4, 256};
+}
+#else
+// One CTA per token for batches up to the SM count.
 constexpr PreConfig sm100_config(int num_batch, int hidden_dim, bool has_post, bool fuse_rms_norm,
                                  int sm_count) {
   if (hidden_dim == 3072) {
@@ -1735,47 +1541,6 @@ constexpr PreConfig sm100_config(int num_batch, int hidden_dim, bool has_post, b
   }
   return num_batch < 8192 ? PreConfig{2, 128} : PreConfig{4, 128};
 }
-#endif  // HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
-
-#if HPC_TARGET_ARCH == 90
-
-constexpr PreConfig pre_config(int num_batch, int hidden_dim) {
-  if (hidden_dim == 6144) {
-    if (num_batch < 192) {
-      return {2, 256};
-    }
-    if (num_batch < 320) {
-      return {4, 384};
-    }
-    if (num_batch < 512) {
-      return {6, 256};
-    }
-    if (num_batch < 768) {
-      return {4, 256};
-    }
-    if (num_batch >= 896 && num_batch < 1152) {
-      return {8, 192};
-    }
-    if (num_batch < 12288) {
-      return {6, 192};
-    }
-    return {8, 128};
-  }
-  // hidden 4096.
-  if (num_batch < 384) {
-    return {2, 256};
-  }
-  if (num_batch < 768) {
-    return {4, 256};
-  }
-  if (num_batch >= 896 && num_batch < 1152) {
-    return {8, 128};
-  }
-  if (num_batch < 12288) {
-    return {6, 128};
-  }
-  return {4, 256};
-}
 #endif  // HPC_TARGET_ARCH == 90
 
 template <int kHiddenDim, int kRowsPerBlock, bool kHasPost, bool kFuseRmsNorm,
@@ -1815,7 +1580,7 @@ void launch_pre_head_rows(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
 }
 
 // Selects launch shape and forwards to launch_pre_head_rows.
-// sm90 uses pre_config(), sm100/103 use sm100_config().
+// sm90 uses pre_config(), other targets use sm100_config().
 template <int kHiddenDim, bool kHasPost, bool kFuseRmsNorm, bool kCastBfloatForNorm>
 void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                      const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
@@ -1830,108 +1595,8 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
         norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
   };
 
-#if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
-  {
-    const PreConfig cfg =
-        sm100_config(num_batch, kHiddenDim, kHasPost, kFuseRmsNorm, get_sm_count());
-    // Only instantiate pairs sm100_config() can return.
-    if constexpr (kHiddenDim == 6144) {
-      if (cfg.rows == 1 && cfg.threads == 768) {
-        launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 768>{});
-        return;
-      }
-      if (cfg.rows == 2 && cfg.threads == 384) {
-        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 384>{});
-        return;
-      }
-      // Instantiate these configurations only for pre.
-      if constexpr (kHasPost) {
-        if (cfg.rows == 4 && cfg.threads == 384) {
-          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 384>{});
-          return;
-        }
-        if (cfg.rows == 4 && cfg.threads == 128) {
-          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 128>{});
-          return;
-        }
-      }
-      if (cfg.rows == 4 && cfg.threads == 256) {
-        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
-        return;
-      }
-      // 192 threads only returned by sm100_config() for folded head.
-      if constexpr (!kHasPost) {
-        if (cfg.rows == 4 && cfg.threads == 192) {
-          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 192>{});
-          return;
-        }
-      }
-    } else if constexpr (kHiddenDim == 3072) {
-      if (cfg.rows == 1 && cfg.threads == 384) {
-        launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 384>{});
-        return;
-      }
-      if (cfg.rows == 2 && cfg.threads == 384) {
-        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 384>{});
-        return;
-      }
-      if constexpr (kHasPost) {
-        if (cfg.rows == 4 && cfg.threads == 192) {
-          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 192>{});
-          return;
-        }
-      } else {
-        if (cfg.rows == 2 && cfg.threads == 192) {
-          launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 192>{});
-          return;
-        }
-      }
-      if (cfg.rows == 4 && cfg.threads == 128) {
-        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 128>{});
-        return;
-      }
-    } else if constexpr (kHiddenDim == 4096) {
-      if (cfg.rows == 1 && cfg.threads == 512) {
-        launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 512>{});
-        return;
-      }
-      if (cfg.rows == 2 && cfg.threads == 512) {
-        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 512>{});
-        return;
-      }
-      if (cfg.rows == 2 && cfg.threads == 256) {
-        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 256>{});
-        return;
-      }
-      // This configuration is selected only for pre.
-      if constexpr (kHasPost) {
-        if (cfg.rows == 4 && cfg.threads == 256) {
-          launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
-          return;
-        }
-      } else {
-        if (cfg.rows == 1 && cfg.threads == 256) {
-          launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 256>{});
-          return;
-        }
-        if (cfg.rows == 2 && cfg.threads == 128) {
-          launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 128>{});
-          return;
-        }
-      }
-      if (cfg.rows == 4 && cfg.threads == 128) {
-        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 128>{});
-        return;
-      }
-    }
-    // Fallback for any pair not covered above.
-    launch(std::integral_constant<int, 1>{}, std::integral_constant<int, kRowThreads>{});
-    return;
-  }
-#endif  // HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
-
-  // SM90 head uses head_rows_per_block() instead of pre_config().
 #if HPC_TARGET_ARCH == 90
+  // SM90 head uses head_rows_per_block() instead of pre_config().
   if constexpr (kHasPost) {
     const PreConfig cfg = pre_config(num_batch, kHiddenDim);
     // Only instantiate pairs pre_config() can return.
@@ -1984,10 +1649,8 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
     }
     // Anything pre_config() does not cover falls through below.
   }
-#endif
 
   // Keep pre-only row configurations out of the head specialization.
-#if HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
   if constexpr (kHasPost) {
     switch (pre_rows_per_block(num_batch, kFuseRmsNorm)) {
       case 1:
@@ -2009,14 +1672,104 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
         launch(std::integral_constant<int, 2>{}, std::integral_constant<int, kRowThreads>{});
         break;
       default:
-        // Head selects four rows only for D=6144.
         if constexpr (kHiddenDim == 6144) {
           launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
         }
         break;
     }
   }
-#endif  // HPC_TARGET_ARCH != 100 && HPC_TARGET_ARCH != 103
+#else
+  const PreConfig cfg = sm100_config(num_batch, kHiddenDim, kHasPost, kFuseRmsNorm, get_sm_count());
+  // Only instantiate pairs sm100_config() can return.
+  if constexpr (kHiddenDim == 6144) {
+    if (cfg.rows == 1 && cfg.threads == 768) {
+      launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 768>{});
+      return;
+    }
+    if (cfg.rows == 2 && cfg.threads == 384) {
+      launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 384>{});
+      return;
+    }
+    if constexpr (kHasPost) {
+      if (cfg.rows == 4 && cfg.threads == 384) {
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 384>{});
+        return;
+      }
+      if (cfg.rows == 4 && cfg.threads == 128) {
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 128>{});
+        return;
+      }
+    }
+    if (cfg.rows == 4 && cfg.threads == 256) {
+      launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
+      return;
+    }
+    if constexpr (!kHasPost) {
+      if (cfg.rows == 4 && cfg.threads == 192) {
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 192>{});
+        return;
+      }
+    }
+  } else if constexpr (kHiddenDim == 3072) {
+    if (cfg.rows == 1 && cfg.threads == 384) {
+      launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 384>{});
+      return;
+    }
+    if (cfg.rows == 2 && cfg.threads == 384) {
+      launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 384>{});
+      return;
+    }
+    if constexpr (kHasPost) {
+      if (cfg.rows == 4 && cfg.threads == 192) {
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 192>{});
+        return;
+      }
+    } else {
+      if (cfg.rows == 2 && cfg.threads == 192) {
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 192>{});
+        return;
+      }
+    }
+    if (cfg.rows == 4 && cfg.threads == 128) {
+      launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 128>{});
+      return;
+    }
+  } else if constexpr (kHiddenDim == 4096) {
+    if (cfg.rows == 1 && cfg.threads == 512) {
+      launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 512>{});
+      return;
+    }
+    if (cfg.rows == 2 && cfg.threads == 512) {
+      launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 512>{});
+      return;
+    }
+    if (cfg.rows == 2 && cfg.threads == 256) {
+      launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 256>{});
+      return;
+    }
+    if constexpr (kHasPost) {
+      if (cfg.rows == 4 && cfg.threads == 256) {
+        launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 256>{});
+        return;
+      }
+    } else {
+      if (cfg.rows == 1 && cfg.threads == 256) {
+        launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 256>{});
+        return;
+      }
+      if (cfg.rows == 2 && cfg.threads == 128) {
+        launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 128>{});
+        return;
+      }
+    }
+    if (cfg.rows == 4 && cfg.threads == 128) {
+      launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 128>{});
+      return;
+    }
+  }
+  // Fallback for any pair not covered above.
+  launch(std::integral_constant<int, 1>{}, std::integral_constant<int, kRowThreads>{});
+#endif  // HPC_TARGET_ARCH == 90
 }
 
 // Match grid, block and cluster dimensions to the kernel's uniform M branch.
@@ -2030,7 +1783,7 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
                                      const __nv_bfloat16* rms_weight_ptr, float rms_eps) {
   constexpr int kThreads = kHiddenDim == 3072 ? 192 : 256;
   const bool weights_aligned = (reinterpret_cast<uintptr_t>(w_ptr) & 31) == 0;
-#if HPC_TARGET_ARCH == 100
+#if HPC_TARGET_ARCH != 90
   if constexpr (kUsePDL && (!kFuseRmsNorm || kCastBfloatForNorm)) {
     constexpr int kUmmaMin = kHiddenDim == 3072 ? 8960 : 8192;
     if (num_batch >= kUmmaMin && weights_aligned) {
@@ -2102,7 +1855,7 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
     attrs[config.numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[config.numAttrs++].val.programmaticStreamSerializationAllowed = 1;
   }
-#if HPC_TARGET_ARCH == 100
+#if HPC_TARGET_ARCH != 90
   int blocks = 1;
   if constexpr (kHiddenDim == 6144) {
     blocks = num_batch < 80 ? 8 : 1;
@@ -2142,63 +1895,7 @@ void launch_post_pre(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_o
                      const float* H_post_in_ptr, const float* w_ptr, const float* hc_scale_ptr,
                      const float* hc_base_ptr, int num_batch, float norm_eps, float hc_eps,
                      float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
-                     float* scratch_ptr, cudaStream_t stream, bool use_pdl) {
-  constexpr int kThreads = 256;
-  constexpr int kClusterSize = kHiddenDim / (kThreads * kElementsPerThread);
-  constexpr bool kTwoStage =
-      kClusterSize >= 2 && kHiddenDim % (kThreads * kElementsPerThread) == 0;
-
-  if constexpr (kTwoStage) {
-    if (scratch_ptr != nullptr) {
-    float* scratch = scratch_ptr;
-    dim3 grid1(kClusterSize, num_batch, 1);
-    dim3 grid2(num_batch, 1, 1);
-    dim3 block(kThreads);
-    auto launch = [&](auto pdl_tag) {
-      constexpr bool kUsePDL = decltype(pdl_tag)::value;
-      auto k1 = kernels::fuse_ihc_post_pre_stage1_kernel<4, kHiddenDim, kElementsPerThread,
-                                                         kThreads, kUsePDL>;
-      auto k2 =
-          kernels::fuse_ihc_post_pre_stage2_kernel<4, kHiddenDim, kElementsPerThread, kThreads,
-                                                   kUsePDL, kFuseRmsNorm, kCastBfloatForNorm>;
-      cudaLaunchConfig_t c1{};
-      c1.gridDim = grid1;
-      c1.blockDim = block;
-      c1.stream = stream;
-      cudaLaunchAttribute a1[1];
-      c1.numAttrs = 0;
-      if constexpr (kUsePDL) {
-        a1[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        a1[0].val.programmaticStreamSerializationAllowed = 1;
-        c1.attrs = a1;
-        c1.numAttrs = 1;
-      }
-      cudaLaunchKernelEx(&c1, k1, y_ptr, scratch, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr,
-                         num_batch);
-      cudaLaunchConfig_t c2{};
-      c2.gridDim = grid2;
-      c2.blockDim = block;
-      c2.stream = stream;
-      cudaLaunchAttribute a2[1];
-      c2.numAttrs = 0;
-      if constexpr (kUsePDL) {
-        a2[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        a2[0].val.programmaticStreamSerializationAllowed = 1;
-        c2.attrs = a2;
-        c2.numAttrs = 1;
-      }
-      cudaLaunchKernelEx(&c2, k2, z_ptr, H_post_out_ptr, y_ptr, scratch, hc_scale_ptr, hc_base_ptr,
-                         num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
-    };
-    if (use_pdl) {
-      launch(std::true_type{});
-    } else {
-      launch(std::false_type{});
-    }
-    return;
-    }
-  }
-
+                     cudaStream_t stream, bool use_pdl) {
   auto launch = [&](auto pdl_tag) {
     constexpr bool kUsePDL = decltype(pdl_tag)::value;
     launch_fuse_ihc_post_pre<kHiddenDim, kFuseRmsNorm, kCastBfloatForNorm, kUsePDL>(
@@ -2253,7 +1950,7 @@ struct PostConfig {
 constexpr PostConfig post_config(int num_batch, int hidden_dim) {
   (void)num_batch;
   int threads = kPostThreadsPerBlock;
-#if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
+#if HPC_TARGET_ARCH != 90
   if (hidden_dim == 4096 && num_batch >= 4096) {
     threads = 256;
   }
@@ -2275,7 +1972,6 @@ void launch_post(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
         output_ptr, x_ptr, residual_ptr, H_post_ptr, num_batch, cfg.splits, stream, use_pdl);
   };
 
-  // 256 threads is reachable only at hidden 4096; guard to avoid instantiating it elsewhere.
   if constexpr (kHiddenDim == 4096) {
     if (cfg.threads == 256) {
       go(std::integral_constant<int, 256>{});
@@ -2329,7 +2025,7 @@ void fuse_ihc_post_pre_async(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* 
                              const float* H_post_in_ptr, const float* w_ptr,
                              const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch,
                              int hc_mult, int hidden_dim, float norm_eps, float hc_eps,
-                             float magnitude, float* scratch_ptr, cudaStream_t stream,
+                             float magnitude, cudaStream_t stream,
                              const __nv_bfloat16* rms_weight_ptr, float rms_eps,
                              bool cast_bfloat_for_norm, bool use_pdl) {
   if (hc_mult != 4) {
@@ -2341,17 +2037,17 @@ void fuse_ihc_post_pre_async(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* 
       launch_post_pre<kHidden, false, false>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
                                              H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
                                              num_batch, norm_eps, hc_eps, magnitude, nullptr, 0.f,
-                                             scratch_ptr, stream, use_pdl);
+                                             stream, use_pdl);
     } else if (cast_bfloat_for_norm) {
       launch_post_pre<kHidden, true, true>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
                                            H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
                                            num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr,
-                                           rms_eps, scratch_ptr, stream, use_pdl);
+                                           rms_eps, stream, use_pdl);
     } else {
       launch_post_pre<kHidden, true, false>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
                                             H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
                                             num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr,
-                                            rms_eps, scratch_ptr, stream, use_pdl);
+                                            rms_eps, stream, use_pdl);
     }
   };
 
@@ -2364,19 +2060,6 @@ void fuse_ihc_post_pre_async(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* 
   } else {
     return;
   }
-}
-
-size_t ihc_post_pre_scratch_floats(int num_batch, int hc_mult, int hidden_dim) {
-  if (hc_mult != 4 || (hidden_dim != 6144 && hidden_dim != 4096)) {
-    return 0;
-  }
-  constexpr int kColsPerBlock = 256 * kElementsPerThread;
-  const int chunks = hidden_dim / kColsPerBlock;
-  if (chunks < 2 || num_batch <= 0 || num_batch >= get_sm_count() * 2) {
-    return 0;
-  }
-  const int proj_rows = 2 * hc_mult;
-  return static_cast<size_t>(num_batch) * chunks * (proj_rows + 1);
 }
 
 void fuse_ihc_post_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,

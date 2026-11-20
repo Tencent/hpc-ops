@@ -159,12 +159,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fuse_ihc_post_pre_entry(
   torch::Tensor z = torch::empty({num_batch, hidden_dim}, options);
   torch::Tensor H_post_out = torch::empty({num_batch, hc_mult}, options.dtype(torch::kFloat32));
 
-  const size_t scratch_floats = ihc_post_pre_scratch_floats(num_batch, hc_mult, hidden_dim);
-  torch::Tensor scratch =
-      torch::empty({static_cast<int64_t>(scratch_floats)}, options.dtype(torch::kFloat32));
-  float *scratch_ptr =
-      scratch_floats > 0 ? reinterpret_cast<float *>(scratch.mutable_data_ptr()) : nullptr;
-
   fuse_ihc_post_pre_async(reinterpret_cast<__nv_bfloat16 *>(y.mutable_data_ptr()),
                           reinterpret_cast<__nv_bfloat16 *>(z.mutable_data_ptr()),
                           reinterpret_cast<float *>(H_post_out.mutable_data_ptr()),
@@ -174,8 +168,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fuse_ihc_post_pre_entry(
                           reinterpret_cast<const float *>(w.const_data_ptr()),
                           reinterpret_cast<const float *>(hc_scale.const_data_ptr()),
                           reinterpret_cast<const float *>(hc_base.const_data_ptr()), num_batch,
-                          hc_mult, hidden_dim, norm_eps, hc_eps, magnitude, scratch_ptr, stream,
-                          rms_weight_ptr, rms_eps, cast_bfloat_for_norm);
+                          hc_mult, hidden_dim, norm_eps, hc_eps, magnitude, stream, rms_weight_ptr,
+                          rms_eps, cast_bfloat_for_norm);
 
   return std::make_tuple(y, z, H_post_out);
 }

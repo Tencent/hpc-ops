@@ -62,9 +62,7 @@ int splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
 }
 
 constexpr int splitk_block_k(int num_batch) {
-#if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
-  return num_batch < 48 ? 1024 : 4096;
-#else
+#if HPC_TARGET_ARCH == 90
   if (num_batch < 2) {
     return 1024;
   }
@@ -72,11 +70,22 @@ constexpr int splitk_block_k(int num_batch) {
     return 2048;
   }
   return 4096;
+#else
+  return num_batch < 48 ? 1024 : 4096;
 #endif
 }
 
 constexpr int head_splitk_block_k(int num_batch, int hidden_dim) {
-#if HPC_TARGET_ARCH == 100 || HPC_TARGET_ARCH == 103
+#if HPC_TARGET_ARCH == 90
+  (void)hidden_dim;
+  if (num_batch < 2) {
+    return 1024;
+  }
+  if (num_batch < 48) {
+    return 2048;
+  }
+  return 4096;
+#else
   if (hidden_dim == 6144) {
     if (num_batch < 16) {
       return 1024;
@@ -88,15 +97,6 @@ constexpr int head_splitk_block_k(int num_batch, int hidden_dim) {
     return 1024;
   }
   return num_batch < 160 ? 2048 : 4096;
-#else
-  (void)hidden_dim;
-  if (num_batch < 2) {
-    return 1024;
-  }
-  if (num_batch < 48) {
-    return 2048;
-  }
-  return 4096;
 #endif
 }
 
