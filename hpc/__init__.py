@@ -55,7 +55,7 @@ def _nvml_arch():
     return major * 10 + minor
 
 
-def _load_module() -> int:
+def _load_module():
     """Loads the extension module for the local device; returns its architecture.
 
     A package carries one `_C_sm<arch>.abi3.so` per architecture it was built
@@ -63,6 +63,14 @@ def _load_module() -> int:
     compatible, so another module cannot stand in. HPC_SM_ARCH overrides the
     detection, for a build machine with no matching GPU.
     """
+    if torch.version.hip:
+        # Loading the HIP library does not initialize a device context, preserving fork workers.
+        module = _pkg_dir / "_C_hip.abi3.so"
+        if not module.is_file():
+            raise ImportError("hpc has no HIP module. Build with 'HPC_BACKEND=hip make'.")
+        torch.ops.load_library(str(module))
+        return "hip"
+
     override = os.getenv("HPC_SM_ARCH", "").strip()
     if override:
         if not override.isdigit():
@@ -93,6 +101,7 @@ def _load_module() -> int:
 
 
 __loaded_arch__ = _load_module()
+__backend__ = "hip" if torch.version.hip else "cuda"
 
 
 def _discover_modules() -> Dict[str, ModuleType]:

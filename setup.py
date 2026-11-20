@@ -1,12 +1,19 @@
 # Copyright (C) 2026 Tencent.
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+
+import torch
+
+BACKEND = os.getenv("HPC_BACKEND", "hip" if torch.version.hip else "cuda").strip().lower()
+if BACKEND not in ("cuda", "hip"):
+    raise SystemExit("HPC_BACKEND must be cuda or hip")
 
 # Architectures the build supports. The same list is in the Makefile and
 # CMakeLists.txt; adding one also needs an HPC_ARCH_EVAL_<arch> block in
@@ -30,6 +37,33 @@ class CMakeBuild(build_ext):
         build_lib_dir = os.path.dirname(self.get_ext_fullpath(ext.name))
         so_dst_dir = os.path.join(build_lib_dir, "hpc")
         os.makedirs(so_dst_dir, exist_ok=True)
+
+        if BACKEND == "hip":
+            from torch.utils.cpp_extension import ROCM_HOME
+
+            build_temp_dir = os.path.join(ext.sourcedir, "build", "hip")
+            os.makedirs(build_temp_dir, exist_ok=True)
+            cmake_args = [
+                "-DHPC_BACKEND=hip",
+                f"-DPython3_EXECUTABLE={sys.executable}",
+                f"-DCMAKE_HIP_COMPILER={ROCM_HOME}/llvm/bin/clang++",
+                f"-DCMAKE_HIP_ARCHITECTURES={';'.join(hip_archs)}",
+                "-DCMAKE_BUILD_TYPE=Release",
+                *ext.version_macros,
+            ]
+            subprocess.check_call(["cmake", ext.sourcedir, *cmake_args], cwd=build_temp_dir)
+            subprocess.check_call(
+                ["cmake", "--build", ".", "--parallel", os.getenv("HPC_BUILD_JOBS", "4")],
+                cwd=build_temp_dir,
+            )
+            shutil.copy(
+                os.path.join(build_temp_dir, "_C_hip.abi3.so"),
+                os.path.join(so_dst_dir, "_C_hip.abi3.so"),
+            )
+            for name in os.listdir(so_dst_dir):
+                if name.startswith("_C_sm") and name.endswith(".abi3.so"):
+                    os.remove(os.path.join(so_dst_dir, name))
+            return
 
         # One module per architecture, each from its own CMake tree, so `make
         # sm90` then `make sm103` then `make sm90` again reuses the sm90 object
@@ -94,14 +128,33 @@ def get_sm_archs():
     return sorted({int(p) for p in parts})
 
 
+def get_hip_archs():
+    """Compile the portable HIP sources for each requested AMD target."""
+    value = os.getenv("HPC_HIP_ARCH", os.getenv("PYTORCH_ROCM_ARCH", "")).strip()
+    if value:
+        archs = re.split(r"[,;]", value)
+    else:
+        archs = [
+            torch.cuda.get_device_properties(i).gcnArchName.split(":")[0]
+            for i in range(torch.cuda.device_count())
+        ]
+    archs = sorted({arch.strip() for arch in archs if arch.strip()})
+    if not archs or any(not re.fullmatch(r"gfx[0-9a-f]+", arch) for arch in archs):
+        raise SystemExit("Set HPC_HIP_ARCH to AMD targets, e.g. HPC_HIP_ARCH=gfx1100")
+    return archs
+
+
 version, git_hash = get_version()
-sm_archs = get_sm_archs()
+sm_archs = get_sm_archs() if BACKEND == "cuda" else []
+hip_archs = get_hip_archs() if BACKEND == "hip" else []
 
 # A wheel only runs on the architectures it has a module for, so the version has
 # to say which — two wheels of the same public version are not interchangeable.
 # Omitted when the build covers every architecture KNOWN_ARCHS lists in the
 # Makefile. Examples: ".sm90" (one arch), ".sm90.100.103" (a subset).
-if sm_archs != KNOWN_ARCHS:
+if BACKEND == "hip":
+    version += ".hip." + ".".join(hip_archs)
+elif sm_archs != KNOWN_ARCHS:
     version += ".sm" + ".".join(str(a) for a in sm_archs)
 
 version_macros = [

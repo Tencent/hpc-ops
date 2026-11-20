@@ -210,3 +210,42 @@ def fuse_ihc_post_pre(
         cast_bfloat_for_norm,
     )
     return y, z, H_post_out
+
+
+@torch.library.register_fake("hpc::fuse_ihc_pre")
+def _fuse_ihc_pre_fake(
+    x,
+    w,
+    hc_scale,
+    hc_base,
+    norm_eps,
+    hc_eps,
+    magnitude,
+    rms_weight=None,
+    rms_eps=0.0,
+    cast_bfloat_for_norm=False,
+):
+    return (
+        x.new_empty((x.shape[0], x.shape[2])),
+        x.new_empty((x.shape[0], x.shape[1]), dtype=torch.float32),
+    )
+
+
+@torch.library.register_fake("hpc::fuse_ihc_head")
+def _fuse_ihc_head_fake(
+    x,
+    w,
+    hc_scale,
+    hc_base,
+    norm_eps,
+    hc_eps,
+    rms_weight=None,
+    rms_eps=0.0,
+    cast_bfloat_for_norm=False,
+):
+    return x.new_empty((x.shape[0], x.shape[2]))
+
+
+@torch.library.register_fake("hpc::fuse_ihc_post")
+def _fuse_ihc_post_fake(x, residual, H_post):
+    return torch.empty_like(residual)
