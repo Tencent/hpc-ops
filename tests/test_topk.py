@@ -8,10 +8,16 @@ sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/li
 import hpc
 import torch
 
-pytestmark = pytest.mark.skipif(
-    bool(os.getenv("SANITIZER_CHECK")),
-    reason="unordered Top-K output is not byte-stable under sanitizer replay",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        bool(os.getenv("SANITIZER_CHECK")),
+        reason="unordered Top-K output is not byte-stable under sanitizer replay",
+    ),
+    pytest.mark.skipif(
+        hpc.__loaded_arch__ not in (90, 100, 103),
+        reason="Top-K kernels are implemented for SM90, SM100 and SM103",
+    ),
+]
 
 TOP_K = 2048
 SPLIT_TEST_N = 270336
