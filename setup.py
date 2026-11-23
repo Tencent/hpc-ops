@@ -13,7 +13,7 @@ from setuptools.command.build_py import build_py
 
 import torch
 
-BACKEND = os.getenv("HPC_BACKEND", "triton" if torch.version.hip else "cuda").strip().lower()
+BACKEND = os.getenv("HPC_BACKEND", "cuda" if not torch.version.hip else "triton").strip().lower()
 if BACKEND == "hip":
     BACKEND = "triton"
 if BACKEND not in ("cuda", "triton"):
@@ -30,15 +30,6 @@ class CMakeExtension(Extension):
         Extension.__init__(self, name, sources=[])
         self.version_macros = version_macros
         self.sourcedir = os.path.abspath(sourcedir)
-
-
-class BuildPy(build_py):
-    def run(self):
-        if BACKEND == "triton":
-            package_dir = os.path.join(self.build_lib, "hpc")
-            if os.path.isdir(package_dir):
-                shutil.rmtree(package_dir)
-        super().run()
 
 
 class CMakeBuild(build_ext):
@@ -83,6 +74,15 @@ class CMakeBuild(build_ext):
                 os.remove(os.path.join(so_dst_dir, name))
 
 
+class BuildPy(build_py):
+    def run(self):
+        if BACKEND == "triton":
+            package_dir = os.path.join(self.build_lib, "hpc")
+            if os.path.isdir(package_dir):
+                shutil.rmtree(package_dir)
+        super().run()
+
+
 def get_version():
     git_hash = subprocess.check_output(
         ["git", "rev-parse", "--short=7", "HEAD"], stderr=subprocess.DEVNULL, text=True
@@ -121,10 +121,11 @@ sm_archs = get_sm_archs() if BACKEND == "cuda" else []
 # to say which — two wheels of the same public version are not interchangeable.
 # Omitted when the build covers every architecture KNOWN_ARCHS lists in the
 # Makefile. Examples: ".sm90" (one arch), ".sm90.100.103" (a subset).
-if BACKEND == "triton":
+if BACKEND == "cuda":
+    if sm_archs != KNOWN_ARCHS:
+        version += ".sm" + ".".join(str(a) for a in sm_archs)
+else:
     version += ".triton"
-elif sm_archs != KNOWN_ARCHS:
-    version += ".sm" + ".".join(str(a) for a in sm_archs)
 
 version_macros = [
     '-DHPC_VERSION_STR="{}"'.format(version),
@@ -136,12 +137,12 @@ with open("hpc/version.py", "w") as fp:
     fp.write('git_hash = "{}"\n'.format(git_hash))
 
 build_options = {}
-if BACKEND == "triton":
+if BACKEND == "cuda":
+    build_options["bdist_wheel"] = {"py_limited_api": "cp39"}
+else:
     build_options["build"] = {
         "build_lib": f"build/lib.{sysconfig.get_platform()}-cpython-{sys.version_info.major}{sys.version_info.minor}"
     }
-else:
-    build_options["bdist_wheel"] = {"py_limited_api": "cp39"}
 
 amd_package_dirs = {}
 if BACKEND == "triton":

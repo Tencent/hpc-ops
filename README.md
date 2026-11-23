@@ -194,10 +194,6 @@ softmax statistics to reduce vocabulary reads and fixed launch overhead.
 
 ### Install from Source
 
-An AMD Triton backend using FlagTree supports RoPE/KV store, MoE reduction, iHC,
-sampling, TopK, STEM TPD, and scale reformatting without FP8 or matrix instructions.
-See [AMD.md](AMD.md) for supported interfaces, installation, and limitations.
-
 ```bash
 git clone https://github.com/Tencent/hpc-ops.git
 cd hpc-ops
@@ -213,6 +209,10 @@ supported architecture; `make sm90` builds a wheel for sm90 only, and
 `SM_ARCH=90,103 make wheel` builds one usable on both. Wheels that cover only
 part of the supported architectures say so in their version, e.g.
 `0.0.1.dev0+g1234567.sm90`.
+
+An AMD Triton backend using FlagTree supports RoPE/KV store, MoE reduction, iHC,
+sampling, TopK, STEM TPD, and scale reformatting without FP8 or matrix instructions.
+See [AMD.md](AMD.md) for supported interfaces, installation, and limitations.
 
 ### Basic Usage
 

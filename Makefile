@@ -29,9 +29,6 @@ export SM_ARCH
 all:
 	python3 setup.py build
 
-triton hip:
-	HPC_BACKEND=triton python3 setup.py build
-
 # A release wheel covers everything unless asked for less. The target-specific
 # default is overridden by SM_ARCH from the environment or the command line,
 # which is how the per architecture shortcuts below narrow it.
@@ -43,6 +40,9 @@ wheel:
 # Per architecture shortcuts: make sm90 == SM_ARCH=90 make wheel
 $(foreach arch,$(KNOWN_ARCHS),sm$(arch)):
 	@$(MAKE) --no-print-directory wheel SM_ARCH=$(patsubst sm%,%,$@)
+
+triton hip:
+	HPC_BACKEND=triton python3 setup.py build
 
 format:
 	python3 -m black --line-length 100 $(PY_FILES)
@@ -68,5 +68,5 @@ sanitizer:$(PY_TEST)
 clean:
 	rm -rf build dist hpc_ops.egg-info hpc.egg-info .pytest_cache tests/__pycache__ site
 
-.PHONY: all triton hip wheel format format-check test sanitizer clean \
-        $(foreach arch,$(KNOWN_ARCHS),sm$(arch))
+.PHONY: all wheel format format-check test sanitizer clean \
+        $(foreach arch,$(KNOWN_ARCHS),sm$(arch)) triton hip
