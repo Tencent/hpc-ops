@@ -75,7 +75,7 @@ Unsupported calls raise `NotImplementedError` with a `TODO(amd)` reason:
 
 - FP8 data paths, including the FP8 RoPE sibling.
 - Matrix kernels in Attention, GEMM, Group GEMM, STEM, and Fused MoE.
-- NVIDIA multicast communication and its communicator.
+- Fused AllReduce and its communicator; AMD communication is not yet implemented.
 - Attention decode task scheduling, which remains tied to the deferred attention kernels.
 
 Coverage is per kernel and interface. A file containing FP8 or matrix kernels

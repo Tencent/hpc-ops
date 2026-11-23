@@ -42,10 +42,10 @@ DEFERRED = {
     "masked_act_mul_and_blockwise_quant": "FP8 data path",
     # TODO(amd): scaled_fp8_quant: FP8 data path.
     "scaled_fp8_quant": "FP8 data path",
-    # TODO(amd): fuse_allreduce_rmsnorm_high_throughput: NVIDIA multicast communication.
-    "fuse_allreduce_rmsnorm_high_throughput": "NVIDIA multicast communication",
-    # TODO(amd): fuse_allreduce_rmsnorm_low_latency: NVIDIA multicast communication.
-    "fuse_allreduce_rmsnorm_low_latency": "NVIDIA multicast communication",
+    # TODO(amd): fuse_allreduce_rmsnorm_high_throughput: AMD communication kernel not yet implemented.
+    "fuse_allreduce_rmsnorm_high_throughput": "AMD communication kernel not yet implemented",
+    # TODO(amd): fuse_allreduce_rmsnorm_low_latency: AMD communication kernel not yet implemented.
+    "fuse_allreduce_rmsnorm_low_latency": "AMD communication kernel not yet implemented",
     # TODO(amd): attention_prefill_bf16: matrix-unit kernel.
     "attention_prefill_bf16": "matrix-unit kernel",
     # TODO(amd): attention_with_kvcache_prefill_bf16: matrix-unit kernel.
