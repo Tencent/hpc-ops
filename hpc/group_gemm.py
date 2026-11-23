@@ -48,15 +48,6 @@ def reformat_x_scale(
     )
 
 
-@torch.library.register_fake("hpc::reformat_x_scale")
-def _reformat_x_scale_fake(x_scale, seqlens, cu_seqlens, out_x_scale, num_seq_per_group_avg):
-    return (
-        out_x_scale
-        if out_x_scale is not None
-        else x_scale.new_empty((x_scale.shape[1], x_scale.shape[0]))
-    )
-
-
 def group_gemm_pertensor_fp8(
     x: Tensor,
     weight: Tensor,

@@ -143,6 +143,13 @@ if BACKEND == "triton":
 else:
     build_options["bdist_wheel"] = {"py_limited_api": "cp39"}
 
+amd_package_dirs = {}
+if BACKEND == "triton":
+    amd_package_dirs["hpc._amd"] = "src/C/amd"
+    for path in sorted(Path("src").glob("*/amd")):
+        if path.parent.name != "C":
+            amd_package_dirs[f"hpc._amd.{path.parent.name}"] = str(path)
+
 setup(
     name="hpc-ops",
     version=version,
@@ -151,11 +158,8 @@ setup(
     author_email="authors@hpc-ops",
     url="https://github.com/Tencent/hpc-ops",
     license="Copyright (C) 2026 Tencent.",
-    packages=find_packages(include=["hpc", "hpc.*"])
-    + [f"hpc._ops.{path.parent.name}.amd" for path in Path("src").glob("*/amd")],
-    package_dir={
-        f"hpc._ops.{path.parent.name}.amd": str(path) for path in Path("src").glob("*/amd")
-    },
+    packages=find_packages(include=["hpc", "hpc.*"]) + list(amd_package_dirs),
+    package_dir=amd_package_dirs,
     ext_modules=[CMakeExtension("hpc", version_macros)] if BACKEND == "cuda" else [],
     cmdclass={"build_ext": CMakeBuild, "build_py": BuildPy},
     package_data={"hpc": ["*.so"]} if BACKEND == "cuda" else {},

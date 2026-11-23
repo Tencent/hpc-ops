@@ -64,7 +64,7 @@ def _load_module():
     detection, for a build machine with no matching GPU.
     """
     if torch.version.hip:
-        from ._triton import register
+        from ._amd import register
 
         register()
         return "triton"

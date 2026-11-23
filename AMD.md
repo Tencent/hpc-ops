@@ -17,15 +17,25 @@ reductions, and indexed memory operations without FP8, WMMA, or MFMA.
 | `stem_tpd` | `src/stem/amd/stem_tpd.py` | `_stem_tpd_kernel`: BF16 threshold selection, prompt-based budget, chunked prefill and fixed retention patterns |
 | `reformat_x_scale` | `src/group_gemm/amd/reformat.py` | `_group_offsets`, `_reformat_kernel`: FP32 grouped transpose and compaction with aligned padding |
 
-Implementations live in `src/<operator>/amd/`. `hpc/_triton/` contains registration,
-shared validation and schemas. Packaging installs the same sources under the
-private `hpc._ops.<operator>.amd` namespace; the source checkout resolves that
-namespace to `src/` as well.
+Each operator's `src/<operator>/amd/entry.py` owns its schemas, registration,
+input validation, output allocation and launch configuration. The kernel files
+listed above contain only Triton device functions. Shared validation lives in
+`src/utils/amd/validation.py`; `src/C/amd/__init__.py` checks the compiler,
+initializes the backend and registers version information. Deferred interfaces
+retain their schemas and `TODO(amd)` errors in `src/C/amd/unsupported.py`.
+Tests check schema parity against the CUDA registrations.
 
-Python launchers validate inputs and use the input GPU's current stream. Kernels
-compile for that device on first use; no native AMD extension is built or loaded.
-`hpc/_triton/_schemas.py` preserves all operator schemas and records a `TODO(amd)`
-for every deferred entry. Tests check schema parity against the CUDA registrations.
+`setup.py` installs these sources into one private package: `hpc._amd` comes from
+`src/C/amd/`, `hpc._amd.<operator>` from each operator's `amd/` directory, and
+`hpc._amd.utils` from `src/utils/amd/`. There is no source-directory search or
+manual import-path mutation at runtime. Development follows `make triton` and
+imports the built package from `build/lib.*`; a standard editable installation
+also provides the package mappings.
+
+`hpc/<operator>.py` retains the public API and existing fake implementations, while
+`hpc/__init__.py` selects and loads the backend before importing those wrappers.
+Python launchers use the input GPU's current stream. Kernels compile for that
+device on first use; no native AMD extension is built or loaded.
 
 ## Install and use
 
@@ -91,8 +101,8 @@ HPC_TRITON_USE_TLE=1 python -m pytest -q tests/test_iHC.py tests/test_sampler.py
 
 The AMD tests cover both iHC channel extraction paths and RMSNorm rounding
 policies, masked routes and odd widths, optional RoPE outputs, padded requests,
-cache strides, streams, graph replay, multiple GPUs, fake tensors,
-`torch.compile`, import without GPU initialization, schema parity, and TODO
+cache strides, streams, graph replay, multiple GPUs, import without GPU
+initialization, schema parity, and TODO
 errors. The existing compute-sanitizer target is NVIDIA-specific. TopK tests that assert
 the CUDA split-workspace layout are skipped on AMD; the functional selection,
 minimum/recommended scratch, graph replay and counter reuse checks still run.

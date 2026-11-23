@@ -521,6 +521,33 @@ For an operator already present:
 6. Build it and a multi-architecture set, then check import, module selection,
    dispatch errors, and tests.
 
+## AMD Triton backend
+
+On ROCm PyTorch, `hpc/__init__.py` loads the Python backend rather than a CUDA
+extension. Keep the same API/entry/kernel boundaries:
+
+```text
+hpc/<op>.py                   public API and fake implementation
+src/<op>/amd/entry.py         schema, registration, validation, allocation and launch
+src/<op>/amd/<kernel>.py      Triton device functions
+src/utils/amd/validation.py   shared host validation
+src/C/amd/__init__.py         backend initialization, dependencies and version information
+src/C/amd/unsupported.py      deferred schemas and TODO errors
+```
+
+`setup.py` maps these sources to the installed private package `hpc._amd`:
+its root is `src/C/amd`, each operator subpackage is `src/<op>/amd`, and the
+utils subpackage is `src/utils/amd`. Import through that package after building
+or installing; do not add source-directory searches, `sys.path` fallbacks or
+manual `__path__` changes. `hpc/` remains the public Python layer and backend
+loader. AMD entry modules register their own schemas; the common initializer
+imports them without maintaining a second operator implementation table.
+
+Use `make triton` to populate `build/lib.*`, then run focused pytest cases as
+usual. `HPC_BACKEND=triton python -m pip install -e . --no-build-isolation` uses
+standard editable package mappings for source debugging. `make format` and
+`make format-check` include the Python files under `src/*/amd/`.
+
 ## Style and repository conventions
 
 - Run `make format` before committing; `make format-check` must pass.

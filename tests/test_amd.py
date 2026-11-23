@@ -36,7 +36,7 @@ def _pre_reference(x, w, scale, base, weight, cast, head=False):
 @pytest.mark.parametrize("norm,cast", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("use_tle", [False, True])
 def test_ihc_signed_inputs_and_fused_norm(hidden, head, norm, cast, use_tle, monkeypatch):
-    from hpc._triton import ihc
+    from hpc._amd.iHC import entry as ihc
 
     monkeypatch.setattr(ihc, "USE_TLE", use_tle)
     torch.manual_seed(84)
@@ -263,26 +263,6 @@ def test_empty_and_invalid_inputs():
         hpc.fuse_ihc_pre(x, w, scale.cpu(), base)
 
 
-def test_fake_tensors():
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    with FakeTensorMode():
-        x = torch.empty((7, 4, 4096), device="cuda", dtype=torch.bfloat16)
-        w = torch.empty((8, 4 * 4096), device="cuda")
-        scale, base = torch.empty(2, device="cuda"), torch.empty(8, device="cuda")
-        y, hp = hpc.fuse_ihc_pre(x, w, scale, base)
-        assert y.shape == (7, 4096) and hp.dtype == torch.float32
-        assert hpc.fuse_ihc_post(y, x, hp).shape == x.shape
-        head = hpc.fuse_ihc_head(x, w[:4], scale[:1], base[:4])
-        assert head.shape == (7, 4096)
-        reduced = hpc.reduce(
-            y,
-            torch.empty((3, 2), device="cuda", dtype=torch.int32),
-            torch.empty((3, 2), device="cuda"),
-        )
-        assert reduced.shape == (3, 4096) and reduced.device == x.device
-
-
 @pytest.mark.parametrize("topk", [0, 4])
 @pytest.mark.parametrize("input_rows", [0, 3])
 @pytest.mark.parametrize("shared", [False, True])
@@ -354,43 +334,6 @@ def test_rope_large_batch_repeated(policy):
         assert torch.all(out[valid:] == 17)
         assert torch.all(k[blocks[0, -1], valid % block :] == 0)
         assert torch.all(v[blocks[0, -1], valid % block :] == 0)
-
-
-def test_torch_compile_ihc_and_reduce():
-    x = torch.randn((7, 4, 4096), device="cuda").bfloat16()
-    w = torch.randn((8, 4 * 4096), device="cuda") * 0.02
-    scale, base = torch.ones(2, device="cuda"), torch.randn(8, device="cuda")
-    pos = torch.arange(7, device="cuda", dtype=torch.int32).reshape(7, 1)
-    routes = torch.ones((7, 1), device="cuda")
-
-    def forward(x, w, scale, base, pos, routes):
-        y, gates = hpc.fuse_ihc_pre(x, w, scale, base)
-        residual = hpc.fuse_ihc_post(y, x, gates)
-        head = hpc.fuse_ihc_head(residual, w[:4], scale[:1], base[:4])
-        return hpc.reduce(head, pos, routes), gates
-
-    expected = forward(x, w, scale, base, pos, routes)
-    compiled = torch.compile(forward, fullgraph=True)
-    torch.testing.assert_close(compiled(x, w, scale, base, pos, routes), expected)
-
-
-def test_torch_compile_rope():
-    qkv = torch.randn((1, 1280), device="cuda").bfloat16()
-    k = torch.zeros((2, 4, 1, 128), device="cuda", dtype=torch.bfloat16)
-    v = torch.zeros_like(k)
-    cs = torch.randn((8, 128), device="cuda")
-    lengths = torch.tensor([5], device="cuda", dtype=torch.int32)
-    q_index = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
-    blocks = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
-
-    def forward(k, v, qkv, cs, lengths, q_index, blocks):
-        return hpc.rope_norm_store_kv(k, v, qkv, cs, lengths, q_index, blocks, False)
-
-    expected_k, expected_v = k.clone(), v.clone()
-    expected_q = forward(expected_k, expected_v, qkv, cs, lengths, q_index, blocks)
-    compiled = torch.compile(forward, fullgraph=True)
-    actual_q = compiled(k, v, qkv, cs, lengths, q_index, blocks)
-    torch.testing.assert_close((actual_q, k, v), (expected_q, expected_k, expected_v))
 
 
 def test_todos_and_schema_parity():

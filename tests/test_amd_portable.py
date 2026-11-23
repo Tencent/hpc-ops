@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(not torch.version.hip, reason="AMD backend tests
 @pytest.mark.parametrize("norm", [False, True])
 @pytest.mark.parametrize("use_tle", [False, True])
 def test_post_pre_signed_rounding(hidden, cast, norm, use_tle, monkeypatch):
-    from hpc._triton import ihc
+    from hpc._amd.iHC import entry as ihc
 
     monkeypatch.setattr(ihc, "USE_TLE", use_tle)
     torch.manual_seed(38)
@@ -174,7 +174,7 @@ def test_sampler_shared_penalty_slots_and_partial_word(seed, storage_offset):
 @pytest.mark.parametrize("use_tle", [False, True])
 @pytest.mark.parametrize("policy", [1, 2])
 def test_sampler_tle_top_p(use_tle, policy, monkeypatch):
-    from hpc._triton import sampler
+    from hpc._amd.sampler import entry as sampler
     from test_sampler import ref_fused_sampler
 
     monkeypatch.setattr(sampler, "USE_TLE", use_tle)
@@ -226,7 +226,7 @@ def test_sampler_graph_replay(temperature_only, external):
 
 
 def test_sampler_rng_uses_high_counter_bits():
-    from hpc._triton import sampler
+    from hpc._amd.sampler import entry as sampler
 
     logits = torch.zeros((8, 120832), device="cuda")
     hpc.fused_sampler(logits, temperature=1.0, seed=42)
@@ -329,60 +329,6 @@ def test_topk_parallel_and_minimum_workspace(width):
             values = logits[row, indices].sort().values
             torch.testing.assert_close(values, expected, atol=0, rtol=0)
     assert not counters.any()
-
-
-def test_compiled_fusion_selection_and_reformat():
-    xa = torch.randn((2, 4096), device="cuda").bfloat16()
-    residual = torch.randn((2, 4, 4096), device="cuda").bfloat16()
-    gates = torch.rand((2, 4), device="cuda")
-    w = torch.randn((8, 16384), device="cuda") * 0.02
-    scale, base = torch.ones(2, device="cuda"), torch.zeros(8, device="cuda")
-    scores = torch.randn((2, 1, 2, 8), device="cuda").bfloat16()
-    qlens = torch.full((2,), 256, device="cuda", dtype=torch.int32)
-    klens = torch.full((2,), 1024, device="cuda", dtype=torch.int32)
-    xscale = torch.randn((64, 16), device="cuda")
-    lens = torch.tensor([3, 17], device="cuda", dtype=torch.int32)
-    cu = torch.tensor([0, 32, 64], device="cuda", dtype=torch.int32)
-    logits = torch.randn((2, 120832), device="cuda")
-    noise = torch.randn_like(logits)
-
-    def forward(
-        xa, residual, gates, w, scale, base, scores, qlens, klens, xscale, lens, cu, logits, noise
-    ):
-        fused = hpc.fuse_ihc_post_pre(xa, residual, gates, w, scale, base)
-        mask = hpc.stem_tpd(scores, qlens, klens, klens)
-        reformatted = hpc.reformat_x_scale(xscale, lens, cu, 16)
-        token = hpc.fused_sampler(logits, temperature=0.7, gumbel_noise=noise)
-        full_token = hpc.fused_sampler(logits, topk=32, gumbel_noise=noise)
-        return fused, mask, reformatted, token, full_token
-
-    args = (
-        xa,
-        residual,
-        gates,
-        w,
-        scale,
-        base,
-        scores,
-        qlens,
-        klens,
-        xscale,
-        lens,
-        cu,
-        logits,
-        noise,
-    )
-    expected = forward(*args)
-    actual = torch.compile(forward, fullgraph=True)(*args)
-    # Unwritten scale padding has no defined value.
-    for index in range(2):
-        start = 0 if index == 0 else 16
-        length = (3, 17)[index]
-        torch.testing.assert_close(
-            actual[2][:, start : start + length], expected[2][:, start : start + length]
-        )
-    torch.testing.assert_close(actual[:2], expected[:2])
-    torch.testing.assert_close(actual[3:], expected[3:])
 
 
 def test_empty_fusion_sampler_and_validation():

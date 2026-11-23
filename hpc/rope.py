@@ -246,13 +246,11 @@ def rope_norm_store_kv_fake(
     is_prefill,
     q_norm_weight,
     k_norm_weight,
-    out_q=None,
-    out_k=None,
-    out_v=None,
-    qk_norm_policy=0,
+    out_q,
+    out_k,
+    out_v,
+    qk_norm_policy,
 ):
-    if out_q is not None:
-        return out_q
     hidden_size = qkv.shape[-1]
     kv_heads = key_cache.shape[-2]
     qk_head_dim = key_cache.shape[-1]
