@@ -3,14 +3,6 @@
 # One module per architecture. See CLAUDE.md for layout and source selection.
 
 cmake_minimum_required(VERSION 3.26)
-set(HPC_BACKEND "cuda" CACHE STRING "GPU backend: cuda or hip")
-if(HPC_BACKEND STREQUAL "hip")
-  project(hpc_ops LANGUAGES CXX HIP)
-  include(cmake/hip.cmake)
-  return()
-elseif(NOT HPC_BACKEND STREQUAL "cuda")
-  message(FATAL_ERROR "Unknown HPC_BACKEND=${HPC_BACKEND}; expected cuda or hip")
-endif()
 project(hpc_ops LANGUAGES CXX CUDA)
 
 enable_language(CUDA)
@@ -67,7 +59,6 @@ message(STATUS "hpc-ops: building sm${HPC_TARGET_ARCH} -> gencode sm_${HPC_GENCO
 file(GLOB_RECURSE HPC_CANDIDATE_SOURCES RELATIVE "${CMAKE_SOURCE_DIR}"
      "${CMAKE_SOURCE_DIR}/src/*.cu" "${CMAKE_SOURCE_DIR}/src/*.cc")
 list(FILTER HPC_CANDIDATE_SOURCES EXCLUDE REGEX ".*test.*")
-list(FILTER HPC_CANDIDATE_SOURCES EXCLUDE REGEX "(^|/)amd/")
 
 set(HPC_SOURCES "")
 foreach(rel IN LISTS HPC_CANDIDATE_SOURCES)

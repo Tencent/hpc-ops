@@ -1,7 +1,7 @@
 PY_FILES=$(shell find hpc -name "*.py") $(shell find tests -name "*.py") $(shell find ./ -maxdepth 1 -name "*.py")
 PY_TEST=$(shell find tests -name "test_*.py")
 CC_FILES=$(shell find src -name "*.cc")
-CU_FILES=$(shell find src -name "*.cu") $(shell find src -name "*.hip")
+CU_FILES=$(shell find src -name "*.cu")
 H_FILES=$(shell find src -name "*.h")
 CUH_FILES=$(shell find src -name "*.cuh")
 
@@ -29,9 +29,8 @@ export SM_ARCH
 all:
 	python3 setup.py build
 
-# On ROCm PyTorch, plain `make` also selects HIP automatically.
-hip:
-	HPC_BACKEND=hip python3 setup.py build
+triton hip:
+	HPC_BACKEND=triton python3 setup.py build
 
 # A release wheel covers everything unless asked for less. The target-specific
 # default is overridden by SM_ARCH from the environment or the command line,
@@ -48,12 +47,12 @@ $(foreach arch,$(KNOWN_ARCHS),sm$(arch)):
 format:
 	python3 -m black --line-length 100 $(PY_FILES)
 	clang-format --style=file -i $(CSRC_FILES)
-	python3 -m cpplint --extensions=cc,cu,cuh,h,hip --headers=h,cuh --quiet $(CSRC_FILES)
+	python3 -m cpplint --extensions=cc,cu,cuh,h --headers=h,cuh --quiet $(CSRC_FILES)
 
 format-check:
 	python3 -m black --check --line-length 100 $(PY_FILES)
 	clang-format --style=file --dry-run -Werror $(CSRC_FILES)
-	python3 -m cpplint --extensions=cc,cu,cuh,h,hip --headers=h,cuh $(CSRC_FILES)
+	python3 -m cpplint --extensions=cc,cu,cuh,h --headers=h,cuh $(CSRC_FILES)
 
 test:$(PY_TEST)
 	@for test in $^; do \
@@ -69,5 +68,5 @@ sanitizer:$(PY_TEST)
 clean:
 	rm -rf build dist hpc_ops.egg-info hpc.egg-info .pytest_cache tests/__pycache__ site
 
-.PHONY: all hip wheel format format-check test sanitizer clean \
+.PHONY: all triton hip wheel format format-check test sanitizer clean \
         $(foreach arch,$(KNOWN_ARCHS),sm$(arch))

@@ -280,7 +280,7 @@ def count_and_gather_fake(
 
 @torch.library.register_fake("hpc::reduce")
 def reduce_fake(x, topk_pos, topk_scale, shared_output):
-    return torch.empty((topk_pos.shape[0], x.shape[1]), dtype=torch.bfloat16)
+    return torch.empty((topk_pos.shape[0], x.shape[1]), dtype=x.dtype, device=x.device)
 
 
 @torch.library.register_fake("hpc::fuse_moe")

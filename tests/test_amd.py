@@ -1,4 +1,4 @@
-"""Correctness and integration coverage for the first portable HIP kernels."""
+"""Correctness and integration coverage for the AMD Triton backend."""
 
 import ast
 import json
@@ -34,7 +34,11 @@ def _pre_reference(x, w, scale, base, weight, cast, head=False):
 @pytest.mark.parametrize("hidden", [4096, 6144])
 @pytest.mark.parametrize("head", [False, True])
 @pytest.mark.parametrize("norm,cast", [(False, False), (True, False), (True, True)])
-def test_ihc_signed_inputs_and_fused_norm(hidden, head, norm, cast):
+@pytest.mark.parametrize("use_tle", [False, True])
+def test_ihc_signed_inputs_and_fused_norm(hidden, head, norm, cast, use_tle, monkeypatch):
+    from hpc._triton import ihc
+
+    monkeypatch.setattr(ihc, "USE_TLE", use_tle)
     torch.manual_seed(84)
     x = torch.randn((7, 4, hidden), dtype=torch.bfloat16, device="cuda")
     w = torch.randn((4 if head else 8, 4 * hidden), device="cuda") * 0.02
@@ -72,8 +76,11 @@ def test_moe_reduce(hidden, topk, shared):
 
 
 @pytest.mark.parametrize("policy", [0, 1, 2])
-@pytest.mark.parametrize("separate_kv", [False, True])
-def test_rope_output_buffers_and_padding(policy, separate_kv):
+@pytest.mark.parametrize(
+    "separate_k,separate_v", [(False, False), (True, False), (False, True), (True, True)]
+)
+@pytest.mark.parametrize("padded_cache", [False, True])
+def test_rope_output_buffers_and_padding(policy, separate_k, separate_v, padded_cache):
     torch.manual_seed(10)
     device = "cuda"
     qkv = torch.randn((8, 10 * 128), device=device).bfloat16()
@@ -82,14 +89,16 @@ def test_rope_output_buffers_and_padding(policy, separate_kv):
     blocks = torch.tensor(
         [[0, 1, 2], [0, 0, 0], [3, 4, 5], [0, 0, 0]], dtype=torch.int32, device=device
     )
-    k = torch.randn((8, 4, 1, 128), device=device).bfloat16()
-    v = torch.randn_like(k)
+    k_storage = torch.randn((8, 5 if padded_cache else 4, 1, 128), device=device).bfloat16()
+    v_storage = torch.randn((8, 6 if padded_cache else 4, 1, 128), device=device).bfloat16()
+    k, v = k_storage[:, :4], v_storage[:, :4]
+    k_gap, v_gap = k_storage[:, 4:].clone(), v_storage[:, 4:].clone()
     ref_k, ref_v = k.clone(), v.clone()
     cs = torch.randn((16, 128), device=device)
     qw, kw = torch.randn((2, 128), device=device)
     q_out = torch.full((8, 8, 128), 17.0, device=device).bfloat16()
-    k_out = torch.full((8, 1, 128), 17.0, device=device).bfloat16() if separate_kv else None
-    v_out = torch.full((8, 1, 128), 17.0, device=device).bfloat16() if separate_kv else None
+    k_out = torch.full((8, 1, 128), 17.0, device=device).bfloat16() if separate_k else None
+    v_out = torch.full((8, 1, 128), 17.0, device=device).bfloat16() if separate_v else None
     q_ref = qkv[:5, : 8 * 128].reshape(5, 8, 128).float()
     k_ref = qkv[:5, 8 * 128 : 9 * 128].reshape(5, 1, 128).float()
     v_ref = qkv[:5, 9 * 128 :].reshape(5, 1, 128)
@@ -123,19 +132,24 @@ def test_rope_output_buffers_and_padding(policy, separate_kv):
     torch.testing.assert_close(q_out[:5].float(), q_ref.bfloat16().float(), atol=3e-2, rtol=1e-2)
     assert torch.all(q_out[5:] == 17)
     for row, (physical, offset) in enumerate([(1, 0), (1, 1), (4, 2), (4, 3), (5, 0)]):
-        if not separate_kv:
+        if not separate_k:
             ref_k[physical, offset] = k_ref[row].bfloat16()
+        if not separate_v:
             ref_v[physical, offset] = v_ref[row]
     ref_k[1, 2:] = ref_v[1, 2:] = 0
     ref_k[5, 1:] = ref_v[5, 1:] = 0
     torch.testing.assert_close(k.float(), ref_k.float(), atol=3e-2, rtol=1e-2)
     torch.testing.assert_close(v, ref_v, atol=0, rtol=0)
-    if separate_kv:
+    torch.testing.assert_close(k_storage[:, 4:], k_gap, atol=0, rtol=0)
+    torch.testing.assert_close(v_storage[:, 4:], v_gap, atol=0, rtol=0)
+    if separate_k:
         torch.testing.assert_close(
             k_out[:5].float(), k_ref.bfloat16().float(), atol=3e-2, rtol=1e-2
         )
+        assert torch.all(k_out[5:] == 17)
+    if separate_v:
         torch.testing.assert_close(v_out[:5], v_ref, atol=0, rtol=0)
-        assert torch.all(k_out[5:] == 17) and torch.all(v_out[5:] == 17)
+        assert torch.all(v_out[5:] == 17)
 
 
 @pytest.mark.parametrize("policy", [0, 1, 2])
@@ -261,6 +275,122 @@ def test_fake_tensors():
         assert hpc.fuse_ihc_post(y, x, hp).shape == x.shape
         head = hpc.fuse_ihc_head(x, w[:4], scale[:1], base[:4])
         assert head.shape == (7, 4096)
+        reduced = hpc.reduce(
+            y,
+            torch.empty((3, 2), device="cuda", dtype=torch.int32),
+            torch.empty((3, 2), device="cuda"),
+        )
+        assert reduced.shape == (3, 4096) and reduced.device == x.device
+
+
+@pytest.mark.parametrize("topk", [0, 4])
+@pytest.mark.parametrize("input_rows", [0, 3])
+@pytest.mark.parametrize("shared", [False, True])
+def test_reduce_empty_and_masked_routes(topk, input_rows, shared):
+    x = torch.randn((input_rows, 513), device="cuda").bfloat16()
+    pos = torch.tensor([[-1, 0, 2, 3]], device="cuda", dtype=torch.int32)[:, :topk].contiguous()
+    scale = torch.full((1, topk), 0.25, device="cuda")
+    scale.masked_fill_((pos < 0) | (pos >= input_rows), float("nan"))
+    extra = torch.randn((1, 513), device="cuda").bfloat16() if shared else None
+    ref = torch.zeros((1, 513), device="cuda")
+    for route in range(topk):
+        index = int(pos[0, route])
+        if 0 <= index < input_rows:
+            ref += x[index].float() * scale[0, route]
+    if shared:
+        ref += extra.float()
+    torch.testing.assert_close(hpc.reduce(x, pos, scale, extra), ref.bfloat16())
+
+
+@pytest.mark.parametrize("policy", [0, 1, 2])
+def test_rope_large_batch_repeated(policy):
+    rows, valid, q_heads, kv_heads, block = 1024, 1021, 64, 8, 64
+    positions = torch.arange(valid, device="cuda")
+    lengths = torch.tensor([valid, 0], dtype=torch.int32, device="cuda")
+    q_index = torch.tensor([0, valid, rows], dtype=torch.int32, device="cuda")
+    blocks = torch.stack([torch.randperm(16, device="cuda"), torch.zeros(16, device="cuda")]).int()
+    k = torch.empty((16, block, kv_heads, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+    cs = torch.randn((rows, 128), device="cuda")
+    qw, kw = torch.randn((2, 128), device="cuda")
+    out = torch.empty((rows, q_heads, 128), device="cuda", dtype=torch.bfloat16)
+    for seed in range(3):
+        torch.manual_seed(seed)
+        qkv = torch.randn((rows, (q_heads + 2 * kv_heads) * 128), device="cuda").bfloat16()
+        q_ref, k_ref, v_ref = torch.split(
+            qkv[:valid].reshape(valid, q_heads + 2 * kv_heads, 128),
+            [q_heads, kv_heads, kv_heads],
+            dim=1,
+        )
+        refs = []
+        for source, weight in ((q_ref, qw), (k_ref, kw)):
+            source = source.float()
+            if policy == 2:
+                source = (
+                    source * torch.rsqrt(source.square().mean(-1, keepdim=True) + 1e-6) * weight
+                )
+            first, second = source[..., :64], source[..., 64:]
+            cosine, sine = cs[:valid, :64].unsqueeze(1), cs[:valid, 64:].unsqueeze(1)
+            rotated = torch.cat(
+                [first * cosine - second * sine, second * cosine + first * sine], -1
+            )
+            if policy == 1:
+                rotated = (
+                    rotated * torch.rsqrt(rotated.square().mean(-1, keepdim=True) + 1e-6) * weight
+                )
+            refs.append(rotated.bfloat16())
+        k.fill_(17)
+        v.fill_(17)
+        out.fill_(17)
+        hpc.rope_norm_store_kv(
+            k, v, qkv, cs, lengths, q_index, blocks, True, qw, kw, out_q=out, qk_norm_policy=policy
+        )
+        torch.testing.assert_close(out[:valid].float(), refs[0].float(), atol=3e-2, rtol=1e-2)
+        physical, offset = blocks[0, positions // block].long(), positions % block
+        torch.testing.assert_close(
+            k[physical, offset].float(), refs[1].float(), atol=3e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(v[physical, offset], v_ref, atol=0, rtol=0)
+        assert torch.all(out[valid:] == 17)
+        assert torch.all(k[blocks[0, -1], valid % block :] == 0)
+        assert torch.all(v[blocks[0, -1], valid % block :] == 0)
+
+
+def test_torch_compile_ihc_and_reduce():
+    x = torch.randn((7, 4, 4096), device="cuda").bfloat16()
+    w = torch.randn((8, 4 * 4096), device="cuda") * 0.02
+    scale, base = torch.ones(2, device="cuda"), torch.randn(8, device="cuda")
+    pos = torch.arange(7, device="cuda", dtype=torch.int32).reshape(7, 1)
+    routes = torch.ones((7, 1), device="cuda")
+
+    def forward(x, w, scale, base, pos, routes):
+        y, gates = hpc.fuse_ihc_pre(x, w, scale, base)
+        residual = hpc.fuse_ihc_post(y, x, gates)
+        head = hpc.fuse_ihc_head(residual, w[:4], scale[:1], base[:4])
+        return hpc.reduce(head, pos, routes), gates
+
+    expected = forward(x, w, scale, base, pos, routes)
+    compiled = torch.compile(forward, fullgraph=True)
+    torch.testing.assert_close(compiled(x, w, scale, base, pos, routes), expected)
+
+
+def test_torch_compile_rope():
+    qkv = torch.randn((1, 1280), device="cuda").bfloat16()
+    k = torch.zeros((2, 4, 1, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+    cs = torch.randn((8, 128), device="cuda")
+    lengths = torch.tensor([5], device="cuda", dtype=torch.int32)
+    q_index = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    blocks = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+
+    def forward(k, v, qkv, cs, lengths, q_index, blocks):
+        return hpc.rope_norm_store_kv(k, v, qkv, cs, lengths, q_index, blocks, False)
+
+    expected_k, expected_v = k.clone(), v.clone()
+    expected_q = forward(expected_k, expected_v, qkv, cs, lengths, q_index, blocks)
+    compiled = torch.compile(forward, fullgraph=True)
+    actual_q = compiled(k, v, qkv, cs, lengths, q_index, blocks)
+    torch.testing.assert_close((actual_q, k, v), (expected_q, expected_k, expected_v))
 
 
 def test_todos_and_schema_parity():
@@ -282,12 +412,15 @@ def test_todos_and_schema_parity():
         torch.ops.hpc.gated_mla_gemm(x, x, x)
     with pytest.raises(NotImplementedError, match="TODO"):
         torch.ops.hpc.fuse_ihc_post_pre(x, x, x, x, x, x, 1e-5, 1e-6, 2.0)
-    assert json.loads(hpc.__built_json__)["backend"] == "hip"
+    assert json.loads(hpc.__built_json__)["backend"] == "triton"
 
 
 def test_import_does_not_initialize_gpu():
     code = "import torch, hpc; assert not torch.cuda.is_initialized(); print(hpc.__backend__)"
-    env = dict(os.environ, PYTHONPATH=str(Path(hpc.__file__).parent.parent))
+    pythonpath = os.pathsep.join(
+        [str(Path(hpc.__file__).parent.parent), os.environ.get("PYTHONPATH", "")]
+    )
+    env = dict(os.environ, PYTHONPATH=pythonpath)
     result = subprocess.run(
         [sys.executable, "-c", code],
         cwd="/tmp",
@@ -296,4 +429,4 @@ def test_import_does_not_initialize_gpu():
         text=True,
         check=True,
     )
-    assert result.stdout.strip() == "hip"
+    assert result.stdout.strip() == "triton"

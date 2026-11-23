@@ -56,7 +56,7 @@ def _nvml_arch():
 
 
 def _load_module():
-    """Loads the extension module for the local device; returns its architecture.
+    """Register AMD Triton operators or load the local CUDA architecture's module.
 
     A package carries one `_C_sm<arch>.abi3.so` per architecture it was built
     for. The match is exact: architecture-specific cubins are not forward
@@ -64,12 +64,10 @@ def _load_module():
     detection, for a build machine with no matching GPU.
     """
     if torch.version.hip:
-        # Loading the HIP library does not initialize a device context, preserving fork workers.
-        module = _pkg_dir / "_C_hip.abi3.so"
-        if not module.is_file():
-            raise ImportError("hpc has no HIP module. Build with 'HPC_BACKEND=hip make'.")
-        torch.ops.load_library(str(module))
-        return "hip"
+        from ._triton import register
+
+        register()
+        return "triton"
 
     override = os.getenv("HPC_SM_ARCH", "").strip()
     if override:
@@ -101,7 +99,7 @@ def _load_module():
 
 
 __loaded_arch__ = _load_module()
-__backend__ = "hip" if torch.version.hip else "cuda"
+__backend__ = "triton" if torch.version.hip else "cuda"
 
 
 def _discover_modules() -> Dict[str, ModuleType]:
@@ -145,5 +143,5 @@ __built_json__ = torch.ops.hpc.built_json()
 __doc__ = """
 High Performance Computing Operators Library
 
-This library provides optimized CUDA kernels for tensor operations.
+This library provides optimized CUDA and AMD Triton kernels for tensor operations.
 """
