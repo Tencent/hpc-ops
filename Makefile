@@ -1,4 +1,4 @@
-PY_FILES=$(shell find hpc -name "*.py") $(shell find src -path "*/amd/*.py") $(shell find benchmark/amd -name "*.py") $(shell find tests -name "*.py") $(shell find ./ -maxdepth 1 -name "*.py")
+PY_FILES=$(shell find hpc -name "*.py") $(shell find src -path "*/amd/*.py") $(shell find tests -name "*.py") $(shell find ./ -maxdepth 1 -name "*.py")
 PY_TEST=$(shell find tests -name "test_*.py")
 CC_FILES=$(shell find src -name "*.cc")
 CU_FILES=$(shell find src -name "*.cu")

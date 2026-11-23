@@ -107,16 +107,6 @@ errors. The existing compute-sanitizer target is NVIDIA-specific. TopK tests tha
 the CUDA split-workspace layout are skipped on AMD; the functional selection,
 minimum/recommended scratch, graph replay and counter reuse checks still run.
 
-Reproduce graph latency measurements and reference checks with:
-
-```bash
-HIP_VISIBLE_DEVICES=0 python benchmark/amd/benchmark_portable.py --output /tmp/amd-latency.json
-```
-
-The benchmark compares iHC fusion with composing the two existing interfaces,
-sampling with equivalent PyTorch expressions, and exact TopK with PyTorch's
-unordered TopK. Performance varies with batch size and row width.
-
 ## Selection and sampling contracts
 
 TopK selects exact FP32 keys, permits any valid subset at a tied boundary,
