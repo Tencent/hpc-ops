@@ -18,7 +18,7 @@ if BACKEND not in ("cuda", "hip"):
 # Architectures the build supports. The same list is in the Makefile and
 # CMakeLists.txt; adding one also needs an HPC_ARCH_EVAL_<arch> block in
 # src/utils/utils.h.
-KNOWN_ARCHS = [90, 100, 103]
+KNOWN_ARCHS = [90, 100, 103, 120]
 
 
 class CMakeExtension(Extension):
