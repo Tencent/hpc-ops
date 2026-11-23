@@ -6,10 +6,21 @@ reductions, and indexed memory operations without FP8, WMMA, or MFMA.
 
 | Public interface | File | Kernel / coverage |
 |---|---|---|
-| `rope_norm_store_kv` | `hpc/_triton/rope.py` | `_rope_kernel`: BF16, head dimension 128, Q/KV heads 8/1 and 64/8; prefill, decode, MTP; norm policies 0/1/2; optional Q/K/V outputs, paged cache and tail clearing |
-| `reduce` | `hpc/_triton/moe.py` | `_reduce_kernel`: BF16 with FP32 accumulation, masked routes, optional shared expert output, K up to 128 |
-| `fuse_ihc_pre`, `fuse_ihc_head` | `hpc/_triton/ihc.py` | `_pre_head_kernel`: four channels, hidden sizes 4096/6144, FP32 projection, optional fused RMSNorm with either rounding policy |
-| `fuse_ihc_post` | `hpc/_triton/ihc.py` | `_post_kernel`: four channels, hidden sizes 4096/6144 |
+| `rope_norm_store_kv` | `src/rope/amd/rope.py` | `_rope_kernel`: BF16, head dimension 128, Q/KV heads 8/1 and 64/8; prefill, decode, MTP; norm policies 0/1/2; optional Q/K/V outputs, paged cache and tail clearing |
+| `reduce` | `src/fuse_moe/amd/reduce.py` | `_reduce_kernel`: BF16 with FP32 accumulation, masked routes, optional shared expert output, K up to 128 |
+| `fuse_ihc_pre`, `fuse_ihc_head` | `src/iHC/amd/iHC.py` | `_pre_head_kernel`: four channels, hidden sizes 4096/6144, FP32 projection, optional fused RMSNorm with either rounding policy |
+| `fuse_ihc_post` | `src/iHC/amd/iHC.py` | `_post_kernel`: four channels, hidden sizes 4096/6144 |
+| `fuse_ihc_post_pre` | `src/iHC/amd/iHC.py` | `_pre_head_kernel` with fused post: BF16 intermediate output, optional RMSNorm with either rounding policy |
+| `fused_sampler_temperature_sample` | `src/sampler/amd/sampler.py` | `_temperature_kernel`, `_temperature_finish`: FP32/BF16 logits, temperature, draft mask, Gumbel-max and token tie breaking |
+| `fused_sampler` | `src/sampler/amd/sampler.py` | `_prepare_kernel`, `_sample_kernel`: block-local TopK and candidate merge, repetition penalty, temperature, softmax policies, TopP, Gumbel-max and atomic penalty writeback |
+| `topk_filtered` (`hpc.topk`) | `src/topk/amd/topk.py` | `_select_kernel` for row-local selection; `_histogram_kernel`, `_refine_kernel`, `_collect_kernel` for parallel exact radix selection; K=512/2048, live rows and ragged lengths |
+| `stem_tpd` | `src/stem/amd/stem_tpd.py` | `_stem_tpd_kernel`: BF16 threshold selection, prompt-based budget, chunked prefill and fixed retention patterns |
+| `reformat_x_scale` | `src/group_gemm/amd/reformat.py` | `_group_offsets`, `_reformat_kernel`: FP32 grouped transpose and compaction with aligned padding |
+
+Implementations live in `src/<operator>/amd/`. `hpc/_triton/` contains registration,
+shared validation and schemas. Packaging installs the same sources under the
+private `hpc._ops.<operator>.amd` namespace; the source checkout resolves that
+namespace to `src/` as well.
 
 Python launchers validate inputs and use the input GPU's current stream. Kernels
 compile for that device on first use; no native AMD extension is built or loaded.
@@ -25,8 +36,9 @@ Python imports that module from FlagTree when other Triton distributions coexist
 
 ```bash
 make triton
+HPC_BACKEND=triton python -m pip install . --no-build-isolation
+# To build a wheel instead:
 HPC_BACKEND=triton python setup.py bdist_wheel
-python -m pip install dist/*triton*.whl
 ```
 
 Plain `make` selects Triton on ROCm PyTorch. `make hip` and `HPC_BACKEND=hip`
@@ -42,9 +54,10 @@ PyTorch's ROCm API. `hpc.__built_json__` reports the backend and compiler versio
 
 `HPC_TRITON_USE_TLE=1` selects `tle.extract_tile` for channel extraction in iHC
 pre/head. The default uses ordinary Triton: TLE did not consistently improve
-performance in the RDNA3 evaluation. The 6144-wide TLE path uses 16 waves to
-limit register spills. RoPE, MoE reduction and iHC post use ordinary Triton in
-both modes.
+performance in the RDNA3 evaluation. The 6144-wide TLE and fused post/pre paths use 16 waves to
+limit register spills. The sampler also offers TLE exclusive prefix sums for TopP.
+RoPE, MoE reduction, TopK, scale reformatting, STEM TPD and iHC post use ordinary
+Triton in both modes.
 
 ```bash
 HPC_TRITON_USE_TLE=1 python your_application.py
@@ -57,8 +70,7 @@ Unsupported calls raise `NotImplementedError` with a `TODO(amd)` reason:
 - FP8 data paths, including the FP8 RoPE sibling.
 - Matrix kernels in Attention, GEMM, Group GEMM, STEM, and Fused MoE.
 - NVIDIA multicast communication and its communicator.
-- Other kernels awaiting a port: iHC post/pre fusion, sampler, TopK, STEM TPD,
-  scale reformatting, and task scheduling.
+- Attention decode task scheduling, which remains tied to the deferred attention kernels.
 
 Coverage is per kernel and interface. A file containing FP8 or matrix kernels
 does not exclude its independent BF16 or ordinary arithmetic kernels.
@@ -71,13 +83,51 @@ runtime validation.
 
 ```bash
 HIP_VISIBLE_DEVICES=0,1 python -m pytest -q \
-  tests/test_amd.py tests/test_iHC.py tests/test_rope.py tests/test_version.py \
-  -k 'not post_pre and not fp8'
-HPC_TRITON_USE_TLE=1 python -m pytest -q tests/test_iHC.py -k 'not post_pre'
+  tests/test_amd.py tests/test_amd_portable.py tests/test_iHC.py \
+  tests/test_rope.py tests/test_sampler.py tests/test_topk.py tests/test_version.py \
+  -k 'not fp8'
+HPC_TRITON_USE_TLE=1 python -m pytest -q tests/test_iHC.py tests/test_sampler.py tests/test_amd_portable.py
 ```
 
 The AMD tests cover both iHC channel extraction paths and RMSNorm rounding
 policies, masked routes and odd widths, optional RoPE outputs, padded requests,
 cache strides, streams, graph replay, multiple GPUs, fake tensors,
 `torch.compile`, import without GPU initialization, schema parity, and TODO
-errors. The existing compute-sanitizer target is NVIDIA-specific.
+errors. The existing compute-sanitizer target is NVIDIA-specific. TopK tests that assert
+the CUDA split-workspace layout are skipped on AMD; the functional selection,
+minimum/recommended scratch, graph replay and counter reuse checks still run.
+
+Reproduce graph latency measurements and reference checks with:
+
+```bash
+HIP_VISIBLE_DEVICES=0 python benchmark/amd/benchmark_portable.py --output /tmp/amd-latency.json
+```
+
+The benchmark compares iHC fusion with composing the two existing interfaces,
+sampling with equivalent PyTorch expressions, and exact TopK with PyTorch's
+unordered TopK. Performance varies with batch size and row width.
+
+## Selection and sampling contracts
+
+TopK selects exact FP32 keys, permits any valid subset at a tied boundary,
+and leaves inactive rows and unused output slots untouched. Large rows use four
+bytewise radix passes across multiple workgroups. The recommended workspace is
+bounded by 64 simultaneously processed rows. A minimum-sized buffer selects the
+row-local fallback; workspace queries report this backend's own layout. The
+three queries are host helpers, not additional GPU kernels. Caller-provided
+counters remain zero and scratch contents need no initialization.
+
+STEM TPD includes every finite BF16 value at its selected threshold, so ties can
+exceed the row budget. Initial, recent-window and diagonal retention are applied
+after threshold selection. Invalid request rows and padded columns are zero.
+
+Sampler vocabulary support remains 120832. External Gumbel noise supports direct
+reference comparisons. Internal Philox noise uses a per-device GPU counter,
+shared by both sampling interfaces, and advances on graph replay. Its sequence
+is backend-specific and does not reproduce cuRAND bit for bit. High counter bits
+participate in the RNG key. Concurrent penalty updates use atomic word writes;
+partial boundary words are handled without accessing beyond the tensor view.
+
+Per-row temperatures on the temperature-only path must remain positive. Eager
+calls validate them before launching; captured graphs retain this input contract
+without a device-to-host validation read during capture.

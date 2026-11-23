@@ -8,7 +8,7 @@ import triton.language as tl
 from triton.experimental.tle import require_tle
 from triton.experimental.tle import language as tle
 
-from ._validation import check_bf16, check_tensor, require
+from hpc._triton._validation import check_bf16, check_tensor, require
 
 USE_TLE = os.getenv("HPC_TRITON_USE_TLE", "0") == "1"
 
@@ -40,12 +40,16 @@ def _pre_head_kernel(
     Y,
     POST,
     RMS_WEIGHT,
+    XA,
+    POST_IN,
+    RESIDUAL_OUT,
     HIDDEN: tl.constexpr,
     BLOCK: tl.constexpr,
     HEAD: tl.constexpr,
     NORM: tl.constexpr,
     CAST_BF16: tl.constexpr,
     USE_TLE: tl.constexpr,
+    FUSE_POST: tl.constexpr,
     norm_eps,
     hc_eps,
     magnitude,
@@ -59,6 +63,16 @@ def _pre_head_kernel(
         cols[None, :] < HIDDEN,
         other=0,
     ).to(tl.float32)
+    if FUSE_POST:
+        xa = tl.load(XA + row.to(tl.int64) * HIDDEN + cols, cols < HIDDEN, other=0).to(tl.float32)
+        gates = tl.load(POST_IN + row * 4 + channels)
+        x = (gates[:, None] * xa[None, :] + x).to(tl.bfloat16)
+        tl.store(
+            RESIDUAL_OUT + (row.to(tl.int64) * 4 + channels[:, None]) * HIDDEN + cols[None, :],
+            x,
+            cols[None, :] < HIDDEN,
+        )
+        x = x.to(tl.float32)
     inv_rms = tl.rsqrt(tl.sum(tl.sum(x * x, 1), 0) / (4 * HIDDEN) + norm_eps)
     scale = tl.load(SCALE)
     p0 = (
@@ -146,6 +160,7 @@ def _pre_head(
     rms_eps,
     cast_bfloat_for_norm,
     head,
+    post_inputs=None,
 ):
     if USE_TLE:
         require_tle("amd", tle.extract_tile)
@@ -165,6 +180,7 @@ def _pre_head(
         require(rms_weight.shape == (hidden,), "rms_weight must have shape [D]")
     y = torch.empty((batch, hidden), device=x.device, dtype=x.dtype)
     post = None if head else torch.empty((batch, 4), device=x.device, dtype=torch.float32)
+    xa, post_in, residual_out = post_inputs if post_inputs is not None else (None, None, None)
     if batch:
         with torch.cuda.device(x.device):
             _pre_head_kernel[(batch,)](
@@ -175,17 +191,21 @@ def _pre_head(
                 y,
                 post,
                 rms_weight,
+                xa,
+                post_in,
+                residual_out,
                 hidden,
                 triton.next_power_of_2(hidden),
                 head,
                 rms_weight is not None,
                 cast_bfloat_for_norm,
                 USE_TLE,
+                post_inputs is not None,
                 norm_eps,
                 hc_eps,
                 magnitude,
                 rms_eps,
-                num_warps=16 if USE_TLE and hidden == 6144 else 8,
+                num_warps=16 if hidden == 6144 and (USE_TLE or post_inputs is not None) else 8,
                 enable_fp_fusion=False,
             )
     return y, post
@@ -276,4 +296,38 @@ def post(x, residual, H_post):
     return y
 
 
-# TODO(amd): fuse_ihc_post_pre requires a fused post/pre kernel.
+def post_pre(
+    xa,
+    residual,
+    H_post_in,
+    w,
+    hc_scale,
+    hc_base,
+    norm_eps,
+    hc_eps,
+    magnitude,
+    rms_weight=None,
+    rms_eps=0.0,
+    cast_bfloat_for_norm=False,
+):
+    check_bf16(xa, residual, "xa")
+    check_tensor(H_post_in, residual, torch.float32, "H_post_in")
+    require(residual.ndim == 3 and residual.shape[1] == 4, "residual must have shape [N,4,D]")
+    require(xa.shape == (residual.shape[0], residual.shape[2]), "xa must have shape [N,D]")
+    require(H_post_in.shape == residual.shape[:2], "H_post_in must have shape [N,4]")
+    y = torch.empty_like(residual)
+    z, gates = _pre_head(
+        residual,
+        w,
+        hc_scale,
+        hc_base,
+        norm_eps,
+        hc_eps,
+        magnitude,
+        rms_weight,
+        rms_eps,
+        cast_bfloat_for_norm,
+        False,
+        (xa, H_post_in, y),
+    )
+    return y, z, gates

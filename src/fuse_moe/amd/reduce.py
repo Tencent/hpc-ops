@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._validation import check_bf16, check_tensor, require
+from hpc._triton._validation import check_bf16, check_tensor, require
 
 
 @triton.jit

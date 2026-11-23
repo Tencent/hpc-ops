@@ -94,36 +94,18 @@ DEFERRED = {
     "group_gemm_pertensor_fp8": "FP8 data path",
     # TODO(amd): group_gemm_blockwise_fp8: FP8 data path.
     "group_gemm_blockwise_fp8": "FP8 data path",
-    # TODO(amd): reformat_x_scale: kernel not yet ported to Triton.
-    "reformat_x_scale": "kernel not yet ported to Triton",
     # TODO(amd): group_gemm_fp8_cp_async: FP8 data path.
     "group_gemm_fp8_cp_async": "FP8 data path",
     # TODO(amd): group_gemm_fp8_scatter_cp_async: FP8 data path.
     "group_gemm_fp8_scatter_cp_async": "FP8 data path",
-    # TODO(amd): fuse_ihc_post_pre: fused post/pre kernel.
-    "fuse_ihc_post_pre": "fused post/pre kernel",
     # TODO(amd): fused_rmsnorm_with_scale: FP8 data path.
     "fused_rmsnorm_with_scale": "FP8 data path",
     # TODO(amd): rope_norm_store_kv_fp8: FP8 data path.
     "rope_norm_store_kv_fp8": "FP8 data path",
-    # TODO(amd): fused_sampler: kernel not yet ported to Triton.
-    "fused_sampler": "kernel not yet ported to Triton",
-    # TODO(amd): fused_sampler_temperature_sample: kernel not yet ported to Triton.
-    "fused_sampler_temperature_sample": "kernel not yet ported to Triton",
     # TODO(amd): stem_oam_prep_paged_kv: FP8 data path.
     "stem_oam_prep_paged_kv": "FP8 data path",
     # TODO(amd): stem_oam_prep_varlen_q: FP8 data path.
     "stem_oam_prep_varlen_q": "FP8 data path",
     # TODO(amd): stem_oam_gemm: matrix-unit kernel.
     "stem_oam_gemm": "matrix-unit kernel",
-    # TODO(amd): stem_tpd: kernel not yet ported to Triton.
-    "stem_tpd": "kernel not yet ported to Triton",
-    # TODO(amd): topk_filtered: kernel not yet ported to Triton.
-    "topk_filtered": "kernel not yet ported to Triton",
-    # TODO(amd): topk_filtered_workspace_size: kernel not yet ported to Triton.
-    "topk_filtered_workspace_size": "kernel not yet ported to Triton",
-    # TODO(amd): topk_filtered_min_workspace_size: kernel not yet ported to Triton.
-    "topk_filtered_min_workspace_size": "kernel not yet ported to Triton",
-    # TODO(amd): topk_filtered_peak_workspace_size: kernel not yet ported to Triton.
-    "topk_filtered_peak_workspace_size": "kernel not yet ported to Triton",
 }

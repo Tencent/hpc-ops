@@ -411,7 +411,9 @@ def test_todos_and_schema_parity():
     with pytest.raises(NotImplementedError, match="TODO.*matrix"):
         torch.ops.hpc.gated_mla_gemm(x, x, x)
     with pytest.raises(NotImplementedError, match="TODO"):
-        torch.ops.hpc.fuse_ihc_post_pre(x, x, x, x, x, x, 1e-5, 1e-6, 2.0)
+        torch.ops.hpc.assign_attention_decode_task(
+            torch.ones(1, device="cuda", dtype=torch.int32), 1, 1, True, 64, None
+        )
     assert json.loads(hpc.__built_json__)["backend"] == "triton"
 
 

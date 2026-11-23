@@ -194,8 +194,8 @@ softmax statistics to reduce vocabulary reads and fixed launch overhead.
 
 ### Install from Source
 
-An AMD Triton backend using FlagTree supports BF16 RoPE/KV store, MoE reduction, and iHC
-pre/head/post without FP8 or matrix instructions. See [AMD.md](AMD.md) for
+An AMD Triton backend using FlagTree supports RoPE/KV store, MoE reduction, iHC,
+sampling, TopK, STEM TPD, and scale reformatting without FP8 or matrix instructions. See [AMD.md](AMD.md) for
 coverage, TODO entries, build instructions, and validation.
 
 ```bash

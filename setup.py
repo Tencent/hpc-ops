@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+from pathlib import Path
 
 from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
@@ -150,7 +151,11 @@ setup(
     author_email="authors@hpc-ops",
     url="https://github.com/Tencent/hpc-ops",
     license="Copyright (C) 2026 Tencent.",
-    packages=find_packages(include=["hpc", "hpc.*"]),
+    packages=find_packages(include=["hpc", "hpc.*"])
+    + [f"hpc._ops.{path.parent.name}.amd" for path in Path("src").glob("*/amd")],
+    package_dir={
+        f"hpc._ops.{path.parent.name}.amd": str(path) for path in Path("src").glob("*/amd")
+    },
     ext_modules=[CMakeExtension("hpc", version_macros)] if BACKEND == "cuda" else [],
     cmdclass={"build_ext": CMakeBuild, "build_py": BuildPy},
     package_data={"hpc": ["*.so"]} if BACKEND == "cuda" else {},

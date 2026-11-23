@@ -180,3 +180,36 @@ def fused_sampler(
         gumbel_noise,
         seed,
     )
+
+
+@torch.library.register_fake("hpc::fused_sampler")
+def _fused_sampler_fake(
+    logits,
+    penalty_mask,
+    slot_id,
+    repetition_penalty,
+    repetition_penalty_val,
+    temperature,
+    temperature_val,
+    softmax_policy,
+    topk,
+    topk_val,
+    topp,
+    topp_val,
+    max_topk,
+    gumbel_noise=None,
+    seed=0,
+):
+    return logits.new_empty((logits.shape[0], 1), dtype=torch.int32)
+
+
+@torch.library.register_fake("hpc::fused_sampler_temperature_sample")
+def _temperature_sample_fake(
+    logits,
+    temperature,
+    temperature_val,
+    gumbel_noise=None,
+    draft_token_ids=None,
+    seed=0,
+):
+    return logits.new_empty((logits.shape[0], 1), dtype=torch.int32)
