@@ -47,12 +47,12 @@ $(foreach arch,$(KNOWN_ARCHS),sm$(arch)):
 format:
 	python3 -m black --line-length 100 $(PY_FILES)
 	clang-format --style=file -i $(CSRC_FILES)
-	python3 -m cpplint --extensions=cc,cu,cuh,h --headers=h,cuh --quiet $(CSRC_FILES)
+	python3 -m cpplint --quiet $(CSRC_FILES)
 
 format-check:
 	python3 -m black --check --line-length 100 $(PY_FILES)
 	clang-format --style=file --dry-run -Werror $(CSRC_FILES)
-	python3 -m cpplint --extensions=cc,cu,cuh,h --headers=h,cuh $(CSRC_FILES)
+	python3 -m cpplint $(CSRC_FILES)
 
 test:$(PY_TEST)
 	@for test in $^; do \

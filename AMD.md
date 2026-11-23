@@ -23,14 +23,11 @@ listed above contain only Triton device functions. Shared validation lives in
 `src/utils/amd/validation.py`; `src/C/amd/__init__.py` checks the compiler,
 initializes the backend and registers version information. Deferred interfaces
 retain their schemas and `TODO(amd)` errors in `src/C/amd/unsupported.py`.
-Tests check schema parity against the CUDA registrations.
 
 `setup.py` installs these sources into one private package: `hpc._amd` comes from
 `src/C/amd/`, `hpc._amd.<operator>` from each operator's `amd/` directory, and
 `hpc._amd.utils` from `src/utils/amd/`. There is no source-directory search or
-manual import-path mutation at runtime. Development follows `make triton` and
-imports the built package from `build/lib.*`; a standard editable installation
-also provides the package mappings.
+manual import-path mutation at runtime.
 
 `hpc/<operator>.py` retains the public API and existing fake implementations, while
 `hpc/__init__.py` selects and loads the backend before importing those wrappers.
@@ -63,9 +60,8 @@ PyTorch's ROCm API. `hpc.__built_json__` reports the backend and compiler versio
 ## Optional TLE path
 
 `HPC_TRITON_USE_TLE=1` selects `tle.extract_tile` for channel extraction in iHC
-pre/head. The default uses ordinary Triton: TLE did not consistently improve
-performance in the RDNA3 evaluation. The 6144-wide TLE and fused post/pre paths use 16 waves to
-limit register spills. The sampler also offers TLE exclusive prefix sums for TopP.
+pre/head and fused post/pre. The sampler also offers TLE exclusive prefix sums
+for TopP. Ordinary Triton is the default.
 RoPE, MoE reduction, TopK, scale reformatting, STEM TPD and iHC post use ordinary
 Triton in both modes.
 
@@ -84,28 +80,6 @@ Unsupported calls raise `NotImplementedError` with a `TODO(amd)` reason:
 
 Coverage is per kernel and interface. A file containing FP8 or matrix kernels
 does not exclude its independent BF16 or ordinary arithmetic kernels.
-
-## Validation
-
-Validated on Radeon PRO W7900D (`gfx1100`, RDNA3), with ROCm PyTorch 2.13 /
-ROCm 7.2 and FlagTree `0.7.0+amd3.6`. Other AMD architectures require their own
-runtime validation.
-
-```bash
-HIP_VISIBLE_DEVICES=0,1 python -m pytest -q \
-  tests/test_amd.py tests/test_amd_portable.py tests/test_iHC.py \
-  tests/test_rope.py tests/test_sampler.py tests/test_topk.py tests/test_version.py \
-  -k 'not fp8'
-HPC_TRITON_USE_TLE=1 python -m pytest -q tests/test_iHC.py tests/test_sampler.py tests/test_amd_portable.py
-```
-
-The AMD tests cover both iHC channel extraction paths and RMSNorm rounding
-policies, masked routes and odd widths, optional RoPE outputs, padded requests,
-cache strides, streams, graph replay, multiple GPUs, import without GPU
-initialization, schema parity, and TODO
-errors. The existing compute-sanitizer target is NVIDIA-specific. TopK tests that assert
-the CUDA split-workspace layout are skipped on AMD; the functional selection,
-minimum/recommended scratch, graph replay and counter reuse checks still run.
 
 ## Selection and sampling contracts
 
