@@ -1,5 +1,6 @@
 # Copyright (C) 2026 Tencent.
 
+import torch
 import triton
 import triton.language as tl
 
@@ -36,3 +37,29 @@ def _reformat_kernel(
         valid = (rows[:, None] < length) & (cols[None, :] < COLS)
         value = tl.load(X + (source + rows[:, None]) * COLS + cols[None, :], valid, other=0)
         tl.store(Y + cols[None, :].to(tl.int64) * ROWS + destination + rows[:, None], value, valid)
+
+
+def get_reformat_tile_size(num_seq_per_group_avg):
+    return next((size for size in (8, 16, 32, 48) if num_seq_per_group_avg <= size), 64)
+
+
+def reformat_x_scale_async(x_scale, output, seqlens, cu_seqlens, offsets, num_seq_per_group_avg):
+    rows, cols = x_scale.shape
+    groups = seqlens.numel()
+    tile = get_reformat_tile_size(num_seq_per_group_avg)
+    with torch.cuda.device(x_scale.device):
+        _group_offsets[(1,)](
+            seqlens, offsets, groups, tile, triton.next_power_of_2(groups), num_warps=4
+        )
+        _reformat_kernel[(groups,)](
+            x_scale,
+            output,
+            seqlens,
+            cu_seqlens,
+            offsets,
+            rows,
+            cols,
+            groups,
+            triton.next_power_of_2(cols),
+            num_warps=4,
+        )

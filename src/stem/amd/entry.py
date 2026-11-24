@@ -1,11 +1,10 @@
 # Copyright (C) 2026 Tencent.
 
 import torch
-import triton
 
 from hpc._amd.utils.validation import check_bf16, check_tensor, require
 
-from .stem_tpd import _stem_tpd_kernel
+from .stem_tpd import stem_tpd_async
 
 
 SCHEMAS = (
@@ -39,29 +38,21 @@ def stem_tpd(
         check_tensor(tensor, block_logits, torch.int32, name)
         require(tensor.shape == (batch,), f"{name} must have shape [B]")
     output = torch.empty_like(block_logits, dtype=torch.uint8)
-    if batch and heads and qrows and kcols:
-        with torch.cuda.device(block_logits.device):
-            _stem_tpd_kernel[(batch * heads * qrows,)](
-                block_logits,
-                output,
-                q_seq_lens,
-                kv_seq_lens,
-                num_prompt_tokens,
-                heads,
-                qrows,
-                kcols,
-                triton.next_power_of_2(kcols),
-                block_size,
-                alpha,
-                initial_blocks,
-                window_size,
-                k_block_num_rate_medium,
-                k_block_num_bias_medium,
-                k_block_num_rate_large,
-                k_block_num_bias_large,
-                num_warps=4 if kcols <= 4096 else 8,
-                enable_fp_fusion=False,
-            )
+    stem_tpd_async(
+        block_logits,
+        output,
+        q_seq_lens,
+        kv_seq_lens,
+        num_prompt_tokens,
+        block_size,
+        alpha,
+        initial_blocks,
+        window_size,
+        k_block_num_rate_medium,
+        k_block_num_bias_medium,
+        k_block_num_rate_large,
+        k_block_num_bias_large,
+    )
     return output
 
 

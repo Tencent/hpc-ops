@@ -1,11 +1,10 @@
 # Copyright (C) 2026 Tencent.
 
 import torch
-import triton
 
 from hpc._amd.utils.validation import check_tensor, require
 
-from .reformat import _group_offsets, _reformat_kernel
+from .reformat import get_reformat_tile_size, reformat_x_scale_async
 
 
 SCHEMAS = (
@@ -28,7 +27,7 @@ def reformat_x_scale(x_scale, seqlens, cu_seqlens, out_x_scale, num_seq_per_grou
     rows, cols = x_scale.shape
     groups = seqlens.numel()
     require(groups > 0 or rows == 0, "nonempty x_scale requires groups")
-    tile = next((size for size in (8, 16, 32, 48) if num_seq_per_group_avg <= size), 64)
+    tile = get_reformat_tile_size(num_seq_per_group_avg)
     require(
         not groups or rows % groups == 0 and (rows // groups) % tile == 0,
         "per-group input capacity must align to the selected tile size",
@@ -41,23 +40,8 @@ def reformat_x_scale(x_scale, seqlens, cu_seqlens, out_x_scale, num_seq_per_grou
     check_tensor(output, x_scale, torch.float32, "out_x_scale")
     require(output.shape == (cols, rows), "out_x_scale must have shape [N,M]")
     if rows and groups:
-        with torch.cuda.device(x_scale.device):
-            offsets = torch.empty(groups, device=x_scale.device, dtype=torch.int64)
-            _group_offsets[(1,)](
-                seqlens, offsets, groups, tile, triton.next_power_of_2(groups), num_warps=4
-            )
-            _reformat_kernel[(groups,)](
-                x_scale,
-                output,
-                seqlens,
-                cu_seqlens,
-                offsets,
-                rows,
-                cols,
-                groups,
-                triton.next_power_of_2(cols),
-                num_warps=4,
-            )
+        offsets = torch.empty(groups, device=x_scale.device, dtype=torch.int64)
+        reformat_x_scale_async(x_scale, output, seqlens, cu_seqlens, offsets, num_seq_per_group_avg)
     return output
 
 

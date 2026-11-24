@@ -1,5 +1,9 @@
 # Copyright (C) 2026 Tencent.
 
+import os
+import threading
+
+import torch
 import triton
 import triton.language as tl
 from triton.experimental.tle import language as tle
@@ -244,3 +248,180 @@ def _penalty_edges(
 @triton.jit
 def _or(first, second):
     return first | second
+
+
+USE_TLE = os.getenv("HPC_TRITON_USE_TLE", "0") == "1"
+_BLOCK_SIZE = 4096
+_rng_states = {}
+_rng_lock = threading.Lock()
+
+
+def reserve_rng_async(reference, external):
+    if external:
+        return None
+    device = reference.device
+    with torch.cuda.device(device):
+        with _rng_lock:
+            if device not in _rng_states:
+                state = torch.zeros((), device=device, dtype=torch.int64)
+                ready = torch.cuda.Event()
+                ready.record()
+                _rng_states[device] = state, ready
+            state, ready = _rng_states[device]
+        torch.cuda.current_stream(device).wait_event(ready)
+        offset = torch.empty((), device=device, dtype=torch.int64)
+        _reserve_rng[(1,)](state, offset, reference.numel(), num_warps=1)
+    return offset
+
+
+def sampler_workspace_shape(logits):
+    return logits.shape[0], triton.cdiv(logits.shape[1], _BLOCK_SIZE)
+
+
+def temperature_sample_async(
+    logits,
+    temperature,
+    temperature_val,
+    gumbel_noise,
+    draft_token_ids,
+    seed,
+    offset,
+    scores,
+    tokens,
+    output,
+):
+    batch, width = logits.shape
+    if not batch:
+        return
+    with torch.cuda.device(logits.device):
+        tiles = triton.cdiv(width, _BLOCK_SIZE)
+        _temperature_kernel[(tiles, batch)](
+            logits,
+            temperature,
+            gumbel_noise,
+            draft_token_ids,
+            offset,
+            scores,
+            tokens,
+            width,
+            logits.stride(0),
+            tiles,
+            _BLOCK_SIZE,
+            temperature is not None,
+            gumbel_noise is not None,
+            draft_token_ids is not None,
+            temperature_val,
+            seed,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+        _temperature_finish[(batch,)](
+            scores, tokens, output, tiles, triton.next_power_of_2(tiles), num_warps=1
+        )
+
+
+def fused_sampler_async(
+    logits,
+    penalty_mask,
+    slot_id,
+    repetition_penalty,
+    repetition_penalty_val,
+    temperature,
+    temperature_val,
+    softmax_policy,
+    topk,
+    topk_val,
+    topp,
+    topp_val,
+    max_topk,
+    gumbel_noise,
+    seed,
+    offset,
+    candidates,
+    maxima,
+    sums,
+    output,
+):
+    batch, width = logits.shape
+    if not batch:
+        return
+    with torch.cuda.device(logits.device):
+        tiles = triton.cdiv(width, _BLOCK_SIZE)
+        pen_stride = penalty_mask.shape[1] if penalty_mask is not None else 0
+        pen_bytes = penalty_mask.numel() if penalty_mask is not None else 0
+        _prepare_kernel[(tiles, batch)](
+            logits,
+            candidates,
+            penalty_mask,
+            slot_id,
+            repetition_penalty,
+            temperature,
+            maxima,
+            sums,
+            width,
+            logits.stride(0),
+            pen_stride,
+            tiles,
+            _BLOCK_SIZE,
+            max_topk,
+            penalty_mask is not None,
+            repetition_penalty is not None,
+            temperature is not None,
+            softmax_policy == 1,
+            repetition_penalty_val,
+            temperature_val,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+        _sample_kernel[(batch,)](
+            candidates,
+            maxima,
+            sums,
+            topk,
+            topp,
+            gumbel_noise,
+            offset,
+            penalty_mask,
+            slot_id,
+            repetition_penalty,
+            output,
+            width,
+            max_topk,
+            tiles,
+            triton.next_power_of_2(tiles),
+            triton.next_power_of_2(tiles * max_topk),
+            softmax_policy,
+            topk is not None,
+            topp is not None,
+            gumbel_noise is not None,
+            penalty_mask is not None,
+            repetition_penalty is not None,
+            pen_stride,
+            pen_bytes,
+            USE_TLE,
+            topk_val,
+            topp_val,
+            repetition_penalty_val,
+            seed,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+        alignment = penalty_mask.data_ptr() % 4 if penalty_mask is not None else 0
+        head_bytes = (4 - alignment) % 4
+        tail_start = pen_bytes - (alignment + pen_bytes) % 4
+        if penalty_mask is not None and (head_bytes or tail_start < pen_bytes):
+            _penalty_edges[(1,)](
+                penalty_mask,
+                slot_id,
+                output,
+                repetition_penalty,
+                batch,
+                triton.next_power_of_2(batch),
+                pen_stride,
+                pen_bytes,
+                head_bytes,
+                tail_start,
+                repetition_penalty is not None,
+                repetition_penalty_val,
+                num_warps=4,
+            )

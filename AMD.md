@@ -18,8 +18,9 @@ reductions, and indexed memory operations without FP8, WMMA, or MFMA.
 | `reformat_x_scale` | `src/group_gemm/amd/reformat.py` | `_group_offsets`, `_reformat_kernel`: FP32 grouped transpose and compaction with aligned padding |
 
 Each operator's `src/<operator>/amd/entry.py` owns its schemas, registration,
-input validation, output allocation and launch configuration. The kernel files
-listed above contain only Triton device functions. Shared validation lives in
+input validation and output/workspace allocation. The kernel files listed above
+contain the Triton kernels and their host launch wrappers, which select launch
+parameters and start the kernels. Shared validation lives in
 `src/utils/amd/validation.py`; `src/C/amd/__init__.py` checks the compiler,
 initializes the backend and registers version information. Deferred interfaces
 retain their schemas and `TODO(amd)` errors in `src/C/amd/unsupported.py`.

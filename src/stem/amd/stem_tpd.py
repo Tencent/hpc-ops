@@ -1,5 +1,6 @@
 # Copyright (C) 2026 Tencent.
 
+import torch
 import triton
 import triton.language as tl
 
@@ -71,3 +72,44 @@ def _stem_tpd_kernel(
     selected |= ((cols <= diagonal) & (cols > diagonal - window_size)) | (cols == diagonal)
     selected &= live & (cols < kblocks)
     tl.store(Y + row.to(tl.int64) * KCOLS + cols, selected.to(tl.uint8), cols < KCOLS)
+
+
+def stem_tpd_async(
+    block_logits,
+    output,
+    q_seq_lens,
+    kv_seq_lens,
+    num_prompt_tokens,
+    block_size,
+    alpha,
+    initial_blocks,
+    window_size,
+    k_block_num_rate_medium,
+    k_block_num_bias_medium,
+    k_block_num_rate_large,
+    k_block_num_bias_large,
+):
+    batch, heads, qrows, kcols = block_logits.shape
+    if batch and heads and qrows and kcols:
+        with torch.cuda.device(block_logits.device):
+            _stem_tpd_kernel[(batch * heads * qrows,)](
+                block_logits,
+                output,
+                q_seq_lens,
+                kv_seq_lens,
+                num_prompt_tokens,
+                heads,
+                qrows,
+                kcols,
+                triton.next_power_of_2(kcols),
+                block_size,
+                alpha,
+                initial_blocks,
+                window_size,
+                k_block_num_rate_medium,
+                k_block_num_bias_medium,
+                k_block_num_rate_large,
+                k_block_num_bias_large,
+                num_warps=4 if kcols <= 4096 else 8,
+                enable_fp_fusion=False,
+            )

@@ -1,11 +1,10 @@
 # Copyright (C) 2026 Tencent.
 
 import torch
-import triton
 
 from hpc._amd.utils.validation import check_bf16, check_tensor, require
 
-from .rope import _rope_kernel
+from .rope import rope_norm_store_kv_async
 
 
 SCHEMAS = (
@@ -90,35 +89,21 @@ def rope_norm_store_kv(
         if output is not None:
             check_bf16(output, qkv, "output")
             require(output.shape == (rows, heads, 128), "output has an invalid shape")
-    if requests:
-        with torch.cuda.device(qkv.device):
-            _rope_kernel[(rows + requests, q_heads + kv_heads)](
-                qkv,
-                cos_sin,
-                num_seqlen_per_req,
-                q_index,
-                kvcache_indices,
-                q_norm_weight if qk_norm_policy else None,
-                k_norm_weight if qk_norm_policy else None,
-                q,
-                kcache,
-                vcache,
-                out_k,
-                out_v,
-                rows,
-                requests,
-                q_heads,
-                kv_heads,
-                kcache.shape[1],
-                kvcache_indices.shape[1],
-                kcache.stride(0),
-                vcache.stride(0),
-                qk_norm_policy,
-                out_k is not None,
-                out_v is not None,
-                num_warps=1,
-                enable_fp_fusion=False,
-            )
+    rope_norm_store_kv_async(
+        kcache,
+        vcache,
+        qkv,
+        cos_sin,
+        num_seqlen_per_req,
+        q_index,
+        kvcache_indices,
+        q_norm_weight,
+        k_norm_weight,
+        q,
+        out_k,
+        out_v,
+        qk_norm_policy,
+    )
     return q
 
 

@@ -1,8 +1,14 @@
 # Copyright (C) 2026 Tencent.
 
+import os
+
+import torch
 import triton
 import triton.language as tl
+from triton.experimental.tle import require_tle
 from triton.experimental.tle import language as tle
+
+USE_TLE = os.getenv("HPC_TRITON_USE_TLE", "0") == "1"
 
 
 @triton.jit
@@ -138,3 +144,75 @@ def _post_kernel(
     else:
         gates = tl.load(GATES + row * 4 + channels)
         tl.store(Y + offsets, x[None, :] * gates[:, None] + residual, cols[None, :] < HIDDEN)
+
+
+def fuse_ihc_pre_head_async(
+    x,
+    w,
+    hc_scale,
+    hc_base,
+    y,
+    post,
+    norm_eps,
+    hc_eps,
+    magnitude,
+    rms_weight,
+    rms_eps,
+    cast_bfloat_for_norm,
+    head,
+    post_inputs,
+):
+    if USE_TLE:
+        require_tle("amd", tle.extract_tile)
+    batch, _, hidden = x.shape
+    xa, post_in, residual_out = post_inputs if post_inputs is not None else (None, None, None)
+    if batch:
+        with torch.cuda.device(x.device):
+            _pre_head_kernel[(batch,)](
+                x,
+                w,
+                hc_scale,
+                hc_base,
+                y,
+                post,
+                rms_weight,
+                xa,
+                post_in,
+                residual_out,
+                hidden,
+                triton.next_power_of_2(hidden),
+                head,
+                rms_weight is not None,
+                cast_bfloat_for_norm,
+                USE_TLE,
+                post_inputs is not None,
+                norm_eps,
+                hc_eps,
+                magnitude,
+                rms_eps,
+                num_warps=16 if hidden == 6144 and (USE_TLE or post_inputs is not None) else 8,
+                enable_fp_fusion=False,
+            )
+
+
+def fuse_ihc_post_async(x, residual, H_post, y):
+    batch, hidden = x.shape
+    if batch:
+        if batch <= 16:
+            block, waves = 512, 8
+        elif batch < 512:
+            block, waves = 256, 1
+        else:
+            block, waves = 1024, 2
+        with torch.cuda.device(x.device):
+            _post_kernel[(batch, triton.cdiv(hidden, block))](
+                x,
+                residual,
+                H_post,
+                y,
+                hidden,
+                block,
+                batch > 16,
+                num_warps=waves,
+                enable_fp_fusion=False,
+            )

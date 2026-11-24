@@ -1,5 +1,6 @@
 # Copyright (C) 2026 Tencent.
 
+import torch
 import triton
 import triton.language as tl
 
@@ -131,3 +132,53 @@ def _rope_kernel(
                             tl.store(
                                 VCACHE + physical.to(tl.int64) * V_STRIDE + kv_offset + vi, value
                             )
+
+
+def rope_norm_store_kv_async(
+    kcache,
+    vcache,
+    qkv,
+    cos_sin,
+    num_seqlen_per_req,
+    q_index,
+    kvcache_indices,
+    q_norm_weight,
+    k_norm_weight,
+    q,
+    out_k,
+    out_v,
+    qk_norm_policy,
+):
+    rows = qkv.shape[0]
+    requests = num_seqlen_per_req.shape[0]
+    q_heads = q.shape[1]
+    kv_heads = kcache.shape[2]
+    if requests:
+        with torch.cuda.device(qkv.device):
+            _rope_kernel[(rows + requests, q_heads + kv_heads)](
+                qkv,
+                cos_sin,
+                num_seqlen_per_req,
+                q_index,
+                kvcache_indices,
+                q_norm_weight if qk_norm_policy else None,
+                k_norm_weight if qk_norm_policy else None,
+                q,
+                kcache,
+                vcache,
+                out_k,
+                out_v,
+                rows,
+                requests,
+                q_heads,
+                kv_heads,
+                kcache.shape[1],
+                kvcache_indices.shape[1],
+                kcache.stride(0),
+                vcache.stride(0),
+                qk_norm_policy,
+                out_k is not None,
+                out_v is not None,
+                num_warps=1,
+                enable_fp_fusion=False,
+            )

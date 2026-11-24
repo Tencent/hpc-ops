@@ -1,11 +1,10 @@
 # Copyright (C) 2026 Tencent.
 
 import torch
-import triton
 
 from hpc._amd.utils.validation import check_bf16, check_tensor, require
 
-from .reduce import _reduce_kernel
+from .reduce import reduce_async
 
 
 SCHEMAS = (
@@ -28,22 +27,7 @@ def reduce(x, topk_pos, topk_scale, shared_output=None):
         check_bf16(shared_output, x, "shared_output")
         require(shared_output.shape == (rows, hidden), "shared_output must have shape [N,D]")
     y = torch.empty((rows, hidden), device=x.device, dtype=x.dtype)
-    if rows and hidden:
-        with torch.cuda.device(x.device):
-            _reduce_kernel[(rows, triton.cdiv(hidden, 1024))](
-                x,
-                topk_pos,
-                topk_scale,
-                shared_output,
-                y,
-                hidden,
-                topk,
-                x.shape[0],
-                shared_output is not None,
-                1024,
-                num_warps=4,
-                enable_fp_fusion=False,
-            )
+    reduce_async(x, topk_pos, topk_scale, shared_output, y)
     return y
 
 

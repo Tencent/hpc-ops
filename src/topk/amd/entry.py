@@ -1,11 +1,15 @@
 # Copyright (C) 2026 Tencent.
 
 import torch
-import triton
 
 from hpc._amd.utils.validation import check_tensor, require
 
-from .topk import _collect_kernel, _histogram_kernel, _refine_kernel, _select_kernel
+from .topk import (
+    topk_filtered_async,
+    topk_filtered_min_workspace_size,
+    topk_filtered_peak_workspace_size,
+    topk_filtered_workspace_size,
+)
 
 
 SCHEMAS = (
@@ -23,19 +27,17 @@ def _size(value, name):
 def workspace_size(num_rows, max_kv_len):
     _size(num_rows, "num_rows")
     _size(max_kv_len, "max_kv_len")
-    if max_kv_len < 32768 or num_rows == 0:
-        return 4, 4
-    rows = min(num_rows, 64)
-    return 4, (rows * triton.cdiv(max_kv_len, 4096) * 256 + rows * 4) * 4
+    return topk_filtered_workspace_size(num_rows, max_kv_len)
 
 
 def min_workspace_size(max_kv_len):
     _size(max_kv_len, "max_kv_len")
-    return 4
+    return topk_filtered_min_workspace_size(max_kv_len)
 
 
 def peak_workspace_size(max_kv_len):
-    return workspace_size(64, max_kv_len)[1]
+    _size(max_kv_len, "max_kv_len")
+    return topk_filtered_peak_workspace_size(max_kv_len)
 
 
 def topk_filtered(logits, ke, output, topk, num_valid_rows, counters=None, workspace=None):
@@ -67,75 +69,9 @@ def topk_filtered(logits, ke, output, topk, num_valid_rows, counters=None, works
                 f"{name} must have at least four aligned bytes",
             )
     if ke.numel():
-        with torch.cuda.device(logits.device):
-            if workspace is None and recommended > 4:
-                workspace = torch.empty(recommended, device=logits.device, dtype=torch.uint8)
-            if recommended > 4 and workspace.numel() >= recommended:
-                width = logits.shape[1]
-                tiles = triton.cdiv(width, 4096)
-                pool = min(ke.numel(), 64)
-                storage = workspace[:recommended].view(torch.int32)
-                histogram = storage[: pool * tiles * 256]
-                state = storage[pool * tiles * 256 :]
-                for row_base in range(0, ke.numel(), pool):
-                    rows = min(pool, ke.numel() - row_base)
-                    for shift in (24, 16, 8, 0):
-                        _histogram_kernel[(tiles, rows)](
-                            logits,
-                            ke,
-                            num_valid_rows,
-                            histogram,
-                            state,
-                            width,
-                            logits.stride(0),
-                            tiles,
-                            topk,
-                            shift,
-                            4096,
-                            row_base,
-                            num_warps=4,
-                        )
-                        _refine_kernel[(rows,)](
-                            ke,
-                            num_valid_rows,
-                            histogram,
-                            state,
-                            width,
-                            tiles,
-                            topk,
-                            shift,
-                            row_base,
-                            num_warps=4,
-                        )
-                    _collect_kernel[(tiles, rows)](
-                        logits,
-                        ke,
-                        num_valid_rows,
-                        state,
-                        output,
-                        width,
-                        logits.stride(0),
-                        output.stride(0),
-                        topk,
-                        4096,
-                        row_base,
-                        num_warps=4,
-                    )
-            else:
-                _select_kernel[(ke.numel(),)](
-                    logits,
-                    ke,
-                    num_valid_rows,
-                    output,
-                    logits.shape[1],
-                    logits.stride(0),
-                    output.stride(0),
-                    topk,
-                    True,
-                    True,
-                    4096,
-                    num_warps=4,
-                )
+        if workspace is None and recommended > 4:
+            workspace = torch.empty(recommended, device=logits.device, dtype=torch.uint8)
+        topk_filtered_async(logits, ke, output, topk, num_valid_rows, workspace)
     return output
 
 

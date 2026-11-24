@@ -1,5 +1,6 @@
 # Copyright (C) 2026 Tencent.
 
+import torch
 import triton
 import triton.language as tl
 
@@ -182,3 +183,95 @@ def _collect_kernel(
                 STATE + local * 4 + 2, tl.sum(selected.to(tl.int32), 0), sem="relaxed"
             )
             tl.store(Y + row.to(tl.int64) * OUT_STRIDE + start + ranks - 1, cols, selected)
+
+
+_BLOCK_SIZE = 4096
+_RADIX_BINS = 256
+_MAX_WORKSPACE_ROWS = 64
+
+
+def topk_filtered_workspace_size(num_rows, max_kv_len):
+    if max_kv_len < 32768 or num_rows == 0:
+        return 4, 4
+    rows = min(num_rows, _MAX_WORKSPACE_ROWS)
+    return 4, (rows * triton.cdiv(max_kv_len, _BLOCK_SIZE) * _RADIX_BINS + rows * 4) * 4
+
+
+def topk_filtered_min_workspace_size(max_kv_len):
+    return 4
+
+
+def topk_filtered_peak_workspace_size(max_kv_len):
+    return topk_filtered_workspace_size(_MAX_WORKSPACE_ROWS, max_kv_len)[1]
+
+
+def topk_filtered_async(logits, ke, output, topk, num_valid_rows, workspace):
+    _, recommended = topk_filtered_workspace_size(ke.numel(), logits.shape[1])
+    if ke.numel():
+        with torch.cuda.device(logits.device):
+            if recommended > 4 and workspace.numel() >= recommended:
+                width = logits.shape[1]
+                tiles = triton.cdiv(width, _BLOCK_SIZE)
+                pool = min(ke.numel(), _MAX_WORKSPACE_ROWS)
+                storage = workspace[:recommended].view(torch.int32)
+                histogram = storage[: pool * tiles * _RADIX_BINS]
+                state = storage[pool * tiles * _RADIX_BINS :]
+                for row_base in range(0, ke.numel(), pool):
+                    rows = min(pool, ke.numel() - row_base)
+                    for shift in (24, 16, 8, 0):
+                        _histogram_kernel[(tiles, rows)](
+                            logits,
+                            ke,
+                            num_valid_rows,
+                            histogram,
+                            state,
+                            width,
+                            logits.stride(0),
+                            tiles,
+                            topk,
+                            shift,
+                            _BLOCK_SIZE,
+                            row_base,
+                            num_warps=4,
+                        )
+                        _refine_kernel[(rows,)](
+                            ke,
+                            num_valid_rows,
+                            histogram,
+                            state,
+                            width,
+                            tiles,
+                            topk,
+                            shift,
+                            row_base,
+                            num_warps=4,
+                        )
+                    _collect_kernel[(tiles, rows)](
+                        logits,
+                        ke,
+                        num_valid_rows,
+                        state,
+                        output,
+                        width,
+                        logits.stride(0),
+                        output.stride(0),
+                        topk,
+                        _BLOCK_SIZE,
+                        row_base,
+                        num_warps=4,
+                    )
+            else:
+                _select_kernel[(ke.numel(),)](
+                    logits,
+                    ke,
+                    num_valid_rows,
+                    output,
+                    logits.shape[1],
+                    logits.stride(0),
+                    output.stride(0),
+                    topk,
+                    True,
+                    True,
+                    _BLOCK_SIZE,
+                    num_warps=4,
+                )

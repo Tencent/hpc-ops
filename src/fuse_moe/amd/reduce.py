@@ -1,5 +1,6 @@
 # Copyright (C) 2026 Tencent.
 
+import torch
 import triton
 import triton.language as tl
 
@@ -35,3 +36,24 @@ def _reduce_kernel(
     if HAS_SHARED:
         value += tl.load(SHARED + offset, cols < HIDDEN, other=0).to(tl.float32)
     tl.store(Y + offset, value, cols < HIDDEN)
+
+
+def reduce_async(x, topk_pos, topk_scale, shared_output, y):
+    rows, topk = topk_pos.shape
+    hidden = x.shape[1]
+    if rows and hidden:
+        with torch.cuda.device(x.device):
+            _reduce_kernel[(rows, triton.cdiv(hidden, 1024))](
+                x,
+                topk_pos,
+                topk_scale,
+                shared_output,
+                y,
+                hidden,
+                topk,
+                x.shape[0],
+                shared_output is not None,
+                1024,
+                num_warps=4,
+                enable_fp_fusion=False,
+            )
