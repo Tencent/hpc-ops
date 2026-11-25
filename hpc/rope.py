@@ -234,6 +234,31 @@ def rope_norm_store_kv_fp8(
     )
 
 
+def multimodal_rope(
+    q: Tensor,
+    k: Tensor,
+    cos_sin_cache: Tensor,
+    positions: Tensor,
+    is_neox: bool = True,
+    out_q: Optional[Tensor] = None,
+    out_k: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor]:
+    """Apply fused RoPE to dense Q/K tensors while preserving strides."""
+    if (out_q is None) != (out_k is None):
+        raise ValueError("out_q and out_k must be provided together")
+    if out_q is None:
+        return torch.ops.hpc.multimodal_rope(q, k, cos_sin_cache, positions, is_neox)
+    return torch.ops.hpc.multimodal_rope.out(
+        q,
+        k,
+        cos_sin_cache,
+        positions,
+        is_neox,
+        out_q=out_q,
+        out_k=out_k,
+    )
+
+
 @torch.library.register_fake("hpc::rope_norm_store_kv")
 def rope_norm_store_kv_fake(
     key_cache,
@@ -325,3 +350,33 @@ def rope_norm_store_kv_fp8_fake(
         device=qkv.device,
     )
     return (out_q_fp8, q_scale, split_k_flag)
+
+
+@torch.library.register_fake("hpc::multimodal_rope")
+def multimodal_rope_fake(
+    q: Tensor,
+    k: Tensor,
+    cos_sin_cache: Tensor,
+    positions: Tensor,
+    is_neox: bool = True,
+):
+    del cos_sin_cache, positions, is_neox
+    return (
+        torch.empty_strided(q.shape, q.stride(), dtype=q.dtype, device=q.device),
+        torch.empty_strided(k.shape, k.stride(), dtype=k.dtype, device=k.device),
+    )
+
+
+@torch.library.register_fake("hpc::multimodal_rope.out")
+def multimodal_rope_out_fake(
+    q: Tensor,
+    k: Tensor,
+    cos_sin_cache: Tensor,
+    positions: Tensor,
+    is_neox: bool = True,
+    *,
+    out_q: Tensor,
+    out_k: Tensor,
+):
+    del q, k, cos_sin_cache, positions, is_neox
+    return out_q, out_k
