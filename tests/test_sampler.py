@@ -9,6 +9,8 @@
    no other feature auto-dispatches to ``fused_sampler_temperature_sample``;
    it supports injected ``gumbel_noise`` (bit-exact) and a ``[B]`` int64
    ``draft_token_ids`` mask.
+3. ``hpc.qwen3_tts_topk_gumbel_sample`` — the short-vocab TTS top-k +
+   Gumbel-max sampler for codec/code logits up to 2048 vocab entries.
 """
 import os
 import sys
@@ -17,7 +19,16 @@ from typing import Optional
 
 import pytest
 
-sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("../build/lib.*/"))[0]))
+
+def _hpc_import_path() -> Path:
+    repo_root = Path(__file__).resolve().parent.parent
+    build_libs = list((repo_root / "build").glob("lib.*/"))
+    if build_libs:
+        return build_libs[0]
+    return repo_root
+
+
+sys.path.insert(0, os.path.realpath(_hpc_import_path()))
 
 import torch
 
@@ -623,3 +634,187 @@ def test_fused_sampler_temperature_distribution(dtype):
     # TV distance between empirical freq and true prob should be small.
     tv = 0.5 * (freq - ref_prob).abs().sum(dim=-1)
     assert (tv < 0.1).all(), f"TV distance too large: {tv.tolist()}"
+
+
+# ===========================================================================
+# (3) Qwen3-TTS short-vocab top-k Gumbel sampler.
+# ===========================================================================
+def ref_qwen3_tts_topk_gumbel_sample(
+    logits: torch.Tensor,
+    noise: torch.Tensor,
+    topk: int,
+    inv_temperature: float,
+) -> torch.Tensor:
+    vals, idx = torch.topk(logits.float(), k=topk, dim=-1, largest=True, sorted=True)
+    cand_noise = torch.gather(noise.float(), 1, idx).clamp(1.0e-20, 1.0 - 1.0e-20)
+    scores = vals * inv_temperature - torch.log(-torch.log(cand_noise))
+    best = torch.argmax(scores, dim=-1, keepdim=True)
+    return torch.gather(idx, 1, best).to(torch.int64)
+
+
+QWEN3_TTS_SAMPLER_VOCABS = [64, 128, 256, 512, 1024, 1536, 2048]
+QWEN3_TTS_SAMPLER_TOPKS = [1, 4, 16, 32, 50, 64]
+QWEN3_TTS_SAMPLER_BATCHES = [1, 4, 8, 16, 32, 64]
+QWEN3_TTS_SAMPLER_INV_TEMPS = [1.0, 1.0 / 0.8, 1.0 / 0.7, 2.0]
+
+
+def _build_qwen3_tts_sampler_cases():
+    cases = []
+    for iv, vocab_size in enumerate(QWEN3_TTS_SAMPLER_VOCABS):
+        for ik, topk in enumerate(QWEN3_TTS_SAMPLER_TOPKS):
+            if topk > vocab_size:
+                continue
+            batch_size = QWEN3_TTS_SAMPLER_BATCHES[(iv + ik) % len(QWEN3_TTS_SAMPLER_BATCHES)]
+            inv_temperature = QWEN3_TTS_SAMPLER_INV_TEMPS[
+                (iv * len(QWEN3_TTS_SAMPLER_TOPKS) + ik) % len(QWEN3_TTS_SAMPLER_INV_TEMPS)
+            ]
+            cases.append(
+                (
+                    f"vocab{vocab_size}_top{topk}_b{batch_size}",
+                    batch_size,
+                    vocab_size,
+                    topk,
+                    inv_temperature,
+                )
+            )
+    return cases
+
+
+QWEN3_TTS_SAMPLER_CASES = _build_qwen3_tts_sampler_cases()
+
+QWEN3_TTS_SAMPLER_BENCH_CASES = [
+    ("vocab64_top64_b8", 8, 64, 64, 1.0),
+    ("vocab256_top16_b8", 8, 256, 16, 1.0 / 0.8),
+    ("vocab512_top16_b1", 1, 512, 16, 1.0),
+    ("vocab512_top50_b16", 16, 512, 50, 1.0 / 0.7),
+    ("vocab1024_top32_b8", 8, 1024, 32, 1.0 / 0.8),
+    ("vocab1024_top64_b32", 32, 1024, 64, 1.0),
+    ("vocab1536_top50_b16", 16, 1536, 50, 1.0 / 0.7),
+    ("vocab2048_top16_b8", 8, 2048, 16, 1.0),
+    ("vocab2048_top50_b1", 1, 2048, 50, 1.0 / 0.7),
+    ("vocab2048_top50_b8", 8, 2048, 50, 1.0 / 0.7),
+    ("vocab2048_top50_b32", 32, 2048, 50, 1.0 / 0.7),
+    ("vocab2048_top64_b64", 64, 2048, 64, 1.0),
+]
+
+
+@pytest.mark.parametrize(
+    "case_name,batch_size,vocab_size,topk,inv_temperature",
+    QWEN3_TTS_SAMPLER_CASES,
+)
+def test_qwen3_tts_topk_gumbel_sample_golden(
+    case_name, batch_size, vocab_size, topk, inv_temperature
+):
+    del case_name
+    torch.manual_seed(0x5150 + batch_size * 17 + vocab_size + topk)
+    logits = torch.randn(batch_size, vocab_size, dtype=torch.float32, device="cuda")
+    noise = torch.rand(batch_size, vocab_size, dtype=torch.float32, device="cuda")
+
+    out = hpc.qwen3_tts_topk_gumbel_sample(logits, noise, topk, inv_temperature)
+    ref = ref_qwen3_tts_topk_gumbel_sample(logits, noise, topk, inv_temperature)
+
+    assert out.shape == (batch_size, 1)
+    assert out.dtype == torch.int64
+    assert torch.equal(out, ref), f"mismatch my={out.flatten()} ref={ref.flatten()}"
+
+
+def _cuda_event_us(fn, warmup: int, iters: int) -> float:
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) * 1000.0 / iters
+
+
+@pytest.mark.skipif(
+    os.getenv("HPC_OPS_RUN_BENCHMARKS") != "1",
+    reason="set HPC_OPS_RUN_BENCHMARKS=1 to run sampler performance tests",
+)
+@pytest.mark.parametrize(
+    "case_name,batch_size,vocab_size,topk,inv_temperature",
+    QWEN3_TTS_SAMPLER_BENCH_CASES,
+)
+def test_qwen3_tts_topk_gumbel_sample_benchmark(
+    case_name, batch_size, vocab_size, topk, inv_temperature
+):
+    torch.manual_seed(0xBADC0DE + batch_size * 17 + vocab_size + topk)
+    logits = torch.randn(batch_size, vocab_size, dtype=torch.float32, device="cuda").contiguous()
+    noise = torch.rand(batch_size, vocab_size, dtype=torch.float32, device="cuda").contiguous()
+
+    out = hpc.qwen3_tts_topk_gumbel_sample(logits, noise, topk, inv_temperature)
+    ref = ref_qwen3_tts_topk_gumbel_sample(logits, noise, topk, inv_temperature)
+    assert torch.equal(out, ref), f"mismatch before benchmark my={out.flatten()} ref={ref.flatten()}"
+
+    warmup = int(os.getenv("HPC_OPS_BENCH_WARMUP", "100"))
+    iters = int(os.getenv("HPC_OPS_BENCH_ITERS", "1000"))
+
+    def hpc_call():
+        hpc.qwen3_tts_topk_gumbel_sample(logits, noise, topk, inv_temperature)
+
+    def torch_call():
+        ref_qwen3_tts_topk_gumbel_sample(logits, noise, topk, inv_temperature)
+
+    hpc_us = _cuda_event_us(hpc_call, warmup, iters)
+    torch_us = _cuda_event_us(torch_call, warmup, iters)
+    speedup = torch_us / hpc_us if hpc_us > 0 else float("nan")
+    print(
+        f"\nqwen3_tts_topk_gumbel_sample[{case_name}] "
+        f"B={batch_size} V={vocab_size} topk={topk} "
+        f"hpc={hpc_us:.3f}us torch={torch_us:.3f}us speedup={speedup:.2f}x "
+        f"warmup={warmup} iters={iters}"
+    )
+
+
+@pytest.mark.parametrize("bad_topk", [0, 65, 2049])
+def test_qwen3_tts_topk_gumbel_sample_rejects_bad_topk(bad_topk):
+    logits = torch.randn(1, 2048, dtype=torch.float32, device="cuda")
+    noise = torch.rand_like(logits)
+    with pytest.raises((RuntimeError, ValueError)):
+        hpc.qwen3_tts_topk_gumbel_sample(logits, noise, bad_topk, 1.0)
+
+
+def test_qwen3_tts_topk_gumbel_sample_rejects_unsupported_vocab():
+    logits = torch.randn(1, 2049, dtype=torch.float32, device="cuda")
+    noise = torch.rand_like(logits)
+    with pytest.raises((RuntimeError, ValueError)):
+        hpc.qwen3_tts_topk_gumbel_sample(logits, noise, 50, 1.0)
+
+
+@pytest.mark.parametrize("bad_logits_dtype", [torch.float16, torch.bfloat16])
+def test_qwen3_tts_topk_gumbel_sample_rejects_logits_dtype(bad_logits_dtype):
+    logits = torch.randn(1, 2048, dtype=bad_logits_dtype, device="cuda")
+    noise = torch.rand(1, 2048, dtype=torch.float32, device="cuda")
+    with pytest.raises((RuntimeError, ValueError)):
+        hpc.qwen3_tts_topk_gumbel_sample(logits, noise, 50, 1.0)
+
+
+def test_qwen3_tts_topk_gumbel_sample_rejects_noise_dtype():
+    logits = torch.randn(1, 2048, dtype=torch.float32, device="cuda")
+    noise = torch.rand(1, 2048, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises((RuntimeError, ValueError)):
+        hpc.qwen3_tts_topk_gumbel_sample(logits, noise, 50, 1.0)
+
+
+def test_qwen3_tts_topk_gumbel_sample_rejects_noise_shape():
+    logits = torch.randn(2, 2048, dtype=torch.float32, device="cuda")
+    noise = torch.rand(1, 2048, dtype=torch.float32, device="cuda")
+    with pytest.raises((RuntimeError, ValueError)):
+        hpc.qwen3_tts_topk_gumbel_sample(logits, noise, 50, 1.0)
+
+
+@pytest.mark.parametrize("bad_tensor", ["logits", "noise"])
+def test_qwen3_tts_topk_gumbel_sample_rejects_non_contiguous(bad_tensor):
+    logits = torch.randn(2, 4096, dtype=torch.float32, device="cuda")[:, ::2]
+    noise = torch.rand(2, 4096, dtype=torch.float32, device="cuda")[:, ::2]
+    if bad_tensor == "logits":
+        noise = noise.contiguous()
+    else:
+        logits = logits.contiguous()
+    with pytest.raises((RuntimeError, ValueError)):
+        hpc.qwen3_tts_topk_gumbel_sample(logits, noise, 50, 1.0)

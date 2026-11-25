@@ -180,3 +180,38 @@ def fused_sampler(
         gumbel_noise,
         seed,
     )
+
+
+def qwen3_tts_topk_gumbel_sample(
+    logits: Tensor,
+    noise: Tensor,
+    topk: int = 50,
+    inv_temperature: float = 1.0,
+) -> Tensor:
+    """Qwen3-TTS short-vocab fused sampler: top-k filter + Gumbel-max.
+
+    Args:
+        logits: Contiguous float32 tensor, shape ``[batch_size, vocab_size]``.
+        noise: Contiguous float32 uniform random tensor in ``(0, 1)``, same shape as logits.
+        topk: Top-k bound; Qwen3-TTS uses 50. Supported range is ``1..64``.
+        inv_temperature: Multiplier applied to logits before Gumbel-max.
+
+    Returns:
+        int64 sampled token ids, shape ``[batch_size, 1]``.
+    """
+    return torch.ops.hpc.qwen3_tts_topk_gumbel_sample(
+        logits,
+        noise,
+        topk,
+        inv_temperature,
+    )
+
+
+@torch.library.register_fake("hpc::qwen3_tts_topk_gumbel_sample")
+def qwen3_tts_topk_gumbel_sample_fake(
+    logits: Tensor,
+    noise: Tensor,
+    topk: int = 50,
+    inv_temperature: float = 1.0,
+):
+    return torch.empty((logits.shape[0], 1), dtype=torch.int64, device=logits.device)

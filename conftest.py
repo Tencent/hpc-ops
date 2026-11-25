@@ -82,6 +82,14 @@ def sanitizer_check(file_name, check):
         raise e
 
 
+def get_hpc_import_path():
+    repo_root = Path(__file__).resolve().parent
+    build_libs = list((repo_root / "build").glob("lib.*/"))
+    if build_libs:
+        return build_libs[0]
+    return repo_root
+
+
 class TraceHook(object):
     def __init__(self, checks, module_name):
         self.checks_ = checks
@@ -103,7 +111,7 @@ class TraceHook(object):
             ret = org_func(*args, **kwargs)
             save_data(tmp_after_invoke_file, "hpc", func_name, ret, args, kwargs)
 
-            pypath = os.path.realpath(list(Path(__file__).parent.glob("./build/lib.*/"))[0])
+            pypath = os.path.realpath(get_hpc_import_path())
             dump_test_py(tmp_py_file, tmp_before_invoke_file, tmp_after_invoke_file, pypath)
             print(tmp_py_file)
 
@@ -123,7 +131,7 @@ class TraceHook(object):
         return True
 
     def hook(self):
-        sys.path.insert(0, os.path.realpath(list(Path(__file__).parent.glob("./build/lib.*/"))[0]))
+        sys.path.insert(0, os.path.realpath(get_hpc_import_path()))
         module = __import__(self.module_name)
 
         dirs = dir(module)
