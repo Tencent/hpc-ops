@@ -589,7 +589,6 @@ __device__ __forceinline__ void ihc_pre_accumulate(const __nv_bfloat16* x_ptr, c
 
   static_assert(kHCDim % kSpan == 0, "the block's span must divide hc_mult * hidden_dim");
 
-  // Flat pass over hc_mult * hidden_dim.
   for (int step = 0; step < kSteps; ++step) {
     const int iflat = step * kSpan + threadIdx.x * kElementsPerThread;
 
@@ -672,7 +671,6 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     }
   }
 
-  // Full tiles use the compile-time trip count; the partial tail falls back to one row at a time.
   if (num_valid_rows == kRowsPerBlock) {
     ihc_pre_accumulate<kHCMult, kHiddenDim, kElementsPerThread, kRowsPerBlock, kThreadsPerBlock,
                        kProjRows, kRowsPerBlock>(x_ptr, w_ptr, row_base, acc_dot, acc_sqsum, 0);
@@ -1464,7 +1462,6 @@ constexpr PreConfig pre_config(int num_batch, int hidden_dim) {
     }
     return {8, 128};
   }
-  // hidden 4096.
   if (num_batch < 384) {
     return {2, 256};
   }
@@ -1956,7 +1953,6 @@ constexpr PostConfig post_config(int num_batch, int hidden_dim) {
   }
 #endif
 
-  // Cover the row in one pass; no grid-stride loop needed.
   const int max_split = hidden_dim / (threads * kElementsPerThread);
   return {threads, max_split > 1 ? max_split : 1};
 }

@@ -29,7 +29,7 @@ def naive_fuse_ihc_pre(x, w, hc_scale, hc_base, hc_mult, norm_eps, hc_eps, magni
 
 @pytest.mark.parametrize("num_batch", [1, 7, 128, 16384])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("hidden_dim", [6144, 4096])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 @pytest.mark.parametrize("norm_eps", [1e-5])
 @pytest.mark.parametrize("hc_eps", [1e-6])
 @pytest.mark.parametrize("magnitude", [2.0])
@@ -59,7 +59,7 @@ def naive_fuse_ihc_post(x, residual, H_post):
 
 @pytest.mark.parametrize("num_batch", [1, 7, 128, 16384])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("hidden_dim", [6144, 4096])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 def test_fuse_ihc_post(num_batch, hc_mult, hidden_dim):
     torch.cuda.manual_seed(13)
 
@@ -90,7 +90,7 @@ def naive_fuse_ihc_head(x, w, hc_scale, hc_base, norm_eps, hc_eps, rms_weight=No
 
 @pytest.mark.parametrize("num_batch", [1, 7, 128, 16384])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("hidden_dim", [6144, 4096])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 @pytest.mark.parametrize("norm_eps", [1e-5])
 @pytest.mark.parametrize("hc_eps", [1e-6])
 def test_fuse_ihc_head(num_batch, hc_mult, hidden_dim, norm_eps, hc_eps):
@@ -137,7 +137,7 @@ def naive_fuse_ihc_post_pre(
 
 @pytest.mark.parametrize("num_batch", [1, 7, 128, 512, 16384])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("hidden_dim", [6144, 4096])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 @pytest.mark.parametrize("fuse_norm", [False, True])
 def test_fuse_ihc_post_pre(num_batch, hc_mult, hidden_dim, fuse_norm):
     torch.cuda.manual_seed(13)
@@ -265,7 +265,7 @@ def make_head_inputs(num_batch, hidden_dim, seed=13):
 
 
 @pytest.mark.parametrize("num_batch", [1, 7, 16, 128, 512, 4096])
-@pytest.mark.parametrize("hidden_dim", [6144, 4096])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 def test_fuse_ihc_post_bitwise(num_batch, hidden_dim):
     torch.manual_seed(13)
     dev = "cuda"
@@ -285,7 +285,7 @@ def test_fuse_ihc_post_bitwise(num_batch, hidden_dim):
 
 
 @pytest.mark.parametrize("num_batch", [1, 7, 16, 128, 512, 4096])
-@pytest.mark.parametrize("hidden_dim", [6144, 4096])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 def test_fuse_ihc_pre_matches_torch(num_batch, hidden_dim):
     x, w, hc_scale, hc_base = make_pre_inputs(num_batch, hidden_dim)
 
@@ -300,7 +300,7 @@ def test_fuse_ihc_pre_matches_torch(num_batch, hidden_dim):
 
 
 @pytest.mark.parametrize("num_batch", [1, 7, 16, 128, 512, 4096])
-@pytest.mark.parametrize("hidden_dim", [6144, 4096])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 def test_fuse_ihc_head_matches_torch(num_batch, hidden_dim):
     x, w, hc_scale, hc_base = make_head_inputs(num_batch, hidden_dim)
 
@@ -311,7 +311,7 @@ def test_fuse_ihc_head_matches_torch(num_batch, hidden_dim):
     torch.testing.assert_close(got.float(), ref.float(), atol=2e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("hidden_dim", [6144, 4096])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 def test_fuse_ihc_pre_gate_structure(hidden_dim):
     """x=1, w=0, scale=0 isolates the constant terms exactly."""
     dev = "cuda"
@@ -332,7 +332,7 @@ def test_fuse_ihc_pre_gate_structure(hidden_dim):
     ), f"H_pre/eps structure wrong: y={y[0, 0].float().item()} expected {expected_y}"
 
 
-@pytest.mark.parametrize("hidden_dim", [6144, 4096])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 def test_fuse_ihc_pre_rsqrt_divisor(hidden_dim):
     """The rsqrt divides by hc_mult*hidden_dim, not hidden_dim (a 2x error otherwise)."""
     x, w, hc_scale, hc_base = make_pre_inputs(64, hidden_dim)
@@ -342,7 +342,7 @@ def test_fuse_ihc_pre_rsqrt_divisor(hidden_dim):
     torch.testing.assert_close(got_y.float(), ref_y.float(), atol=2e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("hidden_dim", [6144, 4096])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 def test_fuse_ihc_post_identity(hidden_dim):
     """H_post=0 must leave the residual bit-for-bit untouched."""
     dev = "cuda"
@@ -357,7 +357,7 @@ def test_fuse_ihc_post_identity(hidden_dim):
 
 
 @pytest.mark.parametrize("num_batch", [7, 512])
-@pytest.mark.parametrize("hidden_dim", [6144])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 def test_fuse_ihc_pre_deterministic(num_batch, hidden_dim):
     x, w, hc_scale, hc_base = make_pre_inputs(num_batch, hidden_dim)
     first_y, first_post = hpc.fuse_ihc_pre(x, w, hc_scale, hc_base, RMS_EPS, HC_EPS, MAGNITUDE)
@@ -369,7 +369,7 @@ def test_fuse_ihc_pre_deterministic(num_batch, hidden_dim):
 
 
 @pytest.mark.parametrize("num_batch", [7, 512])
-@pytest.mark.parametrize("hidden_dim", [6144])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 def test_fuse_ihc_post_deterministic(num_batch, hidden_dim):
     dev = "cuda"
     torch.manual_seed(13)
@@ -390,7 +390,7 @@ def naive_rms_norm(y, rms_weight, rms_eps):
 
 
 @pytest.mark.parametrize("num_batch", [1, 7, 16, 128, 512, 4096])
-@pytest.mark.parametrize("hidden_dim", [6144, 4096])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 @pytest.mark.parametrize("norm_eps", [1e-5])
 @pytest.mark.parametrize("hc_eps", [1e-6])
 @pytest.mark.parametrize("magnitude", [2.0])
@@ -421,7 +421,7 @@ def test_fuse_ihc_pre_with_rms_weight(num_batch, hidden_dim, norm_eps, hc_eps, m
 
 
 @pytest.mark.parametrize("num_batch", [1, 7, 16, 128, 512, 4096])
-@pytest.mark.parametrize("hidden_dim", [6144, 4096])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 @pytest.mark.parametrize("norm_eps", [1e-5])
 @pytest.mark.parametrize("hc_eps", [1e-6])
 def test_fuse_ihc_head_with_rms_weight(num_batch, hidden_dim, norm_eps, hc_eps):
