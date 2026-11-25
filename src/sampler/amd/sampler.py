@@ -1,6 +1,5 @@
 # Copyright (C) 2026 Tencent.
 
-import os
 import threading
 
 import torch
@@ -165,7 +164,6 @@ def _sample_kernel(
     HAS_RP: tl.constexpr,
     PEN_STRIDE: tl.constexpr,
     PEN_BYTES: tl.constexpr,
-    USE_TLE: tl.constexpr,
     topk_value,
     topp_value,
     rp_value,
@@ -201,12 +199,9 @@ def _sample_kernel(
         probabilities = tl.where(denominator > 0, probabilities / denominator, 0)
     else:
         probabilities = tl.full((K,), 0, tl.float32)
-    if USE_TLE:
-        exclusive, _ = tle.cumsum(probabilities, 0)
-    else:
-        exclusive = tl.cumsum(probabilities, 0) - probabilities
     # Candidates are ordered, so the exclusive prefix decides TopP; the first one
     # is always kept, which keeps the set non-empty for any threshold.
+    exclusive, _ = tle.cumsum(probabilities, 0)
     topp = tl.load(TOPP + row) if HAS_P else topp_value
     keep = valid & ((topp <= 0) | (positions == 0) | (exclusive < topp))
     if POLICY != 0:
@@ -268,7 +263,6 @@ def _or(first, second):
     return first | second
 
 
-USE_TLE = os.getenv("HPC_TRITON_USE_TLE", "0") == "1"
 _BLOCK_SIZE = 4096
 _rng_states = {}
 _rng_lock = threading.Lock()
@@ -416,7 +410,6 @@ def fused_sampler_async(
             repetition_penalty is not None,
             pen_stride,
             pen_bytes,
-            USE_TLE,
             topk_val,
             topp_val,
             repetition_penalty_val,

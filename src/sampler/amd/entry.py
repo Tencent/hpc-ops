@@ -7,7 +7,6 @@ from triton.experimental.tle import require_tle
 from hpc._amd.utils.validation import check_tensor, require
 
 from .sampler import (
-    USE_TLE,
     fused_sampler_async,
     reserve_rng_async,
     sampler_workspace_shape,
@@ -142,8 +141,7 @@ def fused_sampler(
             and penalty_mask.shape[1] >= (width + 7) // 8,
             "invalid penalty_mask shape",
         )
-    if USE_TLE:
-        require_tle("amd", tle.cumsum)
+    require_tle("amd", tle.cumsum)
     output = torch.empty((batch, 1), device=logits.device, dtype=torch.int32)
     if not batch:
         return output

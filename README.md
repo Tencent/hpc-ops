@@ -227,8 +227,9 @@ scale reformatting; interfaces needing FP8 or matrix instructions are registered
 but raise `NotImplementedError` with a `TODO(amd)` reason when called. The wheel
 runs on any AMD architecture and says so in its version, e.g.
 `0.0.1.dev0+g1234567.rocm`. `hpc.__backend__` reports `"rocm"`, calls still take
-`cuda` devices following PyTorch's ROCm API, and `HPC_TRITON_USE_TLE=1` enables
-FlagTree's TLE paths in iHC and the sampler.
+`cuda` devices following PyTorch's ROCm API. The sampler's TopP scan runs on
+FlagTree's TLE extensions, and `HPC_TRITON_USE_TLE=1` routes iHC channel
+extraction through them as well.
 
 ### Basic Usage
 
