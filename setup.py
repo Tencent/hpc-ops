@@ -13,11 +13,9 @@ from setuptools.command.build_py import build_py
 
 import torch
 
-BACKEND = os.getenv("HPC_BACKEND", "cuda" if not torch.version.hip else "triton").strip().lower()
-if BACKEND == "hip":
-    BACKEND = "triton"
-if BACKEND not in ("cuda", "triton"):
-    raise SystemExit("HPC_BACKEND must be cuda or triton")
+BACKEND = os.getenv("HPC_BACKEND", "cuda" if not torch.version.hip else "rocm").strip().lower()
+if BACKEND not in ("cuda", "rocm"):
+    raise SystemExit("HPC_BACKEND must be cuda or rocm")
 
 # Architectures the build supports. The same list is in the Makefile and
 # CMakeLists.txt; adding one also needs an HPC_ARCH_EVAL_<arch> block in
@@ -76,7 +74,7 @@ class CMakeBuild(build_ext):
 
 class BuildPy(build_py):
     def run(self):
-        if BACKEND == "triton":
+        if BACKEND == "rocm":
             package_dir = os.path.join(self.build_lib, "hpc")
             if os.path.isdir(package_dir):
                 shutil.rmtree(package_dir)
@@ -125,7 +123,8 @@ if BACKEND == "cuda":
     if sm_archs != KNOWN_ARCHS:
         version += ".sm" + ".".join(str(a) for a in sm_archs)
 else:
-    version += ".triton"
+    # ROCm wheels run on any architecture, so the suffix names the backend.
+    version += ".rocm"
 
 version_macros = [
     '-DHPC_VERSION_STR="{}"'.format(version),
@@ -145,7 +144,7 @@ else:
     }
 
 amd_package_dirs = {}
-if BACKEND == "triton":
+if BACKEND == "rocm":
     amd_package_dirs["hpc._amd"] = "src/C/amd"
     for path in sorted(Path("src").glob("*/amd")):
         if path.parent.name != "C":
@@ -165,5 +164,5 @@ setup(
     cmdclass={"build_ext": CMakeBuild, "build_py": BuildPy},
     package_data={"hpc": ["*.so"]} if BACKEND == "cuda" else {},
     options=build_options,
-    install_requires=["torch"] + (["flagtree>=0.7,<0.8"] if BACKEND == "triton" else []),
+    install_requires=["torch"] + (["flagtree>=0.7,<0.8"] if BACKEND == "rocm" else []),
 )

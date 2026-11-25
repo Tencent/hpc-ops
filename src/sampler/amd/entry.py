@@ -61,6 +61,8 @@ def temperature_sample(
     output = torch.empty((batch, 1), device=logits.device, dtype=torch.int32)
     if not batch:
         return output
+    # This path divides by the temperature with no in-kernel guard, so positive
+    # entries stay a caller contract; capture just cannot afford the D2H read.
     with torch.cuda.device(logits.device):
         if temperature is not None and not torch.cuda.is_current_stream_capturing():
             require(temperature.min().item() > 0, "every temperature tensor element must be > 0")
@@ -187,5 +189,4 @@ def register(library):
     for schema in SCHEMAS:
         library.define(schema)
         name = schema.split("(", 1)[0]
-        dispatch = "CompositeExplicitAutograd" if "workspace_size" in name else "CUDA"
-        library.impl(name, implementations[name], dispatch)
+        library.impl(name, implementations[name], "CUDA")

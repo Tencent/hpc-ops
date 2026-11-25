@@ -5,6 +5,8 @@ import triton
 import triton.language as tl
 
 
+# RMSNorm over one 128-wide head held as two 64-wide halves, so the weight for
+# the second half sits 64 elements further on.
 @triton.jit
 def _norm_pair(first, second, weight, offsets):
     inv = tl.rsqrt(tl.sum(first * first + second * second, 0) / 128 + 1e-6)
@@ -19,6 +21,8 @@ def _store_pair(destination, first, second, offsets):
     tl.store(destination + offsets + 64, second)
 
 
+# Grid is (rows + requests) x (Q heads + KV heads): the rows rotate and store one
+# head each, the extra programs zero the tail of each request's last cache block.
 @triton.jit
 def _rope_kernel(
     QKV,
@@ -63,6 +67,7 @@ def _rope_kernel(
                     tl.store(KCACHE + physical.to(tl.int64) * K_STRIDE + offset, 0, mask)
                     tl.store(VCACHE + physical.to(tl.int64) * V_STRIDE + offset, 0, mask)
     else:
+        # Find the request owning this row: the last QINDEX entry at or below it.
         lo = tl.full((), 0, tl.int32)
         hi = tl.full((), REQUESTS + 1, tl.int32)
         while lo < hi:
@@ -89,6 +94,7 @@ def _rope_kernel(
                             first, second = _norm_pair(first, second, Q_WEIGHT, offsets)
                         else:
                             first, second = _norm_pair(first, second, K_WEIGHT, offsets)
+                    # NeoX pairing: element i rotates against element i + 64.
                     cosine = tl.load(COS_SIN + position.to(tl.int64) * 128 + offsets)
                     sine = tl.load(COS_SIN + position.to(tl.int64) * 128 + offsets + 64)
                     rotated_first = first * cosine - second * sine

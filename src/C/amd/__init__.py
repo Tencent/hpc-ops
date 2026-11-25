@@ -5,12 +5,13 @@ import json
 
 import torch
 
+# tle is imported to check availability; the kernels import tle.language themselves.
 try:
     FLAGTREE_VERSION = importlib.metadata.version("flagtree")
     import triton
-    from triton.experimental import tle
+    from triton.experimental import tle  # noqa: F401
 except (ImportError, importlib.metadata.PackageNotFoundError) as exc:
-    raise ImportError("The AMD backend requires FlagTree >= 0.7 with AMD TLE support") from exc
+    raise ImportError("The ROCm backend requires FlagTree >= 0.7 with AMD TLE support") from exc
 
 from . import unsupported
 from .fuse_moe import entry as moe
@@ -39,7 +40,7 @@ def register():
         {
             "version": version,
             "git-hash": git_hash,
-            "backend": "triton",
+            "backend": "rocm",
             "compiler": "flagtree",
             "flagtree": FLAGTREE_VERSION,
             "triton": triton.__version__,

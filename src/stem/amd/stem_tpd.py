@@ -41,10 +41,14 @@ def _stem_tpd_kernel(
         live & (cols < tl.minimum(kblocks, KCOLS)),
         other=float("-inf"),
     )
+    # Order-preserving 16-bit key for a BF16 value. Non-finite values map below
+    # every finite one, so the 0x80 threshold below admits exactly the finite set.
     bits = x.to(tl.uint16, bitcast=True).to(tl.uint32)
     finite = (bits & 0x7F80) != 0x7F80
     ordered = tl.where(bits & 0x8000 != 0, (~bits) & 0xFFFF, bits ^ 0x8000)
     ordered = tl.where(finite, ordered, 0x7F)
+    # Budget: a three-band schedule on the full prompt length, then a linear
+    # decay toward k * alpha as the query block moves past it.
     k = tl.where(
         prompt < 56,
         prompt,
@@ -59,6 +63,8 @@ def _stem_tpd_kernel(
     ratio = (qpos - k).to(tl.float32) / tl.maximum(decay - 1, 1)
     decayed = tl.floor(k + ratio * (k * alpha - k)).to(tl.int32)
     budget = tl.where((qpos < k) | (decay <= 1), k, tl.maximum(1, tl.minimum(k, decayed)))
+    # Bit-by-bit search for the highest threshold still admitting the budget, so
+    # exact ties at it can exceed the budget rather than be split arbitrarily.
     threshold = tl.full((), 0x80, tl.uint32)
     total_finite = tl.sum(finite.to(tl.int32), 0)
     if budget < total_finite:
@@ -71,6 +77,8 @@ def _stem_tpd_kernel(
     selected = (ordered >= threshold) | (cols < initial_blocks)
     selected |= ((cols <= diagonal) & (cols > diagonal - window_size)) | (cols == diagonal)
     selected &= live & (cols < kblocks)
+    # Invalid rows and padded columns are written as zero, so the caller's mask
+    # needs no pre-fill.
     tl.store(Y + row.to(tl.int64) * KCOLS + cols, selected.to(tl.uint8), cols < KCOLS)
 
 

@@ -21,6 +21,7 @@ def _reduce_kernel(
     row = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     value = tl.full((BLOCK,), 0, tl.float32)
+    # Routes with a negative or out-of-range position contribute nothing.
     for route in range(TOPK):
         index = row.to(tl.int64) * TOPK + route
         pos = tl.load(POSITIONS + index)

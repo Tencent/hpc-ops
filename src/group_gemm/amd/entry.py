@@ -29,7 +29,7 @@ def reformat_x_scale(x_scale, seqlens, cu_seqlens, out_x_scale, num_seq_per_grou
     require(groups > 0 or rows == 0, "nonempty x_scale requires groups")
     tile = get_reformat_tile_size(num_seq_per_group_avg)
     require(
-        not groups or rows % groups == 0 and (rows // groups) % tile == 0,
+        not groups or (rows % groups == 0 and (rows // groups) % tile == 0),
         "per-group input capacity must align to the selected tile size",
     )
     output = (

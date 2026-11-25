@@ -56,7 +56,7 @@ def _nvml_arch():
 
 
 def _load_module():
-    """Load the local CUDA architecture's module or register AMD Triton operators.
+    """Load the local CUDA architecture's module or register the AMD operators.
 
     A package carries one `_C_sm<arch>.abi3.so` per architecture it was built
     for. The match is exact: architecture-specific cubins are not forward
@@ -97,11 +97,13 @@ def _load_module():
     from ._amd import register
 
     register()
-    return "triton"
+    # Reporting the device architecture here would create a GPU context at
+    # import, which the detection above avoids.
+    return "amd"
 
 
 __loaded_arch__ = _load_module()
-__backend__ = "cuda" if not torch.version.hip else "triton"
+__backend__ = "cuda" if not torch.version.hip else "rocm"
 
 
 def _discover_modules() -> Dict[str, ModuleType]:
@@ -145,5 +147,5 @@ __built_json__ = torch.ops.hpc.built_json()
 __doc__ = """
 High Performance Computing Operators Library
 
-This library provides optimized CUDA and AMD Triton kernels for tensor operations.
+This library provides optimized CUDA and AMD kernels for tensor operations.
 """

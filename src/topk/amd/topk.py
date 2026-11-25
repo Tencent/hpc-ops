@@ -5,6 +5,8 @@ import triton
 import triton.language as tl
 
 
+# Order-preserving uint32 key for an FP32 value, so comparing keys compares the
+# floats: negatives invert, non-negatives flip the sign bit, NaN sorts above all.
 @triton.jit
 def _ordered(x):
     bits = x.to(tl.uint32, bitcast=True)
@@ -12,6 +14,8 @@ def _ordered(x):
     return tl.where(x != x, 0xFFFFFFFF, key).to(tl.uint32)
 
 
+# One workgroup per row: four 8-bit radix passes narrow the threshold key, then
+# one pass writes the indices. Rows at or past LIVE stay untouched.
 @triton.jit
 def _select_kernel(
     X,
@@ -22,14 +26,12 @@ def _select_kernel(
     STRIDE: tl.constexpr,
     OUT_STRIDE: tl.constexpr,
     TOPK: tl.constexpr,
-    HAS_LENGTHS: tl.constexpr,
-    HAS_LIVE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
-    live = tl.load(LIVE) if HAS_LIVE else 2147483647
+    live = tl.load(LIVE)
     if row < live:
-        length = tl.minimum(tl.maximum(tl.load(LENGTHS + row), 0), WIDTH) if HAS_LENGTHS else WIDTH
+        length = tl.minimum(tl.maximum(tl.load(LENGTHS + row), 0), WIDTH)
         cols = tl.arange(0, BLOCK)
         if length <= TOPK:
             for start in range(0, length, BLOCK):
@@ -50,11 +52,15 @@ def _select_kernel(
                     key = _ordered(value)
                     active = (indices < length) & ((key & prefix_mask) == prefix)
                     histogram += tl.histogram(((key >> shift) & 255).to(tl.int32), 256, active)
+                # bucket is the highest byte whose keys-at-or-above still cover
+                # the quota; remaining is then the quota left for prefix matches.
                 counts = tl.cumsum(histogram, 0, reverse=True)
                 bucket = tl.max(tl.where(counts >= remaining, bins, 0), 0)
                 remaining -= tl.sum(tl.where(bins > bucket, histogram, 0), 0)
                 prefix |= bucket.to(tl.uint32) << shift
                 prefix_mask |= tl.full((), 255, tl.uint32) << shift
+            # Keys above the threshold all go in; keys equal to it fill the
+            # remaining quota in column order, so exact ties cannot overflow.
             written = tl.full((), 0, tl.int32)
             ties_seen = tl.full((), 0, tl.int32)
             for start in range(0, length, BLOCK):
@@ -72,6 +78,8 @@ def _select_kernel(
                 ties_seen += tl.sum(ties.to(tl.int32), 0)
 
 
+# The same selection across many workgroups for long rows. STATE holds four
+# int32 per row: threshold prefix, remaining quota, output cursor, tie cursor.
 @triton.jit
 def _histogram_kernel(
     X,
@@ -129,6 +137,7 @@ def _refine_kernel(
             )
             histogram += tl.sum(values, 0)
         if SHIFT == 24:
+            # The first pass owns initialization, so caller scratch needs none.
             remaining = tl.full((), TOPK, tl.int32)
             prefix = tl.full((), 0, tl.uint32)
             tl.store(STATE + local * 4 + 2, 0)
@@ -172,6 +181,8 @@ def _collect_kernel(
             remaining = tl.load(STATE + local * 4 + 1)
             ties = (cols < length) & (key == threshold)
             tie_ranks = tl.cumsum(ties.to(tl.int32), 0)
+            # Tiles claim their share of the tie quota and their output range
+            # atomically, so which tied keys win depends on arrival order.
             previous = tl.atomic_add(
                 STATE + local * 4 + 3, tl.sum(ties.to(tl.int32), 0), sem="relaxed"
             )
@@ -190,6 +201,8 @@ _RADIX_BINS = 256
 _MAX_WORKSPACE_ROWS = 64
 
 
+# Short rows need no scratch, so the minimum is the four bytes that select that
+# path; longer rows get per-tile histograms for _MAX_WORKSPACE_ROWS rows at most.
 def topk_filtered_workspace_size(num_rows, max_kv_len):
     if max_kv_len < 32768 or num_rows == 0:
         return 4, 4
@@ -270,8 +283,6 @@ def topk_filtered_async(logits, ke, output, topk, num_valid_rows, workspace):
                     logits.stride(0),
                     output.stride(0),
                     topk,
-                    True,
-                    True,
                     _BLOCK_SIZE,
                     num_warps=4,
                 )

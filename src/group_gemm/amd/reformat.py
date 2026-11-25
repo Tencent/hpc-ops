@@ -5,6 +5,8 @@ import triton
 import triton.language as tl
 
 
+# Each group's destination starts at the running sum of tile-aligned lengths, so
+# the gaps that alignment leaves are never written.
 @triton.jit
 def _group_offsets(LENGTHS, OFFSETS, GROUPS: tl.constexpr, TILE: tl.constexpr, BLOCK: tl.constexpr):
     groups = tl.arange(0, BLOCK)

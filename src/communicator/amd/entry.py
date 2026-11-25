@@ -10,4 +10,4 @@ class MulticastCommunicator:
         comm_name: str = "hpc-comm.sock",
     ):
         # TODO(amd): implement communication buffer management and synchronization.
-        raise NotImplementedError("TODO(amd): multicast communicator is not implemented for AMD")
+        raise NotImplementedError("TODO(amd): multicast communicator is not implemented")

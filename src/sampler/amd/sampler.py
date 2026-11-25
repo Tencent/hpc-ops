@@ -11,12 +11,16 @@ from triton.experimental.tle import language as tle
 from ..topk.topk import _ordered
 
 
+# Per-device counter reserving one Philox range per launch, so the same seed
+# gives fresh noise. It lives on the GPU, so a captured graph advances on replay.
 @triton.jit
 def _reserve_rng(STATE, OFFSET, count):
     previous = tl.atomic_add(STATE, count.to(tl.int64), sem="relaxed")
     tl.store(OFFSET, previous)
 
 
+# Gumbel(0) noise, -log(-log(U)) with the inner log clamped so U -> 1 cannot
+# poison the score. The counter's high bits enter the key, the low bits the draw.
 @triton.jit
 def _noise(NOISE, OFFSET, seed, row, cols, WIDTH: tl.constexpr, EXTERNAL: tl.constexpr):
     index = row.to(tl.int64) * WIDTH + cols
@@ -30,6 +34,8 @@ def _noise(NOISE, OFFSET, seed, row, cols, WIDTH: tl.constexpr, EXTERNAL: tl.con
     return noise
 
 
+# Temperature-only path: each tile reduces to its best Gumbel score and token,
+# and _temperature_finish picks across tiles. Equal scores take the lower token.
 @triton.jit
 def _temperature_kernel(
     X,
@@ -80,6 +86,8 @@ def _temperature_finish(SCORES, TOKENS, Y, TILES: tl.constexpr, BLOCK: tl.conste
     tl.store(Y + row, winner)
 
 
+# Pass one: repetition penalty, temperature, this tile's TopK candidates and,
+# for the full-vocab softmax policy, its max and exponential sum.
 @triton.jit
 def _prepare_kernel(
     X,
@@ -116,6 +124,8 @@ def _prepare_kernel(
         x = tl.where(seen & (rp > 0), adjusted, x)
     t = tl.load(TEMP + row) if HAS_TEMP else temperature
     x = tl.where(t > 0, tl.div_rn(x, t), x)
+    # Key in the high half, complemented column in the low half: one TopK on the
+    # pair orders by value and breaks ties toward the smaller token. 0 loses to all.
     pairs = (_ordered(x).to(tl.uint64) << 32) | (0xFFFFFFFF - cols.to(tl.uint32)).to(tl.uint64)
     pairs = tl.where(valid, pairs, 0)
     candidates = tl.topk(pairs, K)
@@ -127,6 +137,8 @@ def _prepare_kernel(
         tl.store(SUMS + row * TILES + tile, total)
 
 
+# Pass two: merge the tiles' candidates, then softmax (policy 1 over the whole
+# vocabulary, policy 2 over the candidates), TopP, Gumbel-max and the penalty bit.
 @triton.jit
 def _sample_kernel(
     CANDIDATES,
@@ -193,6 +205,8 @@ def _sample_kernel(
         exclusive, _ = tle.cumsum(probabilities, 0)
     else:
         exclusive = tl.cumsum(probabilities, 0) - probabilities
+    # Candidates are ordered, so the exclusive prefix decides TopP; the first one
+    # is always kept, which keeps the set non-empty for any threshold.
     topp = tl.load(TOPP + row) if HAS_P else topp_value
     keep = valid & ((topp <= 0) | (positions == 0) | (exclusive < topp))
     if POLICY != 0:
@@ -203,6 +217,8 @@ def _sample_kernel(
     token = tl.min(tl.where(keep & (score == maximum_score), tokens, 2147483647), 0)
     token = tl.where(token == 2147483647, 0, token)
     tl.store(Y + row, token)
+    # The bit is set with one atomic OR on its aligned 32-bit word. A word that
+    # crosses either end of the tensor is skipped here and left to _penalty_edges.
     if HAS_PENALTY:
         rp = tl.load(RP + row) if HAS_RP else rp_value
         slot = tl.load(SLOTS + row)
@@ -216,6 +232,8 @@ def _sample_kernel(
         tl.atomic_or(address, bits, (rp > 0) & inside, sem="relaxed")
 
 
+# Head and tail bytes of an unaligned mask, folded across rows in one workgroup
+# so each partial word is read and written once without touching its neighbours.
 @triton.jit
 def _penalty_edges(
     PENALTY,

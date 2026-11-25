@@ -11,6 +11,8 @@ from triton.experimental.tle import language as tle
 USE_TLE = os.getenv("HPC_TRITON_USE_TLE", "0") == "1"
 
 
+# Split a [4, BLOCK] tile into its four rows without a transpose in memory; the
+# TLE path does the same with extract_tile.
 @triton.jit
 def _split_channels(x, BLOCK: tl.constexpr):
     first, second = tl.split(tl.permute(tl.reshape(x, (2, 2, BLOCK)), (1, 2, 0)))
@@ -61,6 +63,8 @@ def _pre_head_kernel(
         cols[None, :] < HIDDEN,
         other=0,
     ).to(tl.float32)
+    # The fused post output is rounded to BF16 before it feeds the projections,
+    # so this matches running post and pre as two kernels.
     if FUSE_POST:
         xa = tl.load(XA + row.to(tl.int64) * HIDDEN + cols, cols < HIDDEN, other=0).to(tl.float32)
         gates = tl.load(POST_IN + row * 4 + channels)
@@ -71,6 +75,7 @@ def _pre_head_kernel(
             cols[None, :] < HIDDEN,
         )
         x = x.to(tl.float32)
+    # One scale for all four channels: the norm runs over the whole [4, HIDDEN] row.
     inv_rms = tl.rsqrt(tl.sum(tl.sum(x * x, 1), 0) / (4 * HIDDEN) + norm_eps)
     scale = tl.load(SCALE)
     p0 = (
@@ -89,6 +94,8 @@ def _pre_head_kernel(
         tl.sigmoid(_project(W, x, channels, cols, HIDDEN, 3) * inv_rms * scale + tl.load(BASE + 3))
         + hc_eps
     )
+    # Projections 0-3 gate this layer's mix; 4-7 are the gates the post stage
+    # will apply, scaled by magnitude. The head variant has only the first four.
     if not HEAD:
         for p in tl.static_range(4, 8):
             value = _project(W, x, channels, cols, HIDDEN, p) * inv_rms
