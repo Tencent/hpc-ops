@@ -32,6 +32,22 @@ CUTE_HOST_DEVICE constexpr auto make_tiled_sf(TiledMMA<Atom, ThrLayout, Permutat
   return TiledMMA<SFAtom, ThrLayout, Permutation>{};
 }
 
+// SW128 repeats every 1024 bytes. Resolve each lane's address in stage zero,
+// then advance the physical address by whole periods for the current stage.
+template <typename LdsmOp, int kStageBytes, typename Src, typename Dst>
+CUTE_DEVICE void load_ldsm_stage(const Src &src, Dst dst, int stage) {
+  static_assert(kStageBytes % 1024 == 0, "stage stride must preserve the SW128 swizzle");
+  auto src_vec = recast<uint128_t>(src);
+  auto dst_regs = recast<uint32_t>(dst);
+  CUTE_STATIC_ASSERT_V(size(dst_regs) == size(src_vec) * Int<4>{});
+  CUTE_UNROLL
+  for (int i = 0; i < size(src_vec); ++i) {
+    auto ptr = &src_vec(i) + stage * (kStageBytes / sizeof(uint128_t));
+    LdsmOp::copy(*ptr, dst_regs(4 * i), dst_regs(4 * i + 1), dst_regs(4 * i + 2),
+                 dst_regs(4 * i + 3));
+  }
+}
+
 template <typename TC_, typename TW_, int kTileM_, int kTileN_, int kTileK_>
 struct GroupGemmMxfp8Config {
   using TA = uint8_t;
