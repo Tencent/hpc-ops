@@ -105,8 +105,8 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1) gate_up_fuse_act_mul_q
   auto *shm_sfa = reinterpret_cast<TSF *>(shm_y + cosize(SLayoutC{}));
   auto *shm_sfb = reinterpret_cast<TSF *>(shm_sfa + cosize(SLayoutSFA{}));
 
-  auto sA = make_tensor(make_smem_ptr(shm_a), SLayoutA{});
-  auto sB = make_tensor(make_smem_ptr(shm_b), SLayoutB{});
+  auto sA = as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shm_a), SLayoutA{}));
+  auto sB = as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shm_b), SLayoutB{}));
   auto sY = make_tensor(make_smem_ptr(shm_y), SLayoutC{});
   auto sSFA = make_tensor(make_smem_ptr(shm_sfa), SLayoutSFA{});
   auto sSFB = make_tensor(make_smem_ptr(shm_sfb), SLayoutSFB{});
