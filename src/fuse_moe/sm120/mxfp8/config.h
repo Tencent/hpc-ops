@@ -32,6 +32,19 @@ CUTE_HOST_DEVICE constexpr auto make_tiled_sf(TiledMMA<Atom, ThrLayout, Permutat
   return TiledMMA<SFAtom, ThrLayout, Permutation>{};
 }
 
+// SW128 repeats every 1024 bytes. Resolve each lane's address in stage zero,
+// then advance the physical address by whole periods for the current stage.
+template <typename LdsmOp, int kStageBytes, typename Src, typename Dst>
+CUTE_DEVICE void load_ldsm_stage(const Src &src, Dst dst, int stage) {
+  static_assert(kStageBytes % 1024 == 0, "stage stride must preserve the SW128 swizzle");
+  CUTE_STATIC_ASSERT_V(size(dst) == size(src) * Int<4>{});
+  CUTE_UNROLL
+  for (int i = 0; i < size(src); ++i) {
+    auto ptr = &src(i) + stage * (kStageBytes / sizeof(uint128_t));
+    LdsmOp::copy(*ptr, dst(4 * i), dst(4 * i + 1), dst(4 * i + 2), dst(4 * i + 3));
+  }
+}
+
 template <typename TC_, typename TW_, int kTileM_, int kTileN_, int kTileK_>
 struct GroupGemmMxfp8Config {
   using TA = uint8_t;
@@ -151,7 +164,6 @@ struct GroupGemmMxfp8Config {
   static_assert(size(TiledMma{}) == kNumMmaWarps * 32, "MMA must use 8 warps");
 
   static constexpr int kShmABytes = sizeof_bits_v<TA> * cosize(SLayoutA{}) / 8;
-  static_assert(kShmABytes % 1024 == 0, "B must start on a 1024-byte swizzle boundary");
   static constexpr int kShmBBytes = sizeof_bits_v<TB> * cosize(SLayoutB{}) / 8;
   static constexpr int kShmCBytes = sizeof_bits_v<TC> * cosize(SLayoutC{}) / 8;
   static constexpr int kShmSFABytes = sizeof_bits_v<TSF> * cosize(SLayoutSFA{}) / 8;
