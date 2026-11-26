@@ -102,8 +102,8 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1)
   auto *shm_sfa = reinterpret_cast<TSF *>(shm_c + cosize(SLayoutC{}));
   auto *shm_sfb = reinterpret_cast<TSF *>(shm_sfa + cosize(SLayoutSFA{}));
 
-  auto sA = make_tensor(make_smem_ptr(shm_a), SLayoutA{});
-  auto sB = make_tensor(make_smem_ptr(shm_b), SLayoutB{});
+  auto sA = as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shm_a), SLayoutA{}));
+  auto sB = as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shm_b), SLayoutB{}));
   auto sC = make_tensor(make_smem_ptr(shm_c), SLayoutC{});
   auto sSFA = make_tensor(make_smem_ptr(shm_sfa), SLayoutSFA{});
   auto sSFB = make_tensor(make_smem_ptr(shm_sfb), SLayoutSFB{});
@@ -292,10 +292,10 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1)
     auto thr_copy_a = tiled_copy_a.get_slice(idx);
     auto thr_copy_b = tiled_copy_b.get_slice(idx);
     auto thr_copy_c = tiled_copy_c.get_slice(idx);
-    auto tAsA = recast<uint128_t>(thr_copy_a.partition_S(sA));
-    auto tBsB = recast<uint128_t>(thr_copy_b.partition_S(sB));
-    auto tArA = recast<uint32_t>(thr_copy_a.retile_D(tCrA));
-    auto tBrB = recast<uint32_t>(thr_copy_b.retile_D(tCrB));
+    auto tAsA = thr_copy_a.partition_S(sA);
+    auto tBsB = thr_copy_b.partition_S(sB);
+    auto tArA = thr_copy_a.retile_D(tCrA);
+    auto tBrB = thr_copy_b.retile_D(tCrB);
     auto tCsC = thr_copy_c.partition_D(sC);
 
     constexpr int kNumM = size<1>(decltype(tCrA){});
@@ -330,10 +330,8 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1)
 
 #pragma unroll
         for (int ik = 0; ik < size<2>(tCrA); ++ik) {
-          load_ldsm_stage<SM75_U32x4_LDSM_N, Config::kShmABytes / kStageAB>(
-              tAsA(_, _, ik, 0), tArA(_, _, ik), ismem_read);
-          load_ldsm_stage<typename Config::LdsmOpB, Config::kShmBBytes / kStageAB>(
-              tBsB(_, _, ik, 0), tBrB(_, _, ik), ismem_read);
+          cute::copy(tiled_copy_a, tAsA(_, _, ik, ismem_read), tArA(_, _, ik));
+          cute::copy(tiled_copy_b, tBsB(_, _, ik, ismem_read), tBrB(_, _, ik));
           // fp4: ldmatrix leaves each value in a byte's low 4 bits, the MMA reads bits [5:2]
           fp4_shift_B(typename TiledMma::MMA_Op{}, tCrB(_, _, ik));
 
