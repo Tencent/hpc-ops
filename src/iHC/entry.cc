@@ -13,10 +13,18 @@
 namespace hpc {
 namespace iHC {
 
+static splitk::DispatchMode parse_splitk_mode(int64_t mode) {
+  TORCH_CHECK(mode >= 0 && mode <= 2, "splitk_mode must be 0 (auto), 1 (split-K), or 2 (row), got ",
+              mode);
+  return static_cast<splitk::DispatchMode>(mode);
+}
+
 std::tuple<torch::Tensor, torch::Tensor> fuse_ihc_pre_entry(
     const torch::Tensor &x, const torch::Tensor &w, const torch::Tensor &hc_scale,
     const torch::Tensor &hc_base, double norm_eps, double hc_eps, double magnitude,
-    std::optional<torch::Tensor> rms_weight, double rms_eps, bool cast_bfloat_for_norm) {
+    std::optional<torch::Tensor> rms_weight, double rms_eps, bool cast_bfloat_for_norm,
+    int64_t splitk_mode) {
+  const auto mode = parse_splitk_mode(splitk_mode);
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   TORCH_CHECK(x.is_contiguous(), "x tensor must be contiguous");
@@ -77,9 +85,9 @@ std::tuple<torch::Tensor, torch::Tensor> fuse_ihc_pre_entry(
   auto *output_H_post_ptr = reinterpret_cast<float *>(output_H_post.mutable_data_ptr());
 
   const bool fuse_rms_norm = rms_weight_ptr != nullptr;
-  if (splitk::ihc_pre_splitk_supported(num_batch, hc_mult, hidden_dim, fuse_rms_norm)) {
-    const size_t scratch_floats =
-        splitk::ihc_pre_splitk_scratch_floats(num_batch, hc_mult, hidden_dim, fuse_rms_norm);
+  const size_t scratch_floats =
+      splitk::ihc_pre_splitk_scratch_floats(num_batch, hc_mult, hidden_dim, fuse_rms_norm, mode);
+  if (scratch_floats != 0) {
     torch::Tensor scratch =
         torch::empty({static_cast<int64_t>(scratch_floats)}, options.dtype(torch::kFloat32));
     splitk::fuse_ihc_pre_splitk_async(
@@ -224,7 +232,8 @@ torch::Tensor fuse_ihc_head_entry(const torch::Tensor &x, const torch::Tensor &w
                                   const torch::Tensor &hc_scale, const torch::Tensor &hc_base,
                                   double norm_eps, double hc_eps,
                                   std::optional<torch::Tensor> rms_weight, double rms_eps,
-                                  bool cast_bfloat_for_norm) {
+                                  bool cast_bfloat_for_norm, int64_t splitk_mode) {
+  const auto mode = parse_splitk_mode(splitk_mode);
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   TORCH_CHECK(x.is_contiguous(), "x tensor must be contiguous");
@@ -283,9 +292,9 @@ torch::Tensor fuse_ihc_head_entry(const torch::Tensor &x, const torch::Tensor &w
   auto *output_ptr = reinterpret_cast<__nv_bfloat16 *>(output.mutable_data_ptr());
 
   const bool fuse_rms_norm = rms_weight_ptr != nullptr;
-  if (splitk::ihc_head_splitk_supported(num_batch, hc_mult, hidden_dim, fuse_rms_norm)) {
-    const size_t scratch_floats =
-        splitk::ihc_head_splitk_scratch_floats(num_batch, hc_mult, hidden_dim, fuse_rms_norm);
+  const size_t scratch_floats =
+      splitk::ihc_head_splitk_scratch_floats(num_batch, hc_mult, hidden_dim, fuse_rms_norm, mode);
+  if (scratch_floats != 0) {
     torch::Tensor scratch =
         torch::empty({static_cast<int64_t>(scratch_floats)}, options.dtype(torch::kFloat32));
     splitk::fuse_ihc_head_splitk_async(
@@ -308,7 +317,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "fuse_ihc_pre(Tensor x, Tensor w, Tensor hc_scale, Tensor hc_base, float norm_eps, float "
       "hc_eps, float magnitude, Tensor? rms_weight=None, float rms_eps=0.0, "
-      "bool cast_bfloat_for_norm=False) "
+      "bool cast_bfloat_for_norm=False, *, int splitk_mode=0) "
       "-> (Tensor output_y, Tensor output_H_post)");
   m.impl("fuse_ihc_pre", torch::kCUDA, &hpc::iHC::fuse_ihc_pre_entry);
 
@@ -324,7 +333,8 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 
   m.def(
       "fuse_ihc_head(Tensor x, Tensor w, Tensor hc_scale, Tensor hc_base, float norm_eps, float "
-      "hc_eps, Tensor? rms_weight=None, float rms_eps=0.0, bool cast_bfloat_for_norm=False) "
+      "hc_eps, Tensor? rms_weight=None, float rms_eps=0.0, bool cast_bfloat_for_norm=False, "
+      "*, int splitk_mode=0) "
       "-> Tensor output");
   m.impl("fuse_ihc_head", torch::kCUDA, &hpc::iHC::fuse_ihc_head_entry);
 }

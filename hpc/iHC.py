@@ -44,11 +44,8 @@ def fuse_ihc_pre(
       norm_eps: rms norm eps, float, default value is 1e-5
       hc_eps: eps added to both gates, float, default value is 1e-6
       magnitude: H_post multiplier, float, default value is 2.0
-      rms_weight: optional RMSNorm weight. When given, step 6 continues with
-          y = y * rsqrt(y.square().mean(-1) + rms_eps) * rms_weight, i.e. the
-          caller's input_layernorm is folded into this kernel. y then never
-          reaches HBM unnormalized, saving a [N, d] round trip and one launch.
-          Measured cost of folding it in: +1.7% on this kernel.
+      rms_weight: optional RMSNorm weight applied after step 6.
+          y = y * rsqrt(y.square().mean(-1) + rms_eps) * rms_weight.
           Shape: [d, ]
           Dtype: bfloat16
       rms_eps: eps inside the folded RMSNorm. Only read when rms_weight is given.

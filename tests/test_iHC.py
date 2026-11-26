@@ -135,11 +135,30 @@ def naive_fuse_ihc_post_pre(
     return y, z, H_post_out
 
 
-@pytest.mark.parametrize("num_batch", [1, 7, 128, 512, 513, 545, 16384])
+@pytest.mark.parametrize(
+    ("num_batch", "hidden_dim", "weight_offset"),
+    [
+        (num_batch, hidden_dim, 0)
+        for hidden_dim in (6144, 4096, 3072)
+        for num_batch in (1, 7, 128, 512, 513, 545, 16384)
+    ]
+    + [
+        (148, 4096, 0),
+        (149, 4096, 0),
+        (296, 4096, 0),
+        (297, 4096, 0),
+        (79, 6144, 0),
+        (80, 6144, 0),
+        (296, 6144, 0),
+        (297, 6144, 0),
+        (80, 6144, 4),
+        (296, 6144, 4),
+        (297, 6144, 4),
+    ],
+)
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 @pytest.mark.parametrize("fuse_norm", [False, True])
-def test_fuse_ihc_post_pre(num_batch, hc_mult, hidden_dim, fuse_norm):
+def test_fuse_ihc_post_pre(num_batch, hc_mult, hidden_dim, fuse_norm, weight_offset):
     torch.cuda.manual_seed(13)
     norm_eps, hc_eps, magnitude, rms_eps = 1e-5, 1e-6, 2.0, 1e-5
 
@@ -150,7 +169,10 @@ def test_fuse_ihc_post_pre(num_batch, hc_mult, hidden_dim, fuse_norm):
         dtype=torch.bfloat16
     )
     H_post_in = torch.rand((num_batch, hc_mult), dtype=torch.float32, device="cuda")
-    w = torch.rand((2 * hc_mult, hc_mult * hidden_dim), dtype=torch.float32, device="cuda") * 6e-3
+    weight_rows, weight_cols = 2 * hc_mult, hc_mult * hidden_dim
+    w = torch.rand(weight_rows * weight_cols + weight_offset, dtype=torch.float32, device="cuda")
+    w = w[weight_offset:].view(weight_rows, weight_cols).mul_(6e-3)
+    assert w.data_ptr() % 32 == weight_offset * w.element_size()
     hc_scale = torch.rand((2,), dtype=torch.float32, device="cuda")
     hc_base = torch.rand((2 * hc_mult,), dtype=torch.float32, device="cuda")
     rms_weight = (
@@ -444,3 +466,128 @@ def test_fuse_ihc_head_with_rms_weight(num_batch, hidden_dim, norm_eps, hc_eps):
     )
 
     assert allclose(ref_y, real_y, atol=2e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("op", ["pre", "post_pre", "head"])
+@pytest.mark.parametrize(
+    ("num_batch", "hidden_dim"),
+    [(1, 6144), (80, 6144), (297, 6144), (7, 4096), (512, 4096), (1, 3072), (128, 3072)],
+)
+def test_fuse_ihc_cast_bfloat_for_norm(op, num_batch, hidden_dim):
+    """Use exact half gates and BF16 midpoints to distinguish the two RMSNorm modes."""
+    channels = torch.zeros((num_batch, HC_MULT, hidden_dim), device="cuda", dtype=torch.bfloat16)
+    channels[:, 0, :] = 1.0
+    channels[:, 1, ::2] = 1.0 + 2**-7
+    channels[:, 1, 1::2] = 1.0 - 2**-8
+
+    num_scales = 1 if op == "head" else 2
+    num_gates = num_scales * HC_MULT
+    weight = torch.zeros((num_gates, HC_MULT * hidden_dim), device="cuda", dtype=torch.float32)
+    hc_scale = torch.ones(num_scales, device="cuda", dtype=torch.float32)
+    hc_base = torch.zeros(num_gates, device="cuda", dtype=torch.float32)
+    rms_weight = torch.ones(hidden_dim, device="cuda", dtype=torch.bfloat16)
+    hc_args = (weight, hc_scale, hc_base, RMS_EPS, 0.0)
+
+    mixed = channels.float().sum(dim=1) * 0.5
+    ref_fp32 = naive_rms_norm(mixed, rms_weight, RMS_EPS)
+    ref_bfloat = naive_rms_norm(mixed.bfloat16(), rms_weight, RMS_EPS)
+    assert not torch.equal(ref_fp32, ref_bfloat)
+
+    if op == "post_pre":
+        post_input = torch.zeros_like(mixed, dtype=torch.bfloat16)
+        post_gates = torch.ones((num_batch, HC_MULT), device="cuda", dtype=torch.float32)
+
+    for cast_bfloat_for_norm, ref_y in [(False, ref_fp32), (True, ref_bfloat)]:
+        norm_kwargs = dict(
+            rms_weight=rms_weight, rms_eps=RMS_EPS, cast_bfloat_for_norm=cast_bfloat_for_norm
+        )
+        if op == "pre":
+            output, _ = hpc.fuse_ihc_pre(channels, *hc_args, MAGNITUDE, **norm_kwargs)
+        elif op == "post_pre":
+            _, output, _ = hpc.fuse_ihc_post_pre(
+                post_input, channels, post_gates, *hc_args, MAGNITUDE, **norm_kwargs
+            )
+        else:
+            output = torch.ops.hpc.fuse_ihc_head(channels, *hc_args, **norm_kwargs)
+
+        torch.testing.assert_close(output, ref_y, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("num_batch", [1, 7, 64, 512])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
+def test_fuse_ihc_pre_splitk_force_matches_row(num_batch, hidden_dim):
+    x, w, hc_scale, hc_base = make_pre_inputs(num_batch, hidden_dim)
+
+    args = (x, w, hc_scale, hc_base, RMS_EPS, HC_EPS, MAGNITUDE)
+    row_y, row_post = torch.ops.hpc.fuse_ihc_pre(*args, splitk_mode=2)
+    sk_y, sk_post = torch.ops.hpc.fuse_ihc_pre(*args, splitk_mode=1)
+
+    torch.testing.assert_close(sk_y.float(), row_y.float(), atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(sk_post, row_post, atol=2e-5, rtol=1e-4)
+
+    if num_batch in (1, 512):
+        expected_y, expected_post = (sk_y, sk_post) if num_batch == 1 else (row_y, row_post)
+        auto_y, auto_post = hpc.fuse_ihc_pre(*args)
+        torch.testing.assert_close(auto_y, expected_y, atol=0, rtol=0)
+        torch.testing.assert_close(auto_post, expected_post, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("num_batch", [1, 7, 64, 512])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
+def test_fuse_ihc_pre_splitk_force_with_rms_weight(num_batch, hidden_dim):
+    """The folded-RMSNorm split-K variant must match the row kernel too."""
+    x, w, hc_scale, hc_base = make_pre_inputs(num_batch, hidden_dim)
+    rms_weight = torch.rand((hidden_dim,), dtype=torch.float32, device="cuda").to(
+        dtype=torch.bfloat16
+    )
+
+    args = (x, w, hc_scale, hc_base, RMS_EPS, HC_EPS, MAGNITUDE, rms_weight, RMS_EPS, True)
+    row_y, row_post = torch.ops.hpc.fuse_ihc_pre(*args, splitk_mode=2)
+    sk_y, sk_post = torch.ops.hpc.fuse_ihc_pre(*args, splitk_mode=1)
+
+    torch.testing.assert_close(sk_y.float(), row_y.float(), atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(sk_post, row_post, atol=2e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("num_batch", [1, 7, 64, 512])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
+def test_fuse_ihc_head_splitk_force_matches_row(num_batch, hidden_dim):
+    x, w, hc_scale, hc_base = make_head_inputs(num_batch, hidden_dim)
+
+    args = (x, w, hc_scale, hc_base, RMS_EPS, HC_EPS)
+    row = torch.ops.hpc.fuse_ihc_head(*args, splitk_mode=2)
+    sk = torch.ops.hpc.fuse_ihc_head(*args, splitk_mode=1)
+
+    torch.testing.assert_close(sk.float(), row.float(), atol=2e-2, rtol=1e-2)
+
+    if num_batch in (1, 512):
+        torch.testing.assert_close(
+            hpc.fuse_ihc_head(*args), sk if num_batch == 1 else row, atol=0, rtol=0
+        )
+
+
+@pytest.mark.parametrize("num_batch", [1, 7, 64])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
+def test_fuse_ihc_head_splitk_force_with_rms_weight(num_batch, hidden_dim):
+    x, w, hc_scale, hc_base = make_head_inputs(num_batch, hidden_dim)
+    rms_weight = torch.rand((hidden_dim,), dtype=torch.float32, device="cuda").to(
+        dtype=torch.bfloat16
+    )
+
+    args = (x, w, hc_scale, hc_base, RMS_EPS, HC_EPS, rms_weight, RMS_EPS)
+    row = torch.ops.hpc.fuse_ihc_head(*args, splitk_mode=2)
+    sk = torch.ops.hpc.fuse_ihc_head(*args, splitk_mode=1)
+
+    torch.testing.assert_close(sk.float(), row.float(), atol=2e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("op", ["pre", "head"])
+def test_fuse_ihc_splitk_invalid_mode(op):
+    if op == "pre":
+        fn = torch.ops.hpc.fuse_ihc_pre
+        args = (*make_pre_inputs(1, 4096), RMS_EPS, HC_EPS, MAGNITUDE)
+    else:
+        fn = torch.ops.hpc.fuse_ihc_head
+        args = (*make_head_inputs(1, 4096), RMS_EPS, HC_EPS)
+    with pytest.raises(RuntimeError, match="splitk_mode must be"):
+        fn(*args, splitk_mode=3)
