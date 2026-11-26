@@ -299,8 +299,8 @@ __device__ __forceinline__ void ihc_post_pre_cluster_device(
 }
 
 template <int D, int T, bool Norm, bool Cast, bool PDL = false, bool Aligned32 = false,
-          bool PairFma = false>
-__device__ __forceinline__ void ihc_post_pre_retained_device(
+          bool PairFma = false, bool RetainResidual = true>
+__device__ __forceinline__ void ihc_post_pre_single_row_device(
     __nv_bfloat16* y, __nv_bfloat16* z, float* hp, const __nv_bfloat16* xa,
     const __nv_bfloat16* res, const float* hi, const float* w, const float* scale,
     const float* bias, int m, float eps, float hc_eps, float mag, const __nv_bfloat16* gamma,
@@ -329,7 +329,9 @@ __device__ __forceinline__ void ihc_post_pre_retained_device(
 #pragma unroll
       for (int j = 0; j < E / 2; ++j) v2[j] = ihc_fma2(make_float2(h[i], h[i]), a2[j], b2[j]);
       auto bf = to<__nv_bfloat16>(v);
-      cache[ch][i] = bf;
+      if constexpr (RetainResidual) {
+        cache[ch][i] = bf;
+      }
       store(y + static_cast<int64_t>(row) * 4 * D + i * D + col, bf);
       v = to<float>(bf);
 #pragma unroll
@@ -390,7 +392,14 @@ __device__ __forceinline__ void ihc_post_pre_retained_device(
     auto* o2 = reinterpret_cast<float2*>(&out[0]);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      auto in = to<float>(cache[ch][i]);
+      vec_t<__nv_bfloat16, E> values;
+      if constexpr (RetainResidual) {
+        values = cache[ch][i];
+      } else {
+        const int col = (ch * T + tid) * E;
+        values = load<__nv_bfloat16, E>(y + static_cast<int64_t>(row) * 4 * D + i * D + col);
+      }
+      auto in = to<float>(values);
       auto* i2 = reinterpret_cast<const float2*>(&in[0]);
 #pragma unroll
       for (int j = 0; j < E / 2; ++j)
@@ -446,12 +455,14 @@ __device__ __forceinline__ void ihc_post_pre_rows_device(
   constexpr int E = 8;
   constexpr int Warps = Threads / 32;
   constexpr int Chunks = D / (Threads * E);
+  constexpr bool kSm90 = HPC_TARGET_ARCH == 90;
+  constexpr bool kSingleRow = kSm90 && Rows == 1;
   static_assert(D % (Threads * E) == 0, "block span must divide hidden size");
   if constexpr (UsePDL) {
     cudaGridDependencySynchronize();
   }
   const int row_base = blockIdx.x * Rows;
-  const int valid_rows = min(Rows, m - row_base);
+  const int valid_rows = kSingleRow ? 1 : min(Rows, m - row_base);
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
   __shared__ float partial[Rows][Proj + 1][Warps];
@@ -479,7 +490,7 @@ __device__ __forceinline__ void ihc_post_pre_rows_device(
         reg_xa[r] = load<__nv_bfloat16, E>(xa + static_cast<int64_t>(row_base + r) * D + col);
       }
     }
-#pragma unroll 1
+#pragma unroll(kSingleRow ? HC : 1)
     for (int i = 0; i < HC; ++i) {
       const int flat = i * D + col;
       vec_t<float, E> reg_y[Rows];
@@ -545,25 +556,40 @@ __device__ __forceinline__ void ihc_post_pre_rows_device(
     }
   }
   __syncthreads();
-  for (int idx = threadIdx.x; idx < Rows * (Proj + 1); idx += Threads) {
-    const int r = idx / (Proj + 1);
-    const int c = idx % (Proj + 1);
-    float total = 0.f;
+  if constexpr (!kSm90) {
+    for (int idx = threadIdx.x; idx < Rows * (Proj + 1); idx += Threads) {
+      const int r = idx / (Proj + 1);
+      const int c = idx % (Proj + 1);
+      float total = 0.f;
 #pragma unroll
-    for (int k = 0; k < Warps; ++k) {
-      total += partial[r][c][k];
+      for (int k = 0; k < Warps; ++k) {
+        total += partial[r][c][k];
+      }
+      partial[r][c][0] = total;
     }
-    partial[r][c][0] = total;
+    __syncthreads();
   }
-  __syncthreads();
   for (int idx = threadIdx.x; idx < valid_rows * HC; idx += Threads) {
     const int r = idx / HC;
     const int i = idx % HC;
-    const float scale = rsqrtf_ftz(partial[r][Proj][0] * (1.f / (HC * D)) + norm_eps);
-    h_pre[r][i] = sigmoid(hc_scale[0] * (partial[r][i][0] * scale) + hc_base[i]) + hc_eps;
+    float pre = 0.f, post = 0.f, sq = 0.f;
+    if constexpr (kSm90) {
+      // Reduce warp partials and compute the gates in the same threads.
+#pragma unroll
+      for (int k = 0; k < Warps; ++k) {
+        pre += partial[r][i][k];
+        post += partial[r][HC + i][k];
+        sq += partial[r][Proj][k];
+      }
+    } else {
+      pre = partial[r][i][0];
+      post = partial[r][HC + i][0];
+      sq = partial[r][Proj][0];
+    }
+    const float scale = rsqrtf_ftz(sq * (1.f / (HC * D)) + norm_eps);
+    h_pre[r][i] = sigmoid(hc_scale[0] * (pre * scale) + hc_base[i]) + hc_eps;
     h_out[(row_base + r) * HC + i] =
-        magnitude * sigmoid(hc_scale[1] * (partial[r][HC + i][0] * scale) + hc_base[HC + i]) +
-        hc_eps;
+        magnitude * sigmoid(hc_scale[1] * (post * scale) + hc_base[HC + i]) + hc_eps;
   }
   __syncthreads();
   ihc_mix_epilogue<HC, D, E, Rows, Threads, EpilogueThreads, FuseNorm, CastBfloat>(
@@ -856,12 +882,42 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 }
 
+#if HPC_TARGET_ARCH == 90
+enum class PostPrePath { Rows, Retained, Cluster, ReloadResidual };
+
+template <int kHiddenDim, int kThreads, PostPrePath kPath, int kRows, int kClusterBlocks,
+          int kMinBlocksPerSm, bool kUsePDL, bool kFuseRmsNorm, bool kCastBfloatForNorm>
+__global__ void __launch_bounds__(kThreads, kMinBlocksPerSm)
+    fuse_ihc_post_pre_sm90_kernel(__nv_bfloat16* y, __nv_bfloat16* z, float* h_post_out,
+                                  const __nv_bfloat16* xa, const __nv_bfloat16* residual,
+                                  const float* h_post_in, const float* w, const float* hc_scale,
+                                  const float* hc_base, int num_batch, float norm_eps, float hc_eps,
+                                  float magnitude, const __nv_bfloat16* rms_weight, float rms_eps) {
+  if constexpr (kPath == PostPrePath::Cluster) {
+    ihc_post_pre_cluster_device<kHiddenDim, kClusterBlocks, kFuseRmsNorm, kCastBfloatForNorm,
+                                kUsePDL>(y, z, h_post_out, xa, residual, h_post_in, w, hc_scale,
+                                         hc_base, num_batch, norm_eps, hc_eps, magnitude,
+                                         rms_weight, rms_eps);
+  } else if constexpr (kPath == PostPrePath::Retained || kPath == PostPrePath::ReloadResidual) {
+    constexpr bool kRetainResidual = kPath == PostPrePath::Retained;
+    ihc_post_pre_single_row_device<kHiddenDim, kThreads, kFuseRmsNorm, kCastBfloatForNorm, kUsePDL,
+                                   false, false, kRetainResidual>(
+        y, z, h_post_out, xa, residual, h_post_in, w, hc_scale, hc_base, num_batch, norm_eps,
+        hc_eps, magnitude, rms_weight, rms_eps);
+  } else {
+    ihc_post_pre_rows_device<kHiddenDim, kRows, kThreads, kThreads, kFuseRmsNorm,
+                             kCastBfloatForNorm, kUsePDL>(y, z, h_post_out, xa, residual, h_post_in,
+                                                          w, hc_scale, hc_base, num_batch, norm_eps,
+                                                          hc_eps, magnitude, rms_weight, rms_eps);
+  }
+}
+#else
 // One global entry completes post, pre and optional RMSNorm. M is uniform across
 // the grid; each branch calls an inline device helper with its own fixed layout.
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock,
           bool kUsePDL = false, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false,
           bool kWeightsAligned = true>
-__global__ void __launch_bounds__(HPC_TARGET_ARCH == 90 ? kThreadsPerBlock : 768)
+__global__ void __launch_bounds__(768)
     fuse_ihc_post_pre_kernel(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr,
                              const __nv_bfloat16* xa_ptr, const __nv_bfloat16* residual_ptr,
                              const float* H_post_in_ptr, const float* w_ptr,
@@ -871,20 +927,14 @@ __global__ void __launch_bounds__(HPC_TARGET_ARCH == 90 ? kThreadsPerBlock : 768
   static_assert(kHCMult == 4 && kElementsPerThread == 8, "supported fused layout");
   static_assert(kHiddenDim == 3072 || kHiddenDim == 4096 || kHiddenDim == 6144,
                 "supported hidden dimensions");
-#if HPC_TARGET_ARCH == 90
-  ihc_post_pre_rows_device<kHiddenDim, 1, kThreadsPerBlock, kThreadsPerBlock, kFuseRmsNorm,
-                           kCastBfloatForNorm, kUsePDL, kWeightsAligned>(
-      y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
-      hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
-#else
   if constexpr (kHiddenDim == 6144) {
     if (num_batch < 80) {
       ihc_post_pre_cluster_device<kHiddenDim, 8, kFuseRmsNorm, kCastBfloatForNorm, kUsePDL>(
           y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
           hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
     } else if (num_batch <= 296) {
-      ihc_post_pre_retained_device<kHiddenDim, 768, kFuseRmsNorm, kCastBfloatForNorm, kUsePDL,
-                                   kWeightsAligned>(
+      ihc_post_pre_single_row_device<kHiddenDim, 768, kFuseRmsNorm, kCastBfloatForNorm, kUsePDL,
+                                     kWeightsAligned>(
           y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
           hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
     } else {
@@ -911,8 +961,8 @@ __global__ void __launch_bounds__(HPC_TARGET_ARCH == 90 ? kThreadsPerBlock : 768
           hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
     }
   }
-#endif
 }
+#endif
 
 #if HPC_TARGET_ARCH != 90
 __device__ __forceinline__ void ihc_tmem_fence_before_sync() {
@@ -1235,8 +1285,8 @@ __global__ void __launch_bounds__(384, kHiddenDim == 6144 ? 1 : 2)
       "supported three-warp-group layout");
   static_assert(!kFuseRmsNorm || kCastBfloatForNorm, "RMSNorm requires BF16 intermediate");
   if constexpr (kHiddenDim == 6144 || kHiddenDim == 3072) {
-    ihc_post_pre_retained_device<kHiddenDim, 384, kFuseRmsNorm, kCastBfloatForNorm, kUsePDL,
-                                 kWeightsAligned, true>(
+    ihc_post_pre_single_row_device<kHiddenDim, 384, kFuseRmsNorm, kCastBfloatForNorm, kUsePDL,
+                                   kWeightsAligned, true>(
         y, z, hp, xa, res, hi, w, scale, bias, m, norm_eps, hc_eps, magnitude, gamma, rms_eps);
   } else {
     static_assert(kHiddenDim == 4096, "supported hidden dimension");
@@ -1779,8 +1829,8 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
                                      float norm_eps, float hc_eps, float magnitude,
                                      const __nv_bfloat16* rms_weight_ptr, float rms_eps) {
   constexpr int kThreads = kHiddenDim == 3072 ? 192 : 256;
-  const bool weights_aligned = (reinterpret_cast<uintptr_t>(w_ptr) & 31) == 0;
 #if HPC_TARGET_ARCH != 90
+  const bool weights_aligned = (reinterpret_cast<uintptr_t>(w_ptr) & 31) == 0;
   if constexpr (kUsePDL && (!kFuseRmsNorm || kCastBfloatForNorm)) {
     constexpr int kUmmaMin = kHiddenDim == 3072 ? 8960 : 8192;
     if (num_batch >= kUmmaMin && weights_aligned) {
@@ -1852,7 +1902,95 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
     attrs[config.numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[config.numAttrs++].val.programmaticStreamSerializationAllowed = 1;
   }
-#if HPC_TARGET_ARCH != 90
+#if HPC_TARGET_ARCH == 90
+  if (num_batch == 0) {
+    return cudaSuccess;
+  }
+  using kernels::PostPrePath;
+  // Zero leaves the minimum blocks per SM unspecified for ptxas.
+  auto launch = [&]<int kBlockThreads, PostPrePath kPath = PostPrePath::Rows, int kRows = 1,
+                    int kClusterBlocks = 1, int kMinBlocksPerSm = 0>() {
+    config.gridDim = dim3(((num_batch + kRows - 1) / kRows) * kClusterBlocks);
+    config.blockDim = dim3(kBlockThreads);
+    if constexpr (kClusterBlocks > 1) {
+      auto& attr = attrs[config.numAttrs++];
+      attr.id = cudaLaunchAttributeClusterDimension;
+      attr.val.clusterDim.x = kClusterBlocks;
+      attr.val.clusterDim.y = 1;
+      attr.val.clusterDim.z = 1;
+    }
+    auto kernel = kernels::fuse_ihc_post_pre_sm90_kernel<kHiddenDim, kBlockThreads, kPath, kRows,
+                                                         kClusterBlocks, kMinBlocksPerSm, kUsePDL,
+                                                         kFuseRmsNorm, kCastBfloatForNorm>;
+    return cudaLaunchKernelEx(&config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
+                              H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, norm_eps,
+                              hc_eps, magnitude, rms_weight_ptr, rms_eps);
+  };
+
+  // Cluster and specialized single-row kernels vectorize the four input gates.
+  if (reinterpret_cast<uintptr_t>(H_post_in_ptr) % (4 * sizeof(float)) != 0) {
+    return launch.template operator()<kThreads>();
+  }
+  const int sm_count = get_sm_count();
+  constexpr int kHiddenThreads = kHiddenDim / kElementsPerThread;
+  if constexpr (kHiddenDim != 3072) {
+    // Split the hidden dimension across CTAs when there are few tokens to schedule.
+    const int cluster_limit = kHiddenDim == 6144 ? 3 * sm_count / 5 : sm_count / 2;
+    if (num_batch <= cluster_limit) {
+      constexpr int kClusterBlocks = kHiddenDim == 6144 ? 8 : 4;
+      constexpr int kClusterThreads = kHiddenThreads / kClusterBlocks;
+      return launch.template operator()<kClusterThreads, PostPrePath::Cluster, 1, kClusterBlocks>();
+    }
+  }
+  if (num_batch <= sm_count) {
+    return launch.template operator()<kHiddenThreads, PostPrePath::Retained>();
+  }
+  const int waves = 1 + (num_batch - 1) / sm_count;
+  if (waves <= 2) {
+    constexpr int kMinBlocks = kHiddenDim == 6144 ? 0 : 1;
+    return launch.template operator()<kHiddenThreads, PostPrePath::Rows, 2, 1, kMinBlocks>();
+  }
+  if constexpr (kHiddenDim == 6144) {
+    if (waves <= 4) {
+      return launch.template operator()<kThreads>();
+    }
+    if (waves == 5) {
+      if constexpr (kFuseRmsNorm) {
+        return launch.template operator()<96>();
+      } else {
+        return launch.template operator()<kThreads, PostPrePath::Rows, 2>();
+      }
+    }
+    return launch.template operator()<kHiddenThreads / 2, PostPrePath::Rows, 1, 1, 2>();
+  } else if constexpr (kHiddenDim == 4096) {
+    if (waves <= 3) {
+      return launch.template operator()<kThreads>();
+    }
+    if (waves == 4) {
+      return launch.template operator()<kThreads, PostPrePath::Rows, 2, 1, 2>();
+    }
+    if (waves == 5 && kFuseRmsNorm && kCastBfloatForNorm) {
+      return launch.template operator()<kThreads, PostPrePath::Rows, 2>();
+    }
+    return launch.template operator()<kHiddenThreads / 2, PostPrePath::Retained, 1, 1, 2>();
+  } else {
+    static_assert(kHiddenDim == 3072);
+    if (waves <= 4 || waves == 8 || (kFuseRmsNorm && waves >= 11 && waves <= 13)) {
+      return launch.template operator()<kHiddenThreads, PostPrePath::Rows, 2, 1, 2>();
+    }
+    if ((waves <= 6 && 2 * num_batch <= (2 * waves - 1) * sm_count) || waves == 7) {
+      // Reread y with fewer registers so more CTAs can be resident.
+      return launch.template operator()<128, PostPrePath::ReloadResidual>();
+    }
+    if (waves <= 5) {
+      return launch.template operator()<kThreads>();
+    }
+    if (waves == 9 || num_batch >= 3072) {
+      return launch.template operator()<kHiddenThreads>();
+    }
+    return launch.template operator()<kHiddenThreads / 2, PostPrePath::Retained, 1, 1, 2>();
+  }
+#else
   int blocks = 1;
   if constexpr (kHiddenDim == 6144) {
     blocks = num_batch < 80 ? 8 : 1;
@@ -1873,7 +2011,6 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
   attr.val.clusterDim.x = blocks;
   attr.val.clusterDim.y = 1;
   attr.val.clusterDim.z = 1;
-#endif
   auto launch = [&](auto aligned_tag) {
     constexpr bool kWeightsAligned = decltype(aligned_tag)::value;
     auto kernel =
@@ -1884,6 +2021,7 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
                               hc_eps, magnitude, rms_weight_ptr, rms_eps);
   };
   return weights_aligned ? launch(std::true_type{}) : launch(std::false_type{});
+#endif
 }
 
 template <int kHiddenDim, bool kFuseRmsNorm, bool kCastBfloatForNorm>

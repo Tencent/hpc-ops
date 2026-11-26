@@ -135,7 +135,7 @@ def naive_fuse_ihc_post_pre(
     return y, z, H_post_out
 
 
-@pytest.mark.parametrize("num_batch", [1, 7, 128, 512, 16384])
+@pytest.mark.parametrize("num_batch", [1, 7, 128, 512, 513, 545, 16384])
 @pytest.mark.parametrize("hc_mult", [4])
 @pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 @pytest.mark.parametrize("fuse_norm", [False, True])
