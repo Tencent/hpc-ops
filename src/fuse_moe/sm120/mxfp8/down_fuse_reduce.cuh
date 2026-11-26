@@ -292,8 +292,8 @@ __global__ void __launch_bounds__(Config::kNumThreads, 1)
     auto thr_copy_a = tiled_copy_a.get_slice(idx);
     auto thr_copy_b = tiled_copy_b.get_slice(idx);
     auto thr_copy_c = tiled_copy_c.get_slice(idx);
-    auto tAsA = thr_copy_a.partition_S(sA);
-    auto tBsB = thr_copy_b.partition_S(sB);
+    auto tAsA = thr_copy_a.partition_S(as_position_independent_swizzle_tensor(sA));
+    auto tBsB = thr_copy_b.partition_S(as_position_independent_swizzle_tensor(sB));
     auto tArA = thr_copy_a.retile_D(tCrA);
     auto tBrB = thr_copy_b.retile_D(tCrB);
     auto tCsC = thr_copy_c.partition_D(sC);

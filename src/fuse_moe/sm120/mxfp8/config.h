@@ -151,6 +151,7 @@ struct GroupGemmMxfp8Config {
   static_assert(size(TiledMma{}) == kNumMmaWarps * 32, "MMA must use 8 warps");
 
   static constexpr int kShmABytes = sizeof_bits_v<TA> * cosize(SLayoutA{}) / 8;
+  static_assert(kShmABytes % 1024 == 0, "B must start on a 1024-byte swizzle boundary");
   static constexpr int kShmBBytes = sizeof_bits_v<TB> * cosize(SLayoutB{}) / 8;
   static constexpr int kShmCBytes = sizeof_bits_v<TC> * cosize(SLayoutC{}) / 8;
   static constexpr int kShmSFABytes = sizeof_bits_v<TSF> * cosize(SLayoutSFA{}) / 8;
