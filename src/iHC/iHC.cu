@@ -73,7 +73,7 @@ template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kRowsPerBlock
           int kThreadsPerBlock, int kThreadsPerRow, bool kFuseRmsNorm, bool kCastBfloatForNorm>
 __device__ __forceinline__ void ihc_mix_epilogue(__nv_bfloat16* z_ptr, const __nv_bfloat16* y_ptr,
                                                  const float* pre_gates_ptr, int row_base,
-                                                 int valid_rows,
+                                                 int first_y_row, int valid_rows,
                                                  const __nv_bfloat16* rms_weight_ptr, float rms_eps,
                                                  float* norm_partial) {
   static_assert(kThreadsPerRow % 32 == 0 && kThreadsPerBlock % kThreadsPerRow == 0,
@@ -96,7 +96,7 @@ __device__ __forceinline__ void ihc_mix_epilogue(__nv_bfloat16* z_ptr, const __n
     float output_sqsum = 0.f;
     if (valid) {
       const auto h = load<float, kHCMult>(pre_gates_ptr + r * kHCMult);
-      const auto* y_row_ptr = y_ptr + static_cast<int64_t>(row_base + r) * kHCMult * kHiddenDim;
+      const auto* y_row_ptr = y_ptr + static_cast<int64_t>(first_y_row + r) * kHCMult * kHiddenDim;
       auto* z_row_ptr = z_ptr + static_cast<int64_t>(row_base + r) * kHiddenDim;
 #pragma unroll
       for (int ch = 0; ch < kChunksPerRow; ++ch) {
@@ -470,7 +470,7 @@ __device__ __forceinline__ void ihc_post_pre_single_row_device(
 
 template <int kHiddenDim, int kRowsPerBlock, int kThreadsPerBlock, int kEpilogueThreadsPerRow,
           bool kFuseRmsNorm, bool kCastBfloatForNorm, bool kUsePDL = false,
-          bool kWeightsAligned32 = false>
+          bool kWeightsAligned32 = false, bool kSharedPost = false>
 __device__ __forceinline__ void ihc_post_pre_rows_device(
     __nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr, const __nv_bfloat16* xa_ptr,
     const __nv_bfloat16* residual_ptr, const float* H_post_in_ptr, const float* w_ptr,
@@ -495,6 +495,7 @@ __device__ __forceinline__ void ihc_post_pre_rows_device(
   __shared__ float smem_partial[kRowsPerBlock][kProjRows + 1][kWarpsPerBlock];
   __shared__ __align__(16) float smem_pre_gates[kRowsPerBlock][kHCMult];
   __shared__ float norm_partial[kRowsPerBlock * (kEpilogueThreadsPerRow / 32)];
+  extern __shared__ __align__(16) __nv_bfloat16 shared_post[];
   float acc_dot[kRowsPerBlock][kProjRows];
   float acc_sqsum[kRowsPerBlock];
 #pragma unroll
@@ -538,6 +539,9 @@ __device__ __forceinline__ void ihc_post_pre_rows_device(
           }
           const auto bf = to<__nv_bfloat16>(reg_y[r]);
           store(y_ptr + row * kHCMult * kHiddenDim + flat, bf);
+          if constexpr (kSharedPost) {
+            store(shared_post + r * kHCMult * kHiddenDim + flat, bf);
+          }
           reg_y[r] = to<float>(bf);
 #pragma unroll
           for (int j = 0; j < kElementsPerThread; ++j) {
@@ -625,8 +629,8 @@ __device__ __forceinline__ void ihc_post_pre_rows_device(
   __syncthreads();
   ihc_mix_epilogue<kHCMult, kHiddenDim, kElementsPerThread, kRowsPerBlock, kThreadsPerBlock,
                    kEpilogueThreadsPerRow, kFuseRmsNorm, kCastBfloatForNorm>(
-      z_ptr, y_ptr, &smem_pre_gates[0][0], row_base, valid_rows, rms_weight_ptr, rms_eps,
-      norm_partial);
+      z_ptr, kSharedPost ? shared_post : y_ptr, &smem_pre_gates[0][0], row_base,
+      kSharedPost ? 0 : row_base, valid_rows, rms_weight_ptr, rms_eps, norm_partial);
   if constexpr (kUsePDL) {
     cudaTriggerProgrammaticLaunchCompletion();
   }
@@ -909,11 +913,11 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 }
 
 #if HPC_TARGET_ARCH == 90
-enum class PostPrePath { Rows, Retained, Cluster, ReloadPostOutput };
+enum class PostPrePath { Rows, Retained, Cluster, ReloadPostOutput, SharedPostOutput };
 
 template <int kHiddenDim, int kThreadsPerBlock, PostPrePath kPath, int kRowsPerBlock,
           int kClusterBlocks, int kMinBlocksPerSm, bool kUsePDL, bool kFuseRmsNorm,
-          bool kCastBfloatForNorm>
+          bool kCastBfloatForNorm, int kEpilogueThreadsPerRow = kThreadsPerBlock>
 __global__ void __launch_bounds__(kThreadsPerBlock, kMinBlocksPerSm)
     fuse_ihc_post_pre_sm90_kernel(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr,
                                   const __nv_bfloat16* xa_ptr, const __nv_bfloat16* residual_ptr,
@@ -933,8 +937,9 @@ __global__ void __launch_bounds__(kThreadsPerBlock, kMinBlocksPerSm)
         y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
         hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
   } else {
-    ihc_post_pre_rows_device<kHiddenDim, kRowsPerBlock, kThreadsPerBlock, kThreadsPerBlock,
-                             kFuseRmsNorm, kCastBfloatForNorm, kUsePDL>(
+    constexpr bool kSharedPost = kPath == PostPrePath::SharedPostOutput;
+    ihc_post_pre_rows_device<kHiddenDim, kRowsPerBlock, kThreadsPerBlock, kEpilogueThreadsPerRow,
+                             kFuseRmsNorm, kCastBfloatForNorm, kUsePDL, false, kSharedPost>(
         y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
         hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
   }
@@ -1989,7 +1994,8 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
   using kernels::PostPrePath;
   // Zero leaves the minimum blocks per SM unspecified for ptxas.
   auto launch = [&]<int kBlockThreads, PostPrePath kPath = PostPrePath::Rows, int kRowsPerBlock = 1,
-                    int kClusterBlocks = 1, int kMinBlocksPerSm = 0>() {
+                    int kClusterBlocks = 1, int kMinBlocksPerSm = 0,
+                    int kEpilogueThreads = kBlockThreads>() {
     config.gridDim = dim3(((num_batch + kRowsPerBlock - 1) / kRowsPerBlock) * kClusterBlocks);
     config.blockDim = dim3(kBlockThreads);
     if constexpr (kClusterBlocks > 1) {
@@ -2002,7 +2008,14 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
     auto kernel =
         kernels::fuse_ihc_post_pre_sm90_kernel<kHiddenDim, kBlockThreads, kPath, kRowsPerBlock,
                                                kClusterBlocks, kMinBlocksPerSm, kUsePDL,
-                                               kFuseRmsNorm, kCastBfloatForNorm>;
+                                               kFuseRmsNorm, kCastBfloatForNorm, kEpilogueThreads>;
+    if constexpr (kPath == PostPrePath::SharedPostOutput) {
+      constexpr size_t kShared = kRowsPerBlock * 4 * kHiddenDim * sizeof(__nv_bfloat16);
+      const cudaError_t setup =
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+      if (setup != cudaSuccess) return setup;
+      config.dynamicSmemBytes = kShared;
+    }
     return cudaLaunchKernelEx(&config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
                               H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, norm_eps,
                               hc_eps, magnitude, rms_weight_ptr, rms_eps);
@@ -2014,6 +2027,24 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
   }
   const int sm_count = get_sm_count();
   constexpr int kHiddenThreads = kHiddenDim / kElementsPerThread;
+  const int waves = 1 + (num_batch - 1) / sm_count;
+  if constexpr (kHiddenDim == 3072) {
+    if (waves == 4 || (waves == 5 && 16 * int64_t(num_batch) <= 65 * sm_count)) {
+      return launch.template operator()<kHiddenThreads, PostPrePath::SharedPostOutput, 2, 1, 2,
+                                        kHiddenThreads / 2>();
+    }
+    if ((waves == 6 && 2 * int64_t(num_batch) <= 11 * sm_count) || waves == 8 || waves == 16 ||
+        num_batch >= 3072) {
+      return launch.template operator()<128, PostPrePath::SharedPostOutput, 2, 1, 3, 64>();
+    }
+  } else if constexpr (kHiddenDim == 4096) {
+    if (num_batch >= 3 * sm_count && waves <= 4) {
+      return launch.template operator()<kThreads, PostPrePath::SharedPostOutput, 2, 1, 2, 128>();
+    }
+  } else if (waves == 4 && ((kFuseRmsNorm && !kCastBfloatForNorm) ||
+                            8 * num_batch >= 31 * sm_count)) {
+    return launch.template operator()<kThreads, PostPrePath::SharedPostOutput, 2, 1, 2, 128>();
+  }
   if constexpr (kHiddenDim != 3072) {
     // Split the hidden dimension across CTAs when there are few tokens to schedule.
     const int cluster_limit = kHiddenDim == 6144 ? 3 * sm_count / 5 : sm_count / 2;
@@ -2026,7 +2057,6 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
   if (num_batch <= sm_count) {
     return launch.template operator()<kHiddenThreads, PostPrePath::Retained>();
   }
-  const int waves = 1 + (num_batch - 1) / sm_count;
   if (waves <= 2) {
     constexpr int kMinBlocks = kHiddenDim == 6144 ? 0 : 1;
     return launch.template operator()<kHiddenThreads, PostPrePath::Rows, 2, 1, kMinBlocks>();
