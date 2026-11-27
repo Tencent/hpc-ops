@@ -1,4 +1,4 @@
-PY_FILES=$(shell find hpc -name "*.py") $(shell find tests -name "*.py") $(shell find ./ -maxdepth 1 -name "*.py")
+PY_FILES=$(shell find hpc -name "*.py") $(shell find src -path "*/amd/*.py") $(shell find tests -name "*.py") $(shell find ./ -maxdepth 1 -name "*.py")
 PY_TEST=$(shell find tests -name "test_*.py")
 CC_FILES=$(shell find src -name "*.cc")
 CU_FILES=$(shell find src -name "*.cu")
@@ -41,6 +41,9 @@ wheel:
 $(foreach arch,$(KNOWN_ARCHS),sm$(arch)):
 	@$(MAKE) --no-print-directory wheel SM_ARCH=$(patsubst sm%,%,$@)
 
+rocm:
+	HPC_BACKEND=rocm python3 setup.py build
+
 format:
 	python3 -m black --line-length 100 $(PY_FILES)
 	clang-format --style=file -i $(CSRC_FILES)
@@ -66,4 +69,4 @@ clean:
 	rm -rf build dist hpc_ops.egg-info hpc.egg-info .pytest_cache tests/__pycache__ site
 
 .PHONY: all wheel format format-check test sanitizer clean \
-        $(foreach arch,$(KNOWN_ARCHS),sm$(arch))
+        $(foreach arch,$(KNOWN_ARCHS),sm$(arch)) rocm

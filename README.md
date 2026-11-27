@@ -190,6 +190,10 @@ softmax statistics to reduce vocabulary reads and fixed launch overhead.
 - CUDA Toolkit: CUDA 12.9 or higher (`make wheel` covers sm103, whose
   `compute_103a` gencode requires 12.9; `make sm90` builds with 12.8)
 
+On AMD GPUs, in place of the CUDA toolkit: ROCm-enabled PyTorch and an AMD build
+of [FlagTree 0.7](https://github.com/flagos-ai/FlagTree/wiki/User-manual-for-amd)
+with Triton 3.6 and TLE support, which supplies the `triton` module.
+
 *You can set up the environment by installing the modules listed in requirements-dev.txt.*
 
 ### Install from Source
@@ -209,6 +213,23 @@ supported architecture; `make sm90` builds a wheel for sm90 only, and
 `SM_ARCH=90,103 make wheel` builds one usable on both. Wheels that cover only
 part of the supported architectures say so in their version, e.g.
 `0.0.1.dev0+g1234567.sm90`.
+
+A secondary ROCm backend of Python and Triton sources covers part of the same
+interfaces. `make rocm` or `HPC_BACKEND=rocm` builds it:
+
+```bash
+make rocm
+HPC_BACKEND=rocm python3 -m pip install . --no-build-isolation
+```
+
+It implements RoPE/KV store, MoE reduction, iHC, sampling, TopK, STEM TPD and
+scale reformatting; interfaces needing FP8 or matrix instructions are registered
+but raise `NotImplementedError` with a `TODO(amd)` reason when called. The wheel
+runs on any AMD architecture and says so in its version, e.g.
+`0.0.1.dev0+g1234567.rocm`. `hpc.__backend__` reports `"rocm"`, calls still take
+`cuda` devices following PyTorch's ROCm API. The sampler's TopP scan runs on
+FlagTree's TLE extensions, and `HPC_TRITON_USE_TLE=1` routes iHC channel
+extraction through them as well.
 
 ### Basic Usage
 

@@ -262,6 +262,7 @@ def test_peak_workspace_size_bounds_every_row_count():
         assert worst == peak, f"n={n}: peak is not tight (worst at num_rows={worst_rows})"
 
 
+@pytest.mark.skipif(bool(torch.version.hip), reason="CUDA-specific split workspace layout")
 def test_peak_workspace_size_serves_every_split_schedule():
     # Reuse one peak-sized allocation across both ends of every active split
     # band, then across the adjacent persistent route. The final row forces a
@@ -694,6 +695,7 @@ def test_kv_split_uniform_rows(m, n):
     _validate(logits, out, ke.cpu())
 
 
+@pytest.mark.skipif(bool(torch.version.hip), reason="CUDA-specific split workspace layout")
 def test_kv_split_row_owned_spill_across_grid_boundary():
     # Use the first two-way split whose direct task grid is larger than the
     # persistent CTA pool. H20 resolves this to 118 rows and 236 tasks over 234
@@ -787,6 +789,7 @@ def test_kv_split_forces_fallback():
     _validate(logits, out, ke.cpu())
 
 
+@pytest.mark.skipif(bool(torch.version.hip), reason="CUDA-specific split workspace layout")
 def test_kv_split_matches_single_cta():
     # The split result must be the same index set the single-CTA path produces.
     # The minimum workspace is too small for the split path, so it gives a
@@ -863,6 +866,7 @@ def test_kv_split_cuda_graph_replay():
         (193, 393216, False),
     ],
 )
+@pytest.mark.skipif(bool(torch.version.hip), reason="CUDA-specific split workspace layout")
 def test_kv_split_dispatch_workspace_boundaries(m, n, uses_split):
     _, recommended = hpc.topk_workspace_size(m, n)
     minimum = hpc.topk_min_workspace_size(n)

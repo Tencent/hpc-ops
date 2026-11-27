@@ -4,7 +4,8 @@
 
 hpc-ops is a CUDA operator library for LLM inference. Python wrappers expose
 operators through `torch.ops.hpc.*`; the package contains one extension module
-per SM architecture it was built for, and loads the one matching the device.
+per SM architecture it was built for, and loads the one matching the device. A
+secondary ROCm backend covers part of the same interfaces in Python and Triton.
 
 The usual execution path is:
 
@@ -17,6 +18,9 @@ hpc/<op>.py
   -> CUDA kernel
 ```
 
+On ROCm PyTorch the same wrapper reaches `src/<op>/amd/entry.py` and the Triton
+kernels beside it instead.
+
 Keep these boundaries intact:
 
 - Python wrappers define the user-facing API and fake implementation.
@@ -25,6 +29,7 @@ Keep these boundaries intact:
   architecture at the point where it launches. There is no separate dispatch
   layer and no `host.cc`.
 - `.cu` and `.cuh` files contain kernels and device-side implementation.
+- `src/<op>/amd/entry.py` carries the same duties as `entry.cc` for ROCm.
 - Architecture-specific code lives in `sm<arch>/`; code that works on every
   supported architecture lives at the operator root. Different architectures may
   use entirely different algorithms below the common `*_async` signature.
@@ -57,6 +62,7 @@ python3 -m pytest -v tests/test_<op>.py
 make sanitizer               # run tests under compute-sanitizer checks
 make format                  # format Python and C++/CUDA sources
 make format-check            # check formatting and lint
+make rocm                    # build the ROCm backend's Python sources
 ```
 
 For a normal operator change:
@@ -96,6 +102,8 @@ src/<op>/sm90/<kernel>.cuh        kernel templates and inline device helpers
 src/<op>/sm90/<variant>/<kernel>.cu   an alternative sm90 implementation path
 src/<op>/sm100/...                an independent architecture implementation
 src/<op>/<kernel>.{cu,cuh}        kernels that work on every architecture, at the operator root
+src/<op>/amd/entry.py             ROCm backend: registration, host logic and launch
+src/<op>/amd/<kernel>.py          Triton kernels and their launchers
 tests/test_<op>.py                correctness and API tests
 benchmark/                        performance reproduction and comparison
 ```
@@ -106,6 +114,9 @@ code, and a named subdirectory of the operator root marks a feature with its own
 implementation strategy — is a file name, or a directory below the `sm<arch>/`
 that chose it. Whether code is architecture-specific is therefore always readable
 off the path: it is, exactly when the path contains an `sm<N>/` component.
+
+`amd/` is the one addition, and the same rule applies inside it: its root is
+portable across AMD architectures, a `gfx<N>/` below it would not be.
 
 There is no `entry.h`: nothing outside `entry.cc` calls the host entry point, and
 the signature the architectures share is the `*_async` one in the header at the
@@ -533,6 +544,9 @@ For an operator already present:
 - Keep `entry.cc` to registration, host logic and dispatch.
 - Do not include across an architecture boundary: shared code must not reach into
   `sm<arch>/`, and one `sm<arch>/` must not reach into another.
+- An operator the ROCm backend registers states its schema twice: `m.def` in
+  `entry.cc`, and `SCHEMAS` in `src/<op>/amd/entry.py` or, when ROCm defers it,
+  in `src/C/amd/unsupported.py`. Change them in the same commit.
 - Keep tests focused on public behavior; use benchmarks for performance claims.
 - `3rd/cutlass` is vendored, not a submodule. Refresh it with
   `3rd/update-cutlass.sh`.

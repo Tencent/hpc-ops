@@ -55,44 +55,55 @@ def _nvml_arch():
     return major * 10 + minor
 
 
-def _load_module() -> int:
-    """Loads the extension module for the local device; returns its architecture.
+def _load_module():
+    """Load the local CUDA architecture's module or register the AMD operators.
 
     A package carries one `_C_sm<arch>.abi3.so` per architecture it was built
     for. The match is exact: architecture-specific cubins are not forward
     compatible, so another module cannot stand in. HPC_SM_ARCH overrides the
     detection, for a build machine with no matching GPU.
     """
-    override = os.getenv("HPC_SM_ARCH", "").strip()
-    if override:
-        if not override.isdigit():
-            raise ImportError(f"HPC_SM_ARCH={override!r} is not an architecture number such as 90.")
-        arch = int(override)
-    else:
-        arch = _nvml_arch()
-    if arch is None:
-        # No NVML answer. This falls back to torch, which initializes CUDA.
-        if not torch.cuda.is_available():
+    if not torch.version.hip:
+        override = os.getenv("HPC_SM_ARCH", "").strip()
+        if override:
+            if not override.isdigit():
+                raise ImportError(
+                    f"HPC_SM_ARCH={override!r} is not an architecture number such as 90."
+                )
+            arch = int(override)
+        else:
+            arch = _nvml_arch()
+        if arch is None:
+            # No NVML answer. This falls back to torch, which initializes CUDA.
+            if not torch.cuda.is_available():
+                raise ImportError(
+                    "hpc found no CUDA device to pick an operator module for. Set HPC_SM_ARCH=<arch> "
+                    "to load one anyway, e.g. HPC_SM_ARCH=90 for an H800."
+                )
+            major, minor = torch.cuda.get_device_capability()
+            arch = major * 10 + minor
+
+        modules = _pkg_dir.glob("_C_sm*.abi3.so")
+        built = sorted(int(p.name.removeprefix("_C_sm").removesuffix(".abi3.so")) for p in modules)
+        if arch not in built:
             raise ImportError(
-                "hpc found no CUDA device to pick an operator module for. Set HPC_SM_ARCH=<arch> "
-                "to load one anyway, e.g. HPC_SM_ARCH=90 for an H800."
+                f"hpc has no operator module for this sm{arch} device; this install covers "
+                f"{built or 'no architecture'}. Rebuild including it, e.g. 'SM_ARCH={arch} make'."
             )
-        major, minor = torch.cuda.get_device_capability()
-        arch = major * 10 + minor
 
-    modules = _pkg_dir.glob("_C_sm*.abi3.so")
-    built = sorted(int(p.name.removeprefix("_C_sm").removesuffix(".abi3.so")) for p in modules)
-    if arch not in built:
-        raise ImportError(
-            f"hpc has no operator module for this sm{arch} device; this install covers "
-            f"{built or 'no architecture'}. Rebuild including it, e.g. 'SM_ARCH={arch} make'."
-        )
+        torch.ops.load_library(str(_pkg_dir / f"_C_sm{arch}.abi3.so"))
+        return arch
 
-    torch.ops.load_library(str(_pkg_dir / f"_C_sm{arch}.abi3.so"))
-    return arch
+    from ._amd import register
+
+    register()
+    # Reporting the device architecture here would create a GPU context at
+    # import, which the detection above avoids.
+    return "amd"
 
 
 __loaded_arch__ = _load_module()
+__backend__ = "cuda" if not torch.version.hip else "rocm"
 
 
 def _discover_modules() -> Dict[str, ModuleType]:
@@ -136,5 +147,5 @@ __built_json__ = torch.ops.hpc.built_json()
 __doc__ = """
 High Performance Computing Operators Library
 
-This library provides optimized CUDA kernels for tensor operations.
+This library provides optimized CUDA and AMD kernels for tensor operations.
 """
