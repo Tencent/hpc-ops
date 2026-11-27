@@ -1,4 +1,5 @@
 # Copyright (C) 2026 Tencent.
+# Copyright 2026, The FlagOS Contributors.
 
 SCHEMAS = (
     "act_mul_and_quant(Tensor input, Tensor scale, bool use_bf16_mul, Tensor? output) -> (Tensor)",

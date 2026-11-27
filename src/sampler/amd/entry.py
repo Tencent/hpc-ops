@@ -1,4 +1,5 @@
 # Copyright (C) 2026 Tencent.
+# Copyright 2026, The FlagOS Contributors.
 
 import torch
 from triton.experimental.tle import language as tle
