@@ -1,4 +1,5 @@
 // Copyright 2026 Tencent
+// Copyright 2026, The FlagOS Contributors.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime_api.h>
@@ -12,10 +13,18 @@
 namespace hpc {
 namespace iHC {
 
+static splitk::DispatchMode parse_splitk_mode(int64_t mode) {
+  TORCH_CHECK(mode >= 0 && mode <= 2, "splitk_mode must be 0 (auto), 1 (split-K), or 2 (row), got ",
+              mode);
+  return static_cast<splitk::DispatchMode>(mode);
+}
+
 std::tuple<torch::Tensor, torch::Tensor> fuse_ihc_pre_entry(
     const torch::Tensor &x, const torch::Tensor &w, const torch::Tensor &hc_scale,
     const torch::Tensor &hc_base, double norm_eps, double hc_eps, double magnitude,
-    std::optional<torch::Tensor> rms_weight, double rms_eps, bool cast_bfloat_for_norm) {
+    std::optional<torch::Tensor> rms_weight, double rms_eps, bool cast_bfloat_for_norm,
+    int64_t splitk_mode) {
+  const auto mode = parse_splitk_mode(splitk_mode);
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   TORCH_CHECK(x.is_contiguous(), "x tensor must be contiguous");
@@ -44,8 +53,8 @@ std::tuple<torch::Tensor, torch::Tensor> fuse_ihc_pre_entry(
   int hidden_dim = x.size(2);
 
   TORCH_CHECK(hc_mult == 4, "hc_mult must be 4");
-  TORCH_CHECK(hidden_dim == 6144 || hidden_dim == 4096,
-              "hidden dim must be 6144 (HYV4 production) or 4096");
+  TORCH_CHECK(hidden_dim == 3072 || hidden_dim == 4096 || hidden_dim == 6144,
+              "hidden dim must be 6144 (HYV4), 3072 (HY4 Flash) or 4096, got ", hidden_dim);
   TORCH_CHECK(w.size(0) == 2 * hc_mult, "w tensor's first dim must be 2 * hc_mult");
   TORCH_CHECK(w.size(1) == hc_mult * hidden_dim,
               "w tensor's second dim must be hc_mult * hidden_dim");
@@ -75,9 +84,22 @@ std::tuple<torch::Tensor, torch::Tensor> fuse_ihc_pre_entry(
   auto *output_y_ptr = reinterpret_cast<__nv_bfloat16 *>(output_y.mutable_data_ptr());
   auto *output_H_post_ptr = reinterpret_cast<float *>(output_H_post.mutable_data_ptr());
 
-  fuse_ihc_pre_async(output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
-                     num_batch, hc_mult, hidden_dim, norm_eps, hc_eps, magnitude, stream,
-                     rms_weight_ptr, rms_eps, cast_bfloat_for_norm);
+  const bool fuse_rms_norm = rms_weight_ptr != nullptr;
+  const size_t scratch_floats =
+      splitk::ihc_pre_splitk_scratch_floats(num_batch, hc_mult, hidden_dim, fuse_rms_norm, mode);
+  if (scratch_floats != 0) {
+    torch::Tensor scratch =
+        torch::empty({static_cast<int64_t>(scratch_floats)}, options.dtype(torch::kFloat32));
+    splitk::fuse_ihc_pre_splitk_async(
+        output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+        hc_mult, hidden_dim, norm_eps, hc_eps, magnitude,
+        reinterpret_cast<float *>(scratch.mutable_data_ptr()), stream, true, rms_weight_ptr,
+        static_cast<float>(rms_eps), cast_bfloat_for_norm);
+  } else {
+    fuse_ihc_pre_async(output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                       num_batch, hc_mult, hidden_dim, norm_eps, hc_eps, magnitude, stream,
+                       rms_weight_ptr, rms_eps, cast_bfloat_for_norm);
+  }
 
   return std::make_tuple(output_y, output_H_post);
 }
@@ -107,14 +129,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fuse_ihc_post_pre_entry(
   TORCH_CHECK(residual.dim() == 3, "residual tensor's dim must be 3 (num_batch, hc, hidden_dim)");
   TORCH_CHECK(H_post_in.dim() == 2, "H_post_in tensor's dim must be 2");
   TORCH_CHECK(w.dim() == 2, "w tensor's dim must be 2");
+  TORCH_CHECK(hc_scale.dim() == 1, "hc_scale tensor's dim must be 1");
+  TORCH_CHECK(hc_base.dim() == 1, "hc_base tensor's dim must be 1");
 
   const int num_batch = xa.size(0);
   const int hidden_dim = xa.size(1);
   const int hc_mult = residual.size(1);
 
   TORCH_CHECK(hc_mult == 4, "hc_mult must be 4");
-  TORCH_CHECK(hidden_dim == 6144 || hidden_dim == 4096,
-              "hidden dim must be 6144 (HYV4 production) or 4096");
+  TORCH_CHECK(hidden_dim == 3072 || hidden_dim == 4096 || hidden_dim == 6144,
+              "hidden dim must be 6144 (HYV4), 3072 (HY4 Flash) or 4096, got ", hidden_dim);
   TORCH_CHECK(residual.size(0) == num_batch && residual.size(2) == hidden_dim,
               "residual must be (num_batch, hc_mult, hidden_dim)");
   TORCH_CHECK(H_post_in.size(0) == num_batch && H_post_in.size(1) == hc_mult,
@@ -142,12 +166,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fuse_ihc_post_pre_entry(
   torch::Tensor z = torch::empty({num_batch, hidden_dim}, options);
   torch::Tensor H_post_out = torch::empty({num_batch, hc_mult}, options.dtype(torch::kFloat32));
 
-  const size_t scratch_floats = ihc_post_pre_scratch_floats(num_batch, hc_mult, hidden_dim);
-  torch::Tensor scratch =
-      torch::empty({static_cast<int64_t>(scratch_floats)}, options.dtype(torch::kFloat32));
-  float *scratch_ptr =
-      scratch_floats > 0 ? reinterpret_cast<float *>(scratch.mutable_data_ptr()) : nullptr;
-
   fuse_ihc_post_pre_async(reinterpret_cast<__nv_bfloat16 *>(y.mutable_data_ptr()),
                           reinterpret_cast<__nv_bfloat16 *>(z.mutable_data_ptr()),
                           reinterpret_cast<float *>(H_post_out.mutable_data_ptr()),
@@ -157,8 +175,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> fuse_ihc_post_pre_entry(
                           reinterpret_cast<const float *>(w.const_data_ptr()),
                           reinterpret_cast<const float *>(hc_scale.const_data_ptr()),
                           reinterpret_cast<const float *>(hc_base.const_data_ptr()), num_batch,
-                          hc_mult, hidden_dim, norm_eps, hc_eps, magnitude, scratch_ptr, stream,
-                          rms_weight_ptr, rms_eps, cast_bfloat_for_norm);
+                          hc_mult, hidden_dim, norm_eps, hc_eps, magnitude, stream, rms_weight_ptr,
+                          rms_eps, cast_bfloat_for_norm);
 
   return std::make_tuple(y, z, H_post_out);
 }
@@ -189,8 +207,8 @@ torch::Tensor fuse_ihc_post_entry(const torch::Tensor &x, const torch::Tensor &r
   int hidden_dim = residual.size(2);
 
   TORCH_CHECK(hc_mult == 4, "hc_mult must be 4");
-  TORCH_CHECK(hidden_dim == 6144 || hidden_dim == 4096,
-              "hidden dim must be 6144 (HYV4 production) or 4096");
+  TORCH_CHECK(hidden_dim == 3072 || hidden_dim == 4096 || hidden_dim == 6144,
+              "hidden dim must be 6144 (HYV4), 3072 (HY4 Flash) or 4096, got ", hidden_dim);
   TORCH_CHECK(x.size(0) == num_batch, "x tensor's first dim must be num_batch");
   TORCH_CHECK(x.size(1) == hidden_dim, "x tensor's second dim must be hidden_dim");
   TORCH_CHECK(H_post.size(0) == num_batch, "H_post tensor's first dim must be num_batch");
@@ -214,7 +232,8 @@ torch::Tensor fuse_ihc_head_entry(const torch::Tensor &x, const torch::Tensor &w
                                   const torch::Tensor &hc_scale, const torch::Tensor &hc_base,
                                   double norm_eps, double hc_eps,
                                   std::optional<torch::Tensor> rms_weight, double rms_eps,
-                                  bool cast_bfloat_for_norm) {
+                                  bool cast_bfloat_for_norm, int64_t splitk_mode) {
+  const auto mode = parse_splitk_mode(splitk_mode);
   auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
   TORCH_CHECK(x.is_contiguous(), "x tensor must be contiguous");
@@ -243,8 +262,8 @@ torch::Tensor fuse_ihc_head_entry(const torch::Tensor &x, const torch::Tensor &w
   int hidden_dim = x.size(2);
 
   TORCH_CHECK(hc_mult == 4, "hc_mult must be 4");
-  TORCH_CHECK(hidden_dim == 6144 || hidden_dim == 4096,
-              "hidden dim must be 6144 (HYV4 production) or 4096");
+  TORCH_CHECK(hidden_dim == 3072 || hidden_dim == 4096 || hidden_dim == 6144,
+              "hidden dim must be 6144 (HYV4), 3072 (HY4 Flash) or 4096, got ", hidden_dim);
   TORCH_CHECK(w.size(0) == hc_mult, "w tensor's first dim must be hc_mult");
   TORCH_CHECK(w.size(1) == hc_mult * hidden_dim,
               "w tensor's second dim must be hc_mult * hidden_dim");
@@ -272,9 +291,21 @@ torch::Tensor fuse_ihc_head_entry(const torch::Tensor &x, const torch::Tensor &w
   const auto *hc_base_ptr = reinterpret_cast<const float *>(hc_base.const_data_ptr());
   auto *output_ptr = reinterpret_cast<__nv_bfloat16 *>(output.mutable_data_ptr());
 
-  fuse_ihc_head_async(output_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, hc_mult,
-                      hidden_dim, norm_eps, hc_eps, stream, rms_weight_ptr, rms_eps,
-                      cast_bfloat_for_norm);
+  const bool fuse_rms_norm = rms_weight_ptr != nullptr;
+  const size_t scratch_floats =
+      splitk::ihc_head_splitk_scratch_floats(num_batch, hc_mult, hidden_dim, fuse_rms_norm, mode);
+  if (scratch_floats != 0) {
+    torch::Tensor scratch =
+        torch::empty({static_cast<int64_t>(scratch_floats)}, options.dtype(torch::kFloat32));
+    splitk::fuse_ihc_head_splitk_async(
+        output_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, hc_mult, hidden_dim,
+        norm_eps, hc_eps, reinterpret_cast<float *>(scratch.mutable_data_ptr()), stream, true,
+        rms_weight_ptr, static_cast<float>(rms_eps), cast_bfloat_for_norm);
+  } else {
+    fuse_ihc_head_async(output_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, hc_mult,
+                        hidden_dim, norm_eps, hc_eps, stream, rms_weight_ptr, rms_eps,
+                        cast_bfloat_for_norm);
+  }
 
   return output;
 }
@@ -286,7 +317,7 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def(
       "fuse_ihc_pre(Tensor x, Tensor w, Tensor hc_scale, Tensor hc_base, float norm_eps, float "
       "hc_eps, float magnitude, Tensor? rms_weight=None, float rms_eps=0.0, "
-      "bool cast_bfloat_for_norm=False) "
+      "bool cast_bfloat_for_norm=False, *, int splitk_mode=0) "
       "-> (Tensor output_y, Tensor output_H_post)");
   m.impl("fuse_ihc_pre", torch::kCUDA, &hpc::iHC::fuse_ihc_pre_entry);
 
@@ -302,7 +333,8 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
 
   m.def(
       "fuse_ihc_head(Tensor x, Tensor w, Tensor hc_scale, Tensor hc_base, float norm_eps, float "
-      "hc_eps, Tensor? rms_weight=None, float rms_eps=0.0, bool cast_bfloat_for_norm=False) "
+      "hc_eps, Tensor? rms_weight=None, float rms_eps=0.0, bool cast_bfloat_for_norm=False, "
+      "*, int splitk_mode=0) "
       "-> Tensor output");
   m.impl("fuse_ihc_head", torch::kCUDA, &hpc::iHC::fuse_ihc_head_entry);
 }
